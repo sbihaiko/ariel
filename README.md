@@ -43,15 +43,29 @@ Once the agent can reach the console, make the shell easy for it to use correctl
 - Pagination and size limits, so a large directory or log does not flood the agent's context.
 - Strictly non-interactive commands: no prompts in the middle of a session.
 
-### Stage 3: MCP
+### Stage 3 (optional): sessions
 
-Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs.
+Stages 1 and 2 are enough for an agent to operate the console. Stages 3 and 4 are optional conveniences on top of them.
+
+Agents usually reach the console through one-shot connections (one command per connection, e.g. `echo 'ls --json /data' | nc ps5 2323`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
+
+- `session new` returns a random 128-bit session ID and its TTL. Prefixing a command with `@<sid>` runs it inside that session, and `session close` ends it.
+- A session holds only minimal state: working directory, environment, authorization level and timestamps. Payloads started from a session are not tied to it and keep running after it ends.
+- Sessions expire after a period of inactivity, and the number of concurrent sessions is capped, so a client that forgets to close them cannot exhaust the console's RAM.
+- An unknown or expired ID returns an explicit `session_expired` error instead of silently falling back, so the agent knows to open a new session (for example after a reboot).
+- A session ID is not enough to authorize a destructive operation. Over plain-text connections it can be sniffed, so destructive commands still require their own confirmation, and a session can be bound to the client's IP address.
+- Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 1 operations such as installing and rolling back take a global lock.
+- Sessions are a convenience, not a requirement. Every command also works without one, using absolute paths.
+
+### Stage 4 (optional): MCP
+
+Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP's HTTP transport carries its own session ID (`Mcp-Session-Id`), which maps onto the Stage 3 sessions.
 
 ## Safety model
 
 An agent that can download, write and execute code on a console with kernel privileges needs firm limits. Ariel is designed around these rules:
 
-- **Read is free, change is gated.** Inspecting processes, files and logs is allowed. Writing files, killing processes, downloading and executing payloads require an access token and are marked as destructive so the client asks a human first.
+- **Read is free, change is gated.** Inspecting processes, files and logs is allowed. Writing files, killing processes, downloading and executing payloads require an access token and an explicit confirmation enforced on the console (a `--confirm` flag or a single-use token), so they never run by accident. From Stage 4, MCP tools are also marked as destructive so the client asks a human first.
 - **Allowlisted sources only.** Downloads come only from approved hosts and repositories, and every file is hash-checked before execution.
 - **Protected areas.** System partitions stay read-only. Critical system processes (such as SceShellCore) cannot be killed.
 - **Always recoverable.** Every change is preceded by a backup, and every payload has a previous version to fall back to.
@@ -99,7 +113,7 @@ That is exactly the role of this project. Ariel is the servant that lives on Pro
 
 **Protocols**
 
-- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 3.
+- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 4.
 
 ## Legal
 
