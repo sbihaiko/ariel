@@ -105,6 +105,8 @@ Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-hel
 
 The headless acceptance test runs this section: it substitutes the token, the host and the staging ID, approves on a virtual controller where a human would, and treats IDs and hashes as placeholders. It builds `helloworld.elf` for the machine under test: with the host compiler for the headless suite, with `prospero-clang` (step 3) for a console.
 
+With `PS5_HOST` set, the same harness runs against a real console instead of starting the host build: it reads the access token from you, builds `helloworld.elf` with `prospero-clang`, prints the notification the console shows at every approval step and waits for you to decide on the controller. It runs only the scenarios that need no test clock, and names the ones it skips. That run is manual: it is not part of CI and not part of the Stage 1 gate.
+
 ```console
 $ export ARIEL_TOKEN=<token shown on the console>
 ```

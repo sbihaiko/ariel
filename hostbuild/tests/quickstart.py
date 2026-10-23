@@ -277,14 +277,14 @@ def hello_source(text):
     return match.group(1)
 
 
-def build_hello(text, workdir):
-    """Build helloworld.elf with the host compiler, from the document."""
+def build_hello(text, workdir, cc=None):
+    """Build helloworld.elf from the document with the given compiler."""
     with open(os.path.join(workdir, "hello.c"), "w") as handle:
         handle.write(hello_source(text))
 
+    compiler = list(cc) if cc else [os.environ.get("CC", "cc")]
     result = subprocess.run(
-        [os.environ.get("CC", "cc"), "-Wall", "-Werror",
-         "-o", "helloworld.elf", "hello.c"],
+        compiler + ["-Wall", "-Werror", "-o", "helloworld.elf", "hello.c"],
         cwd=workdir, capture_output=True,
     )
     if result.returncode:
@@ -324,13 +324,20 @@ def nc_path(env):
     return wrapper
 
 
-def run_quick_start(doc_path, workdir, host, port, token, next_line, approve):
-    """Drive the section against one server. Raises FixtureError on a mismatch."""
+def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
+                    notify=None, cc=None):
+    """Drive the section against one server. Raises FixtureError on a mismatch.
+
+    With `notify`, the owner approves on a real console instead: the callback
+    receives the approval ID, the payload name, its size and its hash, shows
+    the notification the console displays, and waits for the owner's decision.
+    The prompt is then not read from a server's standard output.
+    """
     with open(doc_path) as handle:
         text = handle.read()
 
     section = after_stage1(text)
-    build_hello(text, workdir)
+    build_hello(text, workdir, cc)
 
     with open(os.path.join(workdir, "helloworld.elf"), "rb") as handle:
         elf = handle.read()
@@ -362,27 +369,33 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve):
                         "the section approves on the console with nothing "
                         "pending")
 
-                line = next_line()
-                match = PROMPT.match(line or "")
-                if not match:
-                    raise FixtureError(
-                        "expected the approval prompt, got %r" % line)
-                if match.group(1) != pending:
-                    raise FixtureError(
-                        "the prompt names %s but the push staged %s"
-                        % (match.group(1), pending))
-                if push_name is not None and match.group(2) != push_name:
-                    raise FixtureError(
-                        "the prompt names %r, not %r"
-                        % (match.group(2), push_name))
-                if int(match.group(3)) != len(elf):
-                    raise FixtureError(
-                        "the prompt says %s bytes, not %d"
-                        % (match.group(3), len(elf)))
-                if match.group(4) != elf_hash:
-                    raise FixtureError("the prompt shows the wrong hash")
+                if notify is not None:
+                    if push_name is None:
+                        raise FixtureError(
+                            "the section approves on the console before a push")
+                    notify(pending, push_name, len(elf), elf_hash)
+                else:
+                    line = next_line()
+                    match = PROMPT.match(line or "")
+                    if not match:
+                        raise FixtureError(
+                            "expected the approval prompt, got %r" % line)
+                    if match.group(1) != pending:
+                        raise FixtureError(
+                            "the prompt names %s but the push staged %s"
+                            % (match.group(1), pending))
+                    if push_name is not None and match.group(2) != push_name:
+                        raise FixtureError(
+                            "the prompt names %r, not %r"
+                            % (match.group(2), push_name))
+                    if int(match.group(3)) != len(elf):
+                        raise FixtureError(
+                            "the prompt says %s bytes, not %d"
+                            % (match.group(3), len(elf)))
+                    if match.group(4) != elf_hash:
+                        raise FixtureError("the prompt shows the wrong hash")
 
-                approve(pending)
+                    approve(pending)
                 approvals += 1
                 pending = None
                 continue

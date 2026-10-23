@@ -847,6 +847,168 @@ def scenario_notification_rate(server):
     assert_staged(server, lines, "rate3", data)
 
 
+# Console mode, proven without a console. The sentinel is TEST-NET-1, which
+# no console answers on: the plan path must reach it nowhere.
+CONSOLE_SENTINEL = "192.0.2.1"
+CONSOLE_BANNER = "console mode: %s:2324"
+PLAN_RUN = "run  "
+PLAN_SKIP = re.compile(r"^skip (\S.*) \(needs the test clock\)$")
+
+# The scenarios whose behavior is defined by moving the host test clock.
+# This list comes from the SPEC's time-dependent cases, not from the code.
+CLOCK_SCENARIOS = {
+    "missing auth after 5 s of test clock closes with exit 70",
+    "a stalled upload does not block another connection",
+    "an approval expires after 120 s of test clock",
+    "an expired approval does not count among the pending ones",
+    "an unanswered staging object disappears after 15 min",
+    "a second notification within 10 s answers approval_busy with no prompt",
+    "the test clock is host-only and cannot enter the PS5 build",
+}
+
+
+def console_plan(env):
+    """Run the harness's console-mode listing path and return the result."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "acceptance.py")
+    return subprocess.run([sys.executable, script, "--plan"], env=env,
+                          capture_output=True, text=True, timeout=120)
+
+
+def scenario_console_mode_plan(server):
+    """PS5_HOST selects console mode, which names every clock scenario it skips."""
+    del server  # the plan path contacts nothing
+
+    env = os.environ.copy()
+    env["PS5_HOST"] = CONSOLE_SENTINEL
+    planned = console_plan(env)
+    assert planned.returncode == 0, (
+        "the console plan must run without a console, it exited %d: %s"
+        % (planned.returncode, planned.stderr))
+    lines = planned.stdout.splitlines()
+    assert lines and lines[0] == CONSOLE_BANNER % CONSOLE_SENTINEL, (
+        "console mode must announce the console it targets, got %r" % lines[:1])
+
+    run = [line[len(PLAN_RUN):] for line in lines if line.startswith(PLAN_RUN)]
+    skipped = []
+    for line in lines:
+        if not line.startswith("skip "):
+            continue
+        match = PLAN_SKIP.match(line)
+        assert match, "a skipped scenario must name its reason: %r" % line
+        skipped.append(match.group(1))
+
+    assert set(skipped) == CLOCK_SCENARIOS, (
+        "console mode must skip exactly the scenarios that need the test "
+        "clock:\nmissing %r\nunexpected %r"
+        % (sorted(CLOCK_SCENARIOS - set(skipped)),
+           sorted(set(skipped) - CLOCK_SCENARIOS)))
+    assert run, "console mode must run its scenarios against the console"
+    assert not set(run) & set(skipped), (
+        "a scenario cannot be both run and skipped: %r"
+        % sorted(set(run) & set(skipped)))
+    assert any("quick start" in title for title in run), (
+        "console mode must run the quick start, runs %r" % run)
+
+    # With PS5_HOST unset nothing selects console mode.
+    env.pop("PS5_HOST")
+    headless = console_plan(env)
+    assert headless.returncode != 0, (
+        "without PS5_HOST the suite must not enter console mode")
+    assert "PS5_HOST" in (headless.stdout + headless.stderr), (
+        "the refusal must name PS5_HOST, got %r"
+        % (headless.stdout + headless.stderr))
+
+
+class ScriptedLink:
+    """A fake console agent port: scripted replies, recorded exchange order."""
+
+    def __init__(self, replies, events):
+        self.replies = list(replies)
+        self.events = events
+
+    def exchange(self, command, body=None, token=None):
+        self.events.append(("send", command))
+        assert self.replies, "the harness sent an unscripted command: %r" % command
+        return list(self.replies.pop(0))
+
+
+def scripted_session(replies):
+    """One console session over a scripted link and a scripted operator."""
+    import console
+
+    events = []
+    shown = []
+    answers = []
+
+    def read(prompt=""):
+        events.append(("wait", prompt))
+        return answers.pop(0) if answers else ""
+
+    def write(line=""):
+        shown.append(line)
+
+    link = ScriptedLink(replies, events)
+    operator = console.Operator(read=read, write=write, sleep=lambda s: None)
+    return console, link, operator, console.Session(link, operator), events, shown
+
+
+def scenario_console_approval_prompts(server):
+    """An approval step shows the console notification and waits; deny says deny."""
+    del server  # the fake link stands in for the agent port
+
+    data = b"deny me"
+    digest = hashlib.sha256(data).hexdigest()
+    console, link, operator, session, events, shown = scripted_session([
+        ["staged s-0123abcd", "approval_required a-4567ef90", "exit 75"],
+        ["approval_denied", "exit 77"],
+    ])
+
+    lines = session.push("consoledenied", data)
+    staging, approval = console.assert_staged(lines, "consoledenied", data)
+    session.request(approval, "consoledenied", len(data), digest, deny=True)
+    assert session.commit(staging) == ["approval_denied", "exit 77"], (
+        "the scripted commit must answer the denial")
+
+    notification = ("prompt %s payload consoledenied (%d bytes, sha256 %s) "
+                    "will run" % (approval, len(data), digest))
+    assert "Deny consoledenied on the console with the controller." in shown, (
+        "a deny step must ask the owner to deny, showed %r" % shown)
+    assert "The console notification should read:" in shown, (
+        "the owner must be told what the console shows, showed %r" % shown)
+    assert "  " + notification in shown, (
+        "the step must print the notification the console shows, showed %r"
+        % shown)
+
+    sends = [i for i, event in enumerate(events) if event[0] == "send"]
+    waits = [i for i, event in enumerate(events) if event[0] == "wait"]
+    assert sends and waits, "the step must send and wait, events %r" % events
+    assert sends[0] < waits[0] < sends[1], (
+        "the prompt must follow the push and the commit must follow the "
+        "owner's decision, events %r" % events)
+    assert "payload push consoledenied" in events[sends[0]][1], (
+        "the first exchange must be the push")
+    assert "payload commit" in events[sends[1]][1], (
+        "the commit must wait for the decision")
+
+    # An approve step asks the owner to approve, with the same notification.
+    console, link, operator, session, events, shown = scripted_session([
+        ["staged s-0123abcd", "approval_required a-4567ef90", "exit 75"],
+        ["installed consoleapproved %s" % digest, "exit 0"],
+    ])
+    lines = session.push("consoleapproved", data)
+    staging, approval = console.assert_staged(lines, "consoleapproved", data)
+    session.request(approval, "consoleapproved", len(data), digest)
+    assert session.commit(staging) == [
+        "installed consoleapproved %s" % digest, "exit 0"], (
+        "the scripted commit must answer the installation")
+    assert "Approve consoleapproved on the console with the controller." in shown, (
+        "an approval step must ask the owner to approve, showed %r" % shown)
+    assert "  prompt %s payload consoleapproved" % approval in " ".join(shown), (
+        "the approval step must print the console notification, showed %r"
+        % shown)
+
+
 def scenario_test_clock_host_only(server):
     """The test clock cannot be compiled into the PS5 build."""
     del server  # this guard needs no server
@@ -1346,107 +1508,122 @@ def scenario_denied_push(server):
     decide_push(server, "denied", b"deny me", "deny")
 
 
+# Every scenario the headless suite runs, in report order. The third field
+# says whether the scenario's behavior is defined by moving the host test
+# clock; console mode reads this table to skip and name exactly those.
+SCENARIOS = [
+    ("missing auth closes with exit 70", scenario_missing_auth, False),
+    ("missing auth after 5 s of test clock closes with exit 70",
+     scenario_auth_deadline, True),
+    ("a line over 1 KiB closes the connection", scenario_line_limit, False),
+    ("wrong token closes with exit 70", scenario_wrong_token, False),
+    ("right token and a Stage 1 command outside the set answers "
+     "unknown_command", scenario_unknown_command, False),
+    ("two connections are served at the same time",
+     scenario_two_connections, False),
+    ("a fifth concurrent connection answers busy and exit 82",
+     scenario_connection_limit, False),
+    ("a ninth connection answers busy and exit 82 with every refusal slot "
+     "taken", scenario_refusal_slots_exhausted, False),
+    ("a stalled upload does not block another connection",
+     scenario_stalled_upload_does_not_block, True),
+    ("a truncated upload answers upload_mismatch and exit 81",
+     scenario_truncated_upload, False),
+    ("bytes past the declared size answer upload_mismatch and exit 81",
+     scenario_extra_bytes, False),
+    ("a hash mismatch answers upload_mismatch and exit 81",
+     scenario_hash_mismatch, False),
+    ("a name outside the grammar answers bad_name", scenario_bad_name, False),
+    ("a matching push is staged, asks for approval and exits 75",
+     scenario_matching_push, False),
+    ("an upload in many small fragments arrives intact",
+     scenario_fragmented_upload, False),
+    ("an ELF containing 0xff bytes arrives intact",
+     scenario_elf_with_ff, False),
+    ("a denied push is answered on the virtual controller",
+     scenario_denied_push, False),
+    ("a commit before the decision answers approval_required and exit 75",
+     scenario_commit_before_decision, False),
+    ("an approved commit answers installed <name> <hash> and exit 0",
+     scenario_commit_installed, False),
+    ("a second commit of the same name replaces the first build",
+     scenario_commit_replaces, False),
+    ("an approval does not survive a restart of Ariel",
+     scenario_commit_after_restart, False),
+    ("a staging object changed after approval answers approval_stale and "
+     "exit 78", scenario_commit_stale, False),
+    ("an approval is single-use when two commits race",
+     scenario_commit_single_use, False),
+    ("a denied commit answers approval_denied and exit 77 and deletes the "
+     "staging object", scenario_commit_denied, False),
+    ("a run streams the payload's output, then status 0 and exit 0",
+     scenario_run_streams_output, False),
+    ("a payload exiting 3 answers status 3, and one exiting 75 answers "
+     "status 75, never an approval request",
+     scenario_run_reports_payload_status, False),
+    ("an unknown payload name is an error", scenario_run_unknown_name, False),
+    ("an object changed behind Ariel's back answers approval_stale and "
+     "exit 78 and does not run", scenario_run_stale_object, False),
+    ("a FIFO in place of a committed object answers approval_stale and "
+     "exit 78 without blocking other clients",
+     scenario_run_fifo_object, False),
+    ("a run of a committed build needs no new approval, and a push of a "
+     "different build asks again", scenario_run_needs_no_new_approval, False),
+    ("a stored object that cannot be executed answers spawn_failed and "
+     "exit 1", scenario_run_exec_failure, False),
+    ("a finished connection reaches end of stream while a payload runs",
+     scenario_run_does_not_leak_connections, False),
+    ("the quick start's 'After Stage 1' section passes headless",
+     scenario_quick_start, False),
+    ("a change to the 'After Stage 1' section without a change to Ariel "
+     "makes the fixture fail", scenario_quick_start_doc_drift, False),
+    ("a broken setup command or a wrong exported token makes the fixture "
+     "fail", scenario_quick_start_broken_setup, False),
+    ("a failing '$' command in a block of any label makes the fixture fail",
+     scenario_quick_start_unlabeled_block, False),
+    ("an approval expires after 120 s of test clock",
+     scenario_approval_expired, True),
+    ("an expired approval does not count among the pending ones",
+     scenario_expired_not_pending, True),
+    ("an upload over 64 MiB answers staging_full and exit 80",
+     scenario_upload_too_large, False),
+    ("staging past 64 MiB in total answers staging_full",
+     scenario_staging_total, False),
+    ("an unanswered staging object disappears after 15 min",
+     scenario_staging_ttl, True),
+    ("a fourth pending approval answers approval_busy and exit 76 with no "
+     "prompt", scenario_pending_limit, False),
+    ("a second notification within 10 s answers approval_busy with no "
+     "prompt", scenario_notification_rate, True),
+    ("the test clock is host-only and cannot enter the PS5 build",
+     scenario_test_clock_host_only, True),
+    ("console mode with PS5_HOST set names the console scenarios and every "
+     "scenario that needs the test clock", scenario_console_mode_plan, False),
+    ("console mode prints what the owner should see on the console and "
+     "waits for the controller decision",
+     scenario_console_approval_prompts, False),
+]
+
+
 def main():
-    binary = sys.argv[1] if len(sys.argv) > 1 else "./ariel-host"
+    argv = sys.argv[1:]
+
+    # PS5_HOST is the whole switch: with it set the suite runs against the
+    # console, and it starts nothing.
+    if os.environ.get("PS5_HOST", "").strip():
+        import console
+        return console.main(SCENARIOS, argv)
+
+    if "--plan" in argv:
+        print("--plan lists console mode; set PS5_HOST to reach the console",
+              file=sys.stderr)
+        return 2
+
+    binary = argv[0] if argv else "./ariel-host"
     server = Server(binary)
     try:
-        check("missing auth closes with exit 70",
-              lambda: scenario_missing_auth(server))
-        check("missing auth after 5 s of test clock closes with exit 70",
-              lambda: scenario_auth_deadline(server))
-        check("a line over 1 KiB closes the connection",
-              lambda: scenario_line_limit(server))
-        check("wrong token closes with exit 70",
-              lambda: scenario_wrong_token(server))
-        check("right token and a Stage 1 command outside the set answers "
-              "unknown_command", lambda: scenario_unknown_command(server))
-        check("two connections are served at the same time",
-              lambda: scenario_two_connections(server))
-        check("a fifth concurrent connection answers busy and exit 82",
-              lambda: scenario_connection_limit(server))
-        check("a ninth connection answers busy and exit 82 with every "
-              "refusal slot taken",
-              lambda: scenario_refusal_slots_exhausted(server))
-        check("a stalled upload does not block another connection",
-              lambda: scenario_stalled_upload_does_not_block(server))
-        check("a truncated upload answers upload_mismatch and exit 81",
-              lambda: scenario_truncated_upload(server))
-        check("bytes past the declared size answer upload_mismatch and "
-              "exit 81", lambda: scenario_extra_bytes(server))
-        check("a hash mismatch answers upload_mismatch and exit 81",
-              lambda: scenario_hash_mismatch(server))
-        check("a name outside the grammar answers bad_name",
-              lambda: scenario_bad_name(server))
-        check("a matching push is staged, asks for approval and exits 75",
-              lambda: scenario_matching_push(server))
-        check("an upload in many small fragments arrives intact",
-              lambda: scenario_fragmented_upload(server))
-        check("an ELF containing 0xff bytes arrives intact",
-              lambda: scenario_elf_with_ff(server))
-        check("a denied push is answered on the virtual controller",
-              lambda: scenario_denied_push(server))
-        check("a commit before the decision answers approval_required and "
-              "exit 75", lambda: scenario_commit_before_decision(server))
-        check("an approved commit answers installed <name> <hash> and "
-              "exit 0", lambda: scenario_commit_installed(server))
-        check("a second commit of the same name replaces the first build",
-              lambda: scenario_commit_replaces(server))
-        check("an approval does not survive a restart of Ariel",
-              lambda: scenario_commit_after_restart(server))
-        check("a staging object changed after approval answers "
-              "approval_stale and exit 78",
-              lambda: scenario_commit_stale(server))
-        check("an approval is single-use when two commits race",
-              lambda: scenario_commit_single_use(server))
-        check("a denied commit answers approval_denied and exit 77 and "
-              "deletes the staging object",
-              lambda: scenario_commit_denied(server))
-        check("a run streams the payload's output, then status 0 and exit 0",
-              lambda: scenario_run_streams_output(server))
-        check("a payload exiting 3 answers status 3, and one exiting 75 "
-              "answers status 75, never an approval request",
-              lambda: scenario_run_reports_payload_status(server))
-        check("an unknown payload name is an error",
-              lambda: scenario_run_unknown_name(server))
-        check("an object changed behind Ariel's back answers approval_stale "
-              "and exit 78 and does not run",
-              lambda: scenario_run_stale_object(server))
-        check("a FIFO in place of a committed object answers approval_stale "
-              "and exit 78 without blocking other clients",
-              lambda: scenario_run_fifo_object(server))
-        check("a run of a committed build needs no new approval, and a push "
-              "of a different build asks again",
-              lambda: scenario_run_needs_no_new_approval(server))
-        check("a stored object that cannot be executed answers spawn_failed "
-              "and exit 1", lambda: scenario_run_exec_failure(server))
-        check("a finished connection reaches end of stream while a payload "
-              "runs", lambda: scenario_run_does_not_leak_connections(server))
-        check("the quick start's 'After Stage 1' section passes headless",
-              lambda: scenario_quick_start(server))
-        check("a change to the 'After Stage 1' section without a change to "
-              "Ariel makes the fixture fail",
-              lambda: scenario_quick_start_doc_drift(server))
-        check("a broken setup command or a wrong exported token makes the "
-              "fixture fail", lambda: scenario_quick_start_broken_setup(server))
-        check("a failing '$' command in a block of any label makes the "
-              "fixture fail",
-              lambda: scenario_quick_start_unlabeled_block(server))
-        check("an approval expires after 120 s of test clock",
-              lambda: scenario_approval_expired(server))
-        check("an expired approval does not count among the pending ones",
-              lambda: scenario_expired_not_pending(server))
-        check("an upload over 64 MiB answers staging_full and exit 80",
-              lambda: scenario_upload_too_large(server))
-        check("staging past 64 MiB in total answers staging_full",
-              lambda: scenario_staging_total(server))
-        check("an unanswered staging object disappears after 15 min",
-              lambda: scenario_staging_ttl(server))
-        check("a fourth pending approval answers approval_busy and exit 76 "
-              "with no prompt", lambda: scenario_pending_limit(server))
-        check("a second notification within 10 s answers approval_busy "
-              "with no prompt", lambda: scenario_notification_rate(server))
-        check("the test clock is host-only and cannot enter the PS5 build",
-              lambda: scenario_test_clock_host_only(server))
+        for title, scenario, _clock in SCENARIOS:
+            check(title, lambda scenario=scenario: scenario(server))
     finally:
         server.stop()
 
