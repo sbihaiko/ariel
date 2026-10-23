@@ -889,6 +889,49 @@ def scenario_test_clock_host_only(server):
             % allowed.stderr)
 
 
+def scenario_vcontroller_host_only(server):
+    """The virtual controller cannot be compiled into the PS5 build."""
+    del server  # this guard needs no server
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    # No source the PS5 target builds may mention the virtual controller;
+    # only the host build under hostbuild/ may. The approval source on a
+    # console is the controller the owner holds, never a listener.
+    offenders = []
+    for base, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in (".git", "hostbuild")]
+        for name in files:
+            if not name.endswith((".c", ".h")):
+                continue
+            path = os.path.join(base, name)
+            with open(path, "r", errors="replace") as handle:
+                if "vcontroller" in handle.read():
+                    offenders.append(os.path.relpath(path, repo))
+    assert not offenders, (
+        "the PS5 build must not see the virtual controller, but these "
+        "sources mention it: %r" % offenders)
+
+    # The guard itself: without the host define the file refuses to
+    # compile, and the refusal names the virtual controller.
+    source = os.path.join(repo, "hostbuild", "vcontroller.c")
+    compiler = os.environ.get("CC", "cc")
+    with tempfile.TemporaryDirectory() as scratch:
+        obj = os.path.join(scratch, "vcontroller.o")
+        denied = subprocess.run([compiler, "-c", "-o", obj, source],
+                                capture_output=True, text=True)
+        assert denied.returncode != 0, (
+            "vcontroller.c must refuse to compile without ARIEL_HOST_BUILD")
+        assert "the virtual controller is host-only" in denied.stderr, (
+            "the refusal must name the guard, got %r" % denied.stderr)
+        allowed = subprocess.run(
+            [compiler, "-c", "-o", obj, "-DARIEL_HOST_BUILD=1", source],
+            capture_output=True, text=True)
+        assert allowed.returncode == 0, (
+            "vcontroller.c must compile for the host build, got %r"
+            % allowed.stderr)
+
+
 def approve_push(server, name, data):
     """Push, check the prompt, approve it and return the staging ID."""
     lines = push(server, name, data)
@@ -1447,6 +1490,8 @@ def main():
               "with no prompt", lambda: scenario_notification_rate(server))
         check("the test clock is host-only and cannot enter the PS5 build",
               lambda: scenario_test_clock_host_only(server))
+        check("the virtual controller is host-only and cannot enter the PS5 "
+              "build", lambda: scenario_vcontroller_host_only(server))
     finally:
         server.stop()
 
