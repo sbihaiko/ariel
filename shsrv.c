@@ -84,17 +84,26 @@ reap_shell(void *arg) {
 static void
 reap_later(pid_t pid) {
   pthread_t thread;
+  int status;
 
   if(pid <= 0) {
     return;
   }
 
-  if(pthread_create(&thread, NULL, reap_shell, (void*)(intptr_t)pid)) {
-    klog_perror("pthread_create");
+  if(!pthread_create(&thread, NULL, reap_shell, (void*)(intptr_t)pid)) {
+    pthread_detach(thread);
     return;
   }
 
-  pthread_detach(thread);
+  // No thread can wait for this child, and SIGCHLD is no longer ignored.
+  // Wait here rather than leave a zombie. The shell is already spawned, so
+  // this only holds back the next accept until it exits.
+  klog_perror("pthread_create");
+  while(waitpid(pid, &status, 0) < 0) {
+    if(errno != EINTR) {
+      break;
+    }
+  }
 }
 
 
