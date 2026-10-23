@@ -39,7 +39,9 @@ Stage 1 commands already follow a minimal machine-safe grammar: one command per 
 
 New commands in this stage (see [Command coverage](#command-coverage)):
 
-- `payload install | run | list | logs | rollback`, the core of the stage. `run` starts a payload in the background and captures its output to a log.
+- `payload install | run | list | logs | rollback`, the core of the stage. `run` starts a payload in the background and captures its output to a log. It loads the file through the ELF loader, so the payload does not need the executable bit (no `chmod`).
+- `payload run --wait`, which runs the payload in the foreground, streams its output to the connection and returns its exit status, while still writing the log. This is how an agent sees the result of a quick test.
+- `payload push <name>`, which uploads a locally built ELF over the same connection, so no FTP server is needed. A pushed file has no release and no pinned hash, so the console shows its hash and the upload is kept only after a human approves it with the controller. This is the development loop: build on the computer, push, run.
 - `autoload show | edit | safe-boot`, to inspect the autoload configuration and to boot without it when a payload keeps crashing.
 - `sha256sum`, because the existing `sum` is a BSD checksum, not SHA-256.
 - `unzip` and `tar`, because many GitHub releases ship payloads inside an archive.
@@ -112,7 +114,8 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `ps` | | ✅ | S2: `--json` |
 | `procstat` | `/proc/<pid>/*` | ✅ | |
 | `kill` | | ✅ | S1: gated, critical processes protected |
-| `payload run` | `cmd &`, `nohup` | ❌ | S1, gated, output captured to a log |
+| `payload run` | `cmd &`, `nohup` | ❌ | S1, gated, output captured to a log. `--wait` runs it in the foreground |
+| `payload push` | `scp`, `curl -T` | ❌ | S1, gated, hash approved on the console |
 | `timeout` | | ❌ | S2 |
 | `env`, `export`, `exec`, `sleep`, `id`, `sync` | | ✅ | |
 | `sysinfo` | `uname`, `uptime`, `free` | ⚠️ raw values via `sysctl` | S2 |

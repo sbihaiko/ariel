@@ -99,6 +99,25 @@ To run it by name, put it in a folder on the shell's `PATH`, `/user/homebrew/bin
 Hello, world from Ariel!
 ```
 
+## After Stage 1
+
+Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-download-run-persist-roll-back) lands: no FTP server and no `chmod`. The planned flow:
+
+```console
+/$ payload push helloworld
+(the bytes of helloworld.elf follow on the same connection)
+approval_required: approve the hash of "helloworld" on the console
+/$ payload run --wait helloworld one two
+approval_required: approve "run helloworld" on the console
+/$ payload run --wait helloworld one two
+Hello, world from Ariel!
+argv[1] = one
+argv[2] = two
+exit 0
+```
+
+The exact syntax for sending the file bytes over a one-shot connection is still to be designed. Each `approval_required` is answered by a human on the console with the controller; the agent then repeats the command.
+
 ## Troubleshooting
 
 - **`mkdir` fails because the folder exists:** that is fine; `mkdir` creates one level at a time and has no `-p` yet.
