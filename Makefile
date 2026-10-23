@@ -39,7 +39,7 @@ $(SUBDIRS):
 
 .NOTPARALLEL:
 
-all: shsrv-ps5.elf sh.elf
+all: shsrv-ps5.elf sh.elf controller-spike.elf
 
 shsrv.o: sh.elf.inc
 
@@ -57,6 +57,11 @@ sh.elf: sh.o builtin.o elfldr.o pt.o libtelnet.o
 
 sh.elf.inc: sh.elf
 	xxd -i $^ > $@
+
+# The controller spike is a separate payload. It is never linked into
+# shsrv-ps5.elf; the operator sends it to elfldr on its own.
+controller-spike.elf: controller_spike.o notify.o
+	$(CC) -lkernel_sys -lScePad -lSceUserService -o $@ $^
 
 clean:
 	rm -f *.o *.elf
