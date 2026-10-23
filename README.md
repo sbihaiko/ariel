@@ -25,13 +25,27 @@ Ariel closes that gap. The idea is that an agent connects to one endpoint on the
 
 The first milestone is a shell that can, with a single command:
 
-1. **Download a payload from a GitHub release**, by repository name, following the latest release or a pinned tag.
-2. **Verify it** with SHA-256 before anything is executed, and only from an allowlist of sources.
+1. **Download a payload from a GitHub release**, by repository name, following the latest release or a pinned tag, and only from an allowlist of sources. Ariel records the immutable identifiers of what it downloaded (release ID, asset ID), since tags can be moved.
+2. **Verify it** with SHA-256 before anything is executed. A hash published in the same release only detects corruption, not tampering, so the expected hash must come from somewhere Ariel trusts: either it is pinned in the allowlist, or a human approves the new hash on the console (see [Safety model](#safety-model)), after which it is pinned.
 3. **Run it** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
-4. **Persist it**: record what is installed (source, tag, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot.
-5. **Roll back on crash**: keep the previous working version of every payload and a snapshot of the autoload folder before each change. If a new version crashes or fails a health check, restore the last known good state automatically.
+4. **Persist it**: record what is installed (source, identifiers, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot. Approving an installation explicitly includes approving that the payload runs on every boot. `autoload safe-boot` skips autoload on the next boot, so a payload that crashes the console at startup can always be removed.
+5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic (write a new file, then rename it into place) and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
 
 Ariel itself is never overwritten while it is running, so the agent can never lock itself out.
+
+Open design question: autoload is currently run at boot by another loader, not by Ariel. Ariel can only re-check each payload's hash before it starts at boot if Ariel itself becomes the component that runs autoload.
+
+Stage 1 commands already follow a minimal machine-safe grammar: one command per line, no prompts, and an exit status on the last line. Stage 2 extends it to every command.
+
+New commands in this stage (see [Command coverage](#command-coverage)):
+
+- `payload install | run | list | logs | rollback`, the core of the stage. `run` starts a payload in the background and captures its output to a log.
+- `autoload show | edit | safe-boot`, to inspect the autoload configuration and to boot without it when a payload keeps crashing.
+- `sha256sum`, because the existing `sum` is a BSD checksum, not SHA-256.
+- `unzip` and `tar`, because many GitHub releases ship payloads inside an archive.
+- `reboot`, gated, to test that installed payloads survive a restart.
+- `approval status <id>`, to check whether a pending action has been approved on the console.
+- Gating for existing commands that change the system: `rm`, `kill`, `mount`, `umount`, `chroot` and `mknod`.
 
 ### Stage 2: an interface agents can rely on
 
@@ -42,6 +56,15 @@ Once the agent can reach the console, make the shell easy for it to use correctl
 - Optional JSON output for `ps`, `ls`, `stat` and similar commands.
 - Pagination and size limits, so a large directory or log does not flood the agent's context.
 - Strictly non-interactive commands: no prompts in the middle of a session.
+- No pipes or redirection. Commands that would need them get their own flags instead, such as `grep -c` for `| wc -l` and `--limit` for `| head`.
+
+New and extended commands in this stage:
+
+- Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`.
+- Writing files without redirection: `write <path>`, which reads the content from stdin.
+- Missing flags on existing commands: `ls -l -a`, `grep -r -l -c`, more `find` predicates, `rm -r` and `cp -r`.
+- Diagnostics: `date`, `dmesg`, `du`, a `sysinfo` command that aggregates `uname`, `uptime` and memory, and `timeout` so a command cannot hang the connection.
+- Optional: `diff` and network diagnostics (`ifconfig`, `netstat`, `ping`).
 
 ### Stage 3 (optional): sessions
 
@@ -50,27 +73,70 @@ Stages 1 and 2 are enough for an agent to operate the console. Stages 3 and 4 ar
 Agents usually reach the console through one-shot connections (one command per connection, e.g. `echo 'ls --json /data' | nc ps5 2323`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
 
 - `session new` returns a random 128-bit session ID and its TTL. Prefixing a command with `@<sid>` runs it inside that session, and `session close` ends it.
-- A session holds only minimal state: working directory, environment, authorization level and timestamps. Payloads started from a session are not tied to it and keep running after it ends.
+- A session holds only minimal state: working directory, environment and timestamps. It carries no authorization. Creating a session requires the access token, and every gated command still needs its own approval on the console. Payloads started from a session are not tied to it and keep running after it ends.
 - Sessions expire after a period of inactivity, and the number of concurrent sessions is capped, so a client that forgets to close them cannot exhaust the console's RAM.
 - An unknown or expired ID returns an explicit `session_expired` error instead of silently falling back, so the agent knows to open a new session (for example after a reboot).
-- A session ID is not enough to authorize a destructive operation. Over plain-text connections it can be sniffed, so destructive commands still require their own confirmation, and a session can be bound to the client's IP address.
+- Session IDs are generated by a cryptographically secure random number generator and treated as secrets. Over plain-text connections they can still be sniffed, which is why they never authorize anything on their own.
 - Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 1 operations such as installing and rolling back take a global lock.
 - Sessions are a convenience, not a requirement. Every command also works without one, using absolute paths.
 
 ### Stage 4 (optional): MCP
 
-Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP's HTTP transport carries its own session ID (`Mcp-Session-Id`), which maps onto the Stage 3 sessions.
+Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 3 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
+
+## Command coverage
+
+How common bash commands map to Ariel. "shsrv" means the command already exists in the upstream shell. "Stage N" means it is added or extended in that stage. "Gated" commands need approval on the console before they run (see [Safety model](#safety-model)).
+
+| bash | Ariel | Status |
+|---|---|---|
+| `pwd`, `cd` | same | shsrv. Kept across connections with sessions (Stage 3) |
+| `ls` | `ls` | shsrv, no flags. `-l`, `-a`, `--json` and pagination in Stage 2 |
+| `stat`, `file` | same | shsrv. `--json` in Stage 2 |
+| `cat` | `cat` | shsrv. Size limit in Stage 2 |
+| `head`, `tail`, `wc` | same | Stage 2 |
+| `grep` | `grep` | shsrv, only `-i` and `-n`. `-r`, `-l` and `-c` in Stage 2 |
+| `find` | `find` | shsrv, only `-name` and `-type`. More predicates in Stage 2 |
+| `cmp`, `hexdump` | same | shsrv |
+| `diff` | `diff` | Stage 2, optional |
+| `df`, `du` | same | `df` in shsrv, `du` in Stage 2 |
+| `mkdir`, `rmdir`, `touch`, `ln` | same | shsrv, gated |
+| `cp`, `mv`, `rm` | same | shsrv, gated. `-r` in Stage 2 |
+| `chmod`, `chown`, `chgrp` | same | shsrv, gated |
+| `echo > file`, `tee` | `write <path>` | Stage 2 |
+| `tar`, `unzip` | same | Stage 1 |
+| `ps` | `ps`, `procstat` | shsrv. `--json` in Stage 2 |
+| `kill` | `kill` | shsrv, gated. Critical processes protected in Stage 1 |
+| `cmd &`, `nohup` | `payload run` | Stage 1, output captured to a log |
+| `timeout` | `timeout` | Stage 2 |
+| `env`, `export`, `exec`, `sleep`, `id` | same | shsrv |
+| `uname`, `uptime`, `free` | `sysinfo` | Stage 2. Raw values already available through `sysctl` |
+| `date`, `dmesg` | same | Stage 2. Kernel logs are only available through klogsrv today |
+| `mount`, `umount`, `chroot`, `mknod` | same | shsrv, gated in Stage 1 |
+| `sync` | `sync` | shsrv |
+| `reboot` | `reboot` | Stage 1, gated |
+| `curl -o`, `wget` | `http2_get -o` | shsrv. Wrapped by `payload install` with allowlist and hash check in Stage 1 |
+| `sha256sum` | `sha256sum` | Stage 1 |
+| `ifconfig`, `netstat`, `ping` | same | Stage 2, optional |
+
+PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv), plus `payload`, `autoload` (Stage 1) and `session` (Stage 3).
+
+Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `ssh`, `top` and package managers. The agent composes logic on its own side, on the computer it runs on.
 
 ## Safety model
 
 An agent that can download, write and execute code on a console with kernel privileges needs firm limits. Ariel is designed around these rules:
 
-- **Read is free, change is gated.** Inspecting processes, files and logs is allowed. Writing files, killing processes, downloading and executing payloads require an access token and an explicit confirmation enforced on the console (a `--confirm` flag or a single-use token), so they never run by accident. From Stage 4, MCP tools are also marked as destructive so the client asks a human first.
-- **Allowlisted sources only.** Downloads come only from approved hosts and repositories, and every file is hash-checked before execution.
+- **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token. Output is size-limited, and environment variables and credential files are hidden unless explicitly requested.
+- **Change is approved on the console.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and shows a notification on the console describing the exact action (command, target, hash). The action runs only after a human approves it with the controller. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it runs on another machine and has no access to the controller. A flag such as `--confirm` would not be enough, since the agent could simply pass it. Whether payloads can read controller input while another app is in the foreground is still to be validated; if not, a fallback is needed.
+- **Allowlisted sources and trusted hashes.** Downloads come only from approved hosts and repositories, and a payload runs only if its hash is pinned in the allowlist or was approved on the console.
 - **Protected areas.** System partitions stay read-only. Critical system processes (such as SceShellCore) cannot be killed.
-- **Always recoverable.** Every change is preceded by a backup, and every payload has a previous version to fall back to.
-- **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. Ariel's confirmation gates exist so that injected instructions cannot silently turn into code execution.
+- **Designed to recover.** Every change is atomic and journaled, every payload has a previous version to fall back to, and `autoload safe-boot` disables autoload for one boot. This covers crashes, failed health checks and interrupted updates, but not every possible failure.
+- **Trusted network only.** The shell protocol is plain text, so the access token and session IDs can be sniffed by anyone on the same network. Ariel is meant for a trusted home network. On any other network, use an encrypted tunnel. On-console approval keeps destructive actions safe even if the token leaks.
+- **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. On-console approval ensures that injected instructions cannot silently turn into code execution.
 - **Auditable.** Ariel is open source and every action it takes is logged on the console.
+
+From Stage 4, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
 
 ## Using it today
 
