@@ -6,7 +6,7 @@ CFLAGS += -pthread -I..
 LDLIBS += -pthread
 
 BIN  := ariel-host
-SRCS := main.c platform_host.c token.c agent.c vcontroller.c
+SRCS := main.c platform_host.c token.c agent.c vcontroller.c store.c
 OBJS := $(SRCS:.c=.o) sha256.o
 
 all: $(BIN)

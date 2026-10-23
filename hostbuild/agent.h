@@ -20,14 +20,13 @@ along with this program; see the file COPYING. If not, see
 #include "platform.h"
 
 /**
- * What one agent connection needs: the platform port, the access token and
- * Ariel's state directory. The server fills it in once and shares it with
- * every connection.
+ * What one agent connection needs: the platform port and the access token.
+ * The server fills it in once and shares it with every connection. Ariel's
+ * state lives in the store, not here.
  **/
 typedef struct {
   platform_t *platform;
   const char *token;
-  const char *state_dir;
 } agent_t;
 
 /**

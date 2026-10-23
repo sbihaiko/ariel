@@ -34,6 +34,9 @@ along with this program; see the file COPYING. If not, see
  *
  *   approve <approval-id>   answers approved <approval-id>
  *   deny <approval-id>      answers denied <approval-id>
+ *
+ * The pending approvals themselves live in the store, next to the staged
+ * objects, so one mutex covers both.
  **/
 
 /** Start the controller's input reader. Safe to call more than once. **/

@@ -5,11 +5,16 @@ Starts the host build of Ariel in a temporary root, reads the access token
 from its standard output and drives the server only through the agent port.
 Requests for approval reach the virtual controller on the server's standard
 input, and its prompt and acknowledgements arrive on standard output.
-Nothing here reaches into the server's files, except to create the
-temporary root it runs under.
+
+The suite creates the temporary root it runs under. It also writes to a
+staged object from outside, as the ungated telnet shell can in Stage 1, and
+it reads the store back to check what a commit promised: the name's current
+record and the object the new build replaced. Those facts have no reply of
+their own until payload run arrives.
 """
 
 import hashlib
+import os
 import queue
 import re
 import socket
@@ -52,10 +57,15 @@ class Server:
     """The host build of Ariel, started against a temporary root."""
 
     def __init__(self, binary):
+        self.binary = binary
         self.root = tempfile.mkdtemp(prefix="ariel-host-")
+        self.token = None
+        self._start()
+
+    def _start(self):
         self.port = free_port()
         self.proc = subprocess.Popen(
-            [binary, "--port", str(self.port), "--root", self.root],
+            [self.binary, "--port", str(self.port), "--root", self.root],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -64,10 +74,19 @@ class Server:
         self.reader = threading.Thread(target=self._pump, daemon=True)
         self.reader.start()
         try:
-            self.token = self._read_token()
+            token = self._read_token()
         except Exception:
             self.stop()
             raise
+        if self.token is None:
+            self.token = token
+        else:
+            assert token == self.token, "the token must survive a restart"
+
+    def restart(self):
+        """Stop Ariel and start it again against the same root."""
+        self.stop()
+        self._start()
 
     def _pump(self):
         for raw in self.proc.stdout:
@@ -222,6 +241,172 @@ def decide_push(server, name, data, decision, fragments=None):
     return approval
 
 
+def commit(server, staging_id):
+    """Send one payload commit and return the lines the server answered."""
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\npayload commit %s\n" % (server.token, staging_id))
+            .encode("ascii")
+        )
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def staging_path(server, staging_id):
+    return os.path.join(server.root, "data", "ariel", "staging", staging_id)
+
+
+def approve_push(server, name, data):
+    """Push, check the prompt, approve it and return the staging ID."""
+    lines = push(server, name, data)
+    staging, approval = assert_staged(server, lines, name, data)
+    server.controller("approve %s" % approval, "approved %s" % approval)
+    return staging, approval
+
+
+def scenario_commit_installed(server):
+    data = b"committed bytes\n"
+    staging, _ = approve_push(server, "committed", data)
+    lines = commit(server, staging)
+    expected = "installed committed %s" % hashlib.sha256(data).hexdigest()
+    assert lines == [expected, "exit 0"], (
+        "an approved commit must answer 'installed <name> <hash>' and exit 0, "
+        "got %r" % lines
+    )
+    assert not os.path.exists(staging_path(server, staging)), (
+        "a committed staging object must leave staging"
+    )
+
+
+def store_dir(server):
+    return os.path.join(server.root, "data", "ariel", "store")
+
+
+def scenario_commit_replaces(server):
+    first = b"first build"
+    first_hash = hashlib.sha256(first).hexdigest()
+    staging, _ = approve_push(server, "replace", first)
+    assert commit(server, staging) == [
+        "installed replace %s" % first_hash, "exit 0"], (
+        "the first build of a name must be installed"
+    )
+
+    second = b"second build"
+    second_hash = hashlib.sha256(second).hexdigest()
+    staging, _ = approve_push(server, "replace", second)
+    assert commit(server, staging) == [
+        "installed replace %s" % second_hash, "exit 0"], (
+        "a new build of the same name must be installed too"
+    )
+
+    # The store is what the commit promised: the name points at the new
+    # object, and the object it replaces is gone.
+    with open(os.path.join(store_dir(server), "current", "replace")) as fh:
+        current = fh.read().strip()
+    assert current == second_hash, (
+        "the current record must point at the new build, got %r" % current
+    )
+    objects = os.listdir(os.path.join(store_dir(server), "objects"))
+    assert second_hash in objects, (
+        "the new build must be in the store, it holds %r" % objects
+    )
+    assert first_hash not in objects, (
+        "the replaced object must be deleted, store holds %r" % objects
+    )
+
+
+def scenario_commit_after_restart(server):
+    data = b"restart me"
+    staging, _ = approve_push(server, "restart", data)
+    path = staging_path(server, staging)
+    server.restart()
+    assert commit(server, staging) == ["approval_stale", "exit 78"], (
+        "an approval must not survive a restart of Ariel"
+    )
+    assert not os.path.exists(path), (
+        "a staging object must not survive a restart of Ariel"
+    )
+    # The staging ID counter starts again, so a new push needs the name free.
+    fresh = b"after the restart"
+    lines = push(server, "restart", fresh)
+    assert_staged(server, lines, "restart", fresh)
+
+
+def scenario_commit_stale(server):
+    data = b"original bytes"
+    staging, _ = approve_push(server, "changed", data)
+    path = staging_path(server, staging)
+    # The telnet shell can still write to /data in Stage 1, so the object
+    # behind an approval can change between the approval and the commit.
+    with open(path, "wb") as handle:
+        handle.write(b"tampered bytes")
+    assert commit(server, staging) == ["approval_stale", "exit 78"], (
+        "a staging object changed after approval must answer exit 78"
+    )
+    assert not os.path.exists(path), (
+        "an object that no longer matches its approval must be deleted"
+    )
+
+
+def scenario_commit_single_use(server):
+    data = b"one use only"
+    hash_hex = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "single", data)
+
+    results = []
+    barrier = threading.Barrier(2)
+
+    def race():
+        barrier.wait()
+        results.append(commit(server, staging))
+
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    installed = [r for r in results
+                 if r == ["installed single %s" % hash_hex, "exit 0"]]
+    stale = [r for r in results
+             if r == ["approval_stale", "exit 78"]]
+    assert len(results) == 2, "both commits must answer, got %r" % results
+    assert len(installed) == 1, (
+        "exactly one of two concurrent commits may use the approval, got %r"
+        % results
+    )
+    assert len(stale) == 1, (
+        "the other commit must answer approval_stale, got %r" % results
+    )
+
+
+def scenario_commit_denied(server):
+    lines = push(server, "refused", b"do not keep me")
+    staging, approval = assert_staged(server, lines, "refused",
+                                      b"do not keep me")
+    server.controller("deny %s" % approval, "denied %s" % approval)
+    assert commit(server, staging) == ["approval_denied", "exit 77"], (
+        "a denied commit must be terminal and answer exit 77"
+    )
+    assert not os.path.exists(staging_path(server, staging)), (
+        "the denied staging object must be deleted"
+    )
+    assert commit(server, staging) == ["approval_stale", "exit 78"], (
+        "a consumed denial must not be replayed"
+    )
+
+
+def scenario_commit_before_decision(server):
+    lines = push(server, "undecided", b"wait for me")
+    staging, approval = assert_staged(server, lines, "undecided", b"wait for me")
+    assert commit(server, staging) == [
+        "approval_required %s" % approval, "exit 75"], (
+        "a commit before the decision must ask again with the same approval ID"
+    )
+
+
 def scenario_missing_auth(server):
     sock = server.connect()
     try:
@@ -243,8 +428,8 @@ def scenario_wrong_token(server):
 
 def scenario_unknown_command(server):
     for command in (
-        "payload commit s-1",
         "payload run --wait helloworld",
+        "payload status",
         "nonsense",
     ):
         sock = server.connect()
@@ -352,6 +537,22 @@ def main():
               lambda: scenario_elf_with_ff(server))
         check("a denied push is answered on the virtual controller",
               lambda: scenario_denied_push(server))
+        check("a commit before the decision answers approval_required and "
+              "exit 75", lambda: scenario_commit_before_decision(server))
+        check("an approved commit answers installed <name> <hash> and "
+              "exit 0", lambda: scenario_commit_installed(server))
+        check("a second commit of the same name replaces the first build",
+              lambda: scenario_commit_replaces(server))
+        check("an approval does not survive a restart of Ariel",
+              lambda: scenario_commit_after_restart(server))
+        check("a staging object changed after approval answers "
+              "approval_stale and exit 78",
+              lambda: scenario_commit_stale(server))
+        check("an approval is single-use when two commits race",
+              lambda: scenario_commit_single_use(server))
+        check("a denied commit answers approval_denied and exit 77 and "
+              "deletes the staging object",
+              lambda: scenario_commit_denied(server))
     finally:
         server.stop()
 

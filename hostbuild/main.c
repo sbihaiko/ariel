@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "agent.h"
 #include "platform.h"
+#include "store.h"
 #include "token.h"
 
 #ifndef PATH_MAX
@@ -130,6 +131,11 @@ main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
+  if(store_init(state_dir)) {
+    fprintf(stderr, "cannot prepare Ariel's state in %s\n", state_dir);
+    return EXIT_FAILURE;
+  }
+
   if(token_load_or_create(state_dir, agent_token)) {
     fprintf(stderr, "cannot load or create the access token in %s\n",
             state_dir);
@@ -143,7 +149,6 @@ main(int argc, char **argv) {
 
   agent.platform = platform;
   agent.token = agent_token;
-  agent.state_dir = state_dir;
 
   // The harness reads the token from standard output. Print it only once
   // the listener is ready, so the line also announces that the port is up.

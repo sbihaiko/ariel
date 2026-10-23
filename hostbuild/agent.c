@@ -15,10 +15,7 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <poll.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -26,11 +23,8 @@ along with this program; see the file COPYING. If not, see
 
 #include "agent.h"
 #include "sha256.h"
+#include "store.h"
 #include "token.h"
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
 
 /**
  * The agent port bounds: a line is at most 1 KiB, and auth and the command
@@ -64,11 +58,12 @@ static const char staging_full[] =
 static const char approval_busy[] =
   "approval_busy\n"
   "exit 76\n";
-
-/** Staging IDs count up under this lock, shared by every connection. **/
-static pthread_mutex_t staging_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned long staging_count;
-
+static const char approval_denied[] =
+  "approval_denied\n"
+  "exit 77\n";
+static const char approval_stale[] =
+  "approval_stale\n"
+  "exit 78\n";
 
 static int
 write_all(int fd, const char *buf, size_t len) {
@@ -292,14 +287,6 @@ parse_hash(const char *text, char out[SHA256_HEX_LEN + 1]) {
 }
 
 
-static void
-staging_id_new(char *id, size_t size) {
-  pthread_mutex_lock(&staging_lock);
-  snprintf(id, size, "s-%lx", ++staging_count);
-  pthread_mutex_unlock(&staging_lock);
-}
-
-
 /**
  * Read the upload until the client's end of stream. Exactly size bytes are
  * written to outfd and hashed; anything past size is read and dropped, so
@@ -379,8 +366,6 @@ reply(int fd, const char *text) {
 static void
 payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
              const char *hash_text) {
-  char part[PATH_MAX];
-  char path[PATH_MAX];
   char staging_id[APPROVAL_ID_MAX];
   char declared[SHA256_HEX_LEN + 1];
   char computed[SHA256_HEX_LEN + 1];
@@ -408,17 +393,9 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
     return;
   }
 
-  staging_id_new(staging_id, sizeof(staging_id));
+  store_staging_next_id(staging_id, sizeof(staging_id));
 
-  if(snprintf(part, sizeof(part), "%s/staging/%s.part",
-              agent->state_dir, staging_id) >= (int)sizeof(part) ||
-     snprintf(path, sizeof(path), "%s/staging/%s",
-              agent->state_dir, staging_id) >= (int)sizeof(path)) {
-    reply(fd, staging_full);
-    return;
-  }
-
-  if((outfd=open(part, O_WRONLY | O_CREAT | O_EXCL, 0600)) < 0) {
+  if((outfd=store_staging_create(staging_id)) < 0) {
     reply(fd, staging_full);
     return;
   }
@@ -428,7 +405,7 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
 
   if(rc || received != size) {
     close(outfd);
-    unlink(part);
+    store_staging_discard(staging_id);
     // A full disk is a staging failure; every other bad stream is a mismatch.
     reply(fd, rc == -2 ? staging_full : mismatch);
     return;
@@ -439,13 +416,13 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
 
   if(strcmp(computed, declared)) {
     close(outfd);
-    unlink(part);
+    store_staging_discard(staging_id);
     reply(fd, mismatch);
     return;
   }
 
-  if(close(outfd) || rename(part, path)) {
-    unlink(part);
+  if(close(outfd)) {
+    store_staging_discard(staging_id);
     reply(fd, staging_full);
     return;
   }
@@ -466,10 +443,12 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
 
     if(platform->approval_request(platform, &facts,
                                   approval_id, sizeof(approval_id))) {
-      unlink(path);
+      store_staging_discard(staging_id);
       reply(fd, approval_busy);
       return;
     }
+
+    store_stage(staging_id, &facts, approval_id);
 
     len = snprintf(answer, sizeof(answer),
                    "staged %s\napproval_required %s\nexit 75\n",
@@ -480,14 +459,54 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
 
 
 static void
+payload_commit(int fd, const char *staging_id) {
+  char approval_id[APPROVAL_ID_MAX];
+  char answer[256];
+  store_install_t install;
+  int outcome;
+
+  approval_id[0] = '\0';
+  memset(&install, 0, sizeof(install));
+
+  outcome = store_commit(staging_id, &install, approval_id,
+                         sizeof(approval_id));
+
+  switch(outcome) {
+  case STORE_INSTALLED:
+    snprintf(answer, sizeof(answer), "installed %s %s\nexit 0\n",
+             install.name, install.sha256);
+    reply(fd, answer);
+    return;
+  case STORE_APPROVAL_REQUIRED:
+    snprintf(answer, sizeof(answer), "approval_required %s\nexit 75\n",
+             approval_id);
+    reply(fd, answer);
+    return;
+  case STORE_APPROVAL_DENIED:
+    reply(fd, approval_denied);
+    return;
+  default:
+    // An approval that is gone is not an approval: push the build again.
+    reply(fd, approval_stale);
+    return;
+  }
+}
+
+
+static void
 handle_command(agent_t *agent, int fd, char *line) {
   char *argv[5];
   int argc = split_args(line, argv, 5);
 
-  // Exactly one command per connection. Only payload push is known so far;
-  // payload commit and payload run arrive with their own tickets.
+  // Exactly one command per connection. payload run arrives with its own
+  // ticket.
   if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "push")) {
     payload_push(agent, fd, argv[2], argv[3], argv[4]);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "commit")) {
+    payload_commit(fd, argv[2]);
     return;
   }
 

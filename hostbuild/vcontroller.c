@@ -20,29 +20,12 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <string.h>
 
+#include "store.h"
 #include "vcontroller.h"
-
-/** At most this many approvals wait for a decision at once. **/
-#define PENDING_MAX 3
 
 /** The longest prompt text the controller shows. **/
 #define PROMPT_MAX 256
 
-#define DECISION_PENDING  0
-#define DECISION_APPROVED 1
-#define DECISION_DENIED  -1
-
-struct pending {
-  int used;
-  int decision;
-  char id[APPROVAL_ID_MAX];
-  approval_facts_t facts;
-};
-
-static struct pending pending[PENDING_MAX];
-static unsigned long request_count;
-
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t started = PTHREAD_ONCE_INIT;
 
@@ -65,37 +48,14 @@ print_line(const char *fmt, ...) {
 }
 
 
-static struct pending *
-find_pending(const char *id) {
-  int i;
-
-  for(i=0; i<PENDING_MAX; i++) {
-    if(pending[i].used && !strcmp(pending[i].id, id)) {
-      return &pending[i];
-    }
-  }
-  return NULL;
-}
-
-
 static void
-decide(const char *id, int decision) {
-  struct pending *request;
-
-  pthread_mutex_lock(&lock);
-  request = find_pending(id);
-
-  if(!request || request->decision != DECISION_PENDING) {
-    pthread_mutex_unlock(&lock);
+decide(const char *id, int approved) {
+  if(store_approval_decide(id, approved)) {
     print_line("unknown_approval %s", id);
     return;
   }
 
-  request->decision = decision;
-  pthread_mutex_unlock(&lock);
-
-  print_line("%s %s", decision == DECISION_APPROVED ? "approved" : "denied",
-             id);
+  print_line("%s %s", approved ? "approved" : "denied", id);
 }
 
 
@@ -108,9 +68,9 @@ handle_line(char *line) {
   }
 
   if(!strncmp(line, "approve ", 8)) {
-    decide(line + 8, DECISION_APPROVED);
+    decide(line + 8, 1);
   } else if(!strncmp(line, "deny ", 5)) {
-    decide(line + 5, DECISION_DENIED);
+    decide(line + 5, 0);
   } else if(len > 0) {
     print_line("unknown_command");
   }
@@ -154,47 +114,14 @@ vcontroller_start(void) {
 int
 vcontroller_request(const approval_facts_t *facts, char *id, size_t idlen) {
   char prompt[PROMPT_MAX];
-  struct pending *slot = NULL;
-  int i;
 
-  if(snprintf(prompt, sizeof(prompt),
-              "payload %s (%llu bytes, sha256 %s) will run",
-              facts->name, (unsigned long long)facts->size,
-              facts->sha256) >= (int)sizeof(prompt)) {
+  if(store_approval_request(facts, id, idlen, prompt, sizeof(prompt))) {
     return -1;
   }
-
-  pthread_mutex_lock(&lock);
-
-  for(i=0; i<PENDING_MAX; i++) {
-    // A decided request no longer waits for an answer, so its slot is free.
-    if(!pending[i].used || pending[i].decision != DECISION_PENDING) {
-      slot = &pending[i];
-      break;
-    }
-  }
-
-  if(!slot) {
-    pthread_mutex_unlock(&lock);
-    return -1;
-  }
-
-  memset(slot, 0, sizeof(*slot));
-  slot->used = 1;
-  slot->decision = DECISION_PENDING;
-  snprintf(slot->id, sizeof(slot->id), "a-%lx", ++request_count);
-  slot->facts = *facts;
 
   // Show the prompt the owner would see, and only then let the decision
   // arrive, so a test never approves an ID it could not have seen.
-  print_line("prompt %s %s", slot->id, prompt);
+  print_line("prompt %s %s", id, prompt);
 
-  if(snprintf(id, idlen, "%s", slot->id) >= (int)idlen) {
-    slot->used = 0;
-    pthread_mutex_unlock(&lock);
-    return -1;
-  }
-
-  pthread_mutex_unlock(&lock);
   return 0;
 }

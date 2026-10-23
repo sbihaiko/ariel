@@ -1,0 +1,749 @@
+/* Ariel host build: staging, approvals and the hash-addressed store.
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation; either version 3, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; see the file COPYING. If not, see
+<http://www.gnu.org/licenses/>.  */
+
+#if defined(__APPLE__)
+// macOS hides O_NOFOLLOW behind _DARWIN_C_SOURCE once _POSIX_C_SOURCE is
+// defined, and every file here is opened without following symbolic links.
+#define _DARWIN_C_SOURCE 1
+#endif
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "sha256.h"
+#include "store.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/** At most this many staged objects wait for a commit. **/
+#define STAGING_MAX   8
+
+/** At most this many approvals are remembered at once. **/
+#define APPROVALS_MAX 16
+
+/** At most this many approvals wait for a decision at once. **/
+#define PENDING_MAX   3
+
+/** The longest text the controller shows for one approval. **/
+#define PROMPT_MAX    256
+
+/** One read or write of an object moving into the store. **/
+#define MOVE_CHUNK    65536
+
+/** One member of the staging table. **/
+struct staged {
+  int used;
+  char id[APPROVAL_ID_MAX];
+  char approval_id[APPROVAL_ID_MAX];
+  approval_facts_t facts;
+};
+
+/** One member of the approval table. **/
+struct approval {
+  int used;
+  int decided;
+  int approved;
+  char id[APPROVAL_ID_MAX];
+};
+
+/**
+ * One mutex covers the staging table, the approval table and the pending
+ * count. Consuming an approval is atomic because no other connection can
+ * look at the tables while a commit holds it.
+ **/
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct staged staged[STAGING_MAX];
+static struct approval approvals[APPROVALS_MAX];
+static unsigned long staging_count;
+static unsigned long approval_count;
+static char state_dir[PATH_MAX];
+
+/* The directory helpers every entry below Ariel's directory goes through. */
+static int state_open(void);
+static int dir_open(int dirfd, const char *name);
+static int dir_make(int dirfd, const char *name);
+static void staging_clear(void);
+
+
+/** An empty slot, or NULL when the table is full. **/
+static struct staged *
+staged_slot(void) {
+  int i;
+
+  for(i=0; i<STAGING_MAX; i++) {
+    if(!staged[i].used) {
+      return &staged[i];
+    }
+  }
+  return NULL;
+}
+
+
+static struct staged *
+staged_find(const char *id) {
+  int i;
+
+  for(i=0; i<STAGING_MAX; i++) {
+    if(staged[i].used && !strcmp(staged[i].id, id)) {
+      return &staged[i];
+    }
+  }
+  return NULL;
+}
+
+
+/** An empty slot, or NULL when the table is full. **/
+static struct approval *
+approval_slot(void) {
+  int i;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    if(!approvals[i].used) {
+      return &approvals[i];
+    }
+  }
+  return NULL;
+}
+
+
+static struct approval *
+approval_find(const char *id) {
+  int i;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    if(approvals[i].used && !strcmp(approvals[i].id, id)) {
+      return &approvals[i];
+    }
+  }
+  return NULL;
+}
+
+
+static int
+pending_count(void) {
+  int i;
+  int count = 0;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    if(approvals[i].used && !approvals[i].decided) {
+      count++;
+    }
+  }
+  return count;
+}
+
+
+static int
+path_in(char *out, size_t size, const char *sub) {
+  if(snprintf(out, size, "%s/%s", state_dir, sub) >= (int)size) {
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * Open an entry below dirfd. Every entry is opened relative to Ariel's
+ * directory, without following a symbolic link, and a file this creates
+ * belongs to its owner alone.
+ **/
+static int
+open_entry(int dirfd, const char *name, int flags) {
+  if(flags & O_CREAT) {
+    return openat(dirfd, name, flags | O_NOFOLLOW, 0600);
+  }
+  return openat(dirfd, name, flags | O_NOFOLLOW);
+}
+
+
+int
+store_init(const char *dir) {
+  int state_fd;
+  int store_fd;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+  snprintf(state_dir, sizeof(state_dir), "%s", dir);
+  memset(staged, 0, sizeof(staged));
+  memset(approvals, 0, sizeof(approvals));
+  pthread_mutex_unlock(&lock);
+
+  // No approval survives the process, so no staging object may either.
+  staging_clear();
+
+  if((state_fd=state_open()) < 0) {
+    return -1;
+  }
+
+  if(dir_make(state_fd, "store")) {
+    close(state_fd);
+    return -1;
+  }
+
+  if((store_fd=dir_open(state_fd, "store")) >= 0) {
+    if(!dir_make(store_fd, "objects") && !dir_make(store_fd, "current")) {
+      rc = 0;
+    }
+    close(store_fd);
+  }
+
+  close(state_fd);
+  return rc;
+}
+
+
+void
+store_staging_next_id(char *id, size_t size) {
+  pthread_mutex_lock(&lock);
+  snprintf(id, size, "s-%lx", ++staging_count);
+  pthread_mutex_unlock(&lock);
+}
+
+
+int
+store_staging_create(const char *staging_id) {
+  char dir[PATH_MAX];
+  struct staged *slot;
+  int fd = -1;
+  int dirfd;
+
+  pthread_mutex_lock(&lock);
+  slot = staged_slot();
+
+  if(slot) {
+    memset(slot, 0, sizeof(*slot));
+    slot->used = 1;
+    snprintf(slot->id, sizeof(slot->id), "%s", staging_id);
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  if(!slot || path_in(dir, sizeof(dir), "staging")) {
+    return -1;
+  }
+
+  if((dirfd=open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) < 0) {
+    return -1;
+  }
+
+  fd = open_entry(dirfd, staging_id, O_WRONLY | O_CREAT | O_EXCL);
+  close(dirfd);
+
+  if(fd < 0) {
+    pthread_mutex_lock(&lock);
+    slot->used = 0;
+    pthread_mutex_unlock(&lock);
+  }
+
+  return fd;
+}
+
+
+/** Delete every staging object a previous process left behind. **/
+static void
+staging_clear(void) {
+  char dir[PATH_MAX];
+  struct dirent *entry;
+  DIR *list;
+  int dirfd;
+
+  if(path_in(dir, sizeof(dir), "staging")) {
+    return;
+  }
+
+  if((dirfd=open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) < 0) {
+    return;
+  }
+
+  if(!(list=fdopendir(dirfd))) {
+    close(dirfd);
+    return;
+  }
+
+  while((entry=readdir(list))) {
+    if(strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
+      unlinkat(dirfd, entry->d_name, 0);
+    }
+  }
+
+  closedir(list);
+}
+
+
+/** Delete one staging object by name, without following the entry. **/
+static void
+staging_unlink(const char *staging_id) {
+  char dir[PATH_MAX];
+  int dirfd;
+
+  if(path_in(dir, sizeof(dir), "staging")) {
+    return;
+  }
+
+  if((dirfd=open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) < 0) {
+    return;
+  }
+
+  unlinkat(dirfd, staging_id, 0);
+  close(dirfd);
+}
+
+
+void
+store_staging_discard(const char *staging_id) {
+  struct staged *slot;
+
+  staging_unlink(staging_id);
+
+  pthread_mutex_lock(&lock);
+  if((slot=staged_find(staging_id))) {
+    memset(slot, 0, sizeof(*slot));
+  }
+  pthread_mutex_unlock(&lock);
+}
+
+
+int
+store_approval_request(const approval_facts_t *facts, char *id,
+                       size_t idlen, char *prompt, size_t promptlen) {
+  struct approval *slot;
+
+  pthread_mutex_lock(&lock);
+
+  if(pending_count() >= PENDING_MAX || !(slot=approval_slot())) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
+  memset(slot, 0, sizeof(*slot));
+  slot->used = 1;
+  snprintf(slot->id, sizeof(slot->id), "a-%lx", ++approval_count);
+
+  snprintf(prompt, promptlen,
+           "payload %s (%llu bytes, sha256 %s) will run",
+           facts->name, (unsigned long long)facts->size, facts->sha256);
+
+  if(snprintf(id, idlen, "%s", slot->id) >= (int)idlen) {
+    slot->used = 0;
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
+  pthread_mutex_unlock(&lock);
+  return 0;
+}
+
+
+int
+store_approval_decide(const char *id, int approved) {
+  struct approval *request;
+
+  pthread_mutex_lock(&lock);
+  request = approval_find(id);
+
+  if(!request || request->decided) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
+  request->decided = 1;
+  request->approved = approved;
+  pthread_mutex_unlock(&lock);
+
+  return 0;
+}
+
+
+void
+store_stage(const char *staging_id, const approval_facts_t *facts,
+            const char *approval_id) {
+  struct staged *slot;
+
+  pthread_mutex_lock(&lock);
+  slot = staged_find(staging_id);
+
+  if(slot) {
+    memset(slot, 0, sizeof(*slot));
+    slot->used = 1;
+    snprintf(slot->id, sizeof(slot->id), "%s", staging_id);
+    snprintf(slot->approval_id, sizeof(slot->approval_id), "%s",
+             approval_id);
+    slot->facts = *facts;
+  }
+
+  pthread_mutex_unlock(&lock);
+}
+
+
+static int
+write_all(int fd, const char *buf, size_t len) {
+  while(len > 0) {
+    ssize_t n = write(fd, buf, len);
+
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    buf += n;
+    len -= (size_t)n;
+  }
+  return 0;
+}
+
+
+/** Open Ariel's state directory itself. **/
+static int
+state_open(void) {
+  return open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+}
+
+
+/** Open one directory below dirfd, without following a symbolic link. **/
+static int
+dir_open(int dirfd, const char *name) {
+  return openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+}
+
+
+/** Make one directory below dirfd; an existing directory is fine. **/
+static int
+dir_make(int dirfd, const char *name) {
+  return mkdirat(dirfd, name, 0700) && errno != EEXIST ? -1 : 0;
+}
+
+
+static int
+entry_regular(int fd) {
+  struct stat st;
+
+  return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+
+/**
+ * Read the current record of one payload name: the hash of the object it
+ * points at. A record that is missing, not a regular file or not a hash
+ * counts as no record. Returns 0 when hash holds a record.
+ **/
+static int
+current_read(int dirfd, const char *name, char hash[SHA256_HEX_LEN + 1]) {
+  char buf[SHA256_HEX_LEN + 2];
+  size_t total = 0;
+  int fd;
+
+  if((fd=open_entry(dirfd, name, O_RDONLY)) < 0) {
+    return -1;
+  }
+
+  if(!entry_regular(fd)) {
+    close(fd);
+    return -1;
+  }
+
+  while(total < sizeof(buf)) {
+    ssize_t n = read(fd, buf + total, sizeof(buf) - total);
+
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      close(fd);
+      return -1;
+    }
+    if(n == 0) {
+      break;
+    }
+    total += (size_t)n;
+  }
+
+  close(fd);
+
+  if(total < SHA256_HEX_LEN) {
+    return -1;
+  }
+
+  memcpy(hash, buf, SHA256_HEX_LEN);
+  hash[SHA256_HEX_LEN] = '\0';
+
+  return 0;
+}
+
+
+/**
+ * Replace one payload name's current record through a temporary file and
+ * an atomic rename, so a reader never sees a partial record.
+ **/
+static int
+current_write(int dirfd, const char *name, const char *hash) {
+  char tmp[PAYLOAD_NAME_MAX + 32];
+  int fd;
+
+  if(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", name, (long)getpid()) >=
+     (int)sizeof(tmp)) {
+    return -1;
+  }
+
+  if((fd=open_entry(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
+    return -1;
+  }
+
+  if(write_all(fd, hash, strlen(hash)) || write_all(fd, "\n", 1) ||
+     fsync(fd) || close(fd)) {
+    unlinkat(dirfd, tmp, 0);
+    return -1;
+  }
+
+  if(renameat(dirfd, tmp, dirfd, name)) {
+    unlinkat(dirfd, tmp, 0);
+    return -1;
+  }
+
+  return 0;
+}
+
+
+/**
+ * Copy the staging object into a temporary object, hashing the bytes as
+ * they pass, so the object that enters the store is exactly the bytes the
+ * hash covers. Returns 0 on success.
+ **/
+static int
+object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char buf[MOVE_CHUNK];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+
+  sha256_init(&hash);
+  *total = 0;
+
+  while(1) {
+    ssize_t n = read(src, buf, sizeof(buf));
+
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if(n == 0) {
+      break;
+    }
+
+    sha256_update(&hash, buf, (size_t)n);
+    if(write_all(dst, (const char*)buf, (size_t)n)) {
+      return -1;
+    }
+    *total += (uint64_t)n;
+  }
+
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  return 0;
+}
+
+
+/**
+ * Drop a staged entry and its approval: the staging object leaves the
+ * disk and the tables forget both. The caller holds the lock.
+ **/
+static void
+staged_consume(struct staged *entry, struct approval *request) {
+  staging_unlink(entry->id);
+  memset(entry, 0, sizeof(*entry));
+
+  if(request) {
+    memset(request, 0, sizeof(*request));
+  }
+}
+
+
+/**
+ * The approval is granted: hash the staging object again, put it in the
+ * store under its hash, point the payload name's current record at it and
+ * delete the object it replaces. The caller holds the lock.
+ **/
+static int
+staged_install(struct staged *entry, struct approval *request,
+               store_install_t *install) {
+  char tmp[SHA256_HEX_LEN + 32];
+  char hash[SHA256_HEX_LEN + 1];
+  char old[SHA256_HEX_LEN + 1];
+  struct stat st;
+  uint64_t total = 0;
+  int have_old = 0;
+  int existed = 0;
+  int state_fd = -1;
+  int staging_fd = -1;
+  int store_fd = -1;
+  int objects_fd = -1;
+  int current_fd = -1;
+  int src = -1;
+  int dst = -1;
+  int rc = STORE_APPROVAL_STALE;
+
+  if((state_fd=state_open()) < 0) {
+    return STORE_APPROVAL_STALE;
+  }
+
+  if((staging_fd=dir_open(state_fd, "staging")) < 0) {
+    goto out;
+  }
+
+  src = open_entry(staging_fd, entry->id, O_RDONLY);
+  if(src < 0 || !entry_regular(src)) {
+    // The bytes the owner approved are gone or are not a regular file.
+    staged_consume(entry, request);
+    goto out;
+  }
+
+  if((store_fd=dir_open(state_fd, "store")) < 0 ||
+     (objects_fd=dir_open(store_fd, "objects")) < 0 ||
+     (current_fd=dir_open(store_fd, "current")) < 0) {
+    goto out;
+  }
+
+  if(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", entry->facts.sha256,
+              (long)getpid()) >= (int)sizeof(tmp)) {
+    goto out;
+  }
+
+  if((dst=open_entry(objects_fd, tmp, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
+    goto out;
+  }
+
+  if(object_copy(src, dst, &total, hash)) {
+    goto out_temp;
+  }
+
+  if(total != entry->facts.size || strcmp(hash, entry->facts.sha256)) {
+    // The object changed after the approval: it no longer is what the
+    // owner agreed to, so it leaves the console.
+    staged_consume(entry, request);
+    rc = STORE_APPROVAL_STALE;
+    goto out_temp;
+  }
+
+  if(fsync(dst)) {
+    goto out_temp;
+  }
+
+  if(close(dst)) {
+    dst = -1;
+    goto out_temp;
+  }
+  dst = -1;
+
+  existed = fstatat(objects_fd, hash, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISREG(st.st_mode);
+
+  if(renameat(objects_fd, tmp, objects_fd, hash)) {
+    goto out_temp;
+  }
+
+  if(current_read(current_fd, entry->facts.name, old) == 0) {
+    have_old = 1;
+  }
+
+  if(current_write(current_fd, entry->facts.name, hash)) {
+    if(!existed) {
+      unlinkat(objects_fd, hash, 0);
+    }
+    goto out;
+  }
+
+  // Stage 1 keeps one build per name: the object the new one replaces goes.
+  if(have_old && strcmp(old, hash) && !existed) {
+    unlinkat(objects_fd, old, 0);
+  }
+
+  snprintf(install->name, sizeof(install->name), "%s", entry->facts.name);
+  snprintf(install->sha256, sizeof(install->sha256), "%s", hash);
+  staged_consume(entry, request);
+
+  rc = STORE_INSTALLED;
+
+out_temp:
+  if(dst >= 0) {
+    close(dst);
+    unlinkat(objects_fd, tmp, 0);
+  }
+out:
+  if(src >= 0) {
+    close(src);
+  }
+  if(current_fd >= 0) {
+    close(current_fd);
+  }
+  if(objects_fd >= 0) {
+    close(objects_fd);
+  }
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(staging_fd >= 0) {
+    close(staging_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  return rc;
+}
+
+
+int
+store_commit(const char *staging_id, store_install_t *install,
+             char *approval_id, size_t idlen) {
+  struct staged *entry;
+  struct approval *request;
+  int outcome;
+
+  pthread_mutex_lock(&lock);
+
+  entry = staged_find(staging_id);
+  request = entry ? approval_find(entry->approval_id) : NULL;
+
+  if(!request) {
+    // An unknown staging ID and a lost approval both mean: push again.
+    outcome = STORE_APPROVAL_STALE;
+  } else if(!request->decided) {
+    snprintf(approval_id, idlen, "%s", request->id);
+    outcome = STORE_APPROVAL_REQUIRED;
+  } else if(!request->approved) {
+    // A denial is terminal: the bytes leave the console for good.
+    staging_unlink(entry->id);
+    memset(entry, 0, sizeof(*entry));
+    memset(request, 0, sizeof(*request));
+    outcome = STORE_APPROVAL_DENIED;
+  } else {
+    outcome = staged_install(entry, request, install);
+  }
+
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
