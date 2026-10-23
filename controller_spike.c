@@ -25,6 +25,7 @@ along with this program; see the file COPYING. If not, see
  * Build the runbook: docs/controller-spike.md
  **/
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -34,21 +35,39 @@ along with this program; see the file COPYING. If not, see
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <ps5/kernel.h>
+
 #include "notify.h"
 #include "pad.h"
+#include "pt.h"
 
 
 #define SPIKE_PORT        9150
 #define SPIKE_SECONDS     120
+
+/**
+ * Marks the process as a fully privileged system app for every credential
+ * check. GhostControl reads the pad with this authid.
+ **/
+#define SPIKE_AUTHID 0x3800000000010003ULL
 #define SPIKE_FRAME_MS    16
 #define SPIKE_MAX_CLIENTS 4
 #define SPIKE_TRANSCRIPT  4096
 #define SPIKE_LINE        512
+
+/** Name ids of the pad functions inside the process that holds the pad. **/
+#define SPIKE_NID_GETHANDLE "u1GRHp+oWoY"
+#define SPIKE_NID_READSTATE "YndgXqQVV7c"
+#define SPIKE_SHELL         "SceShellCore"
 
 
 /**
@@ -227,14 +246,248 @@ report_error(const char* what, unsigned int code, unsigned int* last) {
 }
 
 
+#define PAD_HOME_DIR "/system_data/priv/home"
+
+
 /**
- * Open the controller for the console's user, retrying later on failure.
+ * Collect the user ids from the home directories, which name each logged-in
+ * account by its id in hex. The user service calls do not return one.
+ **/
+static int
+home_users(int* users, int cap) {
+  DIR* dir;
+  struct dirent* ent;
+  int count = 0;
+
+  dir = opendir(PAD_HOME_DIR);
+  if(!dir) {
+    report("home dir error %d", errno);
+    return 0;
+  }
+
+  while((ent = readdir(dir))) {
+    char* end = NULL;
+    long id;
+
+    if(ent->d_name[0] == '.') {
+      continue;
+    }
+    id = strtol(ent->d_name, &end, 16);
+    if(end == ent->d_name || *end != '\0' || id < 0) {
+      continue;
+    }
+    report("home user %ld (%s)", id, ent->d_name);
+    if(count < cap) {
+      users[count++] = (int)id;
+    }
+  }
+
+  closedir(dir);
+  return count;
+}
+
+
+/**
+ * The pid of a process with the given name, or -1.
+ *
+ * The layout matches find_pid in shsrv.c: the struct size at the start of
+ * each entry, the pid at byte 72 and the thread name at byte 447.
+ **/
+static pid_t
+find_process(const char* name) {
+  int mib[4] = {1, 14, 8, 0};
+  pid_t pid = -1;
+  size_t buf_size;
+  uint8_t* buf;
+
+  if(sysctl(mib, 4, 0, &buf_size, 0, 0)) {
+    report("process list error %d", errno);
+    return -1;
+  }
+  if(!(buf = malloc(buf_size))) {
+    return -1;
+  }
+  if(sysctl(mib, 4, buf, &buf_size, 0, 0)) {
+    free(buf);
+    return -1;
+  }
+
+  for(uint8_t* ptr = buf; ptr < buf + buf_size;) {
+    int size = *(int*)ptr;
+    pid_t found = *(pid_t*)&ptr[72];
+    char* thread = (char*)&ptr[447];
+
+    ptr += size;
+    if(!strcmp(name, thread) && found != getpid()) {
+      pid = found;
+    }
+  }
+
+  free(buf);
+  return pid;
+}
+
+
+/**
+ * Read the controller from inside the process that already holds it.
+ *
+ * A payload is not a registered pad client, so scePadOpen refuses it. The
+ * shell is a client. Attaching to it and calling scePadGetHandle there
+ * borrows the handle the console gave it.
+ **/
+static int
+pad_from_shell(int* user_id) {
+  pid_t pid;
+  intptr_t get_handle;
+  intptr_t read_state;
+  int handle = -1;
+
+  pid = find_process(SPIKE_SHELL);
+  if(pid < 0) {
+    report("no %s process", SPIKE_SHELL);
+    return -1;
+  }
+  report("%s pid %d", SPIKE_SHELL, pid);
+
+  {
+    uint32_t handle = 0;
+
+    if(kernel_dynlib_handle(pid, "libScePad.sprx", &handle)) {
+      report("libScePad.sprx not found (%d)", errno);
+      return -1;
+    }
+    get_handle = kernel_dynlib_resolve(pid, handle, SPIKE_NID_GETHANDLE);
+    read_state = kernel_dynlib_resolve(pid, handle, SPIKE_NID_READSTATE);
+  }
+  report("resolved getHandle %p readState %p",
+         (void*)get_handle, (void*)read_state);
+  if(!get_handle || !read_state) {
+    return -1;
+  }
+
+  if(pt_attach(pid)) {
+    report("attach failed (%d)", errno);
+    return -1;
+  }
+
+  {
+    int candidates[3];
+
+    candidates[0] = 1;
+    candidates[1] = *user_id;
+    candidates[2] = 0x10000000;
+    for(int i=0; i<3 && handle < 0; i++) {
+      int got = (int)pt_call(pid, get_handle, (uint64_t)candidates[i],
+                             (uint64_t)PAD_PORT_TYPE_STANDARD, 0);
+      report("shell getHandle user %d -> 0x%08x", candidates[i],
+             (unsigned int)got);
+      if(got >= 0) {
+        handle = got;
+        *user_id = candidates[i];
+      }
+    }
+  }
+
+  pt_detach(pid, 0);
+
+  if(handle < 0) {
+    return -1;
+  }
+  return handle;
+}
+
+
+/**
+ * Report the name the console stores for a user, so the operator can tell
+ * which account the id belongs to.
+ **/
+static void
+report_user_name(int user) {
+  char name[32];
+  int err;
+
+  memset(name, 0, sizeof name);
+  err = sceUserServiceGetUserName(user, name, sizeof name);
+  if(err) {
+    report("user %d name error 0x%08x", user, (unsigned int)err);
+    return;
+  }
+  report("user %d name %s", user, name[0] ? name : "(empty)");
+
+  /**
+   * The sign-in flag lives in the registry, one entity per account slot.
+   * Slot 1 is the base; each next slot adds 65536.
+   **/
+  for(int slot=1; slot<=16; slot++) {
+    int value = 0;
+    int entity = 125874185 + (slot - 1) * 65536;
+
+    err = sceRegMgrGetInt(entity, &value);
+    if(err) {
+      report("sign-in slot %d error 0x%08x", slot, (unsigned int)err);
+      break;
+    }
+    if(value) {
+      report("sign-in slot %d value %d", slot, value);
+    }
+  }
+
+  {
+    char path[64];
+    struct stat st;
+
+    snprintf(path, sizeof path, "/system_data/priv/home/%x/np/auth.dat", user);
+    if(stat(path, &st) == 0) {
+      report("auth.dat present, %ld bytes", (long)st.st_size);
+    } else {
+      report("auth.dat absent (%d)", errno);
+    }
+  }
+}
+
+
+/**
+ * Open the controller for one user, by opening a handle or by borrowing one.
+ **/
+static int
+pad_try(const char* label, int user, int type, int borrow) {
+  int handle;
+
+  if(user < 0) {
+    return -1;
+  }
+
+  handle = borrow ? scePadGetHandle(user, type, 0)
+                  : scePadOpen(user, type, 0, NULL);
+  if(handle < 0) {
+    if((unsigned int)handle != open_error) {
+      open_error = (unsigned int)handle;
+      report("%s user %d type %d error 0x%08x", label, user, type, open_error);
+    }
+    return -1;
+  }
+
+  open_error = 0;
+  report("%s ok user %d handle %d", label, user, handle);
+  return handle;
+}
+
+
+/**
+ * Open the controller for the console's logged-in user.
+ *
+ * scePadOpen only accepts a user that is logged in, and it rejects anything
+ * else with USER_NOT_LOGIN. GetInitialUser fails in a payload and the
+ * foreground user is not a logged-in user, so the login list is the source.
+ * Borrowing an existing handle covers the case where the system already
+ * holds the controller.
  **/
 static int
 pad_attempt(int* user_id) {
-  int handle;
+  int users[PAD_LOGIN_USERS];
   int err;
-  int id;
+  int handle = -1;
+  int chosen = PAD_USER_INVALID;
 
   err = scePadInit();
   if(err) {
@@ -244,38 +497,69 @@ pad_attempt(int* user_id) {
     report("init ok");
   }
 
-  if(*user_id < 0) {
-    id = -1;
-    err = sceUserServiceGetInitialUser(&id);
-    if(!err && id >= 0) {
-      *user_id = id;
-      user_error = 0;
-      report("user %d (initial)", id);
-    } else {
-      report_error("user initial", err ? (unsigned int)err : ~0u, &user_error);
-      id = -1;
-      err = sceUserServiceGetForegroundUser(&id);
-      if(!err && id >= 0) {
-        *user_id = id;
-        user_error = 0;
-        report("user %d (foreground)", id);
-      } else {
-        report_error("user foreground", err ? (unsigned int)err : ~0u,
-                     &user_error);
-        return -1;
+  err = scePadSetProcessPrivilege(1);
+  if(err) {
+    report_error("privilege", (unsigned int)err, &user_error);
+  }
+
+  for(int i=0; i<PAD_LOGIN_USERS; i++) {
+    users[i] = PAD_USER_INVALID;
+  }
+
+  if(home_users(users, PAD_LOGIN_USERS) == 0) {
+    err = sceUserServiceGetLoginUserIdList(users);
+    if(err) {
+      report_error("login list", (unsigned int)err, &user_error);
+    }
+  }
+
+  if(users[0] != PAD_USER_INVALID) {
+    *user_id = users[0];
+    handle = pad_from_shell(user_id);
+    if(handle >= 0) {
+      return handle;
+    }
+  }
+
+  for(int i=0; i<PAD_LOGIN_USERS && handle < 0; i++) {
+    if(users[i] == PAD_USER_INVALID) {
+      continue;
+    }
+    report_user_name(users[i]);
+    for(int type=0; type<PAD_PORT_TYPE_COUNT && handle < 0; type++) {
+      handle = pad_try("open", users[i], type, 0);
+      if(handle < 0) {
+        handle = pad_try("borrow", users[i], type, 1);
+      }
+    }
+    if(handle >= 0) {
+      chosen = users[i];
+    }
+  }
+
+  if(handle < 0) {
+    int foreground = PAD_USER_INVALID;
+
+    err = sceUserServiceGetForegroundUser(&foreground);
+    if(!err && foreground != PAD_USER_INVALID) {
+      for(int type=0; type<PAD_PORT_TYPE_COUNT && handle < 0; type++) {
+        handle = pad_try("open foreground", foreground, type, 0);
+        if(handle < 0) {
+          handle = pad_try("borrow foreground", foreground, type, 1);
+        }
+      }
+      if(handle >= 0) {
+        chosen = foreground;
       }
     }
   }
 
-  handle = scePadOpen(*user_id, PAD_PORT_TYPE_STANDARD, 0, NULL);
   if(handle < 0) {
-    report_error("open", (unsigned int)handle, &open_error);
     return -1;
   }
 
-  open_error = 0;
-  report("open ok user %d handle %d", *user_id, handle);
-
+  *user_id = chosen;
+  user_error = 0;
   return handle;
 }
 
@@ -444,6 +728,55 @@ accept_clients(int srvfd, long elapsed) {
 
 
 /**
+ * Give this process the credentials a system app has.
+ *
+ * sceUserService refuses a process that still carries the credentials of
+ * the ELF loader's parent, which is what produces USER_NOT_LOGIN. ProsperoMgr
+ * raises them the same way before it calls sceUserService.
+ **/
+static void
+raise_credentials(void) {
+  pid_t pid = getpid();
+  intptr_t root;
+  uint8_t caps[16];
+  uint8_t attrs[32];
+  int failed = 0;
+
+  if(!kernel_get_proc(pid)) {
+    report("credentials: kernel read/write is not available");
+    return;
+  }
+
+  failed |= kernel_set_ucred_uid(pid, 0);
+  failed |= kernel_set_ucred_ruid(pid, 0);
+  failed |= kernel_set_ucred_svuid(pid, 0);
+  failed |= kernel_set_ucred_rgid(pid, 0);
+  failed |= kernel_set_ucred_svgid(pid, 0);
+
+  root = kernel_get_root_vnode();
+  if(root) {
+    failed |= kernel_set_proc_rootdir(pid, root);
+    failed |= kernel_set_proc_jaildir(pid, root);
+  }
+
+  failed |= kernel_set_ucred_authid(pid, SPIKE_AUTHID);
+
+  memset(caps, 0xff, sizeof caps);
+  failed |= kernel_set_ucred_caps(pid, caps);
+
+  memset(attrs, 0, sizeof attrs);
+  attrs[0] = 0x80;
+  failed |= kernel_set_ucred_attrs(pid, attrs);
+
+  if(failed) {
+    report("credentials: one or more kernel_set_ucred calls failed");
+  } else {
+    report("credentials raised");
+  }
+}
+
+
+/**
  * Run the spike for its fixed time.
  **/
 static int
@@ -480,6 +813,9 @@ spike_run(void) {
   if(err) {
     report("user service init error 0x%08x", (unsigned int)err);
   }
+
+  raise_credentials();
+
   report("listening on port %d for %d s, connect with nc", SPIKE_PORT,
          SPIKE_SECONDS);
 
