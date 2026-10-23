@@ -86,40 +86,45 @@ Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server
 
 ## Command coverage
 
-How common bash commands map to Ariel. "shsrv" means the command already exists in the upstream shell. "Stage N" means it is added or extended in that stage. "Gated" commands need approval on the console before they run (see [Safety model](#safety-model)).
+Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-| bash | Ariel | Status |
-|---|---|---|
-| `pwd`, `cd` | same | shsrv. Kept across connections with sessions (Stage 3) |
-| `ls` | `ls` | shsrv, no flags. `-l`, `-a`, `--json` and pagination in Stage 2 |
-| `stat`, `file` | same | shsrv. `--json` in Stage 2 |
-| `cat` | `cat` | shsrv. Size limit in Stage 2 |
-| `head`, `tail`, `wc` | same | Stage 2 |
-| `grep` | `grep` | shsrv, only `-i` and `-n`. `-r`, `-l` and `-c` in Stage 2 |
-| `find` | `find` | shsrv, only `-name` and `-type`. More predicates in Stage 2 |
-| `cmp`, `hexdump` | same | shsrv |
-| `diff` | `diff` | Stage 2, optional |
-| `df`, `du` | same | `df` in shsrv, `du` in Stage 2 |
-| `mkdir`, `rmdir`, `touch`, `ln` | same | shsrv, gated |
-| `cp`, `mv`, `rm` | same | shsrv, gated. `-r` in Stage 2 |
-| `chmod`, `chown`, `chgrp` | same | shsrv, gated |
-| `echo > file`, `tee` | `write <path>` | Stage 2 |
-| `tar`, `unzip` | same | Stage 1 |
-| `ps` | `ps`, `procstat` | shsrv. `--json` in Stage 2 |
-| `kill` | `kill` | shsrv, gated. Critical processes protected in Stage 1 |
-| `cmd &`, `nohup` | `payload run` | Stage 1, output captured to a log |
-| `timeout` | `timeout` | Stage 2 |
-| `env`, `export`, `exec`, `sleep`, `id` | same | shsrv |
-| `uname`, `uptime`, `free` | `sysinfo` | Stage 2. Raw values already available through `sysctl` |
-| `date`, `dmesg` | same | Stage 2. Kernel logs are only available through klogsrv today |
-| `mount`, `umount`, `chroot`, `mknod` | same | shsrv, gated in Stage 1 |
-| `sync` | `sync` | shsrv |
-| `reboot` | `reboot` | Stage 1, gated |
-| `curl -o`, `wget` | `http2_get -o` | shsrv. Wrapped by `payload install` with allowlist and hash check in Stage 1 |
-| `sha256sum` | `sha256sum` | Stage 1 |
-| `ifconfig`, `netstat`, `ping` | same | Stage 2, optional |
+**Today:** ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 and S2 are Stages 1 and 2. "Gated" commands need approval on the console before they run (see [Safety model](#safety-model)).
 
-PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv), plus `payload`, `autoload` (Stage 1) and `session` (Stage 3).
+| Ariel | bash equivalent | Today (shsrv) | Plan |
+|---|---|---|---|
+| `pwd`, `cd` | | ✅ | S3: working directory kept across connections with sessions |
+| `ls` | | ⚠️ no flags | S2: `-l`, `-a`, `--json`, pagination |
+| `stat`, `file` | | ✅ | S2: `--json` |
+| `cat` | | ✅ | S2: size limit |
+| `head`, `tail`, `wc` | | ❌ | S2 |
+| `grep` | | ⚠️ only `-i`, `-n` | S2: `-r`, `-l`, `-c` |
+| `find` | | ⚠️ only `-name`, `-type` | S2: more predicates |
+| `cmp`, `hexdump` | | ✅ | |
+| `diff` | | ❌ | S2, optional |
+| `df` | | ✅ | |
+| `du` | | ❌ | S2 |
+| `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S1: gated |
+| `cp`, `mv` | | ⚠️ no `-r` | S1: gated. S2: `-r` |
+| `rm` | | ⚠️ one file, no `-r` | S1: gated. S2: `-r` |
+| `chmod`, `chown`, `chgrp` | | ✅ | S1: gated |
+| `write <path>` | `echo > file`, `tee` | ❌ | S2, gated |
+| `tar`, `unzip` | | ❌ | S1 |
+| `ps` | | ✅ | S2: `--json` |
+| `procstat` | `/proc/<pid>/*` | ✅ | |
+| `kill` | | ✅ | S1: gated, critical processes protected |
+| `payload run` | `cmd &`, `nohup` | ❌ | S1, gated, output captured to a log |
+| `timeout` | | ❌ | S2 |
+| `env`, `export`, `exec`, `sleep`, `id`, `sync` | | ✅ | |
+| `sysinfo` | `uname`, `uptime`, `free` | ⚠️ raw values via `sysctl` | S2 |
+| `date` | | ❌ | S2 |
+| `dmesg` | | ❌ only through klogsrv | S2 |
+| `mount`, `umount`, `chroot`, `mknod` | | ✅ | S1: gated |
+| `reboot` | | ❌ | S1, gated |
+| `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S1: wrapped by `payload install` with allowlist and hash check |
+| `sha256sum` | | ❌ (`sum` is a BSD checksum) | S1 |
+| `ifconfig`, `netstat`, `ping` | | ❌ | S2, optional |
+
+PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv), plus `payload`, `autoload`, `approval` (Stage 1) and `session` (Stage 3).
 
 Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `ssh`, `top` and package managers. The agent composes logic on its own side, on the computer it runs on.
 
