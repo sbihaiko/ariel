@@ -18,6 +18,7 @@ along with this program; see the file COPYING. If not, see
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -75,6 +76,12 @@ read_all(int fd, char *buf, size_t cap) {
 
 static int
 random_bytes(unsigned char *buf, size_t len) {
+#if defined(__FreeBSD__)
+  // A console has no /dev/urandom to open. FreeBSD libc's arc4random is
+  // seeded from the kernel's cryptographic random source.
+  arc4random_buf(buf, len);
+  return 0;
+#else
   size_t total = 0;
   int fd;
 
@@ -100,6 +107,7 @@ random_bytes(unsigned char *buf, size_t len) {
   }
 
   return close(fd);
+#endif
 }
 
 

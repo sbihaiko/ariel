@@ -40,6 +40,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "notify.h"
+#include "pad.h"
 
 
 #define SPIKE_PORT        9150
@@ -48,9 +49,6 @@ along with this program; see the file COPYING. If not, see
 #define SPIKE_MAX_CLIENTS 4
 #define SPIKE_TRANSCRIPT  4096
 #define SPIKE_LINE        512
-
-#define PAD_PORT_TYPE_STANDARD 0
-#define PAD_BUTTON_INTERCEPTED 0x80000000u
 
 
 /**
@@ -61,45 +59,6 @@ typedef struct pad_buttons {
   unsigned int bit;
   const char*  name;
 } pad_buttons_t;
-
-
-/**
- * ScePadData as the PS5 lays it out. The SDK ships the library but no
- * header, so the layout is declared here. The buffer is padded to 1 KiB
- * because the system may write more than the documented 120 bytes.
- **/
-typedef struct pad_data {
-  uint32_t buttons;
-  uint8_t  left_stick[2];
-  uint8_t  right_stick[2];
-  uint8_t  analog[2];
-  uint16_t padding;
-  float    orientation[4];
-  float    acceleration[3];
-  float    angular_velocity[3];
-  uint8_t  touch[24];
-  uint8_t  connected;
-  uint64_t timestamp;
-  uint8_t  ext[16];
-  uint8_t  count;
-  uint8_t  unknown[15];
-  uint8_t  reserved[1024 - 120];
-} pad_data_t;
-
-
-_Static_assert(offsetof(pad_data_t, connected) == 76, "pad layout");
-_Static_assert(offsetof(pad_data_t, timestamp) == 80, "pad layout");
-_Static_assert(sizeof(pad_data_t) == 1024, "pad buffer size");
-
-
-int sceUserServiceInitialize(void* init_params);
-int sceUserServiceTerminate(void);
-int sceUserServiceGetInitialUser(int* user_id);
-int sceUserServiceGetForegroundUser(int* user_id);
-int scePadInit(void);
-int scePadOpen(int user_id, int type, int index, void* param);
-int scePadReadState(int handle, pad_data_t* data);
-int scePadClose(int handle);
 
 
 static const pad_buttons_t pad_buttons[] = {

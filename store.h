@@ -28,6 +28,12 @@ along with this program; see the file COPYING. If not, see
  * restart except the store's files.
  **/
 
+/**
+ * An approval is good for this long after it was requested. The platform
+ * reads it too: a console shows the prompt for exactly this long.
+ **/
+#define APPROVAL_EXPIRY_MS 120000ULL
+
 /** What one payload commit ended in. **/
 #define STORE_INSTALLED         0
 #define STORE_APPROVAL_REQUIRED 1
