@@ -78,6 +78,7 @@ main(int argc, char **argv) {
   char data_dir[PATH_MAX];
   char run_dir[PATH_MAX];
   char agent_token[TOKEN_LEN];
+  agent_t agent;
   platform_t *platform;
   const char *root;
   uint16_t port = DEFAULT_PORT;
@@ -137,8 +138,11 @@ main(int argc, char **argv) {
   fflush(stdout);
 
   // Every connection is served by a thread of this process, until the
-  // listener fails.
-  agent_server_serve(platform, agent_token, srvfd);
+  // listener fails. The agent outlives the call: a connection may still be
+  // running when the listener fails.
+  agent.platform = platform;
+  agent.token = agent_token;
+  agent_server_serve(&agent, srvfd);
 
   close(srvfd);
   return EXIT_FAILURE;

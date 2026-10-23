@@ -19,6 +19,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <stdint.h>
 
+#include "agent.h"
 #include "platform.h"
 
 /**
@@ -29,8 +30,9 @@ along with this program; see the file COPYING. If not, see
  *
  * Both builds run this loop: the host build as its main loop, the PS5 build
  * in a thread beside the telnet shell. It returns only when the listener
- * fails; the caller owns srvfd.
+ * fails; the caller owns srvfd and agent, and agent must outlive every
+ * connection thread still in flight when this returns.
  **/
-void agent_server_serve(platform_t *platform, const char *token, int srvfd);
+void agent_server_serve(agent_t *agent, int srvfd);
 
 #endif /* ARIEL_AGENT_SERVER_H */

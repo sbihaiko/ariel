@@ -301,12 +301,8 @@ serve_connection(void *arg) {
 
 
 void
-agent_server_serve(platform_t *platform, const char *token, int srvfd) {
-  agent_t agent;
+agent_server_serve(agent_t *agent, int srvfd) {
   int connfd;
-
-  agent.platform = platform;
-  agent.token = token;
 
   while(1) {
     struct connection *conn;
@@ -314,7 +310,7 @@ agent_server_serve(platform_t *platform, const char *token, int srvfd) {
     int rc;
 
     do {
-      connfd = platform->accept(platform, srvfd);
+      connfd = agent->platform->accept(agent->platform, srvfd);
     } while(connfd < 0 && errno == EINTR);
 
     if(connfd < 0) {
@@ -323,7 +319,7 @@ agent_server_serve(platform_t *platform, const char *token, int srvfd) {
     }
 
     if(!connection_take()) {
-      refuse(&agent, connfd);
+      refuse(agent, connfd);
       continue;
     }
 
@@ -334,16 +330,17 @@ agent_server_serve(platform_t *platform, const char *token, int srvfd) {
       continue;
     }
 
-    conn->agent = &agent;
+    conn->agent = agent;
     conn->fd = connfd;
-    conn->wake = platform->wake_new ? platform->wake_new(platform) : -1;
+    conn->wake = agent->platform->wake_new ?
+                 agent->platform->wake_new(agent->platform) : -1;
 
     rc = pthread_create(&thread, NULL, serve_connection, conn);
     if(rc) {
       fprintf(stderr, "pthread_create: %s\n", strerror(rc));
       close(connfd);
-      if(conn->wake >= 0 && platform->wake_close) {
-        platform->wake_close(platform, conn->wake);
+      if(conn->wake >= 0 && agent->platform->wake_close) {
+        agent->platform->wake_close(agent->platform, conn->wake);
       }
       free(conn);
       connection_drop();

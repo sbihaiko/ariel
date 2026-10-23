@@ -115,8 +115,15 @@ reap_later(pid_t pid) {
 static void *
 serve_agent(void *arg) {
   platform_t *platform = arg;
+  agent_t agent;
   int notified = 0;
   int srvfd;
+
+  // One agent for the whole thread. A connection may still be running when
+  // the listener fails and this loop starts a fresh one, so the agent must
+  // not live on a frame that agent_server_serve returns from.
+  agent.platform = platform;
+  agent.token = agent_token;
 
   while(1) {
     if((srvfd=platform->listen(platform, AGENT_PORT)) < 0) {
@@ -130,7 +137,7 @@ serve_agent(void *arg) {
     }
 
     klog_printf("Serving the agent port on %d\n", AGENT_PORT);
-    agent_server_serve(platform, agent_token, srvfd);
+    agent_server_serve(&agent, srvfd);
     close(srvfd);
     sleep(3);
   }
