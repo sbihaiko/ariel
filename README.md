@@ -143,6 +143,10 @@ An agent that can download, write and execute code on a console with kernel priv
 
 From Stage 4, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
 
+## Quick start
+
+To build Ariel, start it on a console and run your first `helloworld.elf` from its shell, follow the [quick start tutorial](docs/quick-start.md).
+
 ## Using it today
 
 Until the Ariel features land, the shell behaves like upstream shsrv. Make sure [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) is running, send the payload to port 9021 and connect with a telnet client on port 2323. Type `help` once connected to see the available commands (`cd`, `ls`, `mkdir`, `stat`, `ps` and others).
