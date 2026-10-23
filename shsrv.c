@@ -15,26 +15,135 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <ps5/kernel.h>
 #include <ps5/klog.h>
 
+#include "agent_server.h"
 #include "elfldr.h"
 #include "notify.h"
+#include "platform.h"
+#include "platform_ps5.h"
 #include "sh.elf.inc"
+#include "store.h"
+#include "token.h"
+
+/** The telnet shell keeps its port and its behavior. **/
+#define TELNET_PORT 2323
+
+/** The raw agent port next to it. **/
+#define AGENT_PORT  2324
+
+/** Ariel's state: the token, the store and staging. **/
+#define STATE_DIR   "/data/ariel"
+
+/** The agent access token, loaded or created at start. **/
+static char agent_token[TOKEN_LEN];
+
+
+/**
+ * Reap one telnet shell process. SIGCHLD is no longer ignored, so an
+ * exited child stays a zombie until someone waits for it. Each child is
+ * waited for by its own thread and never by waitpid(-1): a wildcard wait
+ * would also take the exit status of a payload that `payload run --wait`
+ * is waiting for.
+ **/
+static void *
+reap_shell(void *arg) {
+  pid_t pid = (pid_t)(intptr_t)arg;
+  int status;
+
+  while(waitpid(pid, &status, 0) < 0) {
+    if(errno != EINTR) {
+      break;
+    }
+  }
+
+  return NULL;
+}
+
+
+static void
+reap_later(pid_t pid) {
+  pthread_t thread;
+  int status;
+
+  if(pid <= 0) {
+    return;
+  }
+
+  if(!pthread_create(&thread, NULL, reap_shell, (void*)(intptr_t)pid)) {
+    pthread_detach(thread);
+    return;
+  }
+
+  // No thread can wait for this child, and SIGCHLD is no longer ignored.
+  // Wait here rather than leave a zombie. The shell is already spawned, so
+  // this only holds back the next accept until it exits.
+  klog_perror("pthread_create");
+  while(waitpid(pid, &status, 0) < 0) {
+    if(errno != EINTR) {
+      break;
+    }
+  }
+}
+
+
+/**
+ * Serve the agent port from a thread of this process, next to the telnet
+ * shell. Auth, staging and approvals live in this process's memory under
+ * the store's mutexes.
+ **/
+static void *
+serve_agent(void *arg) {
+  platform_t *platform = arg;
+  agent_t agent;
+  int notified = 0;
+  int srvfd;
+
+  // One agent for the whole thread. A connection may still be running when
+  // the listener fails and this loop starts a fresh one, so the agent must
+  // not live on a frame that agent_server_serve returns from.
+  agent.platform = platform;
+  agent.token = agent_token;
+
+  while(1) {
+    if((srvfd=platform->listen(platform, AGENT_PORT)) < 0) {
+      klog_printf("cannot listen on the agent port %d\n", AGENT_PORT);
+      if(!notified) {
+        notify("Ariel: cannot serve the agent port %d", AGENT_PORT);
+        notified = 1;
+      }
+      sleep(3);
+      continue;
+    }
+
+    klog_printf("Serving the agent port on %d\n", AGENT_PORT);
+    agent_server_serve(&agent, srvfd);
+    close(srvfd);
+    sleep(3);
+  }
+
+  return NULL;
+}
 
 
 /**
@@ -53,6 +162,7 @@ serve_sh(uint16_t port, int notify_user) {
   int optval;
   int connfd;
   int srvfd;
+  pid_t pid;
 
   if(getifaddrs(&ifaddr) == -1) {
     klog_perror("getifaddrs");
@@ -140,7 +250,13 @@ serve_sh(uint16_t port, int notify_user) {
       break;
     }
 
-    elfldr_spawn(connfd, connfd, -1, sh_elf, argv);
+    // The shell is a spawn through the same ELF loader as a payload run,
+    // so it takes the loader's lock; the wait is not under it. The shell
+    // is not waited for here: its own thread reaps it.
+    platform_ps5_loader_lock();
+    pid = elfldr_spawn(connfd, connfd, -1, sh_elf, argv);
+    platform_ps5_loader_unlock();
+    reap_later(pid);
     close(connfd);
   }
 
@@ -210,13 +326,64 @@ init_stdio(void) {
 }
 
 
+static int
+ensure_dir(const char *path) {
+  if(mkdir(path, 0700) && errno != EEXIST) {
+    klog_perror(path);
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * Prepare Ariel's state and start the agent port. A failure here is told to
+ * the owner and nothing else happens: the telnet shell is the way back in
+ * when /data cannot be written, the token cannot be read or the store cannot
+ * be prepared, so it must still come up.
+ **/
+static void
+start_ariel(void) {
+  platform_t *platform;
+  pthread_t agent;
+
+  if(ensure_dir(STATE_DIR) || ensure_dir(STATE_DIR "/staging")) {
+    notify("Ariel: cannot prepare %s", STATE_DIR);
+    return;
+  }
+
+  if(token_load_or_create(STATE_DIR, agent_token)) {
+    notify("Ariel: cannot load or create the access token in %s", STATE_DIR);
+    return;
+  }
+
+  platform = platform_ps5(agent_token);
+
+  if(store_init(STATE_DIR, platform)) {
+    notify("Ariel: cannot prepare the store in %s", STATE_DIR);
+    return;
+  }
+
+  // The token is shown at start and with every approval prompt, so the
+  // owner can always hand it to the agent.
+  notify("Ariel agent port %d\ntoken %s", AGENT_PORT, agent_token);
+
+  if(pthread_create(&agent, NULL, serve_agent, platform)) {
+    klog_perror("pthread_create");
+    notify("Ariel: cannot start the agent port %d", AGENT_PORT);
+    return;
+  }
+
+  pthread_detach(agent);
+}
+
+
 /**
  * Launch shsrv.elf.
  **/
 int
 main(void) {
   int notify_user = 1;
-  int port = 2323;
   pid_t pid;
 
   syscall(SYS_thr_set_name, -1, "shsrv.elf");
@@ -231,9 +398,19 @@ main(void) {
     sleep(1);
   }
 
-  signal(SIGCHLD, SIG_IGN);
+  signal(SIGPIPE, SIG_IGN);
+
+  // SIGCHLD keeps its default handling: a payload run with --wait needs
+  // its exit status, and the telnet shell's processes are reaped by
+  // threads of their own.
+  signal(SIGCHLD, SIG_DFL);
+
+  // Ariel's state never gates the recovery shell: whatever fails here, the
+  // telnet shell below still serves.
+  start_ariel();
+
   while(1) {
-    serve_sh(port, notify_user);
+    serve_sh(TELNET_PORT, notify_user);
     notify_user = 0;
     sleep(3);
   }

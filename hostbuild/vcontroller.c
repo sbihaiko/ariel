@@ -14,6 +14,16 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+/*
+ * The virtual controller exists only in the host build. A PS5 build never
+ * defines ARIEL_HOST_BUILD, so it cannot compile this file in: approvals
+ * on a console come from the controller the owner holds, and nothing a
+ * payload or the network can drive.
+ */
+#ifndef ARIEL_HOST_BUILD
+#error "the virtual controller is host-only"
+#endif
+
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
