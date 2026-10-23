@@ -33,6 +33,7 @@ along with this program; see the file COPYING. If not, see
 #define STORE_APPROVAL_REQUIRED 1
 #define STORE_APPROVAL_DENIED   2
 #define STORE_APPROVAL_STALE    3
+#define STORE_APPROVAL_EXPIRED  4
 
 /** What a successful commit installed. **/
 typedef struct {
@@ -55,22 +56,23 @@ typedef struct {
 int store_name_valid(const char *name);
 
 /**
- * Record the state directory, delete the staging objects a previous
- * process left behind and make the store's directories. Returns 0 on
- * success, -1 on error.
+ * Record the state directory and the platform clock, delete the staging
+ * objects a previous process left behind and make the store's directories.
+ * Returns 0 on success, -1 on error.
  **/
-int store_init(const char *state_dir);
+int store_init(const char *state_dir, struct platform *platform);
 
 /** Take the next staging ID: s-1, s-2, and so on. **/
 void store_staging_next_id(char *id, size_t size);
 
 /**
- * Take a staging slot, create the staging object for a new upload and
- * return its descriptor, opened relative to Ariel's directory without
- * following symbolic links. Returns -1 when the staging slots are all
- * taken or on error.
+ * Take a staging slot, reserve size bytes of the staging quota, create the
+ * staging object for a new upload and return its descriptor, opened
+ * relative to Ariel's directory without following symbolic links. Returns
+ * -1 when the staging slots are all taken, size does not fit the quota
+ * (one upload and the total are both at most 64 MiB) or on error.
  **/
-int store_staging_create(const char *staging_id);
+int store_staging_create(const char *staging_id, uint64_t size);
 
 /** Delete a staging object that never got an approval. **/
 void store_staging_discard(const char *staging_id);

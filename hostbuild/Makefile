@@ -2,11 +2,11 @@
 
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -Werror -O2 -std=c11 -D_POSIX_C_SOURCE=200809L
-CFLAGS += -pthread -I..
+CFLAGS += -pthread -I.. -DARIEL_HOST_BUILD=1
 LDLIBS += -pthread
 
 BIN  := ariel-host
-SRCS := main.c platform_host.c token.c agent.c vcontroller.c store.c
+SRCS := main.c platform_host.c token.c agent.c vcontroller.c store.c testclock.c
 OBJS := $(SRCS:.c=.o) sha256.o
 
 all: $(BIN)

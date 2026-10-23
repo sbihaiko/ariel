@@ -24,6 +24,7 @@ along with this program; see the file COPYING. If not, see
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,10 @@ along with this program; see the file COPYING. If not, see
 /** At most this many staged objects wait for a commit. **/
 #define STAGING_MAX   8
 
+/** Staging holds at most this many bytes in total, and one upload is at
+    most this large. **/
+#define STAGING_BYTES_MAX (64ULL * 1024ULL * 1024ULL)
+
 /** At most this many approvals are remembered at once. **/
 #define APPROVALS_MAX 16
 
@@ -56,12 +61,23 @@ along with this program; see the file COPYING. If not, see
 /** One object is at most 64 MiB, the same limit an upload has. **/
 #define OBJECT_LIMIT  (64ULL * 1024ULL * 1024ULL)
 
+/** An approval is good for this long after it was requested. **/
+#define APPROVAL_EXPIRY_MS 120000ULL
+
+/** A staging object nobody committed leaves after this long. **/
+#define STAGING_TTL_MS     900000ULL
+
+/** At most one notification is shown every this many milliseconds. **/
+#define NOTIFICATION_GAP_MS 10000ULL
+
 /** One member of the staging table. **/
 struct staged {
   int used;
   char id[APPROVAL_ID_MAX];
   char approval_id[APPROVAL_ID_MAX];
   approval_facts_t facts;
+  uint64_t reserved;
+  uint64_t created_ms;
 };
 
 /** One member of the approval table. **/
@@ -69,7 +85,9 @@ struct approval {
   int used;
   int decided;
   int approved;
+  int expired;
   char id[APPROVAL_ID_MAX];
+  uint64_t created_ms;
 };
 
 /**
@@ -83,13 +101,47 @@ static struct staged staged[STAGING_MAX];
 static struct approval approvals[APPROVALS_MAX];
 static unsigned long staging_count;
 static unsigned long approval_count;
+static uint64_t staging_bytes;
+static int notified;
+static uint64_t last_notification_ms;
 static char state_dir[PATH_MAX];
+static platform_t *platform;
 
 /* The directory helpers every entry below Ariel's directory goes through. */
 static int state_open(void);
 static int dir_open(int dirfd, const char *name);
 static int dir_make(int dirfd, const char *name);
 static void staging_clear(void);
+static void expire_locked(uint64_t now);
+static void *expiry_run(void *arg);
+
+
+/** Give a staging entry back: its slot and the bytes it reserved. The
+    caller holds the lock and deals with its file where needed. **/
+static void
+staged_release(struct staged *entry) {
+  staging_bytes -= entry->reserved;
+  memset(entry, 0, sizeof(*entry));
+}
+
+
+/** The platform clock in milliseconds. The caller holds the lock, so no
+    entry can be newer than the time it reads. **/
+static uint64_t
+now_ms(void) {
+  struct timespec now;
+
+  platform->clock(platform, &now);
+
+  return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000ULL;
+}
+
+
+/** How long ago then was, or 0 when then is not in the past. **/
+static uint64_t
+elapsed_ms(uint64_t now, uint64_t then) {
+  return now > then ? now - then : 0;
+}
 
 
 int
@@ -178,7 +230,7 @@ pending_count(void) {
   int count = 0;
 
   for(i=0; i<APPROVALS_MAX; i++) {
-    if(approvals[i].used && !approvals[i].decided) {
+    if(approvals[i].used && !approvals[i].decided && !approvals[i].expired) {
       count++;
     }
   }
@@ -210,13 +262,19 @@ open_entry(int dirfd, const char *name, int flags) {
 
 
 int
-store_init(const char *dir) {
+store_init(const char *dir, platform_t *p) {
+  pthread_t thread;
   int state_fd;
   int store_fd;
+  int wake;
   int rc = -1;
 
   pthread_mutex_lock(&lock);
   snprintf(state_dir, sizeof(state_dir), "%s", dir);
+  platform = p;
+  staging_bytes = 0;
+  notified = 0;
+  last_notification_ms = 0;
   memset(staged, 0, sizeof(staged));
   memset(approvals, 0, sizeof(approvals));
   pthread_mutex_unlock(&lock);
@@ -241,7 +299,23 @@ store_init(const char *dir) {
   }
 
   close(state_fd);
-  return rc;
+
+  if(rc) {
+    return rc;
+  }
+
+  // Expiry runs on the clock, so a staging object leaves at its TTL even
+  // when no request comes to notice.
+  wake = platform->wake_new ? platform->wake_new(platform) : -1;
+  if(pthread_create(&thread, NULL, expiry_run, (void*)(intptr_t)wake)) {
+    if(wake >= 0 && platform->wake_close) {
+      platform->wake_close(platform, wake);
+    }
+    return -1;
+  }
+  pthread_detach(thread);
+
+  return 0;
 }
 
 
@@ -254,37 +328,46 @@ store_staging_next_id(char *id, size_t size) {
 
 
 int
-store_staging_create(const char *staging_id) {
+store_staging_create(const char *staging_id, uint64_t size) {
   char dir[PATH_MAX];
   struct staged *slot;
+  uint64_t now;
   int fd = -1;
   int dirfd;
 
   pthread_mutex_lock(&lock);
+  now = now_ms();
+  expire_locked(now);
+
+  // The declared size is reserved before the bytes arrive, so two uploads
+  // in flight cannot both pass a check the total would fail.
+  if(size > STAGING_BYTES_MAX || staging_bytes > STAGING_BYTES_MAX - size) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
   slot = staged_slot();
 
   if(slot) {
     memset(slot, 0, sizeof(*slot));
     slot->used = 1;
+    slot->created_ms = now;
+    slot->reserved = size;
     snprintf(slot->id, sizeof(slot->id), "%s", staging_id);
+    staging_bytes += size;
   }
 
   pthread_mutex_unlock(&lock);
 
-  if(!slot || path_in(dir, sizeof(dir), "staging")) {
-    return -1;
+  if(slot && !path_in(dir, sizeof(dir), "staging") &&
+     (dirfd=open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) >= 0) {
+    fd = open_entry(dirfd, staging_id, O_WRONLY | O_CREAT | O_EXCL);
+    close(dirfd);
   }
 
-  if((dirfd=open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) < 0) {
-    return -1;
-  }
-
-  fd = open_entry(dirfd, staging_id, O_WRONLY | O_CREAT | O_EXCL);
-  close(dirfd);
-
-  if(fd < 0) {
+  if(fd < 0 && slot) {
     pthread_mutex_lock(&lock);
-    slot->used = 0;
+    staged_release(slot);
     pthread_mutex_unlock(&lock);
   }
 
@@ -342,6 +425,119 @@ staging_unlink(const char *staging_id) {
 }
 
 
+/**
+ * Drop what the clock has outlived. An approval stops counting as pending
+ * after its expiry, but its row stays until a commit finds it or its
+ * staging object leaves, so a late commit can say approval_expired. A
+ * staging object nobody committed leaves after its TTL, together with its
+ * approval. The caller holds the lock.
+ **/
+static void
+expire_locked(uint64_t now) {
+  int i;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    if(approvals[i].used && !approvals[i].expired &&
+       elapsed_ms(now, approvals[i].created_ms) >= APPROVAL_EXPIRY_MS) {
+      approvals[i].expired = 1;
+    }
+  }
+
+  for(i=0; i<STAGING_MAX; i++) {
+    struct staged *entry = &staged[i];
+
+    if(!entry->used || elapsed_ms(now, entry->created_ms) < STAGING_TTL_MS) {
+      continue;
+    }
+
+    {
+      struct approval *request = approval_find(entry->approval_id);
+
+      staging_unlink(entry->id);
+      staged_release(entry);
+      if(request) {
+        memset(request, 0, sizeof(*request));
+      }
+    }
+  }
+}
+
+
+/**
+ * How long until the next staging object reaches its TTL. With none staged,
+ * no object can leave sooner than one TTL from now. The caller holds the
+ * lock and has just expired what the clock outlived.
+ **/
+static uint64_t
+next_expiry_locked(uint64_t now) {
+  uint64_t left = STAGING_TTL_MS;
+  int i;
+
+  for(i=0; i<STAGING_MAX; i++) {
+    uint64_t age;
+
+    if(!staged[i].used) {
+      continue;
+    }
+    age = elapsed_ms(now, staged[i].created_ms);
+    if(age < STAGING_TTL_MS && STAGING_TTL_MS - age < left) {
+      left = STAGING_TTL_MS - age;
+    }
+  }
+
+  return left;
+}
+
+
+/** Throw away every wake a clock advance left in the pipe. **/
+static void
+wake_drain(int wake) {
+  char buf[64];
+
+  while(read(wake, buf, sizeof(buf)) > 0) {
+  }
+}
+
+
+/**
+ * The expiry waiter: drop what the clock outlived, then wait for the next
+ * expiry. With a wake pipe only a clock advance can bring it, and the
+ * advance wakes the poll; without one the platform clock is real time.
+ **/
+static void *
+expiry_run(void *arg) {
+  int wake = (int)(intptr_t)arg;
+
+  while(1) {
+    struct pollfd pfd = {.fd = wake, .events = POLLIN};
+    uint64_t now;
+    uint64_t left;
+
+    pthread_mutex_lock(&lock);
+    now = now_ms();
+    expire_locked(now);
+    left = next_expiry_locked(now);
+    pthread_mutex_unlock(&lock);
+
+    if(wake < 0) {
+      poll(NULL, 0, (int)left);
+      continue;
+    }
+
+    if(platform->wake_idle) {
+      platform->wake_idle(platform, wake, -1, 1);
+    }
+    poll(&pfd, 1, -1);
+    if(platform->wake_idle) {
+      platform->wake_idle(platform, wake, -1, 0);
+    }
+    wake_drain(wake);
+  }
+
+  return NULL;
+}
+
+
 void
 store_staging_discard(const char *staging_id) {
   struct staged *slot;
@@ -350,7 +546,7 @@ store_staging_discard(const char *staging_id) {
 
   pthread_mutex_lock(&lock);
   if((slot=staged_find(staging_id))) {
-    memset(slot, 0, sizeof(*slot));
+    staged_release(slot);
   }
   pthread_mutex_unlock(&lock);
 }
@@ -360,16 +556,29 @@ int
 store_approval_request(const approval_facts_t *facts, char *id,
                        size_t idlen, char *prompt, size_t promptlen) {
   struct approval *slot;
+  uint64_t now;
 
   pthread_mutex_lock(&lock);
+  now = now_ms();
+  expire_locked(now);
 
   if(pending_count() >= PENDING_MAX || !(slot=approval_slot())) {
     pthread_mutex_unlock(&lock);
     return -1;
   }
 
+  // A flood of requests must not wear the owner down: one prompt per
+  // notification window, and a refused one takes no slot and shows no
+  // prompt.
+  if(notified &&
+     elapsed_ms(now, last_notification_ms) < NOTIFICATION_GAP_MS) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
   memset(slot, 0, sizeof(*slot));
   slot->used = 1;
+  slot->created_ms = now;
   snprintf(slot->id, sizeof(slot->id), "a-%lx", ++approval_count);
 
   snprintf(prompt, promptlen,
@@ -382,6 +591,9 @@ store_approval_request(const approval_facts_t *facts, char *id,
     return -1;
   }
 
+  notified = 1;
+  last_notification_ms = now;
+
   pthread_mutex_unlock(&lock);
   return 0;
 }
@@ -392,9 +604,10 @@ store_approval_decide(const char *id, int approved) {
   struct approval *request;
 
   pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
   request = approval_find(id);
 
-  if(!request || request->decided) {
+  if(!request || request->decided || request->expired) {
     pthread_mutex_unlock(&lock);
     return -1;
   }
@@ -416,8 +629,13 @@ store_stage(const char *staging_id, const approval_facts_t *facts,
   slot = staged_find(staging_id);
 
   if(slot) {
+    uint64_t created_ms = slot->created_ms;
+    uint64_t reserved = slot->reserved;
+
     memset(slot, 0, sizeof(*slot));
     slot->used = 1;
+    slot->created_ms = created_ms;
+    slot->reserved = reserved;
     snprintf(slot->id, sizeof(slot->id), "%s", staging_id);
     snprintf(slot->approval_id, sizeof(slot->approval_id), "%s",
              approval_id);
@@ -605,7 +823,7 @@ object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
 static void
 staged_consume(struct staged *entry, struct approval *request) {
   staging_unlink(entry->id);
-  memset(entry, 0, sizeof(*entry));
+  staged_release(entry);
 
   if(request) {
     memset(request, 0, sizeof(*request));
@@ -754,6 +972,7 @@ store_commit(const char *staging_id, store_install_t *install,
   int outcome;
 
   pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
 
   entry = staged_find(staging_id);
   request = entry ? approval_find(entry->approval_id) : NULL;
@@ -761,13 +980,20 @@ store_commit(const char *staging_id, store_install_t *install,
   if(!request) {
     // An unknown staging ID and a lost approval both mean: push again.
     outcome = STORE_APPROVAL_STALE;
+  } else if(request->expired) {
+    // The owner's window closed: the object leaves the console and the
+    // agent pushes the build again.
+    staging_unlink(entry->id);
+    staged_release(entry);
+    memset(request, 0, sizeof(*request));
+    outcome = STORE_APPROVAL_EXPIRED;
   } else if(!request->decided) {
     snprintf(approval_id, idlen, "%s", request->id);
     outcome = STORE_APPROVAL_REQUIRED;
   } else if(!request->approved) {
     // A denial is terminal: the bytes leave the console for good.
     staging_unlink(entry->id);
-    memset(entry, 0, sizeof(*entry));
+    staged_release(entry);
     memset(request, 0, sizeof(*request));
     outcome = STORE_APPROVAL_DENIED;
   } else {

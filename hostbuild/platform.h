@@ -59,6 +59,26 @@ struct platform {
   void (*clock)(platform_t *self, struct timespec *now);
 
   /**
+   * Create the wake pipe of one connection and return its read end, or -1
+   * when this platform has none. A wait polls the pipe together with its
+   * socket, so moving the clock wakes it to recompute its deadline. On a
+   * console no clock moves on its own, so the pipe is not needed.
+   **/
+  int (*wake_new)(platform_t *self);
+
+  /** Close a wake pipe made by wake_new. **/
+  void (*wake_close)(platform_t *self, int fd);
+
+  /**
+   * Tell the platform that the waiter of wake pipe wake is about to block
+   * with nothing to read on fd (idle 1), or has woken (idle 0); fd is -1
+   * for a waiter without a socket. A test clock uses this to tell a
+   * scenario that every waiter has seen an advance. A console may leave it
+   * NULL.
+   **/
+  void (*wake_idle)(platform_t *self, int wake, int fd, int idle);
+
+  /**
    * Ask the owner to approve the facts' action and show the prompt on the
    * console. On success write the approval ID into id and return 0; return
    * -1 when no approval can be requested now.

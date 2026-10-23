@@ -31,8 +31,20 @@ typedef struct {
 
 /**
  * Serve one agent connection: read the auth line, read exactly one command,
- * write the reply and return. The caller owns fd and closes it.
+ * write the reply and return. wake is the connection's wake pipe read end,
+ * or -1 when the platform has none; every wait polls it. The caller owns fd
+ * and wake and closes them.
  **/
-void agent_serve(agent_t *agent, int fd);
+void agent_serve(agent_t *agent, int fd, int wake);
+
+/**
+ * Close a connection after its reply. Read what the client already sent
+ * first: a close with unread input resets the connection, and the reset can
+ * discard a reply the client has not read yet. A refused push leaves its
+ * body unread. The drain has a deadline on the platform clock and polls
+ * wake like every other wait, and it reads a bounded amount, so a client
+ * that keeps sending cannot hold the connection.
+ **/
+void agent_close(platform_t *platform, int fd, int wake);
 
 #endif /* ARIEL_AGENT_H */

@@ -21,6 +21,7 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 
 #include "store.h"
+#include "testclock.h"
 #include "vcontroller.h"
 
 /** The longest prompt text the controller shows. **/
@@ -61,13 +62,17 @@ decide(const char *id, int approved) {
 
 static void
 handle_line(char *line) {
+  char clock_reply[64];
   size_t len = strlen(line);
 
   while(len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
     line[--len] = '\0';
   }
 
-  if(!strncmp(line, "approve ", 8)) {
+  // The clock is the host build's other test aid: it shares this input.
+  if(testclock_handle_line(line, clock_reply, sizeof(clock_reply))) {
+    print_line("%s", clock_reply);
+  } else if(!strncmp(line, "approve ", 8)) {
     decide(line + 8, 1);
   } else if(!strncmp(line, "deny ", 5)) {
     decide(line + 5, 0);

@@ -44,6 +44,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "platform.h"
+#include "testclock.h"
 #include "vcontroller.h"
 
 #ifndef PATH_MAX
@@ -148,7 +149,31 @@ static void
 host_clock(platform_t *self, struct timespec *now) {
   (void)self;
 
-  clock_gettime(CLOCK_MONOTONIC, now);
+  testclock_now(now);
+}
+
+
+static int
+host_wake_new(platform_t *self) {
+  (void)self;
+
+  return testclock_wake_new();
+}
+
+
+static void
+host_wake_close(platform_t *self, int fd) {
+  (void)self;
+
+  testclock_wake_close(fd);
+}
+
+
+static void
+host_wake_idle(platform_t *self, int wake, int fd, int idle) {
+  (void)self;
+
+  testclock_wake_idle(wake, fd, idle);
 }
 
 
@@ -403,6 +428,9 @@ static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
   .clock = host_clock,
+  .wake_new = host_wake_new,
+  .wake_close = host_wake_close,
+  .wake_idle = host_wake_idle,
   .approval_request = host_approval_request,
   .spawn = host_spawn,
 };
@@ -440,6 +468,7 @@ platform_t *
 platform_host(const char *dir) {
   long limit;
 
+  testclock_init();
   snprintf(run_dir, sizeof(run_dir), "%s", dir);
 
   // Read the descriptor bound here, before any connection thread exists:

@@ -32,6 +32,14 @@ PROMPT_LINE = re.compile(
     r"^prompt (a-[0-9a-f]+) payload (\S+) \((\d+) bytes, sha256 ([0-9a-f]{64})\)"
     r" will run$"
 )
+CLOCK_LINE = re.compile(r"^clock (\d+)$")
+
+# The store's expiry runs on the clock in a waiter of its own, so every
+# settle counts it beside the connections a scenario holds.
+EXPIRY_WAITERS = 1
+
+# The server reads a closing connection for this long (agent_close).
+CLOSE_DRAIN_MS = 200
 
 results = []
 
@@ -120,6 +128,37 @@ class Server:
         sock.settimeout(timeout)
         return sock
 
+    def advance(self, ms):
+        """Advance the host test clock and wait for the server to confirm.
+
+        Time moves only when this is called, so a deadline scenario runs
+        without sleeping.
+        """
+        self.proc.stdin.write(("clock advance %d\n" % ms).encode("ascii"))
+        self.proc.stdin.flush()
+        line = self.next_line(timeout=5.0)
+        match = CLOCK_LINE.match(line or "")
+        assert match, "expected a clock confirmation, got %r" % line
+        return int(match.group(1))
+
+    def settle(self, connections):
+        """Wait until the server has seen the clock and has nothing to do.
+
+        Returns once the store's expiry and exactly this many connections
+        are blocked with nothing to read, each past the latest advance. A
+        scenario can then look at what that time did, without sleeping.
+        """
+        waiters = EXPIRY_WAITERS + connections
+        self.proc.stdin.write(("clock settle %d\n" % waiters).encode("ascii"))
+        self.proc.stdin.flush()
+        line = self.next_line(timeout=5.0)
+        assert line == "settled %d" % waiters, (
+            "expected %d settled waiters, got %r" % (waiters, line))
+
+    def fresh(self):
+        """Move past every approval expiry and staging TTL: a clean table."""
+        return self.advance(900_000)
+
     def controller(self, command, expected, timeout=5.0):
         """Drive the virtual controller and return its acknowledgement."""
         self.proc.stdin.write((command + "\n").encode("ascii"))
@@ -147,6 +186,31 @@ def read_reply(sock):
         data += chunk
 
 
+def recv_busy(sock):
+    """Read until the busy reply is complete; the server may keep the socket."""
+    data = b""
+    while not data.endswith(b"exit 82\n"):
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode("ascii", "replace")
+
+
+def assert_open(sock, what):
+    """The server has neither answered on sock nor closed it."""
+    timeout = sock.gettimeout()
+    sock.setblocking(False)
+    try:
+        data = sock.recv(4096)
+    except BlockingIOError:
+        return
+    finally:
+        sock.settimeout(timeout)
+    raise AssertionError("%s: the server %s" % (
+        what, "answered %r" % data if data else "closed the connection"))
+
+
 def reply_lines(reply):
     text = reply.replace("\r\n", "\n")
     return [line for line in text.split("\n") if line != ""]
@@ -171,26 +235,41 @@ def assert_unknown(reply):
 
 
 def push(server, name, data, declared_size=None, declared_hash=None,
-         fragments=None):
-    """Send one payload push and return the lines the server answered."""
+         fragments=None, timeout=5.0, throttle=True):
+    """Send one payload push and return the lines the server answered.
+
+    A push is normally spaced 10 s after the last notification on the test
+    clock, as a real agent would be; a rate-limit scenario passes
+    throttle=False.
+    """
     size = len(data) if declared_size is None else declared_size
     if declared_hash is None:
         declared_hash = hashlib.sha256(data).hexdigest()
-    sock = server.connect()
+    if throttle:
+        server.advance(10_000)
+    sock = server.connect(timeout=timeout)
+    if fragments is not None:
+        # Each fragment leaves as its own segment, without waiting.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         header = "auth %s\npayload push %s %d %s\n" % (
             server.token, name, size, declared_hash)
         sock.sendall(header.encode("ascii"))
-        if fragments is None:
-            sock.sendall(data)
-        else:
-            offset = 0
-            for step in fragments:
-                sock.sendall(data[offset:offset + step])
-                offset += step
-                time.sleep(0.002)
-            sock.sendall(data[offset:])
-        sock.shutdown(socket.SHUT_WR)
+        try:
+            if fragments is None:
+                sock.sendall(data)
+            else:
+                offset = 0
+                for step in fragments:
+                    sock.sendall(data[offset:offset + step])
+                    offset += step
+                sock.sendall(data[offset:])
+            sock.shutdown(socket.SHUT_WR)
+        except (BrokenPipeError, ConnectionResetError):
+            # A refusal such as staging_full can close the connection
+            # before the client finishes sending the body. The reply may
+            # still be waiting to be read.
+            pass
         return reply_lines(read_reply(sock))
     finally:
         sock.close()
@@ -657,6 +736,159 @@ def staging_path(server, staging_id):
     return os.path.join(server.root, "data", "ariel", "staging", staging_id)
 
 
+def assert_staging_full(lines):
+    assert lines == ["staging_full", "exit 80"], (
+        "expected staging_full and exit 80, got %r" % lines)
+
+
+def scenario_upload_too_large(server):
+    """One upload is at most 64 MiB; past that, staging_full."""
+    server.fresh()
+    too_big = 64 * 1024 * 1024 + 1
+    assert_staging_full(push(server, "toobig", b"", declared_size=too_big,
+                             declared_hash="0" * 64))
+    server.assert_no_line()
+
+
+def scenario_staging_total(server):
+    """Staging holds at most 64 MiB in total."""
+    server.fresh()
+    cap = 64 * 1024 * 1024
+    data = b"\0" * cap
+    lines = push(server, "big", data, timeout=30.0)
+    assert_staged(server, lines, "big", data, timeout=30.0)
+
+    # One byte past the total is refused before a new object is made.
+    assert_staging_full(push(server, "extra", b"x"))
+    server.assert_no_line()
+
+
+def scenario_staging_ttl(server):
+    """An unanswered staging object disappears after 15 min, by itself."""
+    server.fresh()
+
+    # Eight objects, three approvals at a time: each group's approvals
+    # expire, but its objects stay until their own TTL.
+    created = []
+    for group, count in ((0, 3), (1, 3), (2, 2)):
+        for i in range(count):
+            name = "ttl%d%d" % (group, i)
+            data = name.encode("ascii")
+            now = server.advance(10_000)
+            lines = push(server, name, data, throttle=False)
+            staging_id, _ = assert_staged(server, lines, name, data)
+            created.append((now, staging_path(server, staging_id)))
+        server.advance(120_000)
+
+    # The ninth object has no room while the table is full.
+    assert_staging_full(push(server, "ttl-full", b""))
+    server.assert_no_line()
+
+    # Only the clock moves from here: no store request can clean up.
+    first, first_path = created[0]
+    now = server.advance(0)
+    server.advance(first + 900_000 - 1 - now)
+    server.settle(0)
+    gone = [path for _, path in created if not os.path.exists(path)]
+    assert not gone, "objects left before their TTL: %r" % gone
+
+    server.advance(1)
+    server.settle(0)
+    assert not os.path.exists(first_path), (
+        "the first object outlived its 15 min TTL")
+    gone = [path for _, path in created[1:] if not os.path.exists(path)]
+    assert not gone, "objects left before their TTL: %r" % gone
+
+    last, _ = created[-1]
+    server.advance(last - first)
+    server.settle(0)
+    stayed = [path for _, path in created if os.path.exists(path)]
+    assert not stayed, "objects outlived their TTL: %r" % stayed
+
+    # Their slots are free again.
+    lines = push(server, "ttl-after", b"after the TTL")
+    assert_staged(server, lines, "ttl-after", b"after the TTL")
+
+
+def scenario_pending_limit(server):
+    """At most three approvals wait for a decision."""
+    server.fresh()
+    for i in range(3):
+        name = "plim%d" % i
+        data = b"pending %d" % i
+        lines = push(server, name, data)
+        assert_staged(server, lines, name, data)
+
+    lines = push(server, "plim3", b"one too many")
+    assert lines == ["approval_busy", "exit 76"], (
+        "a fourth pending approval must answer approval_busy and exit 76, "
+        "got %r" % lines)
+    server.assert_no_line()
+
+
+def scenario_notification_rate(server):
+    """At most one notification is shown every 10 s."""
+    server.fresh()
+    data = b"the first"
+    lines = push(server, "rate1", data)
+    assert_staged(server, lines, "rate1", data)
+
+    # The second push at the same test-clock instant is refused, no prompt.
+    lines = push(server, "rate2", b"the second", throttle=False)
+    assert lines == ["approval_busy", "exit 76"], (
+        "a second notification within 10 s must answer approval_busy and "
+        "exit 76, got %r" % lines)
+    server.assert_no_line()
+
+    # Ten seconds later the next prompt is shown.
+    server.advance(10_000)
+    data = b"the third"
+    lines = push(server, "rate3", data, throttle=False)
+    assert_staged(server, lines, "rate3", data)
+
+
+def scenario_test_clock_host_only(server):
+    """The test clock cannot be compiled into the PS5 build."""
+    del server  # this guard needs no server
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+    # No source the PS5 target builds may mention the test clock; only the
+    # host build under hostbuild/ may.
+    offenders = []
+    for base, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in (".git", "hostbuild")]
+        for name in files:
+            if not name.endswith((".c", ".h")):
+                continue
+            path = os.path.join(base, name)
+            with open(path, "r", errors="replace") as handle:
+                if "testclock" in handle.read():
+                    offenders.append(os.path.relpath(path, repo))
+    assert not offenders, (
+        "the PS5 build must not see the test clock, but these sources "
+        "mention it: %r" % offenders)
+
+    # The guard itself: without the host define the file refuses to
+    # compile, and the refusal names the test clock.
+    source = os.path.join(repo, "hostbuild", "testclock.c")
+    compiler = os.environ.get("CC", "cc")
+    with tempfile.TemporaryDirectory() as scratch:
+        obj = os.path.join(scratch, "testclock.o")
+        denied = subprocess.run([compiler, "-c", "-o", obj, source],
+                                capture_output=True, text=True)
+        assert denied.returncode != 0, (
+            "testclock.c must refuse to compile without ARIEL_HOST_BUILD")
+        assert "the test clock is host-only" in denied.stderr, (
+            "the refusal must name the guard, got %r" % denied.stderr)
+        allowed = subprocess.run(
+            [compiler, "-c", "-o", obj, "-DARIEL_HOST_BUILD=1", source],
+            capture_output=True, text=True)
+        assert allowed.returncode == 0, (
+            "testclock.c must compile for the host build, got %r"
+            % allowed.stderr)
+
+
 def approve_push(server, name, data):
     """Push, check the prompt, approve it and return the staging ID."""
     lines = push(server, name, data)
@@ -806,11 +1038,107 @@ def scenario_commit_before_decision(server):
     )
 
 
+def scenario_approval_expired(server):
+    """An approval expires after 120 s of test clock."""
+    server.fresh()
+    data = b"too late to approve"
+    lines = push(server, "expired", data)
+    staging, _ = assert_staged(server, lines, "expired", data)
+    server.advance(120_000)
+    assert commit(server, staging) == ["approval_expired", "exit 77"], (
+        "a commit after its approval expired must answer approval_expired "
+        "and exit 77")
+    assert not os.path.exists(staging_path(server, staging)), (
+        "an expired approval's staging object must be deleted")
+    assert commit(server, staging) == ["approval_stale", "exit 78"], (
+        "once its object is gone, an expired approval is only stale")
+
+
+def scenario_expired_not_pending(server):
+    """An expired approval does not count among the pending ones."""
+    server.fresh()
+    for i in range(3):
+        data = b"pending %d" % i
+        name = "pnd%d" % i
+        lines = push(server, name, data)
+        assert_staged(server, lines, name, data)
+
+    lines = push(server, "pnd3", b"one too many")
+    assert lines == ["approval_busy", "exit 76"], (
+        "a fourth pending approval must answer approval_busy and exit 76")
+    server.assert_no_line()
+
+    server.advance(120_000)
+
+    data = b"the expired ones no longer count"
+    lines = push(server, "pnd4", data)
+    assert_staged(server, lines, "pnd4", data)
+
+
 def scenario_missing_auth(server):
     sock = server.connect()
     try:
         sock.shutdown(socket.SHUT_WR)
         assert_exit_only(read_reply(sock), 70)
+    finally:
+        sock.close()
+
+
+def scenario_auth_deadline(server):
+    """No auth line: the clock alone closes the connection, at 5 s."""
+    sock = server.connect()
+    try:
+        server.settle(1)
+        server.advance(4_999)
+        server.settle(1)
+        assert_open(sock, "1 ms before the auth deadline")
+
+        server.advance(1)
+        server.settle(1)
+        sock.settimeout(1.0)
+        assert_exit_only(read_reply(sock), 70)
+    finally:
+        sock.close()
+
+
+def assert_closed(sock):
+    """The server closed without a reply. Bytes still in flight may reset it."""
+    data = b""
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except ConnectionResetError:
+        pass
+    assert data == b"", "expected a close with no reply, got %r" % data
+
+
+def scenario_line_limit(server):
+    """A line is at most 1 KiB; past that the connection closes."""
+    sock = server.connect()
+    try:
+        sock.sendall(b"auth " + b"0" * 1100 + b"\n")
+        assert_closed(sock)
+    finally:
+        sock.close()
+
+    # Exactly 1 KiB is still a line: an unknown command, not a close.
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\n" % server.token).encode("ascii") +
+                     b"a" * 1024 + b"\n")
+        assert_unknown(read_reply(sock))
+    finally:
+        sock.close()
+
+    # One byte past the limit closes the connection after auth too.
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\n" % server.token).encode("ascii") +
+                     b"a" * 1025 + b"\n")
+        assert_closed(sock)
     finally:
         sock.close()
 
@@ -845,7 +1173,8 @@ def scenario_two_connections(server):
     first = server.connect(timeout=3.0)
     try:
         first.sendall(("auth %s\n" % server.token).encode("ascii"))
-        time.sleep(0.1)
+        # The first connection is served and waits for its command.
+        server.settle(1)
         second = server.connect(timeout=3.0)
         try:
             second.sendall(
@@ -860,6 +1189,115 @@ def scenario_two_connections(server):
         assert_unknown(read_reply(first))
     finally:
         first.close()
+
+
+def scenario_connection_limit(server):
+    """At most four connections are served; a fifth answers busy, exit 82."""
+    held = []
+    try:
+        for _ in range(4):
+            sock = server.connect()
+            sock.sendall(("auth %s\n" % server.token).encode("ascii"))
+            held.append(sock)
+
+        fifth = server.connect()
+        try:
+            assert reply_lines(read_reply(fifth)) == ["busy", "exit 82"], (
+                "a fifth concurrent connection must answer busy and exit 82")
+        finally:
+            fifth.close()
+    finally:
+        for sock in held:
+            sock.close()
+
+    # Every slot is free again before the next scenario connects.
+    server.settle(0)
+
+
+def scenario_refusal_slots_exhausted(server):
+    """With four served and four refused, the ninth still gets busy, exit 82."""
+    served = []
+    refused = []
+    try:
+        for _ in range(4):
+            sock = server.connect()
+            sock.sendall(("auth %s\n" % server.token).encode("ascii"))
+            served.append(sock)
+
+        # A refused client that keeps its write side open holds its slot
+        # until the close drain ends, so these four take every refusal slot.
+        for _ in range(4):
+            sock = server.connect()
+            sock.settimeout(1.0)
+            assert reply_lines(recv_busy(sock)) == ["busy", "exit 82"], (
+                "a refused connection must answer busy and exit 82")
+            refused.append(sock)
+        server.settle(8)
+
+        # The ninth client sends its auth line only after busy arrives, the
+        # worst case for a reset: the refusal must still drain it and end in
+        # an orderly EOF once the close drain's deadline passes.
+        ninth = server.connect()
+        try:
+            ninth.settimeout(1.0)
+            assert reply_lines(recv_busy(ninth)) == ["busy", "exit 82"], (
+                "with every refusal slot taken the ninth connection must "
+                "still answer busy and exit 82")
+            ninth.sendall(("auth %s\n" % server.token).encode("ascii"))
+            # The eight held connections and the one drain wait for time.
+            server.settle(9)
+            server.advance(CLOSE_DRAIN_MS)
+            try:
+                rest = ninth.recv(4096)
+            except ConnectionResetError:
+                raise AssertionError(
+                    "a refusal past every slot must close with EOF, "
+                    "not a reset")
+            assert rest == b"", "a refusal sends nothing after busy"
+        finally:
+            ninth.close()
+    finally:
+        for sock in refused + served:
+            sock.close()
+
+    # Every slot is free again before the next scenario connects.
+    server.settle(0)
+
+
+def scenario_stalled_upload_does_not_block(server):
+    """One client stalls an upload; another connection still answers fast."""
+    stalled = server.connect()
+    try:
+        stalled.sendall(("auth %s\npayload push stalled 100 %s\n"
+                         % (server.token, "0" * 64)).encode("ascii"))
+        stalled.sendall(b"partial")
+
+        started = time.monotonic()
+        sock = server.connect()
+        try:
+            sock.sendall(("auth %s\nnonsense\n" % server.token)
+                         .encode("ascii"))
+            assert_unknown(read_reply(sock))
+        finally:
+            sock.close()
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, (
+            "a stalled upload blocked another connection for %.2f s" % elapsed)
+
+        # The stalled upload ends only when the clock passes its 60 s stall.
+        server.settle(1)
+        server.advance(59_999)
+        server.settle(1)
+        assert_open(stalled, "1 ms before the upload stall deadline")
+
+        server.advance(1)
+        server.settle(1)
+        stalled.settimeout(1.0)
+        reply = read_reply(stalled)
+        assert reply_lines(reply) == ["upload_mismatch", "exit 81"], (
+            "a stalled upload must end in upload_mismatch, got %r" % reply)
+    finally:
+        stalled.close()
 
 
 def scenario_truncated_upload(server):
@@ -914,12 +1352,23 @@ def main():
     try:
         check("missing auth closes with exit 70",
               lambda: scenario_missing_auth(server))
+        check("missing auth after 5 s of test clock closes with exit 70",
+              lambda: scenario_auth_deadline(server))
+        check("a line over 1 KiB closes the connection",
+              lambda: scenario_line_limit(server))
         check("wrong token closes with exit 70",
               lambda: scenario_wrong_token(server))
         check("right token and a Stage 1 command outside the set answers "
               "unknown_command", lambda: scenario_unknown_command(server))
         check("two connections are served at the same time",
               lambda: scenario_two_connections(server))
+        check("a fifth concurrent connection answers busy and exit 82",
+              lambda: scenario_connection_limit(server))
+        check("a ninth connection answers busy and exit 82 with every "
+              "refusal slot taken",
+              lambda: scenario_refusal_slots_exhausted(server))
+        check("a stalled upload does not block another connection",
+              lambda: scenario_stalled_upload_does_not_block(server))
         check("a truncated upload answers upload_mismatch and exit 81",
               lambda: scenario_truncated_upload(server))
         check("bytes past the declared size answer upload_mismatch and "
@@ -982,6 +1431,22 @@ def main():
         check("a failing '$' command in a block of any label makes the "
               "fixture fail",
               lambda: scenario_quick_start_unlabeled_block(server))
+        check("an approval expires after 120 s of test clock",
+              lambda: scenario_approval_expired(server))
+        check("an expired approval does not count among the pending ones",
+              lambda: scenario_expired_not_pending(server))
+        check("an upload over 64 MiB answers staging_full and exit 80",
+              lambda: scenario_upload_too_large(server))
+        check("staging past 64 MiB in total answers staging_full",
+              lambda: scenario_staging_total(server))
+        check("an unanswered staging object disappears after 15 min",
+              lambda: scenario_staging_ttl(server))
+        check("a fourth pending approval answers approval_busy and exit 76 "
+              "with no prompt", lambda: scenario_pending_limit(server))
+        check("a second notification within 10 s answers approval_busy "
+              "with no prompt", lambda: scenario_notification_rate(server))
+        check("the test clock is host-only and cannot enter the PS5 build",
+              lambda: scenario_test_clock_host_only(server))
     finally:
         server.stop()
 

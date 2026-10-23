@@ -16,8 +16,10 @@ along with this program; see the file COPYING. If not, see
 
 #include <errno.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,8 +40,8 @@ along with this program; see the file COPYING. If not, see
 /** One upload waits at most this long for its next bytes. **/
 #define UPLOAD_STALL_MS     60000L
 
-/** One upload is at most 64 MiB. **/
-#define UPLOAD_LIMIT        (64ULL * 1024ULL * 1024ULL)
+/** A close drains unread input for at most this long. **/
+#define CLOSE_DRAIN_MS      200L
 
 #define READ_CHUNK          65536
 
@@ -63,6 +65,9 @@ static const char approval_busy[] =
   "exit 76\n";
 static const char approval_denied[] =
   "approval_denied\n"
+  "exit 77\n";
+static const char approval_expired[] =
+  "approval_expired\n"
   "exit 77\n";
 static const char approval_stale[] =
   "approval_stale\n"
@@ -92,16 +97,87 @@ write_all(int fd, const char *buf, size_t len) {
 }
 
 
-static long
-millis_left(platform_t *platform, const struct timespec *start, long budget) {
+/** The platform clock in milliseconds. **/
+static int64_t
+now_ms(platform_t *platform) {
   struct timespec now;
-  long elapsed;
 
   platform->clock(platform, &now);
-  elapsed  = (now.tv_sec - start->tv_sec) * 1000L;
-  elapsed += (now.tv_nsec - start->tv_nsec) / 1000000L;
 
-  return budget - elapsed;
+  return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000L;
+}
+
+
+/** Throw away every wake a clock advance left in the pipe. **/
+static void
+wake_drain(int wake) {
+  char buf[64];
+
+  while(read(wake, buf, sizeof(buf)) > 0) {
+  }
+}
+
+
+/**
+ * Wait until fd is readable or the deadline passes. Returns 1 when it is
+ * readable, 0 when the deadline passed, and -1 on error. The wait polls the
+ * socket together with the connection's wake pipe, and the platform's clock
+ * decides whether the deadline has passed: on the host the test clock moves
+ * only when a scenario advances it, and an advance writes the pipe.
+ **/
+static int
+wait_readable(platform_t *platform, int wake, int fd, int64_t deadline_ms) {
+  while(1) {
+    struct pollfd pfd[2];
+    nfds_t nfds = 1;
+    int64_t left;
+    int rc;
+
+    left = deadline_ms - now_ms(platform);
+    if(left <= 0) {
+      return 0;
+    }
+
+    pfd[0].fd = fd;
+    pfd[0].events = POLLIN;
+    pfd[0].revents = 0;
+
+    if(wake >= 0) {
+      pfd[1].fd = wake;
+      pfd[1].events = POLLIN;
+      pfd[1].revents = 0;
+      nfds = 2;
+    }
+
+    // With a test clock, real milliseconds are meaningless: only an
+    // advance can pass the deadline, and that advance wakes this poll.
+    if(wake >= 0 && platform->wake_idle) {
+      platform->wake_idle(platform, wake, fd, 1);
+    }
+    rc = poll(pfd, nfds, wake >= 0 ? -1 : (int)left);
+    if(wake >= 0 && platform->wake_idle) {
+      platform->wake_idle(platform, wake, fd, 0);
+    }
+    if(rc < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+
+    if(wake >= 0 && (pfd[1].revents & POLLIN)) {
+      wake_drain(wake);
+      continue;
+    }
+
+    if(pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+      return 1;
+    }
+
+    if(rc == 0) {
+      return 0;
+    }
+  }
 }
 
 
@@ -111,32 +187,17 @@ millis_left(platform_t *platform, const struct timespec *start, long budget) {
  * or -2 when the line is too long.
  **/
 static int
-read_line(platform_t *platform, int fd, char *buf, size_t size,
-          long budget_ms) {
-  struct timespec start;
+read_line(platform_t *platform, int wake, int fd, char *buf, size_t size,
+          int64_t deadline_ms) {
   size_t len = 0;
 
-  platform->clock(platform, &start);
-
   while(1) {
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    long left = millis_left(platform, &start, budget_ms);
     char c;
     ssize_t n;
-    int rc;
+    int ready;
 
-    if(left <= 0) {
-      return -1;
-    }
-
-    rc = poll(&pfd, 1, (int)left);
-    if(rc < 0) {
-      if(errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-    if(rc == 0) {
+    ready = wait_readable(platform, wake, fd, deadline_ms);
+    if(ready <= 0) {
       return -1;
     }
 
@@ -167,13 +228,22 @@ read_line(platform_t *platform, int fd, char *buf, size_t size,
 }
 
 
+/**
+ * Read and check the auth line. Returns 1 on a good token, 0 when the line
+ * is missing or wrong (the connection is closed with exit 70), and -1 when
+ * the line is over the limit (the connection is closed with no reply).
+ **/
 static int
-authenticate(platform_t *platform, int fd, const char *token) {
+authenticate(platform_t *platform, int wake, int fd, const char *token,
+             int64_t deadline_ms) {
   char candidate[TOKEN_LEN];
   char line[LINE_LIMIT + 1];
   int len;
 
-  len = read_line(platform, fd, line, sizeof(line), AUTH_DEADLINE_MS);
+  len = read_line(platform, wake, fd, line, sizeof(line), deadline_ms);
+  if(len == -2) {
+    return -1;
+  }
   if(len != 5 + TOKEN_HEX_LEN || strncmp(line, "auth ", 5)) {
     return 0;
   }
@@ -277,32 +347,18 @@ parse_hash(const char *text, char out[SHA256_HEX_LEN + 1]) {
  * stream, -1 on a stall, error or overrun, and -2 when the file write fails.
  **/
 static int
-upload_read(platform_t *platform, int fd, int outfd, uint64_t size,
+upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
             sha256_t *hash, uint64_t *received) {
   unsigned char buf[READ_CHUNK];
-  struct timespec last;
+  int64_t deadline = now_ms(platform) + UPLOAD_STALL_MS;
   uint64_t total = 0;
 
-  platform->clock(platform, &last);
-
   while(1) {
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    long left = millis_left(platform, &last, UPLOAD_STALL_MS);
     ssize_t n;
+    int ready;
 
-    if(left <= 0) {
-      *received = total;
-      return -1;
-    }
-
-    if(poll(&pfd, 1, (int)left) < 0) {
-      if(errno == EINTR) {
-        continue;
-      }
-      *received = total;
-      return -1;
-    }
-    if(!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+    ready = wait_readable(platform, wake, fd, deadline);
+    if(ready <= 0) {
       *received = total;
       return -1;
     }
@@ -319,7 +375,7 @@ upload_read(platform_t *platform, int fd, int outfd, uint64_t size,
       break;
     }
 
-    platform->clock(platform, &last);
+    deadline = now_ms(platform) + UPLOAD_STALL_MS;
 
     {
       uint64_t room = size > total ? size - total : 0;
@@ -347,8 +403,8 @@ reply(int fd, const char *text) {
 
 
 static void
-payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
-             const char *hash_text) {
+payload_push(agent_t *agent, int fd, int wake, const char *name,
+             const char *size_text, const char *hash_text) {
   char staging_id[APPROVAL_ID_MAX];
   char declared[SHA256_HEX_LEN + 1];
   char computed[SHA256_HEX_LEN + 1];
@@ -371,20 +427,15 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
     return;
   }
 
-  if(size > UPLOAD_LIMIT) {
-    reply(fd, staging_full);
-    return;
-  }
-
   store_staging_next_id(staging_id, sizeof(staging_id));
 
-  if((outfd=store_staging_create(staging_id)) < 0) {
+  if((outfd=store_staging_create(staging_id, size)) < 0) {
     reply(fd, staging_full);
     return;
   }
 
   sha256_init(&hash);
-  rc = upload_read(platform, fd, outfd, size, &hash, &received);
+  rc = upload_read(platform, wake, fd, outfd, size, &hash, &received);
 
   if(rc || received != size) {
     close(outfd);
@@ -468,6 +519,9 @@ payload_commit(int fd, const char *staging_id) {
   case STORE_APPROVAL_DENIED:
     reply(fd, approval_denied);
     return;
+  case STORE_APPROVAL_EXPIRED:
+    reply(fd, approval_expired);
+    return;
   default:
     // An approval that is gone is not an approval: push the build again.
     reply(fd, approval_stale);
@@ -520,7 +574,7 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
 
 
 static void
-handle_command(agent_t *agent, int fd, char *line) {
+handle_command(agent_t *agent, int fd, int wake, char *line) {
   char *argv[MAX_ARGS + 1];
   int argc = split_args(line, argv, MAX_ARGS);
 
@@ -531,7 +585,7 @@ handle_command(agent_t *agent, int fd, char *line) {
 
   // Exactly one command per connection.
   if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "push")) {
-    payload_push(agent, fd, argv[2], argv[3], argv[4]);
+    payload_push(agent, fd, wake, argv[2], argv[3], argv[4]);
     return;
   }
 
@@ -554,20 +608,59 @@ handle_command(agent_t *agent, int fd, char *line) {
 
 
 void
-agent_serve(agent_t *agent, int fd) {
+agent_serve(agent_t *agent, int fd, int wake) {
   static const char auth_failed[] = "exit 70\n";
   char line[LINE_LIMIT + 1];
+  int64_t start;
+  int len;
+  int auth;
 
-  if(!authenticate(agent->platform, fd, agent->token)) {
+  // The auth deadline runs from the moment the connection is served.
+  start = now_ms(agent->platform);
+  auth = authenticate(agent->platform, wake, fd, agent->token,
+                      start + AUTH_DEADLINE_MS);
+
+  if(auth < 0) {
+    // A line over the limit is not an auth line: close without a reply.
+    return;
+  }
+  if(!auth) {
     write_all(fd, auth_failed, sizeof(auth_failed) - 1);
     return;
   }
 
-  if(read_line(agent->platform, fd, line, sizeof(line),
-               COMMAND_DEADLINE_MS) < 0) {
+  len = read_line(agent->platform, wake, fd, line, sizeof(line),
+                  now_ms(agent->platform) + COMMAND_DEADLINE_MS);
+  if(len == -2) {
+    // A command line over the limit closes the connection too.
+    return;
+  }
+  if(len < 0) {
     reply(fd, unknown);
     return;
   }
 
-  handle_command(agent, fd, line);
+  handle_command(agent, fd, wake, line);
+}
+
+
+void
+agent_close(platform_t *platform, int fd, int wake) {
+  char buf[4096];
+  int64_t deadline;
+  int i;
+
+  shutdown(fd, SHUT_WR);
+  deadline = now_ms(platform) + CLOSE_DRAIN_MS;
+
+  for(i=0; i<8; i++) {
+    if(wait_readable(platform, wake, fd, deadline) <= 0) {
+      break;
+    }
+    if(read(fd, buf, sizeof(buf)) <= 0) {
+      break;
+    }
+  }
+
+  close(fd);
 }
