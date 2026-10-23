@@ -18,6 +18,10 @@ along with this program; see the file COPYING. If not, see
 // macOS hides mkdtemp behind _DARWIN_C_SOURCE once _POSIX_C_SOURCE is
 // defined, and a run's bytes go in a fresh directory only Ariel can read.
 #define _DARWIN_C_SOURCE 1
+#elif defined(__linux__)
+// close_range(2) is reached through syscall(3), which glibc declares for
+// the default feature set.
+#define _DEFAULT_SOURCE 1
 #endif
 
 #include <arpa/inet.h>
@@ -31,6 +35,9 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 
 #include "platform.h"
@@ -49,6 +56,25 @@ static char run_dir[PATH_MAX];
  **/
 static pthread_mutex_t spawn_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/** The largest descriptor the child sweeps, read before any thread forks. **/
+static long fd_limit = 1024;
+
+
+/**
+ * Mark a descriptor close-on-exec, so a payload never inherits the
+ * listener, another client's connection or a file another thread holds.
+ **/
+static int
+set_cloexec(int fd) {
+  int flags = fcntl(fd, F_GETFD);
+
+  if(flags < 0) {
+    return -1;
+  }
+
+  return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
 
 static int
 host_listen(platform_t *self, uint16_t port) {
@@ -60,6 +86,12 @@ host_listen(platform_t *self, uint16_t port) {
 
   if((srvfd=socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     perror("socket");
+    return -1;
+  }
+
+  if(set_cloexec(srvfd)) {
+    perror("fcntl");
+    close(srvfd);
     return -1;
   }
 
@@ -99,6 +131,11 @@ host_accept(platform_t *self, int srvfd) {
   do {
     connfd = accept(srvfd, NULL, NULL);
   } while(connfd < 0 && errno == EINTR);
+
+  if(connfd >= 0 && set_cloexec(connfd)) {
+    close(connfd);
+    return -1;
+  }
 
   return connfd;
 }
@@ -140,6 +177,58 @@ write_all(int fd, const unsigned char *buf, size_t len) {
 
 
 /**
+ * Close every descriptor above the standard ones except keep. This runs in
+ * the child after fork, so it allocates nothing and takes no lock: close()
+ * everywhere, or one close_range() syscall where the platform has it. It is
+ * the second line of defence behind close-on-exec: a connection accepted by
+ * another thread just before the fork is still closed here.
+ **/
+static void
+close_extra_fds(int keep) {
+#if defined(__APPLE__)
+  int fd;
+
+  for(fd = 3; fd < fd_limit; fd++) {
+    if(fd != keep) {
+      close(fd);
+    }
+  }
+#elif defined(SYS_close_range)
+  if(keep > 3) {
+    syscall(SYS_close_range, 3u, (unsigned int)keep - 1u, 0u);
+  }
+  syscall(SYS_close_range, (unsigned int)keep + 1u, ~0u, 0u);
+#else
+  int fd;
+
+  for(fd = 3; fd < fd_limit; fd++) {
+    if(fd != keep) {
+      close(fd);
+    }
+  }
+#endif
+}
+
+
+/**
+ * The child never became the payload. Report errno to the parent through
+ * the close-on-exec error pipe and leave with a status the parent ignores:
+ * a payload that genuinely exits 127 writes nothing to that pipe.
+ **/
+static void
+child_fail(int errfd, int err) {
+  ssize_t n;
+
+  do {
+    n = write(errfd, &err, sizeof(err));
+  } while(n < 0 && errno == EINTR);
+
+  (void)n;
+  _exit(127);
+}
+
+
+/**
  * The host has no exec from memory, so the verified bytes go to a fresh
  * file inside a directory only Ariel can read, run from there and the
  * file and directory go away after the payload exits.
@@ -149,7 +238,9 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
            char *const argv[], int outfd, int *status) {
   char dir[PATH_MAX];
   char path[PATH_MAX];
+  int errpipe[2] = {-1, -1};
   int wait_status;
+  int exec_failed = 0;
   int have_dir = 0;
   int filefd = -1;
   int nullfd = -1;
@@ -172,17 +263,33 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
     goto out;
   }
 
-  if((filefd=open(path, O_WRONLY | O_CREAT | O_EXCL, 0700)) < 0) {
+  if((filefd=open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700)) < 0) {
     goto out;
   }
 
-  if(write_all(filefd, bytes, size) || close(filefd)) {
+  if(write_all(filefd, bytes, size)) {
+    // Keep filefd for the cleanup below: a failed write must not leak the
+    // descriptor or the unlinked temporary file's storage.
+    goto out;
+  }
+
+  if(close(filefd)) {
     filefd = -1;
     goto out;
   }
   filefd = -1;
 
-  if((nullfd=open("/dev/null", O_RDONLY)) < 0) {
+  if((nullfd=open("/dev/null", O_RDONLY | O_CLOEXEC)) < 0) {
+    goto out;
+  }
+
+  // A successful exec closes the write end, so the parent reading the read
+  // end distinguishes "never became the payload" from a payload that
+  // exits 127 on its own.
+  if(pipe(errpipe) < 0) {
+    goto out;
+  }
+  if(set_cloexec(errpipe[0]) || set_cloexec(errpipe[1])) {
     goto out;
   }
 
@@ -195,20 +302,54 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
     // Only async-signal-safe calls between fork and exec. The server
     // ignores SIGPIPE, and an ignored signal stays ignored across exec,
     // so the payload gets the default disposition back.
-    signal(SIGPIPE, SIG_DFL);
+    struct sigaction dfl;
+
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(SIGPIPE, &dfl, NULL);
+
+    close(errpipe[0]);
     if(dup2(nullfd, STDIN_FILENO) < 0 ||
        dup2(outfd, STDOUT_FILENO) < 0 ||
        dup2(outfd, STDERR_FILENO) < 0) {
-      _exit(127);
+      child_fail(errpipe[1], errno);
     }
+
+    // A payload inherits only its standard descriptors: a client whose
+    // connection Ariel already finished reaches end of stream while a long
+    // payload runs.
+    close_extra_fds(errpipe[1]);
+
     execv(path, argv);
-    _exit(127);
+    child_fail(errpipe[1], errno);
+  }
+
+  close(errpipe[1]);
+  errpipe[1] = -1;
+
+  {
+    int child_err = 0;
+    ssize_t n;
+
+    do {
+      n = read(errpipe[0], &child_err, sizeof(child_err));
+    } while(n < 0 && errno == EINTR);
+
+    close(errpipe[0]);
+    errpipe[0] = -1;
+
+    exec_failed = n > 0;
   }
 
   while(waitpid(pid, &wait_status, 0) < 0) {
     if(errno != EINTR) {
       goto out;
     }
+  }
+
+  if(exec_failed) {
+    goto out;
   }
 
   if(WIFEXITED(wait_status)) {
@@ -220,6 +361,12 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
   }
 
 out:
+  if(errpipe[0] >= 0) {
+    close(errpipe[0]);
+  }
+  if(errpipe[1] >= 0) {
+    close(errpipe[1]);
+  }
   if(filefd >= 0) {
     close(filefd);
   }
@@ -249,7 +396,20 @@ static platform_t host_platform = {
 
 platform_t *
 platform_host(const char *dir) {
+  long limit;
+
   snprintf(run_dir, sizeof(run_dir), "%s", dir);
+
+  // Read the descriptor limit here, before any connection thread exists:
+  // the child after fork sweeps descriptors up to it and may not call
+  // anything that reads the process environment safely. The cap keeps a
+  // fallback sweep short; close-on-exec already covers the descriptors
+  // above it.
+  limit = sysconf(_SC_OPEN_MAX);
+  if(limit > 2 && limit <= 65536) {
+    fd_limit = limit;
+  }
+
   vcontroller_start();
   return &host_platform;
 }

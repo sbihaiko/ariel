@@ -203,9 +203,9 @@ path_in(char *out, size_t size, const char *sub) {
 static int
 open_entry(int dirfd, const char *name, int flags) {
   if(flags & O_CREAT) {
-    return openat(dirfd, name, flags | O_NOFOLLOW, 0600);
+    return openat(dirfd, name, flags | O_NOFOLLOW | O_CLOEXEC, 0600);
   }
-  return openat(dirfd, name, flags | O_NOFOLLOW);
+  return openat(dirfd, name, flags | O_NOFOLLOW | O_CLOEXEC);
 }
 
 
@@ -449,14 +449,14 @@ write_all(int fd, const char *buf, size_t len) {
 /** Open Ariel's state directory itself. **/
 static int
 state_open(void) {
-  return open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  return open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
 
 /** Open one directory below dirfd, without following a symbolic link. **/
 static int
 dir_open(int dirfd, const char *name) {
-  return openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  return openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
 

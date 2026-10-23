@@ -7,18 +7,26 @@ staging ID captured from an earlier reply. Each 'Approve it on the console'
 step becomes an approval on the virtual controller. Expected output is
 matched line by line, with `s-...`/`a-...` IDs and hashes as placeholders.
 
+The blocks share one shell, so the documented `export ARIEL_TOKEN` is what
+every later block uses: a token preloaded into the environment or a setup
+command that failed would hide a broken tutorial. Every command must also
+exit 0.
+
 The fixture is driven only through the agent port. It builds helloworld.elf
 from the C source in the same document with the host compiler.
 """
 
 import hashlib
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import uuid
 
 STAGING_ID = re.compile(r"(?<![0-9a-z])s-[0-9a-f]+(?![0-9a-z])")
 APPROVAL_ID = re.compile(r"(?<![0-9a-z])a-[0-9a-f]+(?![0-9a-z])")
@@ -165,8 +173,10 @@ def placeholders(expected, actual):
     return mapping
 
 
-def substitute(command, token, port, ids):
+def substitute(command, token, host, port, ids):
     command = command.replace(TOKEN_PLACEHOLDER, token)
+    command = command.replace("${PS5_HOST}", host)
+    command = command.replace("$PS5_HOST", host)
     # The section names the agent port's documented default; the fixture
     # talks to the port the server actually listens on.
     command = re.sub(r"(?<![0-9])%d(?![0-9])" % DOCUMENTED_PORT,
@@ -175,6 +185,88 @@ def substitute(command, token, port, ids):
         command = re.sub(
             r"(?<![0-9a-z])%s(?![0-9a-z])" % re.escape(before), after, command)
     return command
+
+
+class Shell:
+    """One shell whose state survives every documented block.
+
+    A fresh `bash -c` per block would lose the documented `export`, and a
+    token injected into the environment would hide a broken export. Each
+    block's output goes to a temporary file; a marker line on the shell's
+    own standard output carries the block's exit status, so a setup command
+    that failed is never taken for success.
+    """
+
+    def __init__(self, cwd, env):
+        self.proc = subprocess.Popen(
+            ["bash", "--noprofile", "--norc"],
+            cwd=cwd, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.marker = "ariel-quickstart-" + uuid.uuid4().hex
+        self.count = 0
+        self.lines = queue.Queue()
+        self.reader = threading.Thread(target=self._pump, daemon=True)
+        self.reader.start()
+
+    def _pump(self):
+        for raw in self.proc.stdout:
+            self.lines.put(raw)
+        self.lines.put(None)
+
+    def run(self, command, timeout=30.0):
+        """Run one block and return its exit status, output and errors."""
+        self.count += 1
+        marker = "%s-%d" % (self.marker, self.count)
+        handle, out_path = tempfile.mkstemp(prefix="ariel-block-")
+        os.close(handle)
+        err_path = out_path + ".err"
+        script = ("{\n%s\n} > %s 2> %s\nprintf '%%s %%d\\n' %s \"$?\"\n"
+                  % (command, shlex.quote(out_path), shlex.quote(err_path),
+                     shlex.quote(marker)))
+
+        try:
+            self.proc.stdin.write(script.encode("utf-8"))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            raise FixtureError(
+                "the shell ended before the block could run: %s"
+                % command.split("\n")[0])
+
+        status = None
+        while status is None:
+            try:
+                raw = self.lines.get(timeout=timeout)
+            except queue.Empty:
+                raise FixtureError(
+                    "the command did not finish: %s" % command.split("\n")[0])
+            if raw is None:
+                raise FixtureError(
+                    "the shell ended while the command ran: %s"
+                    % command.split("\n")[0])
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith(marker + " "):
+                status = int(line[len(marker) + 1:])
+
+        with open(out_path, "rb") as output:
+            lines = output.read().decode("utf-8", "replace").split("\n")
+        with open(err_path, "rb") as errors:
+            stderr = errors.read().decode("utf-8", "replace").strip()
+        os.unlink(out_path)
+        os.unlink(err_path)
+        return status, lines, stderr
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
 
 
 def hello_source(text):
@@ -245,9 +337,12 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve):
 
     env = os.environ.copy()
     env["PS5_HOST"] = host
-    env["ARIEL_TOKEN"] = token
+    # The token must come from the section's own export, never from the
+    # harness: a wrong documented token has to break the fixture.
+    env.pop("ARIEL_TOKEN", None)
     nc_path(env)
 
+    shell = Shell(workdir, env)
     ids = {}
     pending = None
     push_name = None
@@ -255,68 +350,68 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve):
     approvals = 0
     runs = 0
 
-    for kind, body in parse_items(section):
-        if kind == "prose":
-            if APPROVE_STEP not in body:
+    try:
+        for kind, body in parse_items(section):
+            if kind == "prose":
+                if APPROVE_STEP not in body:
+                    continue
+
+                if pending is None:
+                    raise FixtureError(
+                        "the section approves on the console with nothing "
+                        "pending")
+
+                line = next_line()
+                match = PROMPT.match(line or "")
+                if not match:
+                    raise FixtureError(
+                        "expected the approval prompt, got %r" % line)
+                if match.group(1) != pending:
+                    raise FixtureError(
+                        "the prompt names %s but the push staged %s"
+                        % (match.group(1), pending))
+                if push_name is not None and match.group(2) != push_name:
+                    raise FixtureError(
+                        "the prompt names %r, not %r"
+                        % (match.group(2), push_name))
+                if int(match.group(3)) != len(elf):
+                    raise FixtureError(
+                        "the prompt says %s bytes, not %d"
+                        % (match.group(3), len(elf)))
+                if match.group(4) != elf_hash:
+                    raise FixtureError("the prompt shows the wrong hash")
+
+                approve(pending)
+                approvals += 1
+                pending = None
                 continue
 
-            if pending is None:
+            command, expected = parse_command(body)
+            command = substitute(command, token, host, port, ids)
+
+            pushed = re.search(r"payload push (\S+)", command)
+            if pushed:
+                push_name = pushed.group(1)
+
+            status, actual, stderr = shell.run(command)
+            if status != 0:
                 raise FixtureError(
-                    "the section approves on the console with nothing pending")
+                    "the command exited %d: %s%s"
+                    % (status, command.split("\n")[0],
+                       ("\n" + stderr) if stderr else ""))
+            compare(expected, actual)
+            ids.update(placeholders(expected, actual))
 
-            line = next_line()
-            match = PROMPT.match(line or "")
-            if not match:
-                raise FixtureError(
-                    "expected the approval prompt, got %r" % line)
-            if match.group(1) != pending:
-                raise FixtureError(
-                    "the prompt names %s but the push staged %s"
-                    % (match.group(1), pending))
-            if push_name is not None and match.group(2) != push_name:
-                raise FixtureError(
-                    "the prompt names %r, not %r"
-                    % (match.group(2), push_name))
-            if int(match.group(3)) != len(elf):
-                raise FixtureError(
-                    "the prompt says %s bytes, not %d"
-                    % (match.group(3), len(elf)))
-            if match.group(4) != elf_hash:
-                raise FixtureError("the prompt shows the wrong hash")
+            for line in trim(actual):
+                match = APPROVAL_REPLY.match(line)
+                if match:
+                    pending = match.group(1)
 
-            approve(pending)
-            approvals += 1
-            pending = None
-            continue
-
-        command, expected = parse_command(body)
-        command = substitute(command, token, port, ids)
-
-        pushed = re.search(r"payload push (\S+)", command)
-        if pushed:
-            push_name = pushed.group(1)
-
-        try:
-            result = subprocess.run(
-                ["bash", "-c", command], cwd=workdir, env=env,
-                capture_output=True, timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            raise FixtureError(
-                "the command did not finish: %s" % command.split("\n")[0])
-
-        actual = result.stdout.decode("utf-8", "replace").split("\n")
-        compare(expected, actual)
-        ids.update(placeholders(expected, actual))
-
-        for line in trim(actual):
-            match = APPROVAL_REPLY.match(line)
-            if match:
-                pending = match.group(1)
-
-        if "payload run --wait" in command:
-            runs += 1
-            run_output = trim(actual)
+            if "payload run --wait" in command:
+                runs += 1
+                run_output = trim(actual)
+    finally:
+        shell.close()
 
     if approvals != 1:
         raise FixtureError(

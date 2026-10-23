@@ -402,6 +402,70 @@ def scenario_run_needs_no_new_approval(server):
     assert_staged(server, lines, "once", other)
 
 
+SLEEP_SOURCE = """
+#include <stdio.h>
+#include <unistd.h>
+
+int
+main(void) {
+  sleep(2);
+  printf("awake\\n");
+  return 0;
+}
+"""
+
+
+def scenario_run_does_not_leak_connections(server):
+    """A finished connection must reach end of stream while a run is going."""
+    data = compile_payload(SLEEP_SOURCE, "sleepy")
+    install_payload(server, "sleepy", data)
+
+    # This client's connection is accepted and still open when the run
+    # forks its payload. The exit path of the quick start's `nc` reads
+    # until the server closes its side, so a payload that inherited this
+    # socket would keep the client waiting until the payload exits.
+    stalled = server.connect(timeout=5.0)
+    try:
+        stalled.sendall(("auth %s\n" % server.token).encode("ascii"))
+        time.sleep(0.1)  # let the server accept and park on the command line
+
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(run_payload(server, "sleepy")))
+        worker.start()
+        try:
+            time.sleep(0.4)  # the payload is forked by now
+            stalled.shutdown(socket.SHUT_WR)
+            stalled.settimeout(1.0)
+            try:
+                # Any reply is beside the point; reaching end of stream
+                # while the payload still runs is the behavior under test.
+                read_reply(stalled)
+            except socket.timeout:
+                raise AssertionError(
+                    "a payload inherited another client's socket: that "
+                    "client waited for end of stream until the payload exited"
+                )
+        finally:
+            worker.join(timeout=10.0)
+        assert not worker.is_alive(), "the run did not finish"
+        assert outcome and outcome[0] == ["awake", "status 0", "exit 0"], (
+            "the run must finish, got %r" % outcome
+        )
+    finally:
+        stalled.close()
+
+
+def scenario_run_exec_failure(server):
+    data = b"this is not an executable\n"
+    install_payload(server, "notexec", data)
+    lines = run_payload(server, "notexec")
+    assert lines == ["spawn_failed", "exit 1"], (
+        "a stored object that cannot be executed must answer spawn_failed "
+        "and exit 1, never the payload's own status line, got %r" % lines
+    )
+
+
 def doc_path(name="quick-start.md"):
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, "..", "..", "docs", name)
@@ -424,6 +488,28 @@ def run_quick_start(server, doc):
     )
 
 
+def fixture_fails(server, text, description):
+    """Run the fixture against mutated documentation and demand a failure."""
+    import quickstart
+
+    handle = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+    try:
+        handle.write(text)
+        handle.close()
+        fresh = Server(server.binary)
+        try:
+            try:
+                run_quick_start(fresh, handle.name)
+            except quickstart.FixtureError:
+                return
+            raise AssertionError(
+                "%s must fail the fixture" % description)
+        finally:
+            fresh.stop()
+    finally:
+        os.unlink(handle.name)
+
+
 def scenario_quick_start(server):
     fresh = Server(server.binary)
     try:
@@ -441,29 +527,33 @@ def scenario_quick_start_doc_drift(server):
     drifted = section.replace(
         "Hello, world from Ariel!", "Goodbye from Ariel!", 1)
     assert drifted != section, (
-        "the 'After Stage 1' section must show the payload's output"
-    )
-    mutated = text.replace(section, drifted, 1)
+        "the 'After Stage 1' section must show the payload's output")
+    fixture_fails(server, text.replace(section, drifted, 1),
+                  "a quick start changed without Ariel")
 
-    handle = tempfile.NamedTemporaryFile(
-        "w", suffix=".md", delete=False)
-    try:
-        handle.write(mutated)
-        handle.close()
-        fresh = Server(server.binary)
-        try:
-            try:
-                run_quick_start(fresh, handle.name)
-            except quickstart.FixtureError:
-                pass
-            else:
-                raise AssertionError(
-                    "a quick start changed without Ariel must fail the fixture"
-                )
-        finally:
-            fresh.stop()
-    finally:
-        os.unlink(handle.name)
+
+def scenario_quick_start_broken_setup(server):
+    import quickstart
+
+    with open(doc_path()) as handle:
+        text = handle.read()
+    section = quickstart.after_stage1(text)
+    export = "$ export ARIEL_TOKEN=%s" % quickstart.TOKEN_PLACEHOLDER
+    assert export in section, "the section must export the token"
+
+    wrong = ("0" if server.token[0] != "0" else "1") + server.token[1:]
+    mutations = (
+        ("a wrong token in the documented export",
+         "$ export ARIEL_TOKEN=%s" % wrong),
+        ("a setup command that does not exist",
+         "$ no-such-ariel-command ARIEL_TOKEN=%s"
+         % quickstart.TOKEN_PLACEHOLDER),
+    )
+
+    for description, replacement in mutations:
+        mutated = text.replace(export, replacement, 1)
+        assert mutated != text, "the section must hold the export command"
+        fixture_fails(server, mutated, description)
 
 
 def staging_path(server, staging_id):
@@ -778,11 +868,17 @@ def main():
         check("a run of a committed build needs no new approval, and a push "
               "of a different build asks again",
               lambda: scenario_run_needs_no_new_approval(server))
+        check("a stored object that cannot be executed answers spawn_failed "
+              "and exit 1", lambda: scenario_run_exec_failure(server))
+        check("a finished connection reaches end of stream while a payload "
+              "runs", lambda: scenario_run_does_not_leak_connections(server))
         check("the quick start's 'After Stage 1' section passes headless",
               lambda: scenario_quick_start(server))
         check("a change to the 'After Stage 1' section without a change to "
               "Ariel makes the fixture fail",
               lambda: scenario_quick_start_doc_drift(server))
+        check("a broken setup command or a wrong exported token makes the "
+              "fixture fail", lambda: scenario_quick_start_broken_setup(server))
     finally:
         server.stop()
 

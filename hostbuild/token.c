@@ -78,7 +78,7 @@ random_bytes(unsigned char *buf, size_t len) {
   size_t total = 0;
   int fd;
 
-  if((fd=open("/dev/urandom", O_RDONLY)) < 0) {
+  if((fd=open("/dev/urandom", O_RDONLY | O_CLOEXEC)) < 0) {
     return -1;
   }
 
@@ -134,7 +134,7 @@ read_token_file(const char *path, char token[TOKEN_LEN]) {
   int len;
   int fd;
 
-  if((fd=open(path, O_RDONLY)) < 0) {
+  if((fd=open(path, O_RDONLY | O_CLOEXEC)) < 0) {
     return -1;
   }
 
@@ -192,7 +192,7 @@ create_token_file(const char *dir, char token[TOKEN_LEN]) {
                 dir, (long)getpid(), i) >= (int)sizeof(tmp)) {
       return -1;
     }
-    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if(fd < 0 && errno != EEXIST) {
       return -1;
     }
