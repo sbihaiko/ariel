@@ -1,4 +1,4 @@
-/* Ariel host build: the narrow platform port.
+/* Ariel: the narrow platform port.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
@@ -41,10 +41,10 @@ typedef struct {
 } approval_facts_t;
 
 /**
- * The platform port. For this tracer it holds only what the agent port
- * needs to run: listening, accepting, a clock and approval requests. The
- * PS5 implementation and the rest of the port arrive with the Stage 1
- * tickets.
+ * The platform port: everything the agent port needs from the system it
+ * runs on. Both builds share this header and the command logic above it;
+ * platform_host.c and platform_ps5.c are the two implementations. The port
+ * widens in Stage 2.
  **/
 typedef struct platform platform_t;
 

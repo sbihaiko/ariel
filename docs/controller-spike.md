@@ -6,6 +6,12 @@ Ariel asks the owner to approve an action with the controller. The open question
 
 `controller-spike.elf` answers that question on a real console. It is a separate payload. It is not part of Ariel.
 
+## The decision it settles
+
+The approval source on a console is the controller ([ADR-0006](adr/0006-the-controller-is-the-approval-source.md)). Ariel builds the PS5 platform port with the controller as that source, behind the platform port, and this spike is how the choice is validated on a real console.
+
+If the run shows that another app in the foreground stops the payload from reading the pad, the source changes behind the platform port, to a fallback the agent cannot reach from the network, and ADR-0006 is rewritten with the result.
+
 ## What the payload does
 
 - It builds as its own ELF, `controller-spike.elf`, next to `shsrv-ps5.elf`. It is never linked into `shsrv-ps5.elf`.

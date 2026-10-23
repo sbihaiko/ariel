@@ -41,10 +41,15 @@ $(SUBDIRS):
 
 all: shsrv-ps5.elf sh.elf controller-spike.elf
 
+# The agent protocol, the store and the token are shared with the host
+# build, which compiles the same sources from hostbuild/.
+ARIEL_OBJS := agent.o agent_server.o store.o token.o
+
 shsrv.o: sh.elf.inc
 
-shsrv-ps5.elf: shsrv.o elfldr.o pt.o notify.o sha256.o
-	$(CC) -lkernel_sys -o $@ $^
+shsrv-ps5.elf: shsrv.o platform_ps5.o $(ARIEL_OBJS) elfldr.o pt.o notify.o \
+               sha256.o
+	$(CC) -lkernel_sys -lScePad -lSceUserService -o $@ $^
 
 sh.elf: sh.o builtin.o elfldr.o pt.o libtelnet.o
 	$(CC) -lkernel_sys -o $@ $^ \

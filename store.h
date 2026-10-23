@@ -1,4 +1,4 @@
-/* Ariel host build: staging, approvals and the hash-addressed store.
+/* Ariel: staging, approvals and the hash-addressed store.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
@@ -27,6 +27,12 @@ along with this program; see the file COPYING. If not, see
  * is atomic and approvals die with the process. Nothing here survives a
  * restart except the store's files.
  **/
+
+/**
+ * An approval is good for this long after it was requested. The platform
+ * reads it too: a console shows the prompt for exactly this long.
+ **/
+#define APPROVAL_EXPIRY_MS 120000ULL
 
 /** What one payload commit ended in. **/
 #define STORE_INSTALLED         0

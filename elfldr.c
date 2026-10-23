@@ -15,6 +15,7 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <elf.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -539,18 +540,38 @@ elfldr_debug(int stdin_fd, int stdout_fd, int stderr_fd,
 }
 
 
+/**
+ * Kill a child that failed to start and reap it. SIGCHLD is not ignored by
+ * the server, so a failed spawn nobody waits for would stay a zombie.
+ * detached says ptrace is already gone from the child.
+ **/
+static int
+elfldr_abandon(pid_t pid, int detached) {
+  if(!detached) {
+    pt_detach(pid, SIGKILL);
+  }
+
+  while(waitpid(pid, 0, 0) < 0) {
+    if(errno != EINTR) {
+      break;
+    }
+  }
+
+  return -1;
+}
+
+
 int
 elfldr_exec(int stdin_fd, int stdout_fd, int stderr_fd,
 	    pid_t pid, uint8_t* elf) {
   if(elfldr_debug(stdin_fd, stdout_fd, stderr_fd, pid, elf, 0)) {
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
 
   if(pt_detach(pid, 0)) {
     perror("pt_detach");
     kill(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 1);
   }
 
   return 0;
@@ -683,16 +704,22 @@ elfldr_spawn(int stdin_fd, int stdout_fd, int stderr_fd,
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC, 0, 0);
   if(kevent(kq, &evt, 1, &evt, 1, 0) < 0) {
     perror("kevent");
+    kill(pid, SIGKILL);
+    elfldr_abandon(pid, 1);
     free(stack);
     close(kq);
     return -1;
   }
 
-  if(waitpid(pid, 0, 0) < 0) {
-    perror("waitpid");
-    free(stack);
-    close(kq);
-    return -1;
+  while(waitpid(pid, 0, 0) < 0) {
+    if(errno != EINTR) {
+      perror("waitpid");
+      kill(pid, SIGKILL);
+      elfldr_abandon(pid, 1);
+      free(stack);
+      close(kq);
+      return -1;
+    }
   }
 
   free(stack);
@@ -703,8 +730,7 @@ elfldr_spawn(int stdin_fd, int stdout_fd, int stderr_fd,
   // via sceKernelGetProcParam()
   if(pt_syscall(pid, 599)) {
     puts("sys_dynlib_process_needed_and_relocate failed");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
 
   // Allow libc to allocate arbitrary amount of memory.
@@ -713,43 +739,36 @@ elfldr_spawn(int stdin_fd, int stdout_fd, int stderr_fd,
   //Insert a breakpoint at the eboot entry.
   if(!(brkpoint=kernel_dynlib_entry_addr(pid, 0))) {
     puts("kernel_dynlib_entry_addr failed");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
   brkpoint += 58;// offset to invocation of main()
 
   if(kernel_mprotect(pid, brkpoint, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC)) {
     puts("kernel_mprotect failed");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
 
   if(pt_copyout(pid, brkpoint, &orginstr, sizeof(orginstr))) {
     perror("pt_copyout");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
   if(pt_copyin(pid, &int3instr, brkpoint, sizeof(int3instr))) {
     perror("pt_copyin");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
 
   // Continue execution until we hit the breakpoint, then remove it.
   if(pt_continue(pid, SIGCONT)) {
     perror("pt_continue");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
   if(waitpid(pid, 0, 0) == -1) {
     perror("waitpid");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
   if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
     perror("pt_copyin");
-    pt_detach(pid, SIGKILL);
-    return -1;
+    return elfldr_abandon(pid, 0);
   }
 
   if(kernel_set_ucred_uid(pid, 0)) {
@@ -761,6 +780,8 @@ elfldr_spawn(int stdin_fd, int stdout_fd, int stderr_fd,
   elfldr_set_environ(pid, environ);
   elfldr_set_cwd(pid, cwd);
 
+  // elfldr_exec kills and reaps the child on every failure path, so the
+  // pid must not be waited for here a second time.
   if(elfldr_exec(stdin_fd, stdout_fd, stderr_fd, pid, elf)) {
     return -1;
   }

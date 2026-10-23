@@ -1,4 +1,4 @@
-/* Ariel host build: staging, approvals and the hash-addressed store.
+/* Ariel: staging, approvals and the hash-addressed store.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
@@ -60,9 +60,6 @@ along with this program; see the file COPYING. If not, see
 
 /** One object is at most 64 MiB, the same limit an upload has. **/
 #define OBJECT_LIMIT  (64ULL * 1024ULL * 1024ULL)
-
-/** An approval is good for this long after it was requested. **/
-#define APPROVAL_EXPIRY_MS 120000ULL
 
 /** A staging object nobody committed leaves after this long. **/
 #define STAGING_TTL_MS     900000ULL
