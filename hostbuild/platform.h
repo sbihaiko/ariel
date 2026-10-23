@@ -65,9 +65,23 @@ struct platform {
    **/
   int (*approval_request)(platform_t *self, const approval_facts_t *facts,
                           char *id, size_t idlen);
+
+  /**
+   * Run a payload in the foreground from its verified bytes: put the bytes
+   * in a fresh file only Ariel can read, execute it with argv (argv[0] is
+   * the payload's name) with its output on outfd, wait for it and return
+   * its exit status in status. Returns 0 when the payload ran, -1 on a
+   * platform error. The bytes are never loaded from a path.
+   **/
+  int (*spawn)(platform_t *self, const unsigned char *bytes, size_t size,
+               char *const argv[], int outfd, int *status);
 };
 
-/** The implementation for the host operating system. **/
-platform_t *platform_host(void);
+/**
+ * The implementation for the host operating system. run_dir is a directory
+ * only Ariel can read, where the bytes of a run are written before they are
+ * executed and removed afterwards.
+ **/
+platform_t *platform_host(const char *run_dir);
 
 #endif /* ARIEL_PLATFORM_H */

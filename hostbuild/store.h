@@ -40,6 +40,20 @@ typedef struct {
   char sha256[65];
 } store_install_t;
 
+/** How reading a payload back for a run ended. **/
+#define STORE_RUN_OK      0
+#define STORE_RUN_UNKNOWN 1
+#define STORE_RUN_STALE   2
+
+/** The verified bytes of one payload, held in memory until they are freed. **/
+typedef struct {
+  unsigned char *bytes;
+  size_t size;
+} store_object_t;
+
+/** Whether name follows the payload-name grammar. Returns 1 when it does. **/
+int store_name_valid(const char *name);
+
 /**
  * Record the state directory, delete the staging objects a previous
  * process left behind and make the store's directories. Returns 0 on
@@ -85,5 +99,17 @@ void store_stage(const char *staging_id, const approval_facts_t *facts,
  **/
 int store_commit(const char *staging_id, store_install_t *install,
                  char *approval_id, size_t idlen);
+
+/**
+ * Read the current object of a payload name into memory once, hash those
+ * bytes and compare the hash with the store's current record. The object
+ * is opened through that record and never followed. Returns STORE_RUN_OK
+ * with the verified bytes, STORE_RUN_UNKNOWN when the name has no record,
+ * or STORE_RUN_STALE when the object no longer matches it.
+ **/
+int store_run_load(const char *name, store_object_t *object);
+
+/** Free the bytes of an object store_run_load returned. **/
+void store_object_free(store_object_t *object);
 
 #endif /* ARIEL_STORE_H */

@@ -43,6 +43,9 @@ along with this program; see the file COPYING. If not, see
 
 #define READ_CHUNK          65536
 
+/** One line is at most 1 KiB, so this many words covers every command. **/
+#define MAX_ARGS            512
+
 static const char bad_name[] =
   "bad_name\n"
   "exit 1\n";
@@ -64,6 +67,12 @@ static const char approval_denied[] =
 static const char approval_stale[] =
   "approval_stale\n"
   "exit 78\n";
+static const char unknown_payload[] =
+  "unknown_payload\n"
+  "exit 1\n";
+static const char spawn_failed[] =
+  "spawn_failed\n"
+  "exit 1\n";
 
 static int
 write_all(int fd, const char *buf, size_t len) {
@@ -205,32 +214,6 @@ split_args(char *line, char *argv[], int max) {
   }
 
   return argc;
-}
-
-
-static int
-name_valid(const char *name) {
-  size_t len = strlen(name);
-  size_t i;
-
-  if(len < 1 || len > PAYLOAD_NAME_MAX) {
-    return 0;
-  }
-  if(!((name[0] >= 'a' && name[0] <= 'z') ||
-       (name[0] >= '0' && name[0] <= '9'))) {
-    return 0;
-  }
-
-  for(i=0; i<len; i++) {
-    char c = name[i];
-
-    if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-         c == '-' || c == '_')) {
-      return 0;
-    }
-  }
-
-  return 1;
 }
 
 
@@ -378,7 +361,7 @@ payload_push(agent_t *agent, int fd, const char *name, const char *size_text,
   int rc;
   int outfd;
 
-  if(!name_valid(name)) {
+  if(!store_name_valid(name)) {
     reply(fd, bad_name);
     return;
   }
@@ -494,12 +477,59 @@ payload_commit(int fd, const char *staging_id) {
 
 
 static void
-handle_command(agent_t *agent, int fd, char *line) {
-  char *argv[5];
-  int argc = split_args(line, argv, 5);
+payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
+  store_object_t object;
+  char answer[64];
+  int status = 0;
+  int outcome;
+  int len;
 
-  // Exactly one command per connection. payload run arrives with its own
-  // ticket.
+  if(!store_name_valid(name)) {
+    reply(fd, bad_name);
+    return;
+  }
+
+  // Read the object once and hash those bytes. Only the verified bytes are
+  // ever spawned: run never hashes one path and loads another.
+  outcome = store_run_load(name, &object);
+
+  if(outcome == STORE_RUN_UNKNOWN) {
+    reply(fd, unknown_payload);
+    return;
+  }
+
+  if(outcome != STORE_RUN_OK) {
+    // The store no longer holds what it recorded: push the build again.
+    reply(fd, approval_stale);
+    return;
+  }
+
+  if(agent->platform->spawn(agent->platform, object.bytes, object.size,
+                            argv, fd, &status)) {
+    store_object_free(&object);
+    reply(fd, spawn_failed);
+    return;
+  }
+
+  store_object_free(&object);
+
+  // status is the payload's own exit status; exit is the protocol's.
+  len = snprintf(answer, sizeof(answer), "status %d\nexit 0\n", status);
+  write_all(fd, answer, (size_t)len);
+}
+
+
+static void
+handle_command(agent_t *agent, int fd, char *line) {
+  char *argv[MAX_ARGS + 1];
+  int argc = split_args(line, argv, MAX_ARGS);
+
+  if(argc == MAX_ARGS + 1) {
+    reply(fd, unknown);
+    return;
+  }
+
+  // Exactly one command per connection.
   if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "push")) {
     payload_push(agent, fd, argv[2], argv[3], argv[4]);
     return;
@@ -507,6 +537,15 @@ handle_command(agent_t *agent, int fd, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "commit")) {
     payload_commit(fd, argv[2]);
+    return;
+  }
+
+  // payload run --wait <name> [args]: the name and its arguments are the
+  // payload's own argv, so argv[0] is the name.
+  if(argc >= 4 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "run") &&
+     !strcmp(argv[2], "--wait")) {
+    argv[argc] = NULL;
+    payload_run(agent, fd, argv[3], &argv[3]);
     return;
   }
 

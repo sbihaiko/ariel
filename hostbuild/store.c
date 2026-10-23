@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -51,6 +52,9 @@ along with this program; see the file COPYING. If not, see
 
 /** One read or write of an object moving into the store. **/
 #define MOVE_CHUNK    65536
+
+/** One object is at most 64 MiB, the same limit an upload has. **/
+#define OBJECT_LIMIT  (64ULL * 1024ULL * 1024ULL)
 
 /** One member of the staging table. **/
 struct staged {
@@ -86,6 +90,32 @@ static int state_open(void);
 static int dir_open(int dirfd, const char *name);
 static int dir_make(int dirfd, const char *name);
 static void staging_clear(void);
+
+
+int
+store_name_valid(const char *name) {
+  size_t len = strlen(name);
+  size_t i;
+
+  if(len < 1 || len > PAYLOAD_NAME_MAX) {
+    return 0;
+  }
+  if(!((name[0] >= 'a' && name[0] <= 'z') ||
+       (name[0] >= '0' && name[0] <= '9'))) {
+    return 0;
+  }
+
+  for(i=0; i<len; i++) {
+    char c = name[i];
+
+    if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+         c == '-' || c == '_')) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
 
 
 /** An empty slot, or NULL when the table is full. **/
@@ -746,4 +776,145 @@ store_commit(const char *staging_id, store_install_t *install,
 
   pthread_mutex_unlock(&lock);
   return outcome;
+}
+
+
+/** Read a whole object into memory, hashing the same bytes on the way. **/
+static int
+object_load(int fd, store_object_t *object, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  struct stat st;
+  unsigned char *bytes;
+  sha256_t hash;
+  size_t alloc;
+  size_t len = 0;
+
+  if(fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+     (uint64_t)st.st_size > OBJECT_LIMIT) {
+    return -1;
+  }
+
+  // One byte past the size just checked tells a file that grew apart.
+  alloc = (size_t)st.st_size + 1;
+
+  if(!(bytes = malloc(alloc))) {
+    return -1;
+  }
+
+  sha256_init(&hash);
+
+  while(1) {
+    ssize_t n;
+
+    if(len == alloc) {
+      // The object grew since it was checked: it is no longer trusted.
+      free(bytes);
+      return -1;
+    }
+
+    n = read(fd, bytes + len, alloc - len);
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      free(bytes);
+      return -1;
+    }
+    if(n == 0) {
+      break;
+    }
+
+    sha256_update(&hash, bytes + len, (size_t)n);
+    len += (size_t)n;
+  }
+
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  object->bytes = bytes;
+  object->size = len;
+  return 0;
+}
+
+
+int
+store_run_load(const char *name, store_object_t *object) {
+  char computed[SHA256_HEX_LEN + 1];
+  char expected[SHA256_HEX_LEN + 1];
+  int objects_fd = -1;
+  int current_fd = -1;
+  int store_fd = -1;
+  int state_fd = -1;
+  int fd = -1;
+  int rc = STORE_RUN_STALE;
+
+  object->bytes = NULL;
+  object->size = 0;
+
+  if(!store_name_valid(name)) {
+    return STORE_RUN_UNKNOWN;
+  }
+
+  pthread_mutex_lock(&lock);
+
+  if((state_fd=state_open()) < 0 ||
+     (store_fd=dir_open(state_fd, "store")) < 0 ||
+     (current_fd=dir_open(store_fd, "current")) < 0) {
+    goto out;
+  }
+
+  if(current_read(current_fd, name, expected) < 0) {
+    rc = STORE_RUN_UNKNOWN;
+    goto out;
+  }
+
+  if((objects_fd=dir_open(store_fd, "objects")) < 0) {
+    goto out;
+  }
+
+  // Open the object through the record, without following a link, and
+  // read it once. The bytes that are hashed are the bytes that run.
+  if((fd=open_entry(objects_fd, expected, O_RDONLY)) < 0) {
+    goto out;
+  }
+
+  if(object_load(fd, object, computed)) {
+    goto out;
+  }
+
+  if(strcmp(computed, expected)) {
+    // The object changed behind Ariel's back: it never runs.
+    store_object_free(object);
+    goto out;
+  }
+
+  rc = STORE_RUN_OK;
+
+out:
+  if(fd >= 0) {
+    close(fd);
+  }
+  if(objects_fd >= 0) {
+    close(objects_fd);
+  }
+  if(current_fd >= 0) {
+    close(current_fd);
+  }
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+void
+store_object_free(store_object_t *object) {
+  free(object->bytes);
+  object->bytes = NULL;
+  object->size = 0;
 }

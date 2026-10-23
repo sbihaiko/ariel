@@ -98,6 +98,7 @@ main(int argc, char **argv) {
   char staging_dir[PATH_MAX];
   char state_dir[PATH_MAX];
   char data_dir[PATH_MAX];
+  char run_dir[PATH_MAX];
   platform_t *platform;
   agent_t agent;
   const char *root;
@@ -121,13 +122,15 @@ main(int argc, char **argv) {
      snprintf(state_dir, sizeof(state_dir), "%s/ariel", data_dir) >=
      (int)sizeof(state_dir) ||
      snprintf(staging_dir, sizeof(staging_dir), "%s/staging", state_dir) >=
-     (int)sizeof(staging_dir)) {
+     (int)sizeof(staging_dir) ||
+     snprintf(run_dir, sizeof(run_dir), "%s/run", state_dir) >=
+     (int)sizeof(run_dir)) {
     fprintf(stderr, "root path is too long\n");
     return EXIT_FAILURE;
   }
 
   if(ensure_dir(root) || ensure_dir(data_dir) || ensure_dir(state_dir) ||
-     ensure_dir(staging_dir)) {
+     ensure_dir(staging_dir) || ensure_dir(run_dir)) {
     return EXIT_FAILURE;
   }
 
@@ -142,7 +145,7 @@ main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  platform = platform_host();
+  platform = platform_host(run_dir);
   if((srvfd=platform->listen(platform, port)) < 0) {
     return EXIT_FAILURE;
   }

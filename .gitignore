@@ -6,3 +6,5 @@
 hostbuild/ariel-host
 /data/
 
+__pycache__/
+*.pyc

@@ -254,6 +254,218 @@ def commit(server, staging_id):
         sock.close()
 
 
+def run_payload(server, name, args=()):
+    """Send one payload run and return the lines the server answered."""
+    command = "payload run --wait %s" % name
+    if args:
+        command += " " + " ".join(args)
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
+        )
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def compile_payload(source, name="payload"):
+    """Build a native payload with the host compiler and return its bytes."""
+    workdir = tempfile.mkdtemp(prefix="ariel-payload-")
+    path = os.path.join(workdir, name + ".c")
+    with open(path, "w") as handle:
+        handle.write(source)
+    binary = os.path.join(workdir, name)
+    subprocess.run(
+        [os.environ.get("CC", "cc"), "-Wall", "-Werror", "-o", binary, path],
+        check=True,
+    )
+    with open(binary, "rb") as handle:
+        return handle.read()
+
+
+HELLO_SOURCE = """
+#include <stdio.h>
+
+int
+main(int argc, char* argv[]) {
+  printf("Hello, world from Ariel!\\n");
+  for(int i = 1; i < argc; i++) {
+    printf("argv[%d] = %s\\n", i, argv[i]);
+  }
+  return 0;
+}
+"""
+
+
+def install_payload(server, name, data):
+    """Push, approve and commit one build, and return its hash."""
+    staging, _ = approve_push(server, name, data)
+    hash_hex = hashlib.sha256(data).hexdigest()
+    assert commit(server, staging) == [
+        "installed %s %s" % (name, hash_hex), "exit 0"], (
+        "an approved commit must install the build"
+    )
+    return hash_hex
+
+
+def scenario_run_streams_output(server):
+    data = compile_payload(HELLO_SOURCE, "hello")
+    install_payload(server, "hello", data)
+    lines = run_payload(server, "hello", ("one", "two"))
+    expected = [
+        "Hello, world from Ariel!",
+        "argv[1] = one",
+        "argv[2] = two",
+        "status 0",
+        "exit 0",
+    ]
+    assert lines == expected, (
+        "a run must stream the payload's output, then its status and exit 0, "
+        "got %r" % lines
+    )
+
+
+EXIT_SOURCE = """
+#include <stdio.h>
+
+int
+main(void) {
+  printf("exiting %d\\n", EXIT_CODE);
+  return EXIT_CODE;
+}
+"""
+
+
+def scenario_run_reports_payload_status(server):
+    for code in (3, 75):
+        data = compile_payload(
+            EXIT_SOURCE.replace("EXIT_CODE", str(code)), "exit%d" % code)
+        install_payload(server, "exit%d" % code, data)
+        lines = run_payload(server, "exit%d" % code)
+        expected = ["exiting %d" % code, "status %d" % code, "exit 0"]
+        assert lines == expected, (
+            "a payload exiting %d must answer 'status %d' and 'exit 0', "
+            "got %r" % (code, code, lines)
+        )
+
+
+def scenario_run_unknown_name(server):
+    lines = run_payload(server, "nosuchpayload")
+    assert lines == ["unknown_payload", "exit 1"], (
+        "an unknown name must be an error, got %r" % lines
+    )
+
+    lines = run_payload(server, "../x")
+    assert lines == ["bad_name", "exit 1"], (
+        "a name outside the grammar must be an error, got %r" % lines
+    )
+
+
+def scenario_run_stale_object(server):
+    data = compile_payload(HELLO_SOURCE, "stale")
+    hash_hex = install_payload(server, "stale", data)
+    # The ungated telnet shell can still write to /data in Stage 1.
+    path = os.path.join(store_dir(server), "objects", hash_hex)
+    with open(path, "wb") as handle:
+        handle.write(b"tampered bytes")
+    lines = run_payload(server, "stale")
+    assert lines == ["approval_stale", "exit 78"], (
+        "an object changed behind Ariel's back must answer approval_stale "
+        "and exit 78 and must not run, got %r" % lines
+    )
+
+
+def scenario_run_needs_no_new_approval(server):
+    data = compile_payload(HELLO_SOURCE, "once")
+    install_payload(server, "once", data)
+
+    expected = [
+        "Hello, world from Ariel!",
+        "argv[1] = one",
+        "status 0",
+        "exit 0",
+    ]
+    assert run_payload(server, "once", ("one",)) == expected, (
+        "the first run of a committed build must need no approval"
+    )
+    server.assert_no_line()
+    assert run_payload(server, "once", ("one",)) == expected, (
+        "a later run of the same build must need no approval either"
+    )
+    server.assert_no_line()
+
+    # A different build is a different hash, so it asks the owner again.
+    other = compile_payload(
+        EXIT_SOURCE.replace("EXIT_CODE", "0"), "once-other")
+    lines = push(server, "once", other)
+    assert_staged(server, lines, "once", other)
+
+
+def doc_path(name="quick-start.md"):
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "..", "..", "docs", name)
+
+
+def run_quick_start(server, doc):
+    """Run the quick start's 'After Stage 1' section against one server."""
+    import quickstart
+
+    workdir = tempfile.mkdtemp(prefix="ariel-quickstart-")
+    quickstart.run_quick_start(
+        doc_path=doc,
+        workdir=workdir,
+        host=HOST,
+        port=server.port,
+        token=server.token,
+        next_line=lambda timeout=5.0: server.next_line(timeout=timeout),
+        approve=lambda approval_id: server.controller(
+            "approve %s" % approval_id, "approved %s" % approval_id),
+    )
+
+
+def scenario_quick_start(server):
+    fresh = Server(server.binary)
+    try:
+        run_quick_start(fresh, doc_path())
+    finally:
+        fresh.stop()
+
+
+def scenario_quick_start_doc_drift(server):
+    import quickstart
+
+    with open(doc_path()) as handle:
+        text = handle.read()
+    section = quickstart.after_stage1(text)
+    drifted = section.replace(
+        "Hello, world from Ariel!", "Goodbye from Ariel!", 1)
+    assert drifted != section, (
+        "the 'After Stage 1' section must show the payload's output"
+    )
+    mutated = text.replace(section, drifted, 1)
+
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".md", delete=False)
+    try:
+        handle.write(mutated)
+        handle.close()
+        fresh = Server(server.binary)
+        try:
+            try:
+                run_quick_start(fresh, handle.name)
+            except quickstart.FixtureError:
+                pass
+            else:
+                raise AssertionError(
+                    "a quick start changed without Ariel must fail the fixture"
+                )
+        finally:
+            fresh.stop()
+    finally:
+        os.unlink(handle.name)
+
+
 def staging_path(server, staging_id):
     return os.path.join(server.root, "data", "ariel", "staging", staging_id)
 
@@ -428,7 +640,7 @@ def scenario_wrong_token(server):
 
 def scenario_unknown_command(server):
     for command in (
-        "payload run --wait helloworld",
+        "payload run helloworld",
         "payload status",
         "nonsense",
     ):
@@ -553,6 +765,24 @@ def main():
         check("a denied commit answers approval_denied and exit 77 and "
               "deletes the staging object",
               lambda: scenario_commit_denied(server))
+        check("a run streams the payload's output, then status 0 and exit 0",
+              lambda: scenario_run_streams_output(server))
+        check("a payload exiting 3 answers status 3, and one exiting 75 "
+              "answers status 75, never an approval request",
+              lambda: scenario_run_reports_payload_status(server))
+        check("an unknown payload name is an error",
+              lambda: scenario_run_unknown_name(server))
+        check("an object changed behind Ariel's back answers approval_stale "
+              "and exit 78 and does not run",
+              lambda: scenario_run_stale_object(server))
+        check("a run of a committed build needs no new approval, and a push "
+              "of a different build asks again",
+              lambda: scenario_run_needs_no_new_approval(server))
+        check("the quick start's 'After Stage 1' section passes headless",
+              lambda: scenario_quick_start(server))
+        check("a change to the 'After Stage 1' section without a change to "
+              "Ariel makes the fixture fail",
+              lambda: scenario_quick_start_doc_drift(server))
     finally:
         server.stop()
 
