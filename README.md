@@ -21,40 +21,51 @@ Ariel closes that gap. The idea is that an agent connects to one endpoint on the
 
 ## Goals
 
-### Stage 1: download, run, persist, roll back
+### Stage 1: hello world, end to end
 
-The first milestone is a shell that can, with a single command:
+The first milestone is the smallest loop that proves the whole idea: an agent builds a payload on a computer, pushes it to the console, a human approves it with the controller, and the agent runs it and reads its output. The [quick start](docs/quick-start.md#after-stage-1) is this stage's acceptance test, and it runs headless in CI against a host build of Ariel.
+
+- **An agent port (2324)** next to the telnet shell: raw TCP with no telnet negotiation, so a binary upload arrives intact. One command per connection after `auth`, no prompts, and every reply ends with an `exit <status>` line.
+- **An access token** on the agent port. Every connection starts with `auth <token>`; Ariel shows the token on the console at first start.
+- **`payload push <name> <size> <sha256>`** uploads a locally built ELF over the same connection, so no FTP server is needed. Ariel stages it and the console shows its hash.
+- **Approval on the console.** A push answers `approval_required <id>`; a human approves with the controller. Approving a pushed build also approves running that exact build.
+- **`payload commit <staging-id>`** moves an approved upload into Ariel's store. The bytes are sent once.
+- **`payload run --wait <name>`** runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports the payload's exit status on a `status <n>` line, apart from the protocol's `exit` line.
+- **A host build** of Ariel behind a platform port, with a virtual controller for tests. It never ships in the PS5 build.
+
+The agent port offers only these commands. Everything else, including every command that changes the system, stays on the telnet shell exactly as in upstream shsrv until Stage 2. Until then, approval protects only the agent port: anyone who can reach the telnet shell can still do what they can today.
+
+### Stage 2: persist and recover
+
+Make the console safe to leave in an agent's hands:
 
 1. **Download a payload from a GitHub release**, by repository name, following the latest release or a pinned tag, and only from an allowlist of sources. Ariel records the immutable identifiers of what it downloaded (release ID, asset ID), since tags can be moved.
 2. **Verify it** with SHA-256 before anything is executed. A hash published in the same release only detects corruption, not tampering, so the expected hash must come from somewhere Ariel trusts: either it is pinned in the allowlist, or a human approves the new hash on the console (see [Safety model](#safety-model)), after which it is pinned.
-3. **Run it** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
+3. **Run it in the background** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
 4. **Persist it**: record what is installed (source, identifiers, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot. Approving an installation explicitly includes approving that the payload runs on every boot. `autoload safe-boot` skips autoload on the next boot, so a payload that crashes the console at startup can always be removed.
-5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic (write a new file, then rename it into place) and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
+5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
+6. **Gate everything that changes the system**, on both ports: every existing command that changes the system, starts code or reveals the environment, including running an ELF by path (the full list is in [Command coverage](#command-coverage)). The access token extends to the telnet shell.
 
 Ariel itself is never overwritten while it is running, so the agent can never lock itself out.
 
-Open design question: autoload is currently run at boot by another loader, not by Ariel. Ariel can only re-check each payload's hash before it starts at boot if Ariel itself becomes the component that runs autoload.
-
-Stage 1 commands already follow a minimal machine-safe grammar: one command per line, no prompts, and an exit status on the last line. Stage 2 extends it to every command.
+Ariel is not the boot loader: autoload is run at boot by another loader, and Ariel manages its configuration and keeps itself in it. So Ariel cannot re-check a payload's hash at boot; making Ariel the boot-time autoloader is a later decision.
 
 New commands in this stage (see [Command coverage](#command-coverage)):
 
-- `payload install | run | list | logs | rollback`, the core of the stage. `run` starts a payload in the background and captures its output to a log. It loads the file through the ELF loader, so the payload does not need the executable bit (no `chmod`).
-- `payload run --wait`, which runs the payload in the foreground, streams its output to the connection and returns its exit status, while still writing the log. This is how an agent sees the result of a quick test.
-- `payload push <name>`, which uploads a locally built ELF over the same connection, so no FTP server is needed. A pushed file has no release and no pinned hash, so the console shows its hash and the upload is kept only after a human approves it with the controller. This is the development loop: build on the computer, push, run.
+- `payload install | run | list | logs | rollback | config`. `run` without `--wait` starts a payload in the background and captures its output to a log; `config` sets a payload's health check.
 - `autoload show | edit | safe-boot`, to inspect the autoload configuration and to boot without it when a payload keeps crashing.
 - `sha256sum`, because the existing `sum` is a BSD checksum, not SHA-256.
 - `unzip` and `tar`, because many GitHub releases ship payloads inside an archive.
 - `reboot`, gated, to test that installed payloads survive a restart.
-- `approval status <id>`, to check whether a pending action has been approved on the console.
-- Gating for existing commands that change the system: `rm`, `kill`, `mount`, `umount`, `chroot` and `mknod`.
+- `approval status <id>`, to poll a pending approval.
+- `audit tail`, to read the audit log.
 
-### Stage 2: an interface agents can rely on
+### Stage 3: an interface agents can rely on
 
-Once the agent can reach the console, make the shell easy for it to use correctly:
+Once the agent can operate the console safely, make the shell easy for it to use correctly:
 
 - Proper argument parsing with quotes.
-- Exit status and a separate error channel for every command.
+- Exit status and a separate error channel for every command, extending the Stage 1 grammar to all of them.
 - Optional JSON output for `ps`, `ls`, `stat` and similar commands.
 - Pagination and size limits, so a large directory or log does not flood the agent's context.
 - Strictly non-interactive commands: no prompts in the middle of a session.
@@ -68,66 +79,67 @@ New and extended commands in this stage:
 - Diagnostics: `date`, `dmesg`, `du`, a `sysinfo` command that aggregates `uname`, `uptime` and memory, and `timeout` so a command cannot hang the connection.
 - Optional: `diff` and network diagnostics (`ifconfig`, `netstat`, `ping`).
 
-### Stage 3 (optional): sessions
+### Stage 4 (optional): sessions
 
-Stages 1 and 2 are enough for an agent to operate the console. Stages 3 and 4 are optional conveniences on top of them.
+Stages 1 to 3 are enough for an agent to operate the console. Stages 4 and 5 are optional conveniences on top of them.
 
-Agents usually reach the console through one-shot connections (one command per connection, e.g. `echo 'ls --json /data' | nc ps5 2323`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
+Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
 
 - `session new` returns a random 128-bit session ID and its TTL. Prefixing a command with `@<sid>` runs it inside that session, and `session close` ends it.
 - A session holds only minimal state: working directory, environment and timestamps. It carries no authorization. Creating a session requires the access token, and every gated command still needs its own approval on the console. Payloads started from a session are not tied to it and keep running after it ends.
 - Sessions expire after a period of inactivity, and the number of concurrent sessions is capped, so a client that forgets to close them cannot exhaust the console's RAM.
 - An unknown or expired ID returns an explicit `session_expired` error instead of silently falling back, so the agent knows to open a new session (for example after a reboot).
 - Session IDs are generated by a cryptographically secure random number generator and treated as secrets. Over plain-text connections they can still be sniffed, which is why they never authorize anything on their own.
-- Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 1 operations such as installing and rolling back take a global lock.
+- Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 2 operations such as installing and rolling back take a global lock.
 - Sessions are a convenience, not a requirement. Every command also works without one, using absolute paths.
 
-### Stage 4 (optional): MCP
+### Stage 5 (optional): MCP
 
-Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 3 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
+Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 4 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
 
 ## Command coverage
 
 Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-**Today:** ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 and S2 are Stages 1 and 2. "Gated" commands need approval on the console before they run (see [Safety model](#safety-model)).
+**Today:** ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S4 are Stages 1 to 4. "Gated" commands need approval on the console before they run (see [Safety model](#safety-model)).
 
 | Ariel | bash equivalent | Today (shsrv) | Plan |
 |---|---|---|---|
-| `pwd`, `cd` | | ✅ | S3: working directory kept across connections with sessions |
-| `ls` | | ⚠️ no flags | S2: `-l`, `-a`, `--json`, pagination |
-| `stat`, `file` | | ✅ | S2: `--json` |
-| `cat` | | ✅ | S2: size limit |
-| `head`, `tail`, `wc` | | ❌ | S2 |
-| `grep` | | ⚠️ only `-i`, `-n` | S2: `-r`, `-l`, `-c` |
-| `find` | | ⚠️ only `-name`, `-type` | S2: more predicates |
+| `pwd`, `cd` | | ✅ | S4: working directory kept across connections with sessions |
+| `ls` | | ⚠️ no flags | S3: `-l`, `-a`, `--json`, pagination |
+| `stat`, `file` | | ✅ | S3: `--json` |
+| `cat` | | ✅ | S3: size limit |
+| `head`, `tail`, `wc` | | ❌ | S3 |
+| `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c` |
+| `find` | | ⚠️ only `-name`, `-type` | S3: more predicates |
 | `cmp`, `hexdump` | | ✅ | |
-| `diff` | | ❌ | S2, optional |
+| `diff` | | ❌ | S3, optional |
 | `df` | | ✅ | |
-| `du` | | ❌ | S2 |
-| `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S1: gated |
-| `cp`, `mv` | | ⚠️ no `-r` | S1: gated. S2: `-r` |
-| `rm` | | ⚠️ one file, no `-r` | S1: gated. S2: `-r` |
-| `chmod`, `chown`, `chgrp` | | ✅ | S1: gated |
-| `write <path>` | `echo > file`, `tee` | ❌ | S2, gated |
-| `tar`, `unzip` | | ❌ | S1 |
-| `ps` | | ✅ | S2: `--json` |
+| `du` | | ❌ | S3 |
+| `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S2: gated |
+| `cp`, `mv` | | ⚠️ no `-r` | S2: gated. S3: `-r` |
+| `rm` | | ⚠️ one file, no `-r` | S2: gated. S3: `-r` |
+| `chmod`, `chown`, `chgrp` | | ✅ | S2: gated |
+| `write <path>` | `echo > file`, `tee` | ❌ | S3, gated |
+| `tar`, `unzip` | | ❌ | S2 |
+| `ps` | | ✅ | S3: `--json` |
 | `procstat` | `/proc/<pid>/*` | ✅ | |
-| `kill` | | ✅ | S1: gated, critical processes protected |
-| `payload run` | `cmd &`, `nohup` | ❌ | S1, gated, output captured to a log. `--wait` runs it in the foreground |
-| `payload push` | `scp`, `curl -T` | ❌ | S1, gated, hash approved on the console |
-| `timeout` | | ❌ | S2 |
-| `env`, `export`, `exec`, `sleep`, `id`, `sync` | | ✅ | |
-| `sysinfo` | `uname`, `uptime`, `free` | ⚠️ raw values via `sysctl` | S2 |
-| `date` | | ❌ | S2 |
-| `dmesg` | | ❌ only through klogsrv | S2 |
-| `mount`, `umount`, `chroot`, `mknod` | | ✅ | S1: gated |
-| `reboot` | | ❌ | S1, gated |
-| `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S1: wrapped by `payload install` with allowlist and hash check |
-| `sha256sum` | | ❌ (`sum` is a BSD checksum) | S1 |
-| `ifconfig`, `netstat`, `ping` | | ❌ | S2, optional |
+| `kill` | | ✅ | S2: gated, critical processes protected |
+| `payload run` | `cmd &`, `nohup` | ❌ | S1: `--wait` runs an approved build in the foreground. S2: background runs with a log |
+| `payload push`, `payload commit` | `scp`, `curl -T` | ❌ | S1, hash approved on the console |
+| `timeout` | | ❌ | S3 |
+| `sleep`, `id`, `sync` | | ✅ | |
+| `env`, `export`, `exec` | | ✅ | S2: gated |
+| `sysinfo` | `uname`, `uptime`, `free` | ⚠️ raw values via `sysctl` | S3 |
+| `date` | | ❌ | S3 |
+| `dmesg` | | ❌ only through klogsrv | S3 |
+| `mount`, `umount`, `chroot`, `mknod` | | ✅ | S2: gated |
+| `reboot` | | ❌ | S2, gated |
+| `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
+| `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
+| `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional |
 
-PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv), plus `payload`, `autoload`, `approval` (Stage 1) and `session` (Stage 3).
+PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) and `session` (Stage 4).
 
 Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `ssh`, `top` and package managers. The agent composes logic on its own side, on the computer it runs on.
 
@@ -135,8 +147,8 @@ Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `s
 
 An agent that can download, write and execute code on a console with kernel privileges needs firm limits. Ariel is designed around these rules:
 
-- **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token. Output is size-limited, and environment variables and credential files are hidden unless explicitly requested.
-- **Change is approved on the console.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and shows a notification on the console describing the exact action (command, target, hash). The action runs only after a human approves it with the controller. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it runs on another machine and has no access to the controller. A flag such as `--confirm` would not be enough, since the agent could simply pass it. Whether payloads can read controller input while another app is in the foreground is still to be validated; if not, a fallback is needed.
+- **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token. Output is size-limited. `env` is gated, and Ariel's own secrets (its token and approval state) cannot be read through any command.
+- **Change is approved on the console.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. Approving a payload version (at install or commit) also approves running that exact version, so a build is approved once, not once per run. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and shows a notification on the console describing the exact action (command, target, hash). The action runs only after a human approves it with the controller. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it runs on another machine and has no access to the controller. A flag such as `--confirm` would not be enough, since the agent could simply pass it. Whether payloads can read controller input while another app is in the foreground is still to be validated; if not, a fallback is needed.
 - **Allowlisted sources and trusted hashes.** Downloads come only from approved hosts and repositories, and a payload runs only if its hash is pinned in the allowlist or was approved on the console.
 - **Protected areas.** System partitions stay read-only. Critical system processes (such as SceShellCore) cannot be killed.
 - **Designed to recover.** Every change is atomic and journaled, every payload has a previous version to fall back to, and `autoload safe-boot` disables autoload for one boot. This covers crashes, failed health checks and interrupted updates, but not every possible failure.
@@ -144,7 +156,7 @@ An agent that can download, write and execute code on a console with kernel priv
 - **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. On-console approval ensures that injected instructions cannot silently turn into code execution.
 - **Auditable.** Ariel is open source and every action it takes is logged on the console.
 
-From Stage 4, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
+From Stage 5, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
 
 ## Quick start
 
@@ -162,7 +174,7 @@ Ariel builds exactly like shsrv, with the [ps5-payload-sdk](https://github.com/p
 
 ### Known limitations (inherited from shsrv)
 
-The session is not attached to a TTY, so homebrew that changes terminal properties will not work, and most commands are only partially implemented. Stage 2 addresses the limitations that matter most to agents.
+The session is not attached to a TTY, so homebrew that changes terminal properties will not work, and most commands are only partially implemented. Stage 3 addresses the limitations that matter most to agents.
 
 ## Why "Ariel"
 
@@ -182,7 +194,7 @@ That is exactly the role of this project. Ariel is the servant that lives on Pro
 
 **Payload management (design references)**
 
-- [ChronicLoader](https://github.com/StonedModder/ChronicLoader-PS5-Payload): payload updater and `autoload.txt` manager. Its design (SHA-256 state, timestamped backups, managed autoload) inspired Ariel's Stage 1. It is distributed as a binary only, so no code is reused.
+- [ChronicLoader](https://github.com/StonedModder/ChronicLoader-PS5-Payload): payload updater and `autoload.txt` manager. Its design (SHA-256 state, timestamped backups, managed autoload) inspired Ariel's Stage 2. It is distributed as a binary only, so no code is reused.
 - [ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager): web-based payload store, launcher and autoload manager.
 
 **AI on the console**
@@ -191,7 +203,7 @@ That is exactly the role of this project. Ariel is the servant that lives on Pro
 
 **Protocols**
 
-- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 4.
+- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 5.
 
 ## Legal
 

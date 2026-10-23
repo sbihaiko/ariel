@@ -101,22 +101,45 @@ Hello, world from Ariel!
 
 ## After Stage 1
 
-Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-download-run-persist-roll-back) lands: no FTP server and no `chmod`. The planned flow:
+Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-hello-world-end-to-end) lands: no FTP server and no `chmod`. Stage 1 adds an agent port (2324) next to the telnet shell: raw TCP, one command per connection after `auth`, and every reply ends with an `exit <status>` line. Every connection starts with `auth <token>`, using the access token Ariel shows on the console at first start. Status `75` means a human must approve the action on the console with the controller.
+
+The headless acceptance test runs this section: it substitutes the token, the host and the staging ID, approves on a virtual controller where a human would, and treats IDs and hashes as placeholders. It builds `helloworld.elf` for the machine under test: with the host compiler for the headless suite, with `prospero-clang` (step 3) for a console.
 
 ```console
-/$ payload push helloworld
-(the bytes of helloworld.elf follow on the same connection)
-approval_required: approve the hash of "helloworld" on the console
-/$ payload run --wait helloworld one two
-approval_required: approve "run helloworld" on the console
-/$ payload run --wait helloworld one two
-Hello, world from Ariel!
-argv[1] = one
-argv[2] = two
+$ export ARIEL_TOKEN=<token shown on the console>
+```
+
+Upload the payload. The command declares its size and SHA-256, and the bytes follow on the same connection. Ariel answers once the upload ends, so `nc` must close its sending side at the end of input: macOS `nc` does this by default; on Linux use `nc -N`.
+
+```console
+$ { printf 'auth %s\npayload push helloworld %s %s\n' "$ARIEL_TOKEN" \
+      "$(wc -c < helloworld.elf | tr -d ' ')" \
+      "$(openssl dgst -sha256 -r helloworld.elf | cut -d' ' -f1)"; cat helloworld.elf; } | nc $PS5_HOST 2324
+staged s-4f2a9c
+approval_required a-81d0e3
+exit 75
+```
+
+Approve it on the console. The notification names the payload, its hash, and that it will be executed. Then commit the staged upload:
+
+```console
+$ printf 'auth %s\npayload commit s-4f2a9c\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324
+installed helloworld 3b1f0c...
 exit 0
 ```
 
-The exact syntax for sending the file bytes over a one-shot connection is still to be designed. Each `approval_required` is answered by a human on the console with the controller; the agent then repeats the command.
+Run it in the foreground. Approving the commit approved running this exact build, so no new approval is needed:
+
+```console
+$ printf 'auth %s\npayload run --wait helloworld one two\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324
+Hello, world from Ariel!
+argv[1] = one
+argv[2] = two
+status 0
+exit 0
+```
+
+`status` is the payload's own exit status; `exit` is Ariel's, so a payload that exits with 75 is never mistaken for an approval request. A new build of `helloworld` is a new hash, so pushing it asks for approval again.
 
 ## Troubleshooting
 
