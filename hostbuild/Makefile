@@ -6,8 +6,14 @@ CFLAGS += -pthread -I.. -DARIEL_HOST_BUILD=1
 LDLIBS += -pthread
 
 BIN  := ariel-host
-SRCS := main.c platform_host.c token.c agent.c vcontroller.c store.c testclock.c
-OBJS := $(SRCS:.c=.o) sha256.o
+
+# The platform port, the agent protocol, the store and the token are shared
+# with the PS5 build, so they live at the repository root.
+SHARED_SRCS := ../agent.c ../agent_server.c ../store.c ../token.c
+SHARED_OBJS := $(notdir $(SHARED_SRCS:.c=.o))
+
+SRCS := main.c platform_host.c vcontroller.c testclock.c
+OBJS := $(SRCS:.c=.o) $(SHARED_OBJS) sha256.o
 
 all: $(BIN)
 
@@ -15,6 +21,9 @@ $(BIN): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(SHARED_OBJS): %.o: ../%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # SHA-256 is vendored at the repository root and shared with the PS5 build.

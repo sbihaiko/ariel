@@ -918,14 +918,19 @@ def scenario_vcontroller_host_only(server):
     compiler = os.environ.get("CC", "cc")
     with tempfile.TemporaryDirectory() as scratch:
         obj = os.path.join(scratch, "vcontroller.o")
-        denied = subprocess.run([compiler, "-c", "-o", obj, source],
-                                capture_output=True, text=True)
+        # The shared headers live at the repository root, as in the host
+        # build's own include path.
+        include = "-I%s" % repo
+        denied = subprocess.run(
+            [compiler, include, "-c", "-o", obj, source],
+            capture_output=True, text=True)
         assert denied.returncode != 0, (
             "vcontroller.c must refuse to compile without ARIEL_HOST_BUILD")
         assert "the virtual controller is host-only" in denied.stderr, (
             "the refusal must name the guard, got %r" % denied.stderr)
         allowed = subprocess.run(
-            [compiler, "-c", "-o", obj, "-DARIEL_HOST_BUILD=1", source],
+            [compiler, include, "-c", "-o", obj, "-DARIEL_HOST_BUILD=1",
+             source],
             capture_output=True, text=True)
         assert allowed.returncode == 0, (
             "vcontroller.c must compile for the host build, got %r"

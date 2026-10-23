@@ -1,4 +1,4 @@
-/* Ariel host build: the agent protocol.
+/* Ariel: the agent protocol.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
