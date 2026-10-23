@@ -19,6 +19,10 @@ along with this program; see the file COPYING. If not, see
  * monotonic clock, approvals from the controller, and spawning a payload
  * through the ELF loader. There is no test clock and no virtual
  * controller here, and nothing on the network can grant an approval.
+ *
+ * The controller is the approval source recorded in ADR-0006; the
+ * controller spike (docs/controller-spike.md) is the console run that
+ * validates reading it while another app is in the foreground.
  **/
 
 #include <arpa/inet.h>

@@ -12,3 +12,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0003](0003-commits-and-pushes-are-automatic.md) | Commits and pushes are automatic |
 | [0004](0004-language-of-the-record.md) | Everything written is English |
 | [0005](0005-where-decisions-go.md) | Where decisions go |
+| [0006](0006-the-controller-is-the-approval-source.md) | The controller is the approval source on PS5 |
