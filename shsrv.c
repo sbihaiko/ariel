@@ -337,13 +337,53 @@ ensure_dir(const char *path) {
 
 
 /**
+ * Prepare Ariel's state and start the agent port. A failure here is told to
+ * the owner and nothing else happens: the telnet shell is the way back in
+ * when /data cannot be written, the token cannot be read or the store cannot
+ * be prepared, so it must still come up.
+ **/
+static void
+start_ariel(void) {
+  platform_t *platform;
+  pthread_t agent;
+
+  if(ensure_dir(STATE_DIR) || ensure_dir(STATE_DIR "/staging")) {
+    notify("Ariel: cannot prepare %s", STATE_DIR);
+    return;
+  }
+
+  if(token_load_or_create(STATE_DIR, agent_token)) {
+    notify("Ariel: cannot load or create the access token in %s", STATE_DIR);
+    return;
+  }
+
+  platform = platform_ps5(agent_token);
+
+  if(store_init(STATE_DIR, platform)) {
+    notify("Ariel: cannot prepare the store in %s", STATE_DIR);
+    return;
+  }
+
+  // The token is shown at start and with every approval prompt, so the
+  // owner can always hand it to the agent.
+  notify("Ariel agent port %d\ntoken %s", AGENT_PORT, agent_token);
+
+  if(pthread_create(&agent, NULL, serve_agent, platform)) {
+    klog_perror("pthread_create");
+    notify("Ariel: cannot start the agent port %d", AGENT_PORT);
+    return;
+  }
+
+  pthread_detach(agent);
+}
+
+
+/**
  * Launch shsrv.elf.
  **/
 int
 main(void) {
   int notify_user = 1;
-  platform_t *platform;
-  pthread_t agent;
   pid_t pid;
 
   syscall(SYS_thr_set_name, -1, "shsrv.elf");
@@ -365,33 +405,9 @@ main(void) {
   // threads of their own.
   signal(SIGCHLD, SIG_DFL);
 
-  if(ensure_dir(STATE_DIR) || ensure_dir(STATE_DIR "/staging")) {
-    notify("Ariel: cannot prepare %s", STATE_DIR);
-    return EXIT_FAILURE;
-  }
-
-  if(token_load_or_create(STATE_DIR, agent_token)) {
-    notify("Ariel: cannot load or create the access token in %s", STATE_DIR);
-    return EXIT_FAILURE;
-  }
-
-  platform = platform_ps5(agent_token);
-
-  if(store_init(STATE_DIR, platform)) {
-    notify("Ariel: cannot prepare the store in %s", STATE_DIR);
-    return EXIT_FAILURE;
-  }
-
-  // The token is shown at start and with every approval prompt, so the
-  // owner can always hand it to the agent.
-  notify("Ariel agent port %d\ntoken %s", AGENT_PORT, agent_token);
-
-  if(pthread_create(&agent, NULL, serve_agent, platform)) {
-    klog_perror("pthread_create");
-    notify("Ariel: cannot start the agent port %d", AGENT_PORT);
-  } else {
-    pthread_detach(agent);
-  }
+  // Ariel's state never gates the recovery shell: whatever fails here, the
+  // telnet shell below still serves.
+  start_ariel();
 
   while(1) {
     serve_sh(TELNET_PORT, notify_user);
