@@ -23,6 +23,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "platform.h"
+#include "vcontroller.h"
 
 
 static int
@@ -87,14 +88,25 @@ host_clock(platform_t *self, struct timespec *now) {
 }
 
 
+static int
+host_approval_request(platform_t *self, const approval_facts_t *facts,
+                      char *id, size_t idlen) {
+  (void)self;
+
+  return vcontroller_request(facts, id, idlen);
+}
+
+
 static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
   .clock = host_clock,
+  .approval_request = host_approval_request,
 };
 
 
 platform_t *
 platform_host(void) {
+  vcontroller_start();
   return &host_platform;
 }

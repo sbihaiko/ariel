@@ -20,9 +20,20 @@ along with this program; see the file COPYING. If not, see
 #include "platform.h"
 
 /**
+ * What one agent connection needs: the platform port, the access token and
+ * Ariel's state directory. The server fills it in once and shares it with
+ * every connection.
+ **/
+typedef struct {
+  platform_t *platform;
+  const char *token;
+  const char *state_dir;
+} agent_t;
+
+/**
  * Serve one agent connection: read the auth line, read exactly one command,
  * write the reply and return. The caller owns fd and closes it.
  **/
-void agent_serve(platform_t *platform, int fd, const char *token);
+void agent_serve(agent_t *agent, int fd);
 
 #endif /* ARIEL_AGENT_H */

@@ -36,7 +36,7 @@ along with this program; see the file COPYING. If not, see
 
 
 struct connection {
-  platform_t *platform;
+  agent_t *agent;
   int fd;
 };
 
@@ -58,7 +58,7 @@ serve_connection(void *arg) {
   struct connection *conn = arg;
   int fd = conn->fd;
 
-  agent_serve(conn->platform, fd, agent_token);
+  agent_serve(conn->agent, fd);
   close(fd);
   free(conn);
 
@@ -94,9 +94,11 @@ parse_args(int argc, char **argv, uint16_t *port, const char **root) {
 
 int
 main(int argc, char **argv) {
+  char staging_dir[PATH_MAX];
   char state_dir[PATH_MAX];
   char data_dir[PATH_MAX];
   platform_t *platform;
+  agent_t agent;
   const char *root;
   uint16_t port = DEFAULT_PORT;
   int srvfd;
@@ -116,12 +118,15 @@ main(int argc, char **argv) {
   if(snprintf(data_dir, sizeof(data_dir), "%s/data", root) >=
      (int)sizeof(data_dir) ||
      snprintf(state_dir, sizeof(state_dir), "%s/ariel", data_dir) >=
-     (int)sizeof(state_dir)) {
+     (int)sizeof(state_dir) ||
+     snprintf(staging_dir, sizeof(staging_dir), "%s/staging", state_dir) >=
+     (int)sizeof(staging_dir)) {
     fprintf(stderr, "root path is too long\n");
     return EXIT_FAILURE;
   }
 
-  if(ensure_dir(root) || ensure_dir(data_dir) || ensure_dir(state_dir)) {
+  if(ensure_dir(root) || ensure_dir(data_dir) || ensure_dir(state_dir) ||
+     ensure_dir(staging_dir)) {
     return EXIT_FAILURE;
   }
 
@@ -135,6 +140,10 @@ main(int argc, char **argv) {
   if((srvfd=platform->listen(platform, port)) < 0) {
     return EXIT_FAILURE;
   }
+
+  agent.platform = platform;
+  agent.token = agent_token;
+  agent.state_dir = state_dir;
 
   // The harness reads the token from standard output. Print it only once
   // the listener is ready, so the line also announces that the port is up.
@@ -159,7 +168,7 @@ main(int argc, char **argv) {
       continue;
     }
 
-    conn->platform = platform;
+    conn->agent = &agent;
     conn->fd = connfd;
 
     rc = pthread_create(&thread, NULL, serve_connection, conn);

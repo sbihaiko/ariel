@@ -43,7 +43,7 @@ all: shsrv-ps5.elf sh.elf controller-spike.elf
 
 shsrv.o: sh.elf.inc
 
-shsrv-ps5.elf: shsrv.o elfldr.o pt.o notify.o
+shsrv-ps5.elf: shsrv.o elfldr.o pt.o notify.o sha256.o
 	$(CC) -lkernel_sys -o $@ $^
 
 sh.elf: sh.o builtin.o elfldr.o pt.o libtelnet.o

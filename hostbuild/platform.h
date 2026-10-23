@@ -17,13 +17,34 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_PLATFORM_H
 #define ARIEL_PLATFORM_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
+/** The longest payload name the agent port accepts. **/
+#define PAYLOAD_NAME_MAX 32
+
+/** An approval ID is short, for example a-1. **/
+#define APPROVAL_ID_MAX 32
+
+/**
+ * The immutable fact record an approval is bound to: what exactly the
+ * owner approves. A copy of it, never a pointer, is what the platform
+ * holds, so a caller cannot change the facts after the request.
+ **/
+typedef struct {
+  char name[PAYLOAD_NAME_MAX + 1];
+  uint64_t size;
+  char sha256[65];
+  char staging_id[APPROVAL_ID_MAX];
+  int run;  /** The approved build will be executed. **/
+} approval_facts_t;
+
 /**
  * The platform port. For this tracer it holds only what the agent port
- * needs to run: listening, accepting and a clock. The PS5 implementation
- * and the rest of the port arrive with the Stage 1 tickets.
+ * needs to run: listening, accepting, a clock and approval requests. The
+ * PS5 implementation and the rest of the port arrive with the Stage 1
+ * tickets.
  **/
 typedef struct platform platform_t;
 
@@ -36,6 +57,14 @@ struct platform {
 
   /** Read the platform's monotonic clock. **/
   void (*clock)(platform_t *self, struct timespec *now);
+
+  /**
+   * Ask the owner to approve the facts' action and show the prompt on the
+   * console. On success write the approval ID into id and return 0; return
+   * -1 when no approval can be requested now.
+   **/
+  int (*approval_request)(platform_t *self, const approval_facts_t *facts,
+                          char *id, size_t idlen);
 };
 
 /** The implementation for the host operating system. **/
