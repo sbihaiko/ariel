@@ -27,6 +27,7 @@ along with this program; see the file COPYING. If not, see
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -35,7 +36,9 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#if defined(__linux__)
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
 #include <sys/syscall.h>
 #endif
 #include <unistd.h>
@@ -56,7 +59,7 @@ static char run_dir[PATH_MAX];
  **/
 static pthread_mutex_t spawn_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/** The largest descriptor the child sweeps, read before any thread forks. **/
+/** One past the largest descriptor the child sweeps, read before any fork. **/
 static long fd_limit = 1024;
 
 
@@ -180,33 +183,44 @@ write_all(int fd, const unsigned char *buf, size_t len) {
  * Close every descriptor above the standard ones except keep. This runs in
  * the child after fork, so it allocates nothing and takes no lock: close()
  * everywhere, or one close_range() syscall where the platform has it. It is
- * the second line of defence behind close-on-exec: a connection accepted by
- * another thread just before the fork is still closed here.
+ * the second line of defence behind close-on-exec: another thread can accept
+ * a connection between the fork and exec, so the child inherits that
+ * descriptor before it is marked close-on-exec.
+ *
+ * The sweep covers every descriptor number the process can hold. A
+ * descriptor above it would survive into the payload and keep another
+ * client's connection open after Ariel finished it.
  **/
 static void
 close_extra_fds(int keep) {
-#if defined(__APPLE__)
-  int fd;
+#if defined(SYS_close_range)
+  int covered = 1;
 
-  for(fd = 3; fd < fd_limit; fd++) {
-    if(fd != keep) {
-      close(fd);
-    }
+  if(keep > 3 &&
+     syscall(SYS_close_range, 3u, (unsigned int)keep - 1u, 0u) != 0) {
+    covered = 0;
   }
-#elif defined(SYS_close_range)
-  if(keep > 3) {
-    syscall(SYS_close_range, 3u, (unsigned int)keep - 1u, 0u);
+  if(syscall(SYS_close_range, (unsigned int)keep + 1u, ~0u, 0u) != 0) {
+    covered = 0;
   }
-  syscall(SYS_close_range, (unsigned int)keep + 1u, ~0u, 0u);
-#else
-  int fd;
+  if(covered) {
+    return;
+  }
 
-  for(fd = 3; fd < fd_limit; fd++) {
-    if(fd != keep) {
-      close(fd);
-    }
-  }
+  // A kernel without close_range(2), or one that refused it: sweep every
+  // descriptor number instead. fd_limit was read before any thread could
+  // fork, so an accepted connection cannot hide above the sweep.
 #endif
+
+  {
+    long fd;
+
+    for(fd = 3; fd < fd_limit; fd++) {
+      if(fd != keep) {
+        close((int)fd);
+      }
+    }
+  }
 }
 
 
@@ -394,19 +408,47 @@ static platform_t host_platform = {
 };
 
 
+/**
+ * One past the highest descriptor number this process can hold. sysconf
+ * reports RLIMIT_NOFILE; on macOS the kernel's per-process cap bounds the
+ * numbers that are actually handed out, and the smaller of the two is the
+ * bound the child has to sweep.
+ **/
+static long
+open_max(void) {
+  long limit = sysconf(_SC_OPEN_MAX);
+
+#if defined(__APPLE__)
+  int maxfiles = 0;
+  size_t size = sizeof(maxfiles);
+
+  if(sysctlbyname("kern.maxfilesperproc", &maxfiles, &size, NULL, 0) == 0 &&
+     maxfiles > 2 && (limit < 0 || (long)maxfiles < limit)) {
+    limit = maxfiles;
+  }
+#endif
+
+  if(limit > (long)INT_MAX) {
+    limit = (long)INT_MAX;
+  }
+
+  return limit;
+}
+
+
 platform_t *
 platform_host(const char *dir) {
   long limit;
 
   snprintf(run_dir, sizeof(run_dir), "%s", dir);
 
-  // Read the descriptor limit here, before any connection thread exists:
+  // Read the descriptor bound here, before any connection thread exists:
   // the child after fork sweeps descriptors up to it and may not call
-  // anything that reads the process environment safely. The cap keeps a
-  // fallback sweep short; close-on-exec already covers the descriptors
-  // above it.
-  limit = sysconf(_SC_OPEN_MAX);
-  if(limit > 2 && limit <= 65536) {
+  // anything that reads the process environment safely. Neither limit is
+  // shortened further; a descriptor above the sweep would survive into the
+  // payload.
+  limit = open_max();
+  if(limit > 2) {
     fd_limit = limit;
   }
 

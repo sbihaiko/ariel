@@ -402,23 +402,63 @@ def scenario_run_needs_no_new_approval(server):
     assert_staged(server, lines, "once", other)
 
 
-SLEEP_SOURCE = """
+LINGER_SOURCE = """
+#include <fcntl.h>
 #include <stdio.h>
+#include <time.h>
 #include <unistd.h>
 
 int
-main(void) {
-  sleep(2);
+main(int argc, char* argv[]) {
+  struct timespec pause = {0, 10 * 1000 * 1000};
+  FILE* started;
+
+  if(argc < 3) {
+    return 2;
+  }
+
+  // Signal that the payload is running, then wait for the harness to let
+  // it finish. Neither side has to guess how long a fork or a run takes.
+  started = fopen(argv[1], "w");
+  if(!started) {
+    return 2;
+  }
+  if(fputs("started\\n", started) == EOF) {
+    (void)fclose(started);
+    return 2;
+  }
+  if(fclose(started) != 0) {
+    return 2;
+  }
+
+  while(access(argv[2], F_OK) != 0) {
+    (void)nanosleep(&pause, NULL);
+  }
+
   printf("awake\\n");
   return 0;
 }
 """
 
 
+def wait_for_file(path, timeout=5.0):
+    """Wait for an explicit signal from the payload, never a guessed delay."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def scenario_run_does_not_leak_connections(server):
     """A finished connection must reach end of stream while a run is going."""
-    data = compile_payload(SLEEP_SOURCE, "sleepy")
-    install_payload(server, "sleepy", data)
+    data = compile_payload(LINGER_SOURCE, "linger")
+    install_payload(server, "linger", data)
+
+    workdir = tempfile.mkdtemp(prefix="ariel-linger-")
+    started = os.path.join(workdir, "started")
+    release = os.path.join(workdir, "release")
 
     # This client's connection is accepted and still open when the run
     # forks its payload. The exit path of the quick start's `nc` reads
@@ -427,14 +467,18 @@ def scenario_run_does_not_leak_connections(server):
     stalled = server.connect(timeout=5.0)
     try:
         stalled.sendall(("auth %s\n" % server.token).encode("ascii"))
-        time.sleep(0.1)  # let the server accept and park on the command line
 
         outcome = []
         worker = threading.Thread(
-            target=lambda: outcome.append(run_payload(server, "sleepy")))
+            target=lambda: outcome.append(
+                run_payload(server, "linger", (started, release))))
         worker.start()
         try:
-            time.sleep(0.4)  # the payload is forked by now
+            # The payload itself says when it has started, and it stays
+            # running until the release file appears, so the end-of-stream
+            # check below cannot be satisfied by the payload exiting first.
+            assert wait_for_file(started), (
+                "the payload never signalled that it started")
             stalled.shutdown(socket.SHUT_WR)
             stalled.settimeout(1.0)
             try:
@@ -447,6 +491,9 @@ def scenario_run_does_not_leak_connections(server):
                     "client waited for end of stream until the payload exited"
                 )
         finally:
+            # Let the payload finish even when the check above failed.
+            with open(release, "w") as handle:
+                handle.write("go\n")
             worker.join(timeout=10.0)
         assert not worker.is_alive(), "the run did not finish"
         assert outcome and outcome[0] == ["awake", "status 0", "exit 0"], (
