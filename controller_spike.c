@@ -90,6 +90,8 @@ static size_t   transcript_len;
 static unsigned int user_error;
 static unsigned int init_error;
 static unsigned int open_error;
+static unsigned int login_error;
+static int login_reported;
 
 
 /**
@@ -228,6 +230,43 @@ report_error(const char* what, unsigned int code, unsigned int* last) {
 
 
 /**
+ * Try every logged-in user when the chosen user cannot open the pad.
+ **/
+static int
+pad_open_login_users(int* user_id) {
+  user_login_list_t list;
+  int handle;
+  int err;
+  int i;
+
+  memset(&list, 0xff, sizeof(list));
+  err = sceUserServiceGetLoginUserIdList(&list);
+  if(err) {
+    report_error("login list", (unsigned int)err, &login_error);
+    return -1;
+  }
+
+  for(i = 0; i < USER_LOGIN_MAX; i++) {
+    if(list.user_id[i] < 0 || list.user_id[i] == *user_id) {
+      continue;
+    }
+    handle = scePadOpen(list.user_id[i], PAD_PORT_TYPE_STANDARD, 0, NULL);
+    if(handle >= 0 || !login_reported) {
+      report("login user %d open 0x%08x", list.user_id[i],
+             (unsigned int)(handle < 0 ? handle : 0));
+    }
+    if(handle >= 0) {
+      *user_id = list.user_id[i];
+      return handle;
+    }
+  }
+
+  login_reported = 1;
+  return -1;
+}
+
+
+/**
  * Open the controller for the console's user, retrying later on failure.
  **/
 static int
@@ -270,7 +309,10 @@ pad_attempt(int* user_id) {
   handle = scePadOpen(*user_id, PAD_PORT_TYPE_STANDARD, 0, NULL);
   if(handle < 0) {
     report_error("open", (unsigned int)handle, &open_error);
-    return -1;
+    handle = pad_open_login_users(user_id);
+    if(handle < 0) {
+      return -1;
+    }
   }
 
   open_error = 0;

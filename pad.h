@@ -64,6 +64,14 @@ int sceUserServiceInitialize(void* init_params);
 int sceUserServiceTerminate(void);
 int sceUserServiceGetInitialUser(int* user_id);
 int sceUserServiceGetForegroundUser(int* user_id);
+
+#define USER_LOGIN_MAX 4
+
+typedef struct {
+  int user_id[USER_LOGIN_MAX]; // -1 marks an empty slot
+} user_login_list_t;
+
+int sceUserServiceGetLoginUserIdList(user_login_list_t* list);
 int scePadInit(void);
 int scePadOpen(int user_id, int type, int index, void* param);
 int scePadReadState(int handle, pad_data_t* data);
