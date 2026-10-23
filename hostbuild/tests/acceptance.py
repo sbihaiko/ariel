@@ -376,6 +376,41 @@ def scenario_run_stale_object(server):
     )
 
 
+def scenario_run_fifo_object(server):
+    # A fresh server: a run that hangs must not take the other checks down.
+    fresh = Server(server.binary)
+    try:
+        data = compile_payload(HELLO_SOURCE, "fifo")
+        hash_hex = install_payload(fresh, "fifo", data)
+        other = install_payload(fresh, "fine", compile_payload(
+            HELLO_SOURCE, "fine"))
+        path = os.path.join(store_dir(fresh), "objects", hash_hex)
+        os.unlink(path)
+        os.mkfifo(path, 0o600)
+
+        # A FIFO with no writer must not block the open, and the stale
+        # answer must come back while the store is still usable.
+        sock = fresh.connect(timeout=3.0)
+        try:
+            sock.sendall(("auth %s\npayload run --wait fifo\n"
+                          % fresh.token).encode("ascii"))
+            lines = reply_lines(read_reply(sock))
+        finally:
+            sock.close()
+        assert lines == ["approval_stale", "exit 78"], (
+            "a FIFO in place of a committed object must answer "
+            "approval_stale and exit 78, got %r" % lines
+        )
+
+        lines = run_payload(fresh, "fine")
+        assert lines[-2:] == ["status 0", "exit 0"], (
+            "another client must still run after the FIFO, got %r" % lines
+        )
+        assert other
+    finally:
+        fresh.stop()
+
+
 def scenario_run_needs_no_new_approval(server):
     data = compile_payload(HELLO_SOURCE, "once")
     install_payload(server, "once", data)
@@ -601,6 +636,21 @@ def scenario_quick_start_broken_setup(server):
         mutated = text.replace(export, replacement, 1)
         assert mutated != text, "the section must hold the export command"
         fixture_fails(server, mutated, description)
+
+
+def scenario_quick_start_unlabeled_block(server):
+    import quickstart
+
+    with open(doc_path()) as handle:
+        text = handle.read()
+    section = quickstart.after_stage1(text)
+
+    for label in ("sh", "bash", "shell", ""):
+        extra = "\n```%s\n$ no-such-ariel-command\n```\n" % label
+        mutated = text.replace(section, section.rstrip("\n") + extra + "\n", 1)
+        assert mutated != text, "the section must be found"
+        fixture_fails(server, mutated,
+                      "a failing command in a '%s' block" % label)
 
 
 def staging_path(server, staging_id):
@@ -912,6 +962,9 @@ def main():
         check("an object changed behind Ariel's back answers approval_stale "
               "and exit 78 and does not run",
               lambda: scenario_run_stale_object(server))
+        check("a FIFO in place of a committed object answers approval_stale "
+              "and exit 78 without blocking other clients",
+              lambda: scenario_run_fifo_object(server))
         check("a run of a committed build needs no new approval, and a push "
               "of a different build asks again",
               lambda: scenario_run_needs_no_new_approval(server))
@@ -926,6 +979,9 @@ def main():
               lambda: scenario_quick_start_doc_drift(server))
         check("a broken setup command or a wrong exported token makes the "
               "fixture fail", lambda: scenario_quick_start_broken_setup(server))
+        check("a failing '$' command in a block of any label makes the "
+              "fixture fail",
+              lambda: scenario_quick_start_unlabeled_block(server))
     finally:
         server.stop()
 

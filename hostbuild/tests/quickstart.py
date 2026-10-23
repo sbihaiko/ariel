@@ -93,7 +93,8 @@ def parse_items(section):
                 body.append(lines[index])
                 index += 1
             index += 1
-            if tag == "console":
+            # Every block that holds a `$` command runs, whatever its label.
+            if tag == "console" or any(l.startswith("$ ") for l in body):
                 items.append(("console", body))
             continue
         prose.append(line)

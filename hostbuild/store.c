@@ -874,7 +874,9 @@ store_run_load(const char *name, store_object_t *object) {
 
   // Open the object through the record, without following a link, and
   // read it once. The bytes that are hashed are the bytes that run.
-  if((fd=open_entry(objects_fd, expected, O_RDONLY)) < 0) {
+  // O_NONBLOCK keeps a FIFO with no writer from hanging the open while the
+  // store lock is held; object_load rejects anything but a regular file.
+  if((fd=open_entry(objects_fd, expected, O_RDONLY | O_NONBLOCK)) < 0) {
     goto out;
   }
 
