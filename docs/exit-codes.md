@@ -12,6 +12,8 @@ The inspection commands add these error words, all with exit 1: `missing_operand
 
 The file commands `mkdir`, `rmdir`, `touch` and `rm` take one absolute path. Each one answers `approval_required` (75) with a challenge first, and runs only after the owner signs it. The challenge binds the path and the entry's identity (kind, device and inode); the approval is single-use. Any other command outside the read-only set is gated the same way and then does nothing, answering `unknown_command`. A write outside `/data`, `/user` and `/mnt/usb*` answers `protected` (87) without asking.
 
+`kill <pid> <SIGNAL>` is gated like a payload commit: it answers `approval_required` with exit 75 until the owner signs its challenge, which binds the pid, the signal and the process's start identity. After a grant, the same command runs once and answers `killed <pid> <SIGNAL>` with exit 0. Its error words are `bad_signal` (the signal is not TERM, KILL, INT or HUP), `no_such_process` and `kill_failed`, all exit 1; a pid that is not a decimal number answers `unknown_command`, and a kill with another argument count is an unlisted command, gated like any other. The audit log records `kill.request`, `kill.done`, `kill.stale`, `kill.failed` and `kill.protected`, like the file commands. Exit 87 (`protected`) covers a kill of a critical process and of Ariel's own process; those are refused whether or not an approval exists. A process that was restarted under the same pid answers `approval_stale` with exit 78, and its approval is spent.
+
 ## Assigned
 
 | Exit | Word | Meaning | What the agent does |

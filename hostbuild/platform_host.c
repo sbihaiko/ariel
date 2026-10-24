@@ -28,6 +28,7 @@ along with this program; see the file COPYING. If not, see
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -290,6 +291,64 @@ host_approval_grant(platform_t *self, const char *id,
   (void)self;
 
   return store_approval_grant(id, signature, console, action_sha256);
+}
+
+
+static int
+host_processes(platform_t *self, int32_t *pids, size_t max) {
+  FILE *ps;
+  char line[64];
+  size_t count = 0;
+
+  (void)self;
+
+  if(!(ps=popen("ps -axo pid=", "r"))) {
+    return -1;
+  }
+  while(fgets(line, sizeof(line), ps)) {
+    char *end;
+    long pid = strtol(line, &end, 10);
+
+    if(end == line || count == max) {
+      continue;
+    }
+    pids[count++] = (int32_t)pid;
+  }
+  if(pclose(ps) == -1) {
+    return -1;
+  }
+  return (int)count;
+}
+
+
+/** The process the harness marks critical, read from the environment. **/
+static int32_t critical_pid;
+
+static int
+host_process_start(platform_t *self, int32_t pid, char *out, size_t size) {
+  (void)self;
+
+  if(pid <= 0 || (kill((pid_t)pid, 0) && errno != EPERM)) {
+    return -1;
+  }
+  snprintf(out, size, "h.%u", vcontroller_epoch(pid));
+  return 0;
+}
+
+
+static int
+host_process_critical(platform_t *self, int32_t pid) {
+  (void)self;
+
+  return pid == (int32_t)getpid() || (critical_pid > 0 && pid == critical_pid);
+}
+
+
+static int
+host_process_signal(platform_t *self, int32_t pid, int sig) {
+  (void)self;
+
+  return kill((pid_t)pid, sig) ? -1 : 0;
 }
 
 
@@ -719,6 +778,10 @@ static platform_t host_platform = {
   .spawn_kill = host_spawn_kill,
   .run = host_run,
   .fault = host_fault,
+  .processes = host_processes,
+  .process_start = host_process_start,
+  .process_critical = host_process_critical,
+  .process_signal = host_process_signal,
 };
 
 
@@ -781,6 +844,14 @@ platform_host(const char *dir, const char *fs_root) {
     if(seed && *seed && strlen(seed) < sizeof(nonce_seed)) {
       snprintf(nonce_seed, sizeof(nonce_seed), "%s", seed);
       nonce_seeded = 1;
+    }
+  }
+
+  {
+    const char *pid = getenv("ARIEL_HOST_CRITICAL_PID");
+
+    if(pid && *pid) {
+      critical_pid = (int32_t)strtol(pid, NULL, 10);
     }
   }
 

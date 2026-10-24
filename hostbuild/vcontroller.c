@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,8 +38,18 @@ along with this program; see the file COPYING. If not, see
 /** The longest prompt text the controller shows. **/
 #define PROMPT_MAX 256
 
+/** How many pids the controller tracks restarts for. **/
+#define EPOCH_MAX 32
+
 static pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t started = PTHREAD_ONCE_INIT;
+
+static pthread_mutex_t epoch_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+  int32_t pid;
+  unsigned epoch;
+} epochs[EPOCH_MAX];
+static size_t epoch_count;
 
 
 /**
@@ -56,6 +67,62 @@ print_line(const char *fmt, ...) {
   putchar('\n');
   fflush(stdout);
   pthread_mutex_unlock(&out_lock);
+}
+
+
+unsigned
+vcontroller_epoch(int32_t pid) {
+  unsigned epoch = 0;
+  size_t i;
+
+  pthread_mutex_lock(&epoch_lock);
+  for(i=0; i<epoch_count; i++) {
+    if(epochs[i].pid == pid) {
+      epoch = epochs[i].epoch;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&epoch_lock);
+
+  return epoch;
+}
+
+
+static int
+record_restart(int32_t pid) {
+  size_t i;
+  int done = 0;
+
+  pthread_mutex_lock(&epoch_lock);
+  for(i=0; i<epoch_count && !done; i++) {
+    if(epochs[i].pid == pid) {
+      epochs[i].epoch++;
+      done = 1;
+    }
+  }
+  if(!done && epoch_count < EPOCH_MAX) {
+    epochs[epoch_count].pid = pid;
+    epochs[epoch_count].epoch = 1;
+    epoch_count++;
+    done = 1;
+  }
+  pthread_mutex_unlock(&epoch_lock);
+
+  return done ? 0 : -1;
+}
+
+
+static void
+restart(const char *text) {
+  char *end;
+  long pid = strtol(text, &end, 10);
+
+  if(end == text || *end || pid <= 0 || pid > INT32_MAX ||
+     record_restart((int32_t)pid)) {
+    print_line("unknown_command");
+    return;
+  }
+  print_line("restarted %ld", pid);
 }
 
 
@@ -84,6 +151,8 @@ handle_line(char *line) {
     print_line("%s", clock_reply);
   } else if(!strncmp(line, "deny ", 5)) {
     deny(line + 5);
+  } else if(!strncmp(line, "restart ", 8)) {
+    restart(line + 8);
   } else if(len > 0) {
     print_line("unknown_command");
   }

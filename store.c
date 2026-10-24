@@ -833,7 +833,8 @@ decimal(uint64_t value, char *out, size_t size) {
  * The action an approval is of, with its options. A payload's build is an
  * action on its name. A gated command is an action on its target, with the
  * entry's kind and identity, or with the argument count of a command nothing
- * implements. text holds the numbers the options point at.
+ * implements. A kill is an action on its pid, with the hash of its pid and
+ * start, its signal and start. text holds the numbers the options point at.
  **/
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
@@ -843,7 +844,14 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     action->command = facts->command;
     action->target = facts->target;
     action->sha256 = APPROVAL_NO_HASH;
-    if(facts->kind[0]) {
+    if(!strcmp(facts->command, "kill")) {
+      action->sha256 = facts->sha256;
+      options[0].key = "signal";
+      options[0].value = facts->signal;
+      options[1].key = "start";
+      options[1].value = facts->start;
+      action->noptions = 2;
+    } else if(facts->kind[0]) {
       decimal(facts->dev, text[0], sizeof(text[0]));
       decimal(facts->ino, text[1], sizeof(text[1]));
       options[0].key = "kind";
@@ -951,8 +959,12 @@ store_approval_request(const approval_facts_t *facts,
   slot->challenge.action_len = (size_t)len;
   slot->challenge.issued_ms = now;
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
+  slot->facts = *facts;
 
-  if(slot->gated) {
+  if(slot->gated && !strcmp(facts->command, "kill")) {
+    snprintf(prompt, promptlen, "kill %s with %s (start %s) will run",
+             facts->target, facts->signal, facts->start);
+  } else if(slot->gated) {
     snprintf(prompt, promptlen, "%s %s will run", facts->command,
              facts->target);
   } else {
@@ -970,10 +982,14 @@ store_approval_request(const approval_facts_t *facts,
 }
 
 
-/** Whether two entries are the same object: the same kind, device and inode. **/
+/**
+ * Whether two targets are the same object: the same kind, device and inode,
+ * and for a kill the same signal and process start.
+ **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
-  return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino;
+  return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
+         !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start);
 }
 
 
@@ -1136,25 +1152,14 @@ store_approval_deny(const char *id) {
 int
 store_approval_facts(const char *id, approval_facts_t *facts) {
   struct approval *request;
-  struct staged *entry;
-  int found = 0;
-  int i;
+  int found;
 
   pthread_mutex_lock(&lock);
   request = approval_find(id);
+  found = request != NULL;
 
-  if(request && request->gated) {
+  if(found) {
     *facts = request->facts;
-    found = 1;
-  } else if(request) {
-    for(i=0; i<STAGING_MAX; i++) {
-      entry = &staged[i];
-      if(entry->used && !strcmp(entry->approval_id, id)) {
-        *facts = entry->facts;
-        found = 1;
-        break;
-      }
-    }
   }
   pthread_mutex_unlock(&lock);
 

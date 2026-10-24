@@ -503,6 +503,21 @@ def check_audit_tail(session, context):
         "no agent-port command may change the audit log")
 
 
+def check_kill_refusals(session, context):
+    del context
+    link = session.link
+    assert link.exchange("kill 99999999 NOPE") == ["bad_signal", "exit 1"]
+    assert link.exchange("kill 99999999 TERM") == ["no_such_process", "exit 1"]
+    assert link.exchange("kill x TERM") == ["unknown_command", "exit 1"]
+    lines = link.exchange("ps")
+    shells = [line.split() for line in lines[1:-1]
+              if line.split() and line.split()[-1] == "SceShellCore"]
+    assert shells, "the console must list SceShellCore, got %r" % lines
+    pid = shells[0][0]
+    assert link.exchange("kill %s TERM" % pid) == ["protected", "exit 87"], (
+        "SceShellCore must be refused with exit 87")
+
+
 def check_inspection_commands(session, context):
     del context
     link = session.link
@@ -575,6 +590,9 @@ CHECKS = [
      check_approval_status),
     ("a read-only command with a relative path answers relative_path and "
      "exit 1", check_read_only_relative),
+    ("kill with a bad signal, a bad pid or no such process answers an "
+     "error and exit 1, and SceShellCore is refused with exit 87",
+     check_kill_refusals),
     ("the read-only commands on the console's root and data directory exit 0",
      check_read_only_on_console),
     ("the token, approval state and nonces answer protected and exit 87 when "

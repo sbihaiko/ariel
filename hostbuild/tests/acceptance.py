@@ -20,6 +20,7 @@ import os
 import platform
 import queue
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -1062,6 +1063,11 @@ HOST_FILE_SCENARIOS = {
     "previous=-",
 }
 
+# Scenarios that act on a process only the host build starts (a victim the
+# suite spawns, or Ariel's own pid). A console has no such process to act on.
+HOST_FIXTURE_REASON = ("needs a process only the host build starts, which "
+                       "console mode cannot name")
+
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
@@ -1095,6 +1101,18 @@ CLOCK_SCENARIOS = {
     "a command nothing implements asks the owner and then does nothing",
     "a file command's audit lines reach audit tail",
     "the challenge of a file command names its path, sha256 none and identity",
+    "kill asks for approval, and a grant runs it once and audits the request, "
+    "grant and kill",
+    "a restarted process under the same pid answers approval_stale and exit "
+    "78 and is not signalled",
+    "a kill signal or start changed in the challenge answers "
+    "signature_action_mismatch, and the real grant still runs it",
+}
+
+# The scenarios that act on a process only the host build starts, or on
+# Ariel's own pid. A console has neither to act on.
+HOST_FIXTURE_SCENARIOS = {
+    "kill of Ariel's own process answers protected and exit 87",
 }
 
 # The read-only scenarios that need the host test root: they write scratch
@@ -1146,7 +1164,7 @@ def scenario_console_mode_plan(server):
         skipped.append(match.group(1))
 
     expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
-                      | HOST_FILE_SCENARIOS)
+                      | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
         "clock, the host test root, the fault injector or the host's files:"
@@ -3564,6 +3582,171 @@ def scenario_canonical_encoder(server):
     assert done.returncode == 0, "canonical_test failed:\n" + done.stdout
 
 
+# ---------------------------------------------------------------------------
+# kill (issue #25): gated by the owner's signature, bound to the target pid,
+# its signal and its start identity, and refused for critical processes.
+# ---------------------------------------------------------------------------
+
+KILL_PROMPT_LINE = re.compile(
+    r"^prompt (a-[0-9a-f]+) kill (\d+) with (TERM|KILL|INT|HUP) "
+    r"\(start (\S+)\) will run$")
+
+
+def critical_pid(server):
+    """A critical process: the host fixture, or SceShellCore on a console."""
+    pid = getattr(server, "critical_pid", None)
+    if pid is not None:
+        return pid
+    rows = rows_of(run_command(server, "ps"))
+    for row in rows[1:]:
+        if row[-1] == "SceShellCore":
+            return int(row[0])
+    raise AssertionError("the console lists no SceShellCore: %r" % rows)
+
+
+def kill_audit(server, kind, name):
+    """The audit lines of one kind that name one target."""
+    return [event for event in audit_tail(server)
+            if AUDIT_LINE.match(event)
+            and event.split()[1] == kind and event.split()[2] == str(name)]
+
+
+def kill_approval(server, pid, sig="TERM"):
+    """Request a kill and check its 75, challenge and prompt.
+
+    Returns the approval ID, the challenge line and the start identity the
+    challenge binds to the process.
+    """
+    server.advance(120000)
+    lines = run_command(server, "kill %d %s" % (pid, sig))
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "a kill needing approval must answer 75, got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0])
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert approval and challenge and challenge.group(1) == approval.group(1), (
+        "expected approval_required and a matching challenge, got %r" % lines)
+    action = challenge_action(lines[1]).split("\n")
+    assert "command=kill" in action and "target=%d" % pid in action and (
+        "option.signal=%s" % sig in action), (
+        "the challenge must name the kill, its pid and its signal: %r" % action)
+    starts = [line[len("option.start="):] for line in action
+              if line.startswith("option.start=")]
+    assert len(starts) == 1, "the challenge must bind one start: %r" % action
+    prompt = KILL_PROMPT_LINE.match(server.next_line() or "")
+    assert prompt and prompt.group(1) == approval.group(1) and (
+        prompt.group(2) == str(pid)) and prompt.group(3) == sig, (
+        "expected the kill prompt for %d, got %r" % (pid, lines))
+    assert prompt.group(4) == starts[0], "the prompt must show the bound start"
+    return approval.group(1), lines[1], starts[0]
+
+
+def spawn_victim():
+    return subprocess.Popen(["sleep", "600"])
+
+
+def scenario_kill_bad_arguments(server):
+    """The signal is read before the pid; a bad pid is unknown, and a wrong
+    arity is not a kill, so it is gated like any unlisted command."""
+    assert run_command(server, "kill 99999999 NOPE") == [
+        "bad_signal", "exit 1"]
+    assert run_command(server, "kill 99999999 TERM") == [
+        "no_such_process", "exit 1"]
+    assert run_command(server, "kill x TERM") == ["unknown_command", "exit 1"]
+    server.assert_no_line()
+    assert_unlisted_gated(server, "kill TERM")
+
+
+def scenario_kill_critical_refused(server):
+    """A critical process is refused with exit 87: no approval, no signal."""
+    pid = critical_pid(server)
+    assert run_command(server, "kill %d TERM" % pid) == [
+        "protected", "exit 87"], "a critical process must be refused"
+    server.assert_no_line()
+    assert kill_audit(server, "kill.protected", pid), (
+        "the refusal must be in the audit log")
+
+
+def scenario_kill_own_process_refused(server):
+    """Ariel never signals its own process: exit 87, no approval asked."""
+    pid = server.proc.pid
+    assert run_command(server, "kill %d TERM" % pid) == [
+        "protected", "exit 87"], "Ariel's own process must be refused"
+    server.assert_no_line()
+
+
+def scenario_kill_needs_grant_and_runs_once(server):
+    """A kill waits for the owner's signature, then runs once and is audited."""
+    victim = spawn_victim()
+    try:
+        pid = victim.pid
+        approval, challenge, _start = kill_approval(server, pid, "TERM")
+        assert victim.poll() is None, "the victim must live until the grant"
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "kill %d TERM" % pid) == [
+            "killed %d TERM" % pid, "exit 0"], "the granted kill must run"
+        assert victim.wait(timeout=5) == -signal.SIGTERM, (
+            "the victim must die of SIGTERM")
+        assert approval_status(server, approval) == [
+            "approval_status %s consumed" % approval, "exit 0"], (
+            "a performed kill spends its approval")
+        ours = [event.split()[1] for event in audit_tail(server)
+                if AUDIT_LINE.match(event) and event.split()[3] == approval]
+        assert ours == ["kill.request", "grant", "kill.done"], (
+            "the audit log must show the request, the grant and the kill: %r"
+            % ours)
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def scenario_kill_stale_after_restart(server):
+    """A process restarted under the same pid answers 78 and is not signalled."""
+    victim = spawn_victim()
+    try:
+        pid = victim.pid
+        approval, challenge, start = kill_approval(server, pid, "TERM")
+        sign_and_grant(server, approval, challenge)
+        server.controller("restart %d" % pid, "restarted %d" % pid)
+        assert run_command(server, "kill %d TERM" % pid) == [
+            "approval_stale", "exit 78"], (
+            "a restarted process must answer approval_stale")
+        assert victim.poll() is None, "a stale approval must signal nothing"
+        assert kill_audit(server, "kill.stale", pid), (
+            "the stale refusal must be in the audit log")
+        _approval, _challenge, restarted = kill_approval(server, pid, "TERM")
+        assert restarted != start, (
+            "the restarted process must bind a new start identity")
+        assert victim.poll() is None
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def scenario_kill_retarget_refused(server):
+    """A signature for another signal or start is refused; the real one runs."""
+    victim = spawn_victim()
+    try:
+        pid = victim.pid
+        approval, challenge, start = kill_approval(server, pid, "TERM")
+        swaps = [
+            ("signal", "option.signal=TERM", "option.signal=KILL"),
+            ("start", "option.start=%s" % start, "option.start=h.9"),
+        ]
+        for what, old, new in swaps:
+            signature = sign_challenge(server, retarget(challenge, old, new))
+            assert grant(server, approval, signature) == [
+                "signature_action_mismatch", "exit 85"], (
+                "a signature for another %s must be refused" % what)
+        assert victim.poll() is None, "a refused grant must signal nothing"
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "kill %d TERM" % pid) == [
+            "killed %d TERM" % pid, "exit 0"]
+        assert victim.wait(timeout=5) == -signal.SIGTERM
+    finally:
+        victim.kill()
+        victim.wait()
+
+
 SERVER_BINARY = "./ariel-host"
 
 
@@ -3735,6 +3918,19 @@ SCENARIOS = [
      scenario_signature_twice, CLOCK_REASON),
     ("a consumed nonce is refused after Ariel restarts",
      scenario_signature_replay_after_restart, CLOCK_REASON),
+    ("kill with a bad signal, a bad pid or no such process answers an "
+     "error and exit 1, and a wrong arity is gated", scenario_kill_bad_arguments, False),
+    ("kill of the critical process answers protected and exit 87 and asks "
+     "no approval", scenario_kill_critical_refused, False),
+    ("kill of Ariel's own process answers protected and exit 87",
+     scenario_kill_own_process_refused, HOST_FIXTURE_REASON),
+    ("kill asks for approval, and a grant runs it once and audits the request, "
+     "grant and kill", scenario_kill_needs_grant_and_runs_once, True),
+    ("a restarted process under the same pid answers approval_stale and exit "
+     "78 and is not signalled", scenario_kill_stale_after_restart, True),
+    ("a kill signal or start changed in the challenge answers "
+     "signature_action_mismatch, and the real grant still runs it",
+     scenario_kill_retarget_refused, True),
     ("the PS5 build rejects the host test key",
      scenario_ps5_rejects_test_key, None),
     ("the PS5 platform no longer reads the controller",
@@ -3806,12 +4002,17 @@ def main():
     binary = argv[0] if argv else "./ariel-host"
     global SERVER_BINARY
     SERVER_BINARY = binary
-    server = Server(binary)
+    # The critical fixture is named to Ariel at start, so it must exist first.
+    critical = subprocess.Popen(["sleep", "600"])
+    server = Server(binary, env={"ARIEL_HOST_CRITICAL_PID": str(critical.pid)})
+    server.critical_pid = critical.pid
     try:
         for title, scenario, _clock in SCENARIOS:
             check(title, lambda scenario=scenario: scenario(server))
     finally:
         server.stop()
+        critical.kill()
+        critical.wait()
 
     failed = [name for name, ok, _ in results if not ok]
     if failed:

@@ -16,6 +16,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +110,29 @@ static const char spawn_failed[] =
 static const char audit_failed[] =
   "audit_failed\n"
   "exit 1\n";
+static const char bad_signal[] =
+  "bad_signal\n"
+  "exit 1\n";
+static const char no_such_process[] =
+  "no_such_process\n"
+  "exit 1\n";
+static const char kill_failed[] =
+  "kill_failed\n"
+  "exit 1\n";
+static const char protected_process[] =
+  "protected\n"
+  "exit 87\n";
+
+/** The signals kill accepts, by the name the owner reads. **/
+static const struct {
+  const char *name;
+  int sig;
+} kill_signals[] = {
+  {"TERM", SIGTERM},
+  {"KILL", SIGKILL},
+  {"INT", SIGINT},
+  {"HUP", SIGHUP},
+};
 
 static const char already_running[] =
   "already_running\n"
@@ -1162,6 +1186,115 @@ run_command(agent_t *agent, int fd, int argc, char *argv[]) {
 }
 
 
+static int
+kill_signal(const char *name) {
+  size_t i;
+
+  for(i=0; i<sizeof(kill_signals)/sizeof(kill_signals[0]); i++) {
+    if(!strcmp(kill_signals[i].name, name)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+/** The identity of a process: the SHA-256 of "pid start". **/
+static int
+kill_identity(const char *pid, const char *start,
+              char hex[SHA256_HEX_LEN + 1]) {
+  char record[64];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+  int len;
+
+  len = snprintf(record, sizeof(record), "%s %s", pid, start);
+  if(len < 0 || (size_t)len >= sizeof(record)) {
+    return -1;
+  }
+
+  sha256_init(&hash);
+  sha256_update(&hash, record, (size_t)len);
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+  return 0;
+}
+
+
+/**
+ * kill <pid> <SIGNAL>: a process is signalled only with the owner's approval
+ * for its pid, signal and start identity. A critical process, and Ariel
+ * itself, is refused whatever is approved. A granted approval whose start no
+ * longer matches is spent and answers approval_stale; nothing is signalled.
+ **/
+static void
+kill_command(agent_t *agent, int fd, const char *pid_text,
+             const char *signal_name) {
+  platform_t *platform = agent->platform;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  char pid_str[16];
+  char start[PROCESS_START_MAX + 1];
+  char identity[SHA256_HEX_LEN + 1];
+  char answer[64];
+  uint64_t value;
+  int32_t pid;
+  int index;
+
+  if(parse_size(pid_text, &value) || value == 0 || value > INT32_MAX) {
+    reply(fd, unknown);
+    return;
+  }
+  pid = (int32_t)value;
+  snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+
+  if((index=kill_signal(signal_name)) < 0) {
+    reply(fd, bad_signal);
+    return;
+  }
+
+  if(platform->process_start(platform, pid, start, sizeof(start))) {
+    reply(fd, no_such_process);
+    return;
+  }
+
+  if(kill_identity(pid_str, start, identity)) {
+    reply(fd, unknown);
+    return;
+  }
+
+  if(platform->process_critical(platform, pid)) {
+    audit_reply(fd, "kill", "protected", pid_str, "-", protected_process);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "kill");
+  snprintf(facts.target, sizeof(facts.target), "%s", pid_str);
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", identity);
+  snprintf(facts.signal, sizeof(facts.signal), "%s", kill_signals[index].name);
+  snprintf(facts.start, sizeof(facts.start), "%s", start);
+
+  // A start that changed since the owner signed answers approval_stale there.
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  // The record comes before the signal: a kill the log cannot hold is not sent.
+  if(audit_line("kill", "done", pid_str, challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  if(platform->process_signal(platform, pid, kill_signals[index].sig)) {
+    audit_reply(fd, "kill", "failed", pid_str, challenge.id, kill_failed);
+    return;
+  }
+  snprintf(answer, sizeof(answer), "killed %s %s\nexit 0\n", pid_str,
+           kill_signals[index].name);
+  reply(fd, answer);
+}
+
+
 /**
  * audit tail [n]: the newest n lines of the audit log, at most AUDIT_TAIL_MAX.
  * Reading the log writes nothing to it.
@@ -1219,6 +1352,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "list")) {
     payload_list(fd);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "kill")) {
+    kill_command(agent, fd, argv[1], argv[2]);
     return;
   }
 

@@ -33,6 +33,9 @@ along with this program; see the file COPYING. If not, see
 /** The longest path a gated file command names, the longest argv[0] of an
     unimplemented command. **/
 #define APPROVAL_TARGET_MAX 128
+/** The longest signal name and process start identity a kill carries. **/
+#define SIGNAL_NAME_MAX  8
+#define PROCESS_START_MAX 31
 
 /**
  * The immutable fact record an approval is bound to: what exactly the
@@ -42,6 +45,8 @@ along with this program; see the file COPYING. If not, see
  * A payload commit fills the name, size, hash, staging ID and run. A gated
  * action, a file command or an unimplemented command, fills the target
  * instead, with its entry's kind, device and inode, or its argument count.
+ * For kill, name is the target pid, and signal and start are its signal and
+ * start identity; for anything else they are empty.
  **/
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
@@ -55,6 +60,8 @@ typedef struct {
   uint64_t dev;
   uint64_t ino;
   uint64_t argc;
+  char signal[SIGNAL_NAME_MAX + 1];
+  char start[PROCESS_START_MAX + 1];
 } approval_facts_t;
 
 /**
@@ -198,6 +205,28 @@ struct platform {
    * console, where no fault is injected.
    **/
   void (*fault)(platform_t *self, const char *step);
+
+  /**
+   * Write the pids of the processes on this system into pids, at most max
+   * of them. Returns how many, or -1 when the list cannot be read.
+   **/
+  int (*processes)(platform_t *self, int32_t *pids, size_t max);
+
+  /**
+   * Write the start identity of process pid into out: text that stays the
+   * same while that process lives and differs for a later process that
+   * reuses its pid. Returns 0, or -1 when there is no such process.
+   **/
+  int (*process_start)(platform_t *self, int32_t pid, char *out, size_t size);
+
+  /**
+   * Whether pid is a critical system process, which no command may signal
+   * even with an approval. Returns 1 or 0.
+   **/
+  int (*process_critical)(platform_t *self, int32_t pid);
+
+  /** Send signal sig to process pid. Returns 0, or -1 on error. **/
+  int (*process_signal)(platform_t *self, int32_t pid, int sig);
 };
 
 /**

@@ -36,6 +36,8 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -323,6 +325,136 @@ ps5_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
 }
 
 
+/**
+ * The kernel's list of processes, in a buffer the caller frees. Each record
+ * is a kinfo_proc, and its own size says where the next one starts.
+ **/
+static int
+procs_snapshot(char **buf, size_t *size) {
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
+  size_t need = 0;
+  char *data;
+
+  if(sysctl(mib, 4, NULL, &need, NULL, 0)) {
+    return -1;
+  }
+  if(!(data = malloc(need ? need : 1))) {
+    return -1;
+  }
+  if(sysctl(mib, 4, data, &need, NULL, 0)) {
+    free(data);
+    return -1;
+  }
+
+  *buf = data;
+  *size = need;
+  return 0;
+}
+
+
+static int
+proc_find(int32_t pid, struct kinfo_proc *out) {
+  char *buf;
+  char *p;
+  char *end;
+  size_t size;
+  int found = -1;
+
+  if(procs_snapshot(&buf, &size)) {
+    return -1;
+  }
+
+  end = buf + size;
+  for(p=buf; p<end; ) {
+    struct kinfo_proc *ki = (struct kinfo_proc *)p;
+    size_t step = (size_t)ki->ki_structsize;
+
+    if(step == 0 || step > (size_t)(end - p)) {
+      break;
+    }
+    if(ki->ki_pid == pid) {
+      *out = *ki;
+      found = 0;
+      break;
+    }
+    p += step;
+  }
+
+  free(buf);
+  return found;
+}
+
+
+static int
+ps5_processes(platform_t *self, int32_t *pids, size_t max) {
+  char *buf;
+  char *p;
+  char *end;
+  size_t size;
+  size_t count = 0;
+
+  (void)self;
+
+  if(procs_snapshot(&buf, &size)) {
+    return -1;
+  }
+
+  end = buf + size;
+  for(p=buf; p<end && count < max; ) {
+    struct kinfo_proc *ki = (struct kinfo_proc *)p;
+    size_t step = (size_t)ki->ki_structsize;
+
+    if(step == 0 || step > (size_t)(end - p)) {
+      break;
+    }
+    pids[count++] = ki->ki_pid;
+    p += step;
+  }
+
+  free(buf);
+  return (int)count;
+}
+
+
+static int
+ps5_process_start(platform_t *self, int32_t pid, char *out, size_t size) {
+  struct kinfo_proc ki;
+
+  (void)self;
+
+  if(proc_find(pid, &ki)) {
+    return -1;
+  }
+  snprintf(out, size, "%lld.%06ld", (long long)ki.ki_start.tv_sec,
+           (long)ki.ki_start.tv_usec);
+  return 0;
+}
+
+
+static int
+ps5_process_critical(platform_t *self, int32_t pid) {
+  struct kinfo_proc ki;
+
+  (void)self;
+
+  if(pid == (int32_t)getpid()) {
+    return 1;
+  }
+  if(proc_find(pid, &ki)) {
+    return 0;
+  }
+  return !strcmp(ki.ki_comm, "SceShellCore");
+}
+
+
+static int
+ps5_process_signal(platform_t *self, int32_t pid, int sig) {
+  (void)self;
+
+  return kill((pid_t)pid, sig) ? -1 : 0;
+}
+
+
 static platform_t ps5_platform = {
   // A console has no test clock, so no wait has a wake pipe and every
   // deadline runs on real time.
@@ -343,6 +475,10 @@ static platform_t ps5_platform = {
   .spawn_poll = ps5_spawn_poll,
   .spawn_kill = ps5_spawn_kill,
   .run = ps5_run,
+  .processes = ps5_processes,
+  .process_start = ps5_process_start,
+  .process_critical = ps5_process_critical,
+  .process_signal = ps5_process_signal,
 };
 
 

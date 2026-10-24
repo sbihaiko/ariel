@@ -18,6 +18,7 @@ along with this program; see the file COPYING. If not, see
 #define ARIEL_VCONTROLLER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "platform.h"
 
@@ -35,6 +36,9 @@ along with this program; see the file COPYING. If not, see
  * It is driven by lines on standard input:
  *
  *   deny <approval-id>      answers denied <approval-id>
+ *   restart <pid>           answers restarted <pid>; the process now has
+ *                           a new start identity, as if it had been
+ *                           restarted under the same pid
  *
  * The pending approvals themselves live in the store, next to the staged
  * objects, so one mutex covers both.
@@ -42,6 +46,9 @@ along with this program; see the file COPYING. If not, see
 
 /** Start the controller's input reader. Safe to call more than once. **/
 void vcontroller_start(void);
+
+/** How many times the controller has restarted pid: its start identity. **/
+unsigned vcontroller_epoch(int32_t pid);
 
 /** Request approval; see platform_t.approval_request. **/
 int vcontroller_request(const approval_facts_t *facts,
