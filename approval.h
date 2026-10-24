@@ -44,7 +44,10 @@ along with this program; see the file COPYING. If not, see
 #define APPROVAL_MESSAGE_MAX 1024
 
 /** At most this many options belong to one action. **/
-#define APPROVAL_OPTIONS_MAX 8
+#define APPROVAL_OPTIONS_MAX 12
+
+/** The longest option value the encoder carries. **/
+#define APPROVAL_VALUE_MAX   64
 
 /** The hash of an action with no content behind it. **/
 #define APPROVAL_NO_HASH "none"

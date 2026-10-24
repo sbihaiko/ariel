@@ -1132,8 +1132,10 @@ CLOCK_SCENARIOS = {
     "a run of a file replaced by another object with the same bytes answers "
     "approval_stale and exit 78",
     "a bare name found on the PATH is gated as the file it resolves to",
-    "a run's request, grant and completion reach audit tail in order",
+    "a run's request, grant, start and status reach audit tail in order",
     "the challenge of a run names its path, its sha256 and its identity",
+    "a run's arguments are part of the signed action, and other arguments "
+    "answer approval_stale",
     "kill asks for approval, and a grant runs it once and audits the request, "
     "grant and kill",
     "a restarted process under the same pid answers approval_stale and exit "
@@ -1222,6 +1224,11 @@ HOST_ROOT_SCENARIOS = {
     "a run of a missing path, a directory or a file without execute bits "
     "answers its word and exit 1 without asking",
     "a run of Ariel's token answers protected and exit 87 without asking",
+    "a run with an argument the signer cannot show, or with too many, answers "
+    "unknown and exit 1 without asking",
+    "a run of a file over 64 MiB answers too_large and exit 1 without asking",
+    "a run never follows a symbolic link, by path or on the PATH, and answers "
+    "symbolic_link",
 }
 
 
@@ -3600,17 +3607,21 @@ def scenario_elf_token_refused(server):
 
 
 def scenario_elf_run_is_audited(server):
-    """A run's request, grant and completion reach audit tail in that order."""
+    """A run's request, grant, start and exit status reach audit tail in that order."""
     server.advance(120000)
     path = install_elf(server, "elf-audited", compile_payload(HELLO_SOURCE, "hello"))
     approval, challenge = gate_request(server, path)
     sign_and_grant(server, approval, challenge)
     assert run_command(server, path) == [HELLO_OUTPUT, "status 0", "exit 0"]
-    ours = [event.split()[1] for event in audit_tail(server)
+    ours = [event.split() for event in audit_tail(server)
             if AUDIT_LINE.match(event) and event.split()[2] == path
             and event.split()[3] == approval]
-    assert ours == ["run.request", "grant", "run.done"], (
-        "the audit log must show the request, the grant and the run: %r" % ours)
+    kinds = [fields[1] for fields in ours]
+    assert kinds == ["run.request", "grant", "run.start", "run.status"], (
+        "the audit log must show the request, the grant, the start and the status: %r"
+        % kinds)
+    assert ours[-1][4] == "status-0", (
+        "the status line must carry the payload's status, got %r" % ours[-1])
 
 
 def scenario_elf_action_names_its_facts(server):
@@ -3940,6 +3951,71 @@ def scenario_unzip_actions_are_audited(server):
     for event in expected:
         assert event in events, (
             "audit tail must show %r, got %r" % (event, sorted(events)))
+
+
+def scenario_elf_arguments_are_signed(server):
+    """A run's arguments are part of what the owner signs: other ones answer approval_stale."""
+    server.advance(120000)
+    path = install_elf(server, "elf-args", compile_payload(HELLO_SOURCE, "hello"))
+    approval, challenge = gate_request(server, path)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, path + " extra") == ["approval_stale", "exit 78"], (
+        "a run with arguments the owner did not sign must answer approval_stale")
+    server.assert_no_line()
+
+    approval, challenge = gate_request(server, path + " extra")
+    action = challenge_action(challenge)
+    assert "\noption.argc=1\n" in action and "\noption.arg0=extra\n" in action, (
+        "the challenge must carry the arguments, got %r" % action)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, path + " extra") == [
+        HELLO_OUTPUT, "argv[1] = extra", "status 0", "exit 0"], (
+        "a run with the signed arguments must run once")
+
+
+def scenario_elf_arguments_the_signer_cannot_show_are_refused(server):
+    """A run with an argument the signer cannot show, or with too many, answers unknown and never asks."""
+    path = install_elf(server, "elf-args-refused", compile_payload(HELLO_SOURCE, "hello"))
+    assert run_command(server, path + " /user") == ["unknown_command", "exit 1"], (
+        "an argument with a slash cannot be signed, so the run must be refused")
+    server.assert_no_line()
+    assert run_command(server, path + " " + " ".join(["a"] * 9)) == [
+        "unknown_command", "exit 1"], (
+        "more arguments than the signer carries must be refused")
+    server.assert_no_line()
+
+
+def scenario_elf_too_large_answers_too_large(server):
+    """A file over the run limit answers too_large and exit 1 without asking."""
+    path = install_elf(server, "elf-large", b"")
+    os.truncate(path, 64 * 1024 * 1024 + 1)
+    assert run_command(server, path) == ["too_large", "exit 1"], (
+        "a file over 64 MiB must answer too_large and exit 1")
+    server.assert_no_line()
+
+
+def scenario_elf_symbolic_link_is_refused(server):
+    """A run never follows a symbolic link, by path or on the PATH: symbolic_link, exit 1."""
+    target = install_elf(server, "elf-link-target", compile_payload(HELLO_SOURCE, "hello"))
+    link = os.path.join(server.root, "data", "elf-link")
+    os.symlink(target, link)
+    assert run_command(server, link) == ["symbolic_link", "exit 1"], (
+        "a symbolic link must not be run")
+    server.assert_no_line()
+
+    folder = os.path.join(server.root, "bin")
+    os.makedirs(folder, exist_ok=True)
+    os.symlink(target, os.path.join(folder, "elf-path-link"))
+    saved = server.env
+    server.env = dict(saved or {}, PATH=folder)
+    server.restart()
+    try:
+        assert run_command(server, "elf-path-link") == ["symbolic_link", "exit 1"], (
+            "a PATH entry that is a symbolic link must not be run")
+        server.assert_no_line()
+    finally:
+        server.env = saved
+        server.restart()
 
 
 def scenario_two_connections(server):
@@ -4501,7 +4577,7 @@ def scenario_ps5_has_no_pad(server):
 
 # A file action has no payload hash, so its line records none in the sha256 field.
 AUDIT_LINE = re.compile(
-    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64}|none)$")
+    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64}|none|status-\d+)$")
 
 
 def audit_log_path(server):
@@ -5687,10 +5763,19 @@ SCENARIOS = [
      scenario_elf_refusals_need_no_owner, HOST_ROOT_REASON),
     ("a run of Ariel's token answers protected and exit 87 without asking",
      scenario_elf_token_refused, HOST_ROOT_REASON),
-    ("a run's request, grant and completion reach audit tail in order",
+    ("a run's request, grant, start and status reach audit tail in order",
      scenario_elf_run_is_audited, True),
     ("the challenge of a run names its path, its sha256 and its identity",
      scenario_elf_action_names_its_facts, True),
+    ("a run's arguments are part of the signed action, and other arguments "
+     "answer approval_stale", scenario_elf_arguments_are_signed, True),
+    ("a run with an argument the signer cannot show, or with too many, answers "
+     "unknown and exit 1 without asking",
+     scenario_elf_arguments_the_signer_cannot_show_are_refused, HOST_ROOT_REASON),
+    ("a run of a file over 64 MiB answers too_large and exit 1 without asking",
+     scenario_elf_too_large_answers_too_large, HOST_ROOT_REASON),
+    ("a run never follows a symbolic link, by path or on the PATH, and answers "
+     "symbolic_link", scenario_elf_symbolic_link_is_refused, HOST_ROOT_REASON),
     ("pwd and ls <absolute path> run through the agent port",
      scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",

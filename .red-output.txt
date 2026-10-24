@@ -51,14 +51,17 @@ PASS a command nothing implements asks the owner and then does nothing
 PASS writes outside /data, /user and /mnt/usb* answer protected and exit 87 without asking, and so does Ariel's token
 PASS a file command's audit lines reach audit tail
 PASS the challenge of a file command names its path, sha256 none and identity
-FAIL a file run by path prints nothing until the owner signs, then runs once: AssertionError: a signed run must print the payload's output, its status and exit 0
-FAIL a run of a file rewritten after approval answers approval_stale and exit 78: AssertionError: a file rewritten after approval must answer approval_stale
-FAIL a run of a file replaced by another object with the same bytes answers approval_stale and exit 78: AssertionError: a file replaced after approval must answer approval_stale
-FAIL a bare name found on the PATH is gated as the file it resolves to: AssertionError: the challenge must name the resolved path, not the bare name
-FAIL a run of a missing path, a directory or a file without execute bits answers its word and exit 1 without asking: AssertionError: 
-FAIL a run of Ariel's token answers protected and exit 87 without asking: AssertionError: the token must never be run
-FAIL a run's request, grant and completion reach audit tail in order: AssertionError: expected a clock confirmation, got 'prompt a-1 unlisted /var/folders/hm/2613d1tx3dx75fn21zzrzn500000gq/T/ariel-host-lerit5rt/data/elf-missing will run'
-FAIL the challenge of a run names its path, its sha256 and its identity: AssertionError: the owner must be asked about /var/folders/hm/2613d1tx3dx75fn21zzrzn500000gq/T/ariel-host-lerit5rt/data/elf-facts
+PASS a file run by path prints nothing until the owner signs, then runs once
+PASS a run of a file rewritten after approval answers approval_stale and exit 78
+PASS a run of a file replaced by another object with the same bytes answers approval_stale and exit 78
+PASS a bare name found on the PATH is gated as the file it resolves to
+PASS a run of a missing path, a directory or a file without execute bits answers its word and exit 1 without asking
+PASS a run of Ariel's token answers protected and exit 87 without asking
+FAIL a run's request, grant, start and status reach audit tail in order: AssertionError: the audit log must show the request, the grant, the start and the status: ['run.request', 'grant', 'run.done']
+PASS the challenge of a run names its path, its sha256 and its identity
+FAIL a run's arguments are part of the signed action, and other arguments answer approval_stale: AssertionError: a run with arguments the owner did not sign must answer approval_stale
+FAIL a run of a file over 64 MiB answers too_large and exit 1 without asking: AssertionError: a file over 64 MiB must answer too_large and exit 1
+PASS a run never follows a symbolic link, by path or on the PATH, and answers symbolic_link
 PASS pwd and ls <absolute path> run through the agent port
 PASS cd on the agent port answers an error: no working directory
 PASS each read-only command runs with no approval and exits 0 with its output
@@ -72,12 +75,12 @@ PASS ps and procstat list Ariel's own process and refuse a missing or unknown pi
 PASS sysctl reads a kernel parameter, and a sysctl write is refused and changes nothing
 PASS sum and sfoinfo read absolute paths and refuse relative ones
 PASS authid answers 'not available on this platform' on the host and exit 1
-FAIL two connections are served at the same time: AssertionError: expected 2 settled waiters, got 'prompt a-2 unlisted /var/folders/hm/2613d1tx3dx75fn21zzrzn500000gq/T/ariel-host-lerit5rt/data/elf-facts will run'
-FAIL a fifth concurrent connection answers busy and exit 82: AssertionError: expected 1 settled waiters, got 'unsettled 1 1'
-FAIL a ninth connection answers busy and exit 82 with every refusal slot taken: AssertionError: expected 9 settled waiters, got 'settled 1'
-FAIL a stalled upload does not block another connection: AssertionError: expected 2 settled waiters, got 'settled 9'
-FAIL a truncated upload answers upload_mismatch and exit 81: AssertionError: expected a clock confirmation, got 'unsettled 1 1'
-FAIL bytes past the declared size answer upload_mismatch and exit 81: AssertionError: expected no output, got 'clock 270000'
+PASS two connections are served at the same time
+PASS a fifth concurrent connection answers busy and exit 82
+PASS a ninth connection answers busy and exit 82 with every refusal slot taken
+PASS a stalled upload does not block another connection
+PASS a truncated upload answers upload_mismatch and exit 81
+PASS bytes past the declared size answer upload_mismatch and exit 81
 PASS a hash mismatch answers upload_mismatch and exit 81
 PASS a name outside the grammar answers bad_name
 PASS a matching push is staged, asks for approval and exits 75
@@ -160,5 +163,5 @@ PASS a recovery killed after its renames, then a clean start, leaves the listing
 PASS the previous version is kept and listed, and the one before it is dropped
 PASS a payload the record marks running is not started again on restart
 
-14 scenario(s) failed
+3 scenario(s) failed
 make: *** [test] Error 1

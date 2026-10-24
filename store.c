@@ -870,16 +870,22 @@ value_key(const char *command) {
  * they have no options.
  * A reptyr is an action on its pid with its start, and a PS5 built-in also
  * carries its arguments after the target as text, arg1 first, so the owner
- * reads them. text holds the numbers the options point at.
+ * reads them. A run is an action on its path with the hash, kind and
+ * identity of its file, and each of its arguments, arg0 first. text holds
+ * the numbers the options point at. Returns -1 when the facts cannot be
+ * signed.
  **/
-static void
+static int
 action_build(const approval_facts_t *facts, approval_action_t *action,
              approval_option_t options[APPROVAL_OPTIONS_MAX],
              char text[4][24]) {
   static const char *const arg_keys[BUILTIN_ARGS_MAX] = {
     "arg1", "arg2", "arg3", "arg4", "arg5",
   };
-  size_t i;
+  static const char *const run_arg[RUN_ARGS_MAX] = {
+    "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7"
+  };
+  uint64_t i;
 
   if(facts->target[0]) {
     action->command = facts->command;
@@ -911,6 +917,9 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       size_t n = 0;
 
       if(!strcmp(facts->command, "run")) {
+        if(facts->argc > RUN_ARGS_MAX) {
+          return -1;
+        }
         action->sha256 = facts->sha256;
       }
       decimal(facts->dev, text[0], sizeof(text[0]));
@@ -937,6 +946,15 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
         options[n].key = "minor";
         options[n++].value = text[3];
       }
+      if(!strcmp(facts->command, "run")) {
+        decimal(facts->argc, text[2], sizeof(text[2]));
+        options[n].key = "argc";
+        options[n++].value = text[2];
+        for(i=0; i<facts->argc; i++) {
+          options[n].key = run_arg[i];
+          options[n++].value = facts->arg[i];
+        }
+      }
       action->noptions = n;
     } else {
       decimal(facts->argc, text[0], sizeof(text[0]));
@@ -949,7 +967,8 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[action->noptions].value = facts->value;
       action->noptions++;
     }
-    for(i=0; i<BUILTIN_ARGS_MAX && facts->arg[i][0]; i++) {
+    for(i=0; strcmp(facts->command, "run") &&
+             i<BUILTIN_ARGS_MAX && facts->arg[i][0]; i++) {
       options[action->noptions].key = arg_keys[i];
       options[action->noptions].value = facts->arg[i];
       action->noptions++;
@@ -979,6 +998,22 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
   }
 
   action->options = options;
+  return 0;
+}
+
+
+/** The run's prompt: its path and arguments first, so a long hash cannot hide them. **/
+static void
+run_prompt(char *prompt, size_t promptlen, const approval_facts_t *facts) {
+  size_t n = (size_t)snprintf(prompt, promptlen, "run %s", facts->target);
+  uint64_t i;
+
+  for(i=0; i<facts->argc && n<promptlen; i++) {
+    n += (size_t)snprintf(prompt + n, promptlen - n, " %s", facts->arg[i]);
+  }
+  if(n < promptlen) {
+    snprintf(prompt + n, promptlen - n, " (sha256 %s) will run", facts->sha256);
+  }
 }
 
 
@@ -1002,7 +1037,9 @@ store_approval_request(const approval_facts_t *facts,
   // The approval is of this one action. What the owner reads and signs is
   // the output of the one encoder, and a build whose facts it refuses can
   // not be approved at all.
-  action_build(facts, &action, options, text);
+  if(action_build(facts, &action, options, text)) {
+    return -1;
+  }
 
   pthread_mutex_lock(&lock);
   now = now_ms();
@@ -1077,8 +1114,7 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen, "kill %s with %s (start %s) will run",
              facts->target, facts->signal, facts->start);
   } else if(slot->gated && !strcmp(facts->command, "run")) {
-    snprintf(prompt, promptlen, "run %s (sha256 %s) will run", facts->target,
-             facts->sha256);
+    run_prompt(prompt, promptlen, facts);
   } else if(slot->gated) {
     snprintf(prompt, promptlen, "%s %s%s%s will run", facts->command,
              facts->target, facts->dest[0] ? " " : "", facts->dest);
@@ -1097,11 +1133,28 @@ store_approval_request(const approval_facts_t *facts,
 }
 
 
+/** Whether two facts carry the same arguments, in the same order. **/
+static int
+same_args(const approval_facts_t *a, const approval_facts_t *b) {
+  uint64_t i;
+
+  if(a->argc != b->argc) {
+    return 0;
+  }
+  for(i=0; i<a->argc && i<RUN_ARGS_MAX; i++) {
+    if(strcmp(a->arg[i], b->arg[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
 /**
  * Whether two targets are the same action on the same object: the same
  * kind, device and inode, the same requested value and destination, the same
  * mount or mknod options, the same signal and process start for a kill, and
- * the same content hash, argument count and argument hash.
+ * the same content hash, argument count, argument hash and run arguments.
  **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
@@ -1113,7 +1166,8 @@ same_identity(const approval_facts_t *a, const approval_facts_t *b) {
          !strcmp(a->type, b->type) && a->major == b->major &&
          a->minor == b->minor &&
          !strcmp(a->sha256, b->sha256) &&
-         !memcmp(a->arg, b->arg, sizeof(a->arg));
+         !memcmp(a->arg, b->arg, sizeof(a->arg)) &&
+         same_args(a, b);
 }
 
 
@@ -1151,8 +1205,8 @@ store_gate_check(const approval_facts_t *facts,
   struct approval *row;
   int rc;
 
-  action_build(facts, &action, options, text);
-  if(approval_canonical(&action, canonical, sizeof(canonical)) < 0) {
+  if(action_build(facts, &action, options, text) ||
+     approval_canonical(&action, canonical, sizeof(canonical)) < 0) {
     return STORE_GATE_REFUSED;
   }
 

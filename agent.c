@@ -921,10 +921,42 @@ elf_lookup(const char *root, const char *name, char *path, size_t size,
 
 
 /**
+ * Copy a run's arguments, after its name, into facts. Returns -1 when there
+ * are more than RUN_ARGS_MAX or one is longer than an option value.
+ **/
+static int
+run_arguments(approval_facts_t *facts, int argc, char *argv[]) {
+  int i;
+
+  if(argc - 1 > RUN_ARGS_MAX) {
+    return -1;
+  }
+  facts->argc = (uint64_t)(argc - 1);
+  for(i=1; i<argc; i++) {
+    if(strlen(argv[i]) > APPROVAL_VALUE_MAX) {
+      return -1;
+    }
+    snprintf(facts->arg[i - 1], sizeof(facts->arg[i - 1]), "%s", argv[i]);
+  }
+  return 0;
+}
+
+
+static int
+audit_status(const char *path, const char *id, int status) {
+  char sha256[32];
+  const char *name = approval_target_valid(path) ? path : "-";
+
+  snprintf(sha256, sizeof(sha256), "status-%d", status);
+  return store_audit_append("run.status", name, id, sha256);
+}
+
+
+/**
  * One run of an executable, by absolute path or by a bare name on the PATH.
- * The owner signs the resolved path and the file's hash, and the bytes that
- * were hashed are the bytes that run. Returns 0 when the name is not an
- * executable this platform runs, so the caller treats it as unlisted.
+ * The owner signs the resolved path, the file's hash and the arguments, and
+ * the bytes that were hashed are the bytes that run. Returns 0 when the name
+ * is not an executable this platform runs, so the caller treats it as unlisted.
  **/
 static int
 elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
@@ -963,12 +995,17 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
   snprintf(facts.command, sizeof(facts.command), "%s", "run");
   snprintf(facts.target, sizeof(facts.target), "%s", path);
+  if(run_arguments(&facts, argc, argv)) {
+    free(bytes);
+    audit_reply(fd, "run", "refused", path, "-", unknown);
+    return 1;
+  }
   if(!gate_pass(agent, fd, &facts, &challenge)) {
     free(bytes);
     return 1;
   }
 
-  if(audit_line("run", "done", path, challenge.id)) {
+  if(audit_line("run", "start", path, challenge.id)) {
     free(bytes);
     reply(fd, audit_failed);
     return 1;
@@ -982,6 +1019,11 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
     return 1;
   }
   free(bytes);
+
+  if(audit_status(path, challenge.id, status)) {
+    reply(fd, audit_failed);
+    return 1;
+  }
 
   len = snprintf(answer, sizeof(answer), "status %d\nexit 0\n", status);
   write_all(fd, answer, (size_t)len);

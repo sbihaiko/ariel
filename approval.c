@@ -26,7 +26,6 @@ along with this program; see the file COPYING. If not, see
 #define SEGMENT_MAX  32
 #define TARGET_MAX   128
 #define KEY_MAX      16
-#define VALUE_MAX    64
 #define HASH_LEN     64
 
 
@@ -150,7 +149,7 @@ approval_target_valid(const char *target) {
 
 int
 approval_value_valid(const char *value) {
-  return in_set(value, 1, VALUE_MAX, "._-", 0);
+  return in_set(value, 1, APPROVAL_VALUE_MAX, "._-", 0);
 }
 
 
@@ -206,7 +205,7 @@ option_value_ok(const approval_option_t *option) {
   if(!strcmp(option->key, "from")) {
     return option->value[0] == '/' && target_ok(option->value);
   }
-  return in_set(option->value, 1, VALUE_MAX, "._-", 0);
+  return in_set(option->value, 1, APPROVAL_VALUE_MAX, "._-", 0);
 }
 
 

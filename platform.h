@@ -57,7 +57,12 @@ along with this program; see the file COPYING. If not, see
  * For exec, the target is the program, sha256 its bytes, argc the arguments
  * after it and args their hash. For export, sha256 is the hash of the value.
  * A PS5 built-in fills arg with its arguments after the target, as text.
+ * For a run, argc counts the arguments after its name and arg holds each one.
  **/
+
+/** The most arguments a run can sign, and each one's longest value. **/
+#define RUN_ARGS_MAX 8
+
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
   char name[PAYLOAD_NAME_MAX + 1];
@@ -81,7 +86,7 @@ typedef struct {
   uint64_t minor;
   char replaces[65];  /** The build a rollback replaces; empty otherwise. **/
   char args[ARGS_HASH_MAX + 1];
-  char arg[BUILTIN_ARGS_MAX][BUILTIN_ARG_MAX + 1];
+  char arg[RUN_ARGS_MAX][BUILTIN_ARG_MAX + 1];  /** A built-in's or a run's. **/
 } approval_facts_t;
 
 /**

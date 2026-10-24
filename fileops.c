@@ -1441,9 +1441,13 @@ read_run(int dirfd, const char *leaf, approval_facts_t *facts,
     close(fd);
     return FILEOPS_CHANGED;
   }
-  if(st.st_size < 0 || (uint64_t)st.st_size > FILEOPS_RUN_MAX) {
+  if(st.st_size < 0) {
     close(fd);
     return FILEOPS_FAILED;
+  }
+  if((uint64_t)st.st_size > FILEOPS_RUN_MAX) {
+    close(fd);
+    return FILEOPS_TOO_LARGE;
   }
 
   buf = malloc((size_t)st.st_size + 1);
