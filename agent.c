@@ -56,6 +56,9 @@ static const char bad_name[] =
 static const char unknown[] =
   "unknown_command\n"
   "exit 1\n";
+static const char list_failed[] =
+  "list_failed\n"
+  "exit 1\n";
 static const char mismatch[] =
   "upload_mismatch\n"
   "exit 81\n";
@@ -582,6 +585,51 @@ payload_commit(int fd, const char *staging_id) {
 }
 
 
+static void
+number_text(uint64_t value, char *out, size_t size) {
+  if(value) {
+    snprintf(out, size, "%llu", (unsigned long long)value);
+  } else {
+    snprintf(out, size, "-");
+  }
+}
+
+
+/** payload list: one line per installed payload, read-only. **/
+static void
+payload_list(int fd) {
+  state_payload_t *entries;
+  char line[1024];
+  char release[24];
+  char asset[24];
+  size_t count = 0;
+  size_t i;
+
+  entries = calloc(STATE_PAYLOADS_MAX, sizeof(*entries));
+  if(!entries || store_list(entries, STATE_PAYLOADS_MAX, &count)) {
+    free(entries);
+    reply(fd, list_failed);
+    return;
+  }
+
+  for(i=0; i<count; i++) {
+    number_text(entries[i].release, release, sizeof(release));
+    number_text(entries[i].asset, asset, sizeof(asset));
+    snprintf(line, sizeof(line),
+             "payload %s source=%s version=%s release=%s asset=%s sha256=%s "
+             "path=%s running=%s\n",
+             entries[i].name, entries[i].source,
+             entries[i].version[0] ? entries[i].version : "-",
+             release, asset, entries[i].sha256, entries[i].path,
+             entries[i].running ? "yes" : "no");
+    reply(fd, line);
+  }
+
+  free(entries);
+  reply(fd, "exit 0\n");
+}
+
+
 /**
  * approval grant <id> <signature> [<console> <action-sha256>]: the owner's
  * signature arrives here, on whatever connection carries it, the agent's
@@ -722,6 +770,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "commit")) {
     payload_commit(fd, argv[2]);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "list")) {
+    payload_list(fd);
     return;
   }
 

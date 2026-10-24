@@ -90,35 +90,6 @@ struct staged {
 /** The file in Ariel's directory that holds the consumed nonces. **/
 #define NONCES_FILE "nonces"
 
-/**
- * The state file: the single record of installed payloads. It lives beside
- * the store and replaces Stage 1's per-name current records.
- **/
-#define STATE_FILE "state"
-
-/** The state file's marker, so a later reader can tell this text apart. **/
-#define STATE_MARKER "ariel-state-v1"
-
-/** At most this many payloads fit in the state file. **/
-#define STATE_PAYLOADS_MAX 64
-
-/** One installed payload, as the state file holds it between starts. **/
-struct state_payload {
-  int used;
-  char name[PAYLOAD_NAME_MAX + 1];
-  char source[16];
-  char version[64];
-  uint64_t release;
-  uint64_t asset;
-  char sha256[SHA256_HEX_LEN + 1];
-  char path[256];
-  int running;
-};
-
-/** The record in memory. state_loaded is 1 once this start has read it. **/
-static struct state_payload state_payloads[STATE_PAYLOADS_MAX];
-static int state_loaded;
-
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -150,15 +121,13 @@ static char state_dir[PATH_MAX];
 static platform_t *platform;
 
 /* The directory helpers every entry below Ariel's directory goes through. */
-static int state_open(void);
+static int root_open(void);
 static int dir_open(int dirfd, const char *name);
 static int dir_make(int dirfd, const char *name);
 static void staging_clear(void);
 static void expire_locked(uint64_t now);
 static void *expiry_run(void *arg);
 static int nonces_load(void);
-static int state_load(void);
-static int state_save_locked(void);
 static int write_all(int fd, const char *buf, size_t len);
 
 
@@ -324,14 +293,12 @@ store_init(const char *dir, platform_t *p) {
   memset(staged, 0, sizeof(staged));
   memset(approvals, 0, sizeof(approvals));
   nonce_count = 0;
-  state_loaded = 0;
-  memset(state_payloads, 0, sizeof(state_payloads));
   pthread_mutex_unlock(&lock);
 
   // No approval survives the process, so no staging object may either.
   staging_clear();
 
-  if((state_fd=state_open()) < 0) {
+  if((state_fd=root_open()) < 0) {
     return -1;
   }
 
@@ -354,10 +321,9 @@ store_init(const char *dir, platform_t *p) {
     close(store_fd);
   }
 
-  // The first start of Stage 2 builds the state file from Stage 1's current
-  // records, which live under the store just made; every later start reads
-  // the file and leaves those records alone.
-  if(!rc && state_load()) {
+  // The state file is built from Stage 1's current records, which live under
+  // the store just made; a start that finds the file leaves those alone.
+  if(!rc && state_open(state_dir)) {
     rc = -1;
   }
 
@@ -644,7 +610,7 @@ nonces_write(const unsigned char list[][APPROVAL_NONCE_LEN], size_t count) {
   int closed;
   int fd;
 
-  if((dirfd=state_open()) < 0) {
+  if((dirfd=root_open()) < 0) {
     return -1;
   }
 
@@ -704,7 +670,7 @@ nonces_load(void) {
   int fd;
   int rc = 0;
 
-  if((dirfd=state_open()) < 0) {
+  if((dirfd=root_open()) < 0) {
     return -1;
   }
 
@@ -1011,7 +977,7 @@ write_all(int fd, const char *buf, size_t len) {
 
 /** Open Ariel's state directory itself. **/
 static int
-state_open(void) {
+root_open(void) {
   return open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
@@ -1035,22 +1001,6 @@ entry_regular(int fd) {
   struct stat st;
 
   return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-
-/** Whether text is exactly one lowercase hex SHA-256 and nothing else. **/
-static int
-hash_text(const char *text) {
-  size_t i;
-
-  for(i=0; i<SHA256_HEX_LEN; i++) {
-    if(!((text[i] >= '0' && text[i] <= '9') ||
-         (text[i] >= 'a' && text[i] <= 'f'))) {
-      return 0;
-    }
-  }
-
-  return text[SHA256_HEX_LEN] == '\0';
 }
 
 
@@ -1242,7 +1192,7 @@ staged_install(struct staged *entry, struct approval *request,
   int dst = -1;
   int rc = STORE_APPROVAL_STALE;
 
-  if((state_fd=state_open()) < 0) {
+  if((state_fd=root_open()) < 0) {
     return STORE_APPROVAL_STALE;
   }
 
@@ -1312,6 +1262,10 @@ staged_install(struct staged *entry, struct approval *request,
     goto out;
   }
 
+  if(state_record(entry->facts.name, hash)) {
+    goto out;
+  }
+
   // Stage 1 keeps one build per name: the object the new one replaces goes.
   if(have_old && strcmp(old, hash) && !existed) {
     unlinkat(objects_fd, old, 0);
@@ -1319,6 +1273,7 @@ staged_install(struct staged *entry, struct approval *request,
 
   snprintf(install->name, sizeof(install->name), "%s", entry->facts.name);
   snprintf(install->sha256, sizeof(install->sha256), "%s", hash);
+  object_path(hash, install->path, sizeof(install->path));
   staged_consume(entry, request);
 
   rc = STORE_INSTALLED;
@@ -1470,7 +1425,7 @@ store_run_load(const char *name, store_object_t *object) {
 
   pthread_mutex_lock(&lock);
 
-  if((state_fd=state_open()) < 0 ||
+  if((state_fd=root_open()) < 0 ||
      (store_fd=dir_open(state_fd, "store")) < 0 ||
      (current_fd=dir_open(store_fd, "current")) < 0) {
     goto out;
@@ -1532,4 +1487,10 @@ store_object_free(store_object_t *object) {
   free(object->bytes);
   object->bytes = NULL;
   object->size = 0;
+}
+
+
+int
+store_list(state_payload_t *entries, size_t max, size_t *count) {
+  return state_list(entries, max, count);
 }

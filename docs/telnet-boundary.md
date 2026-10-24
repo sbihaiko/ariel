@@ -10,7 +10,7 @@ So the owner must keep the console on a network they trust, or reach port 2323 o
 
 ## What the gate does cover
 
-The agent port offers only `payload push`, `payload commit` and `payload run --wait`. Every other command answers `unknown_command`. The only way to put new code on the console through that port is a push, which waits for an approval signed by the owner. The headless acceptance suite checks this in the scenario named "the agent port opens no system change outside the gate and the telnet shell stays out of scope" (`hostbuild/tests/acceptance.py`, run by `make -C hostbuild test`). The host build has no telnet shell, so that scenario cannot test it.
+The agent port offers only `payload push`, `payload commit`, `payload run --wait` and `payload list`. Every other command answers `unknown_command`. The only way to put new code on the console through that port is a push, which waits for an approval signed by the owner. The headless acceptance suite checks this in the scenario named "the agent port opens no system change outside the gate and the telnet shell stays out of scope" (`hostbuild/tests/acceptance.py`, run by `make -C hostbuild test`). The host build has no telnet shell, so that scenario cannot test it.
 
 ## Manual check: the telnet boundary
 

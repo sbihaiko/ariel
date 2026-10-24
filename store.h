@@ -20,6 +20,7 @@ along with this program; see the file COPYING. If not, see
 #include <stddef.h>
 
 #include "platform.h"
+#include "state.h"
 
 /**
  * Ariel's state: the staged objects, the pending approvals and the store
@@ -152,28 +153,10 @@ int store_run_load(const char *name, store_object_t *object);
 void store_object_free(store_object_t *object);
 
 /**
- * One installed payload, as the state file records it. A push has no release,
- * so release and asset are 0 and version is empty; running is 1 only while a
- * background run of it is alive, which Stage 2's later slices add.
+ * The installed payloads, as the state file records them. Fills entries, at
+ * most max of them, and sets count. Returns 0, or -1 when the record cannot
+ * be read.
  **/
-typedef struct {
-  char name[PAYLOAD_NAME_MAX + 1];
-  char source[16];
-  char version[64];
-  uint64_t release;
-  uint64_t asset;
-  char sha256[65];
-  char path[256];
-  int running;
-} store_payload_t;
-
-/**
- * Read the state file: the single record of installed payloads. On the first
- * start of Stage 2, when no state file exists yet, it is built once from
- * Stage 1's per-name current records; a later start reads the file and never
- * touches those records again. Fills entries, at most max of them, and sets
- * count. Returns 0, or -1 when the record cannot be read.
- **/
-int store_list(store_payload_t *entries, size_t max, size_t *count);
+int store_list(state_payload_t *entries, size_t max, size_t *count);
 
 #endif /* ARIEL_STORE_H */

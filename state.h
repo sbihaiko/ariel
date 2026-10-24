@@ -1,0 +1,60 @@
+/* Ariel: the state file, the single record of installed payloads.
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation; either version 3, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; see the file COPYING. If not, see
+<http://www.gnu.org/licenses/>.  */
+
+#ifndef ARIEL_STATE_H
+#define ARIEL_STATE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "platform.h"
+
+/** At most this many payloads fit in the state file. **/
+#define STATE_PAYLOADS_MAX 64
+
+/**
+ * One installed payload, as the state file records it. A push has no release,
+ * so release and asset are 0 and version is empty; running is 1 only while a
+ * background run of it is alive, which Stage 2's later slices add.
+ **/
+typedef struct {
+  char name[PAYLOAD_NAME_MAX + 1];
+  char source[16];
+  char version[64];
+  uint64_t release;
+  uint64_t asset;
+  char sha256[65];
+  char path[256];
+  int running;
+} state_payload_t;
+
+/**
+ * Read the state file under dir, or build it once from Stage 1's current
+ * records when no state file exists yet. Returns 0, or -1 when the record
+ * cannot be read or built.
+ **/
+int state_open(const char *dir);
+
+/** Record the hash a commit installed under name. Returns 0, or -1. **/
+int state_record(const char *name, const char *hash);
+
+/**
+ * Copy the installed payloads into entries, at most max of them, and set
+ * count. Returns 0, or -1 before state_open has loaded the record.
+ **/
+int state_list(state_payload_t *entries, size_t max, size_t *count);
+
+#endif /* ARIEL_STATE_H */

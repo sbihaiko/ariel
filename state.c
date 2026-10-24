@@ -33,7 +33,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "sha256.h"
 #include "state.h"
-#include "ps5_at.h"
+#include "store.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -44,9 +44,6 @@ along with this program; see the file COPYING. If not, see
 
 /** The state file's marker, so a later reader can tell this text apart. **/
 #define STATE_MARKER "ariel-state-v1"
-
-/** At most this many payloads fit in the state file. **/
-#define STATE_PAYLOADS_MAX 64
 
 /** One read of a file moving through memory. **/
 #define READ_CHUNK 65536
@@ -464,14 +461,14 @@ state_read(void) {
 static int
 state_migrate(void) {
   struct dirent *entry;
-  int dirfd = -1;
+  int root_fd = -1;
   int store_fd = -1;
   int current_fd = -1;
   DIR *list = NULL;
   int rc = -1;
 
-  if((dirfd=open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
-     < 0 || (store_fd=dir_open(dirfd, "store")) < 0 ||
+  if((root_fd=open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
+     < 0 || (store_fd=dir_open(root_fd, "store")) < 0 ||
      (current_fd=dir_open(store_fd, "current")) < 0) {
     goto out;
   }
@@ -520,8 +517,8 @@ out:
   if(store_fd >= 0) {
     close(store_fd);
   }
-  if(dirfd >= 0) {
-    close(dirfd);
+  if(root_fd >= 0) {
+    close(root_fd);
   }
 
   return rc;

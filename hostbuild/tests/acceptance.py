@@ -1210,13 +1210,29 @@ def listed(lines, name):
     return matches[0] if matches else None
 
 
-def scenario_list_after_commit(server):
-    """After a commit, payload list shows the payload with every field.
+def expected_listing(name, hash_hex):
+    """The payload list line a push of name committed as hash_hex shows.
 
     Stage 1 records only a name and a hash. A push has no release, so its
     version identifiers and source say so, and nothing is running: the commit
     approved running the build, it did not start it.
     """
+    return ("payload %s source=push version=- release=- asset=- "
+            "sha256=%s path=/data/ariel/store/objects/%s running=no" % (
+                name, hash_hex, hash_hex))
+
+
+def state_path(server):
+    return os.path.join(server.root, "data", "ariel", "state")
+
+
+def read_state(server):
+    with open(state_path(server), "rb") as fh:
+        return fh.read()
+
+
+def scenario_list_after_commit(server):
+    """After a commit, payload list shows the payload with every field."""
     data = b"listed bytes\n"
     hash_hex = hashlib.sha256(data).hexdigest()
     staging, _ = approve_push(server, "listed", data)
@@ -1225,13 +1241,65 @@ def scenario_list_after_commit(server):
         "the build must be committed before it can be listed")
 
     lines = payload_list(server)
-    entry = listed(lines, "listed")
-    assert entry == (
-        "payload listed source=push version=- release=- asset=- "
-        "sha256=%s path=/data/ariel/store/objects/%s running=no" % (
-            hash_hex, hash_hex)), (
+    assert listed(lines, "listed") == expected_listing("listed", hash_hex), (
         "payload list must show the name, source, version identifiers, hash, "
         "path and whether it is running, got %r" % lines)
+
+
+def scenario_state_survives_restart(server):
+    """The state file records committed payloads, and a restart reads them back.
+
+    Listing is read-only: the state file is the same bytes after it.
+    """
+    data = b"survives a restart\n"
+    hash_hex = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "survivor", data)
+    assert commit(server, staging) == [
+        "installed survivor %s" % hash_hex, "exit 0"], (
+        "the build must be committed before it can be listed")
+
+    before = read_state(server)
+    assert listed(payload_list(server), "survivor") == expected_listing(
+        "survivor", hash_hex), "the commit must be in the state file"
+    assert read_state(server) == before, "payload list must not write state"
+
+    server.restart()
+
+    assert read_state(server) == before, (
+        "a restart of Ariel must not rewrite the state file")
+    assert listed(payload_list(server), "survivor") == expected_listing(
+        "survivor", hash_hex), "the payload must survive a restart of Ariel"
+
+
+def scenario_stage1_store_migrates_once(server):
+    """A store Stage 1 wrote is migrated on the first start, and only once.
+
+    Stage 1 kept no state file, only per-name current records. Removing the
+    state file and starting again is the Stage 1 store; the first start builds
+    the state file from those records, and a second start changes nothing.
+    """
+    data = b"stage one build\n"
+    hash_hex = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "stage1", data)
+    assert commit(server, staging) == [
+        "installed stage1 %s" % hash_hex, "exit 0"], (
+        "the build must be committed before the store can be migrated")
+
+    server.stop()
+    os.remove(state_path(server))
+    server._start()
+
+    assert listed(payload_list(server), "stage1") == expected_listing(
+        "stage1", hash_hex), (
+        "the first start must build the state file from the current records")
+    migrated = read_state(server)
+
+    server.restart()
+
+    assert read_state(server) == migrated, (
+        "a second start must not change the state file")
+    assert listed(payload_list(server), "stage1") == expected_listing(
+        "stage1", hash_hex), "a second start must list the same payload"
 
 
 def scenario_commit_installed(server):
@@ -2197,6 +2265,11 @@ SCENARIOS = [
      scenario_commit_installed, False),
     ("after a commit, payload list shows the payload with every field",
      scenario_list_after_commit, False),
+    ("the state file records a commit, survives a restart and is not "
+     "rewritten by listing", scenario_state_survives_restart, False),
+    ("a store written by Stage 1 is migrated on the first start, and a "
+     "second start changes nothing", scenario_stage1_store_migrates_once,
+     False),
     ("a second commit of the same name replaces the first build",
      scenario_commit_replaces, False),
     ("an approval does not survive a restart of Ariel",
