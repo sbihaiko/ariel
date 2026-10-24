@@ -24,12 +24,14 @@ along with this program; see the file COPYING. If not, see
 #error "the virtual controller is host-only"
 #endif
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "store.h"
 #include "testclock.h"
@@ -37,6 +39,9 @@ along with this program; see the file COPYING. If not, see
 
 /** The longest prompt text the controller shows. **/
 #define PROMPT_MAX 256
+
+/** The longest command line the controller reads, with its terminator. **/
+#define COMMAND_MAX 1024
 
 /** How many pids the controller tracks restarts for. **/
 #define EPOCH_MAX 32
@@ -159,18 +164,47 @@ handle_line(char *line) {
 }
 
 
+/**
+ * Read commands from descriptor 0, never through stdin's FILE. A thread
+ * blocked in getline holds stdin's lock, and glibc's exit takes every
+ * stream's lock to flush it: an Ariel that refuses to start would then hang
+ * in exit until the harness closed its input.
+ **/
 static void *
 read_commands(void *arg) {
-  char *line = NULL;
-  size_t cap = 0;
+  char line[COMMAND_MAX];
+  size_t len = 0;
+  int overlong = 0;
+  char c;
+  ssize_t n;
 
   (void)arg;
 
-  while(getline(&line, &cap, stdin) >= 0) {
-    handle_line(line);
+  while((n=read(STDIN_FILENO, &c, 1)) != 0) {
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if(c != '\n') {
+      if(len + 1 < sizeof(line)) {
+        line[len++] = c;
+      } else {
+        overlong = 1;
+      }
+      continue;
+    }
+    line[len] = '\0';
+    if(overlong) {
+      print_line("unknown_command");
+    } else {
+      handle_line(line);
+    }
+    len = 0;
+    overlong = 0;
   }
 
-  free(line);
   return NULL;
 }
 
