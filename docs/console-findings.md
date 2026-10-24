@@ -224,6 +224,46 @@ Three things the console taught that the host build cannot:
 
 One more, from the deploy rather than the commands: sending the ELF with a plain `nc` that closed early crashed the console into a reboot, and the payloads that had been running did not come back (only the loader did). The working shape is to send every byte, shut the writing side, and read until the peer closes.
 
+## Issue #55: the capture API on the console
+
+Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014). The spike is `capture_spike.c` and the `capture-spike.elf` target in the `Makefile`; it is not part of `all`, is never linked into `shsrv-ps5.elf`, and the operator sends it to the loader on 9021 on its own, as the controller spike is sent. It writes every step to `/data/capture-spike.log` before taking it, so a crash still says where it died. A copy of `/system/common/lib/libSceScreenShot.sprx` fetched over FTP was read on the workstation to name the exports.
+
+**What the library is.** `/system/common/lib/libSceScreenShot.sprx` is the VSH build: an IPC client (`SceScreenShotIpcClient`, command `0x34560000`) in front of a system daemon, not a capture implementation of its own. It carries 13 exported functions. The public PS5 3.20 export dump and the PS4 map agree on these names, and the disassembly agrees with the ones the spike called:
+
+| NID | Name | Called here |
+| --- | --- | --- |
+| `G7KlmIYFIZc` | `sceScreenShotSetParam` | yes, returned 0 |
+| `JuMLLmmvRgk` | `sceScreenShotCapture` | yes, never completed |
+| `ahHhOf+QNkQ` | `sceScreenShotSetOverlayImage` | yes, returned `0x80BE0003` |
+| `2xxUtuC-RzE` | `sceScreenShotEnable` | no |
+| `tIYf0W5VTi8` | `sceScreenShotDisable` | no |
+| `-SV-oTNGFQk` | `sceScreenShotIsDisabled` | resolved, not trusted as a flag |
+| `ICNJ-1POs84` | `sceScreenShotIsVshScreenCaptureDisabled` | resolved, not trusted as a flag |
+| `73WQ4Jj0nJI`, `hNmK4SdhPT0`, `VlAQIgXa2R0`, `ysfza71rm9M`, `BDUaqlVdSAY`, `itlWFWV3Tzc` | unnamed in every public list found | no |
+
+**What a capture hands back.** `sceScreenShotCapture(int mode, char *path, int (*cancel)(void*), void *userdata)` — from the disassembly: `mode` below 2, `path` a non-null 1024-byte buffer the function clears before it starts, `cancel` optional. It polls the daemon every 16 ms while the answer is `0x80020023`, calls `cancel` if one is given, and on success writes into the caller's buffer the path the system chose. The caller therefore chooses no location: it passes metadata (`SceScreenShotParam`, 0x28 bytes: `thisSize`, `photoTitle`, `gameTitle`, `gameComment`, `reserved`) and the system names the file in its own gallery. Public sources put that gallery at `/user/av_contents/photo/<NPXS…>/<TITLEID>/<NNN>/`, outside `/data`; not verified on this console, because no capture completed.
+
+**What the console answered.**
+
+| Attempt | Reply |
+| --- | --- |
+| `dlopen` of the library by path and by name | null, with `dlerror()` null too; `dlopen` also answers null for `libkernel_sys.sprx` and the other system libraries, as `docs/console-findings.md` already recorded |
+| `sceKernelLoadStartModule("/system/common/lib/libSceScreenShot.sprx", …)` at once | loaded (handle 33), and every export resolved, but the first call died inside an unresolved import |
+| `sceKernelLoadStartModule` after `/system/common/lib/libSceIpmi.sprx` and `/system/common/lib/libSceSysUtil.sprx` | loaded (handle 35), all 13 exports resolved, calls survive |
+| `sceKernelDlsym(handle, nid, &fn)` for each export | `0x80020003` for every one, plain and `#E#A`-decorated; `kernel_dynlib_resolve(getpid(), handle, nid)` answers instead |
+| `SetParam("Ariel capture spike", …, "issue #55")` | `0`, twice |
+| `Capture(mode 0, buf, cancel at 15 s, …)` | `0x80020023` until the cancel fired, then `0x80BE000A`; buffer empty |
+| `SetOverlayImage("/data/shot-spike2.jpg", 1280, 720, 0)` | `0x80BE0003` (the export takes a path and two coordinates; no image either way) |
+
+Four things this run settled:
+
+- **The library loads in a payload only after its imports are present.** Loaded alone, it resolves and then dies on the first call that crosses a PLT entry into `libSceIpmi`/`libSceSysUtil`; loaded after those two, it answers. A payload has no `dlopen` at all, so `sceKernelLoadStartModule` with the full path is the only door, and `kernel_dynlib_resolve` with the kernel's own symbol table is the only lookup.
+- **A payload is not refused by the capture service, and not served either.** `SetParam` answers success and `Capture` is accepted (`0x80020023` is "still working", not an error), but on this console it never left that state: no game running, the system UI on screen, 15 s and no image. Whether `mode 1`, a running title, or the VSH's own identity changes that is not measured.
+- **Where the image goes is the system's choice.** The caller's buffer says where it went; it is not an argument.
+- **The spike's last run took the console down.** The run that tried both modes in one payload stopped answering ping, the shell's 2323, the agent's 2324, the loader's 9021 and FTP's 2121, and no magic packet brought it back within two minutes. The cause is not known: the log on `/data` will name the last step taken when the console answers again. Treat a second `Capture` in one payload, or the flag queries that preceded it, as the suspects until then.
+
+**Not measured.** The time and memory a capture costs, the size and format of the file (the system's PNG/JPEG setting), what a protected scene answers (no game or video app was run), and whether a capture works while a title is in the foreground. Each needs a console that completes a capture first.
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.

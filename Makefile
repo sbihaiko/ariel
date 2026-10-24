@@ -115,6 +115,11 @@ controller-spike.elf: controller_spike.o notify.o pt.o
 	$(CC) -lkernel_sys -lScePad -lSceUserService -lSceSystemService \
 	      -lSceRegMgr -o $@ $^
 
+# The capture spike is a separate payload, answering issue #55. It is never
+# linked into shsrv-ps5.elf; the operator sends it to elfldr on its own.
+capture-spike.elf: capture_spike.o notify.o
+	$(CC) -lkernel_sys -o $@ $^
+
 # The primitives probe is a separate payload. It is never linked into
 # shsrv-ps5.elf; the operator sends it to elfldr on its own. ps5_at.h is a
 # header, so the probe needs no extra object.
