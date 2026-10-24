@@ -7566,7 +7566,8 @@ def scenario_commit_after_its_pin_moved_answers_78(_server):
         lines_one = install_request(fx.server, INSTALL_NAME)
         staging_one, approval_one = assert_staged(
             fx.server, lines_one, INSTALL_NAME, first)
-        fx.fake.data = second
+        fx.fake.add_release(INSTALL_TAG, RELEASE_ID, ASSET_ID, ASSET_ID,
+                            second, latest=True)
         lines_two = install_request(fx.server, INSTALL_NAME)
         staging_two, approval_two = assert_staged(
             fx.server, lines_two, INSTALL_NAME, second)
