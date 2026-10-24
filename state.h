@@ -41,6 +41,8 @@ typedef struct {
   char path[256];
   int running;
   char previous[65];
+  uint64_t timeout;
+  int failed;
 } state_payload_t;
 
 /**
@@ -74,5 +76,20 @@ int state_referenced(const char *hash, const char *name);
  * count. Returns 0, or -1 before state_open has loaded the record.
  **/
 int state_list(state_payload_t *entries, size_t max, size_t *count);
+
+/**
+ * Set the one-shot health timeout of name, in seconds; 0 keeps the default.
+ * Returns 0, or -1 when name is not installed or the record cannot be saved.
+ **/
+int state_health_set(const char *name, uint64_t timeout);
+
+/**
+ * Copy the health timeout and failed flag of name. Returns 0, or -1 when name
+ * is not installed.
+ **/
+int state_health_get(const char *name, uint64_t *timeout, int *failed);
+
+/** Set the failed flag of name, the current build having failed its check. **/
+int state_failed_set(const char *name, int failed);
 
 #endif /* ARIEL_STATE_H */

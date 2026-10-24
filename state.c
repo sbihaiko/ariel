@@ -61,6 +61,8 @@ struct state_payload {
   char path[256];
   int running;
   char previous[SHA256_HEX_LEN + 1];
+  uint64_t timeout;
+  int failed;
 };
 
 /**
@@ -240,12 +242,13 @@ state_save_locked(void) {
     }
 
     wrote = snprintf(body + len, size - len,
-                     "payload %s %s %s %llu %llu %s %s %d %s\n",
+                     "payload %s %s %s %llu %llu %s %s %d %s %llu %d\n",
                      entry->name, entry->source,
                      entry->version[0] ? entry->version : "-",
                      (unsigned long long)entry->release,
                      (unsigned long long)entry->asset, entry->sha256,
-                     entry->path, entry->running, entry->previous);
+                     entry->path, entry->running, entry->previous,
+                     (unsigned long long)entry->timeout, entry->failed);
     if(wrote < 0 || len + (size_t)wrote >= size) {
       free(body);
       return -1;
@@ -300,26 +303,35 @@ parse_payload(char *line) {
   char version[64];
   unsigned long long release;
   unsigned long long asset;
+  unsigned long long timeout = 0;
   int running;
+  int failed = 0;
   int got;
 
   memset(&parsed, 0, sizeof(parsed));
-  got = sscanf(line, "payload %32s %15s %63s %llu %llu %64s %255s %d %64s",
+  got = sscanf(line,
+               "payload %32s %15s %63s %llu %llu %64s %255s %d %64s %llu %d",
                parsed.name, parsed.source, version, &release, &asset,
-               parsed.sha256, parsed.path, &running, parsed.previous);
+               parsed.sha256, parsed.path, &running, parsed.previous,
+               &timeout, &failed);
 
   // A line from before previous was recorded has eight fields; its payload
-  // had no previous version, and the next save writes the ninth.
+  // had no previous version. A line from before health checks has nine.
   if(got == 8) {
     snprintf(parsed.previous, sizeof(parsed.previous), "-");
     got = 9;
   }
+  if(got == 9) {
+    got = 11;
+  }
 
-  if(got != 9 || !store_name_valid(parsed.name) || !hash_text(parsed.sha256) ||
-     (running != 0 && running != 1) ||
+  if(got != 11 || !store_name_valid(parsed.name) || !hash_text(parsed.sha256) ||
+     (running != 0 && running != 1) || (failed != 0 && failed != 1) ||
      (strcmp(parsed.previous, "-") && !hash_text(parsed.previous))) {
     return -1;
   }
+  parsed.timeout = (uint64_t)timeout;
+  parsed.failed = failed;
 
   if(strcmp(version, "-")) {
     snprintf(parsed.version, sizeof(parsed.version), "%s", version);
@@ -607,6 +619,9 @@ state_record(const char *name, const char *hash, const char *previous) {
     snprintf(entry->source, sizeof(entry->source), "push");
   }
 
+  if(strcmp(entry->sha256, hash)) {
+    entry->failed = 0;
+  }
   snprintf(entry->sha256, sizeof(entry->sha256), "%s", hash);
   snprintf(entry->previous, sizeof(entry->previous), "%s", previous);
   object_path(hash, entry->path, sizeof(entry->path));
@@ -691,6 +706,8 @@ state_list(state_payload_t *entries, size_t max, size_t *count) {
     entries[n].running = entry->running;
     snprintf(entries[n].previous, sizeof(entries[n].previous), "%s",
              entry->previous);
+    entries[n].timeout = entry->timeout;
+    entries[n].failed = entry->failed;
     n++;
   }
 
@@ -698,4 +715,56 @@ state_list(state_payload_t *entries, size_t max, size_t *count) {
   *count = n;
 
   return 0;
+}
+
+
+int
+state_health_set(const char *name, uint64_t timeout) {
+  struct state_payload *entry;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+
+  if(loaded && (entry=payload_find(name))) {
+    entry->timeout = timeout;
+    rc = state_save_locked();
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
+state_failed_set(const char *name, int failed) {
+  struct state_payload *entry;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+
+  if(loaded && (entry=payload_find(name))) {
+    entry->failed = failed;
+    rc = state_save_locked();
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
+state_health_get(const char *name, uint64_t *timeout, int *failed) {
+  struct state_payload *entry;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+
+  if(loaded && (entry=payload_find(name))) {
+    *timeout = entry->timeout;
+    *failed = entry->failed;
+    rc = 0;
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
 }

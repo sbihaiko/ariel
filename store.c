@@ -913,6 +913,13 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[0].key = "start";
       options[0].value = facts->start;
       action->noptions = 1;
+    } else if(!strcmp(facts->command, "payload.config")) {
+      decimal(facts->argc, text[0], sizeof(text[0]));
+      options[0].key = "kind";
+      options[0].value = "one-shot";
+      options[1].key = "timeout";
+      options[1].value = text[0];
+      action->noptions = 2;
     } else if(facts->kind[0]) {
       size_t n = 0;
 
@@ -2614,6 +2621,173 @@ store_rollback(const char *name, char *approval_id, size_t idlen,
   }
 
   pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
+/**
+ * A failed health check puts the previous build back as current. The build
+ * that failed is dropped unless another name still holds it. The caller holds
+ * the lock.
+ **/
+static int
+health_replace_locked(const char *name, const char *failed, char *restored,
+                      size_t size) {
+  char previous[SHA256_HEX_LEN + 1];
+  char current[SHA256_HEX_LEN + 1];
+  char current_text[SHA256_HEX_LEN + 2];
+  char tmp_current[PAYLOAD_NAME_MAX + 8];
+  struct journal j;
+  int state_fd = -1;
+  int store_fd = -1;
+  int objects_fd = -1;
+  int current_fd = -1;
+  int rc = STORE_HEALTH_FAILED;
+
+  if((state_fd=root_open()) < 0 ||
+     (store_fd=dir_open(state_fd, "store")) < 0 ||
+     (objects_fd=dir_open(store_fd, "objects")) < 0 ||
+     (current_fd=dir_open(store_fd, "current")) < 0) {
+    goto out;
+  }
+
+  if(transaction_recover_locked(state_fd, store_fd)) {
+    goto out;
+  }
+
+  if(current_read(current_fd, name, current) || strcmp(current, failed) ||
+     state_previous(name, previous, sizeof(previous)) ||
+     !object_present(objects_fd, previous)) {
+    goto out;
+  }
+
+  snprintf(current_text, sizeof(current_text), "%s\n", previous);
+  snprintf(tmp_current, sizeof(tmp_current), "%s.tmp", name);
+  if(tmp_write(current_fd, tmp_current, current_text, SHA256_HEX_LEN + 1)) {
+    goto out;
+  }
+
+  memset(&j, 0, sizeof(j));
+  snprintf(j.kind, sizeof(j.kind), "payload");
+  snprintf(j.name, sizeof(j.name), "%s", name);
+  snprintf(j.hash, sizeof(j.hash), "%s", previous);
+  snprintf(j.previous, sizeof(j.previous), "%s", "-");
+  snprintf(j.drop, sizeof(j.drop), "%s",
+           state_referenced(failed, name) ? "-" : failed);
+
+  snprintf(j.phase, sizeof(j.phase), "prepared");
+  if(journal_write(store_fd, &j)) {
+    transaction_rollback_locked(store_fd, name, previous);
+    goto out;
+  }
+  fault_at("prepared");
+
+  snprintf(j.phase, sizeof(j.phase), "committed");
+  if(journal_write(store_fd, &j)) {
+    goto out;
+  }
+  fault_at("committed");
+
+  if(transaction_roll_forward_locked(store_fd, &j)) {
+    goto out;
+  }
+
+  journal_clear(store_fd);
+
+  snprintf(restored, size, "%s", previous);
+  rc = STORE_HEALTH_REPLACED;
+
+out:
+  if(current_fd >= 0) {
+    close(current_fd);
+  }
+  if(objects_fd >= 0) {
+    close(objects_fd);
+  }
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  return rc;
+}
+
+
+/**
+ * A failed health check with no previous build: the payload leaves autoload,
+ * when it is listed there, and is marked failed. The caller holds the lock.
+ **/
+static int
+health_mark_locked(const char *name) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char next[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  char next_hex[SHA256_HEX_LEN + 1];
+  int state_fd = -1;
+  int store_fd = -1;
+  int len;
+  int edit;
+  int rc = STORE_HEALTH_FAILED;
+
+  if((state_fd=root_open()) < 0 ||
+     (store_fd=dir_open(state_fd, "store")) < 0) {
+    goto out;
+  }
+
+  if(transaction_recover_locked(state_fd, store_fd)) {
+    goto out;
+  }
+
+  len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
+  if(len < 0) {
+    goto out;
+  }
+  text_hash(text, (size_t)len, hex);
+
+  edit = autoload_edit(text, 0, name, next, sizeof(next));
+  if(edit == AUTOLOAD_OK) {
+    text_hash(next, strlen(next), next_hex);
+    if(autoload_transaction_locked(state_fd, store_fd, next, hex, next_hex,
+                                   "autoload_remove", name, "-") < 0) {
+      goto out;
+    }
+  } else if(edit != AUTOLOAD_ABSENT) {
+    goto out;
+  }
+
+  if(state_failed_set(name, 1)) {
+    goto out;
+  }
+  rc = STORE_HEALTH_MARKED;
+
+out:
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  return rc;
+}
+
+
+int
+store_health_failed(const char *name, const char *failed, char *restored,
+                    size_t size) {
+  char previous[SHA256_HEX_LEN + 1];
+  int outcome;
+
+  pthread_mutex_lock(&lock);
+  if(state_previous(name, previous, sizeof(previous))) {
+    outcome = STORE_HEALTH_FAILED;
+  } else if(strcmp(previous, "-")) {
+    outcome = health_replace_locked(name, failed, restored, size);
+  } else {
+    outcome = health_mark_locked(name);
+  }
+  pthread_mutex_unlock(&lock);
+
   return outcome;
 }
 

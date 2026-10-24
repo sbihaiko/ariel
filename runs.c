@@ -185,6 +185,71 @@ runs_start(platform_t *platform, const char *name, const char *sha256,
 
 
 int
+runs_health(platform_t *platform, const char *name, const char *sha256,
+            const unsigned char *bytes, size_t size, uint64_t timeout_ms) {
+  char id[24];
+  char *argv[2];
+  uint64_t deadline;
+  pid_t pid = 0;
+  int status = 0;
+  int got = 0;
+  int timed_out = 0;
+  int logfd;
+
+  if((logfd=store_log_open(name, 1)) < 0) {
+    return RUNS_UNHEALTHY;
+  }
+
+  argv[0] = (char*)name;
+  argv[1] = NULL;
+  deadline = platform_ms(platform) + timeout_ms;
+  if(platform->spawn_start(platform, bytes, size, argv, logfd, &pid)) {
+    close(logfd);
+    return RUNS_UNHEALTHY;
+  }
+  close(logfd);
+
+  snprintf(id, sizeof(id), "%ld", (long)pid);
+  if(store_audit_append("health.start", name, id, sha256)) {
+    stop_and_reap(platform, pid);
+    return RUNS_AUDIT;
+  }
+
+  for(;;) {
+    got = platform->spawn_poll(platform, pid, &status);
+    if(got < 0) {
+      status = -1;
+      break;
+    }
+    if(got) {
+      break;
+    }
+    if(platform_ms(platform) >= deadline) {
+      stop_and_reap(platform, pid);
+      timed_out = 1;
+      break;
+    }
+    pause_briefly();
+  }
+
+  if(timed_out) {
+    if(store_audit_append("health.timeout", name, id, sha256)) {
+      return RUNS_AUDIT;
+    }
+    return RUNS_TIMED_OUT;
+  }
+
+  snprintf(id, sizeof(id), "%d", status);
+  if(got > 0 && status == 0) {
+    return store_audit_append("health.ok", name, id, sha256) ? RUNS_AUDIT
+                                                          : RUNS_HEALTHY;
+  }
+  return store_audit_append("health.fail", name, id, sha256) ? RUNS_AUDIT
+                                                            : RUNS_UNHEALTHY;
+}
+
+
+int
 runs_running(const char *name) {
   size_t i;
   int running = 0;

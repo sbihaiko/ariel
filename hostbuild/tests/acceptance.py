@@ -419,6 +419,13 @@ main(int argc, char* argv[]) {
 """
 
 
+def healthy_build(tag):
+    """A build that runs and exits 0, so its one-shot health check passes."""
+    return compile_payload(
+        HELLO_SOURCE.replace("Hello, world from Ariel!", "Hello from %s!" % tag),
+        tag)
+
+
 def install_payload(server, name, data):
     """Push, approve and commit one build, and return its hash."""
     staging, _ = approve_push(server, name, data)
@@ -458,12 +465,25 @@ main(void) {
 """
 
 
+EXIT_ON_ARG_SOURCE = """
+#include <stdio.h>
+
+int
+main(int argc, char* argv[]) {
+  printf("exiting %d\\n", EXIT_CODE);
+  return argc > 1 ? EXIT_CODE : 0;
+}
+"""
+
+
 def scenario_run_reports_payload_status(server):
+    # A build that exits nonzero with no arguments fails its one-shot check at
+    # commit, so this build exits with its status only when given an argument.
     for code in (3, 75):
         data = compile_payload(
-            EXIT_SOURCE.replace("EXIT_CODE", str(code)), "exit%d" % code)
+            EXIT_ON_ARG_SOURCE.replace("EXIT_CODE", str(code)), "exit%d" % code)
         install_payload(server, "exit%d" % code, data)
-        lines = run_payload(server, "exit%d" % code)
+        lines = run_payload(server, "exit%d" % code, ("now",))
         expected = ["exiting %d" % code, "status %d" % code, "exit 0"]
         assert lines == expected, (
             "a payload exiting %d must answer 'status %d' and 'exit 0', "
@@ -569,8 +589,9 @@ main(int argc, char* argv[]) {
   struct timespec pause = {0, 10 * 1000 * 1000};
   FILE* started;
 
+  // With no arguments this is the one-shot health check, which must exit 0.
   if(argc < 3) {
-    return 2;
+    return 0;
   }
 
   // Signal that the payload is running, then wait for the harness to let
@@ -660,8 +681,15 @@ def scenario_run_does_not_leak_connections(server):
 
 
 def scenario_run_exec_failure(server):
+    # Bytes that cannot be executed fail their one-shot check at commit. With
+    # no previous version the failed build stays current, so an ad-hoc run of
+    # it still reaches spawn_failed.
     data = b"this is not an executable\n"
-    install_payload(server, "notexec", data)
+    digest = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "notexec", data)
+    assert commit(server, staging) == [
+        "health_failed notexec %s" % digest, "exit 1"], (
+        "a build that cannot be executed must fail its one-shot check")
     lines = run_payload(server, "notexec")
     assert lines == ["spawn_failed", "exit 1"], (
         "a stored object that cannot be executed must answer spawn_failed "
@@ -755,7 +783,7 @@ def scenario_background_logs_one_shot(server):
 
 def scenario_background_hung_payload_is_cut(server):
     data = compile_payload(HANG_SOURCE, "bghang")
-    digest = install_payload(server, "bghang", data)
+    digest = install_hanging(server, "bghang", data)
     lines = background_run(server, "bghang")
     assert lines[-1] == "exit 0" and lines[0].startswith("pid "), (
         "a background run must answer a pid, got %r" % lines)
@@ -793,8 +821,10 @@ def scenario_background_run_refusals(server):
 
     data = compile_payload(EXIT_SOURCE.replace("EXIT_CODE", "0"), "bgnever")
     install_payload(server, "bgnever", data)
-    assert payload_logs(server, "bgnever") == ["no_log", "exit 1"], (
-        "logs of a payload that never ran must answer no_log")
+    # Activation runs the one-shot check, which writes the log, so a committed
+    # payload has its check's output there before any background run.
+    assert payload_logs(server, "bgnever") == ["exiting 0", "exit 0"], (
+        "the log of a committed payload must hold its health check's output")
 
     data = compile_payload(SLEEP_SOURCE, "bgsleep")
     install_payload(server, "bgsleep", data)
@@ -1093,6 +1123,13 @@ HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console 
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
+    "a one-shot past its timeout fails, and with no previous version it is "
+    "marked failed",
+    "a failed one-shot with no previous version is removed from autoload",
+    "payload config is gated, applied after a grant and audited, and refuses "
+    "unknown payloads, other kinds and a zero timeout",
+    "a rollback whose restored build fails its health check is replaced by "
+    "the build it rolled back from",
     "rollbacks that end, and requests left to expire, free their approval "
     "rows, so a push still asks for approval",
     "each gated built-in answers 75 and its challenge before anything runs",
@@ -1612,7 +1649,7 @@ def read_state(server):
 
 def scenario_list_after_commit(server):
     """After a commit, payload list shows the payload with every field."""
-    data = b"listed bytes\n"
+    data = healthy_build("listed")
     hash_hex = hashlib.sha256(data).hexdigest()
     staging, _ = approve_push(server, "listed", data)
     assert commit(server, staging) == [
@@ -1630,7 +1667,7 @@ def scenario_state_survives_restart(server):
 
     Listing is read-only: the state file is the same bytes after it.
     """
-    data = b"survives a restart\n"
+    data = healthy_build("survivor")
     hash_hex = hashlib.sha256(data).hexdigest()
     staging, _ = approve_push(server, "survivor", data)
     assert commit(server, staging) == [
@@ -1657,7 +1694,7 @@ def scenario_stage1_store_migrates_once(server):
     state file and starting again is the Stage 1 store; the first start builds
     the state file from those records, and a second start changes nothing.
     """
-    data = b"stage one build\n"
+    data = healthy_build("stage-one-build")
     hash_hex = hashlib.sha256(data).hexdigest()
     staging, _ = approve_push(server, "stage1", data)
     assert commit(server, staging) == [
@@ -1691,15 +1728,16 @@ def scenario_state_without_previous_starts(server):
     del server  # a start that fails must not take the suite's Ariel with it
     legacy = Server(SERVER_BINARY)
     try:
-        data = b"eight field build\n"
+        data = healthy_build("legacy")
         hash_hex = hashlib.sha256(data).hexdigest()
         install_payload(legacy, "legacy", data)
 
         legacy.stop()
         with open(state_path(legacy), "r") as fh:
             lines = fh.read().splitlines()
-        eight = [line.rsplit(" ", 1)[0] if line.startswith("payload ") else line
-                 for line in lines]
+        # Keep the word "payload" and the eight fields through running.
+        eight = [" ".join(line.split(" ")[:9]) if line.startswith("payload ")
+                 else line for line in lines]
         with open(state_path(legacy), "w") as fh:
             fh.write("\n".join(eight) + "\n")
         legacy._start()
@@ -1713,7 +1751,7 @@ def scenario_state_without_previous_starts(server):
 
 
 def scenario_commit_installed(server):
-    data = b"committed bytes\n"
+    data = healthy_build("committed-build")
     staging, _ = approve_push(server, "committed", data)
     lines = commit(server, staging)
     expected = "installed committed %s" % hashlib.sha256(data).hexdigest()
@@ -1731,7 +1769,7 @@ def store_dir(server):
 
 
 def scenario_commit_replaces(server):
-    first = b"first build"
+    first = healthy_build("replace-first-build")
     first_hash = hashlib.sha256(first).hexdigest()
     staging, _ = approve_push(server, "replace", first)
     assert commit(server, staging) == [
@@ -1739,7 +1777,7 @@ def scenario_commit_replaces(server):
         "the first build of a name must be installed"
     )
 
-    second = b"second build"
+    second = healthy_build("replace-second-build")
     second_hash = hashlib.sha256(second).hexdigest()
     staging, _ = approve_push(server, "replace", second)
     assert commit(server, staging) == [
@@ -1776,8 +1814,8 @@ def scenario_shared_build_survives_a_replacement(server):
     shared_hash = hashlib.sha256(shared).hexdigest()
     install_payload(server, "shared-a", shared)
     install_payload(server, "shared-b", shared)
-    install_payload(server, "shared-a", b"shared-a second build\n")
-    install_payload(server, "shared-a", b"shared-a third build\n")
+    install_payload(server, "shared-a", healthy_build("shared-a-second-build"))
+    install_payload(server, "shared-a", healthy_build("shared-a-third-build"))
 
     assert listed(payload_list(server), "shared-b") == expected_listing(
         "shared-b", shared_hash), (
@@ -1788,8 +1826,8 @@ def scenario_shared_build_survives_a_replacement(server):
         "shared-b must still run the build it committed, got %r" % lines)
 
 
-FIRST_BUILD = b"journal first build\n"
-SECOND_BUILD = b"journal second build\n"
+FIRST_BUILD = healthy_build("journal-first-build")
+SECOND_BUILD = healthy_build("journal-second-build")
 JOURNAL_NAME = "journal"
 JOURNAL_FILE = "journal"
 
@@ -1800,8 +1838,9 @@ int
 main(int argc, char* argv[]) {
   FILE* log;
 
+  // With no arguments this is the one-shot health check, which must exit 0.
   if(argc < 2) {
-    return 2;
+    return 0;
   }
 
   // Each start appends one line, so the harness can count how often it ran.
@@ -1993,13 +2032,13 @@ def scenario_previous_version_is_kept_then_dropped(server):
     del server  # the object store is read from the root, so this Ariel is its own
     history = Server(SERVER_BINARY)
     try:
-        first = install_payload(history, "history", b"history build a\n")
-        second = install_payload(history, "history", b"history build b\n")
+        first = install_payload(history, "history", healthy_build("history-build-a"))
+        second = install_payload(history, "history", healthy_build("history-build-b"))
         assert listed(payload_list(history), "history") == expected_listing(
             "history", second, first), (
             "the replaced build must be listed as previous")
 
-        third = install_payload(history, "history", b"history build c\n")
+        third = install_payload(history, "history", healthy_build("history-build-c"))
         assert listed(payload_list(history), "history") == expected_listing(
             "history", third, second), (
             "the newest replacement must name the build it replaced")
@@ -2020,8 +2059,8 @@ def rollback_request(server, name):
 
 def scenario_rollback_restores_the_previous_version(server):
     """A rollback answers 75 with its challenge; after a grant the previous build is current."""
-    previous = install_payload(server, "rollb", b"rollback build a\n")
-    current = install_payload(server, "rollb", b"rollback build b\n")
+    previous = install_payload(server, "rollb", healthy_build("rollback-build-a"))
+    current = install_payload(server, "rollb", healthy_build("rollback-build-b"))
 
     lines = rollback_request(server, "rollb")
     assert len(lines) == 3 and APPROVAL_LINE.match(lines[0]) and (
@@ -2064,7 +2103,7 @@ def scenario_rollback_restores_the_previous_version(server):
 
 def scenario_rollback_without_previous_version_answers_error(server):
     """No previous version, or no such payload: an error, with no prompt."""
-    install_payload(server, "rollfirst", b"first build only\n")
+    install_payload(server, "rollfirst", healthy_build("first-build-only"))
 
     assert send_command(server, "payload rollback rollfirst") == [
         "no_previous_version", "exit 1"], (
@@ -2083,15 +2122,15 @@ def scenario_rollback_without_previous_version_answers_error(server):
 
 def scenario_rollback_refused_when_the_store_moved_on(server):
     """A grant for a rollback the store no longer matches answers approval_stale."""
-    install_payload(server, "rollmoved", b"moved build a\n")
-    current = install_payload(server, "rollmoved", b"moved build b\n")
+    install_payload(server, "rollmoved", healthy_build("moved-build-a"))
+    current = install_payload(server, "rollmoved", healthy_build("moved-build-b"))
 
     lines = rollback_request(server, "rollmoved")
     approval = APPROVAL_LINE.match(lines[0]).group(1)
     server.next_line()
     sign_and_grant(server, approval, challenge_of(lines))
 
-    newest = install_payload(server, "rollmoved", b"moved build c\n")
+    newest = install_payload(server, "rollmoved", healthy_build("moved-build-c"))
     assert send_command(server, "payload rollback rollmoved") == [
         "approval_stale", "exit 78"], (
         "a rollback whose facts changed after the grant must answer "
@@ -2105,8 +2144,8 @@ def scenario_rollback_refused_when_the_store_moved_on(server):
 
 def scenario_rollback_denied_answers_77(server):
     """A denied rollback answers approval_denied and changes nothing."""
-    previous = install_payload(server, "rolldeny", b"denied build a\n")
-    current = install_payload(server, "rolldeny", b"denied build b\n")
+    previous = install_payload(server, "rolldeny", healthy_build("denied-build-a"))
+    current = install_payload(server, "rolldeny", healthy_build("denied-build-b"))
 
     lines = rollback_request(server, "rolldeny")
     approval = APPROVAL_LINE.match(lines[0]).group(1)
@@ -2139,8 +2178,8 @@ def scenario_rollbacks_give_their_approval_rows_back(server):
 
 
 def rollbacks_give_rows_back(server):
-    previous = install_payload(server, "rollmany", b"many build a\n")
-    current = install_payload(server, "rollmany", b"many build b\n")
+    previous = install_payload(server, "rollmany", healthy_build("many-build-a"))
+    current = install_payload(server, "rollmany", healthy_build("many-build-b"))
 
     for i in range(ROLLBACK_ROUNDS):
         lines = rollback_request(server, "rollmany")
@@ -2172,8 +2211,8 @@ def scenario_unreadable_record_answers_rollback_failed(server):
     del server  # a table filled by an earlier scenario must not decide this one
     broken = Server(SERVER_BINARY)
     try:
-        previous = install_payload(broken, "rollbroken", b"broken build a\n")
-        current = install_payload(broken, "rollbroken", b"broken build b\n")
+        previous = install_payload(broken, "rollbroken", healthy_build("broken-build-a"))
+        current = install_payload(broken, "rollbroken", healthy_build("broken-build-b"))
 
         lines = rollback_request(broken, "rollbroken")
         approval = APPROVAL_LINE.match(lines[0]).group(1)
@@ -2342,7 +2381,7 @@ def scenario_commit_stale(server):
 
 
 def scenario_commit_single_use(server):
-    data = b"one use only"
+    data = healthy_build("one-use-build")
     hash_hex = hashlib.sha256(data).hexdigest()
     staging, _ = approve_push(server, "single", data)
 
@@ -2440,7 +2479,7 @@ def scenario_approval_status(server):
     answers consumed, and an id Ariel never issued is an error.
     """
     server.fresh()
-    data = b"status of this approval"
+    data = healthy_build("statused")
     lines = push(server, "statused", data)
     staging, approval = assert_staged(server, lines, "statused", data)
     assert approval_status(server, approval) == [
@@ -4483,7 +4522,7 @@ def scenario_signature_malformed(server):
 
 
 def scenario_signature_twice(server):
-    data = b"one signature, two tries"
+    data = healthy_build("one-signature-build")
     staging, approval, challenge = push_for_challenge(
         server, "twice", data)
     signature = sign_challenge(server, challenge)
@@ -4694,7 +4733,7 @@ def autoload_approve(server, op, name):
 
 def scenario_autoload_edit_asks_before_it_applies(server):
     """An autoload edit without a grant answers 75 and leaves the list as it was."""
-    install_payload(server, "asks", b"asks build\n")
+    install_payload(server, "asks", healthy_build("asks-build"))
     autoload_ask(server, "add", "asks")
     assert "autoload asks" not in autoload_listing(server), (
         "an edit that was asked for must not be applied before its grant")
@@ -4702,7 +4741,7 @@ def scenario_autoload_edit_asks_before_it_applies(server):
 
 def scenario_autoload_edit_applies_after_grant(server):
     """A granted autoload add is applied, shown by autoload show and audited."""
-    install_payload(server, "boot", b"boot build\n")
+    install_payload(server, "boot", healthy_build("boot-build"))
     approval = autoload_approve(server, "add", "boot")
     assert autoload_apply(server, "add", "boot", approval) == [
         "autoload add boot", "exit 0"], "a granted autoload add must apply"
@@ -4730,7 +4769,7 @@ def scenario_autoload_pins_ariel(server):
 
 def scenario_autoload_refusals_answer_their_words(server):
     """Unknown, present and absent names are refused with their own words."""
-    install_payload(server, "refused", b"refused build\n")
+    install_payload(server, "refused", healthy_build("refused-build"))
     assert send_command(server, "autoload edit add ghost") == [
         "unknown_payload", "exit 1"], "adding a payload that is not installed"
     approval = autoload_approve(server, "add", "refused")
@@ -4744,8 +4783,8 @@ def scenario_autoload_refusals_answer_their_words(server):
 
 def scenario_autoload_stale_grant_answers_78(server):
     """A grant for a list that has since changed answers approval_stale."""
-    install_payload(server, "stale_one", b"stale one build\n")
-    install_payload(server, "stale_two", b"stale two build\n")
+    install_payload(server, "stale_one", healthy_build("stale-one-build"))
+    install_payload(server, "stale_two", healthy_build("stale-two-build"))
     stale, challenge = autoload_ask(server, "add", "stale_one")
 
     other = autoload_approve(server, "add", "stale_two")
@@ -4776,7 +4815,7 @@ def autoload_apply_until_crash(server, op, name, approval):
 
 def crash_autoload(server, step):
     """Grant an autoload add of crash_tool, then crash its apply at step."""
-    install_payload(server, "crash_tool", b"crash tool build\n")
+    install_payload(server, "crash_tool", healthy_build("crash-tool-build"))
     server.env = {FAULT_ENV: step}
     server.restart()
     approval, challenge = autoload_ask(server, "add", "crash_tool")
@@ -4909,8 +4948,8 @@ def scenario_committed_autoload_without_its_file_rolls_forward(server):
 
 def scenario_autoload_busy_is_audited(server):
     """An autoload edit refused as busy answers approval_busy and is audited."""
-    install_payload(server, "busy_one", b"busy one build\n")
-    install_payload(server, "busy_two", b"busy two build\n")
+    install_payload(server, "busy_one", healthy_build("busy-one-build"))
+    install_payload(server, "busy_two", healthy_build("busy-two-build"))
     autoload_ask(server, "add", "busy_one")
     lines = send_command(server, "autoload edit add busy_two")
     assert lines == ["approval_busy", "exit 76"], (
@@ -4925,7 +4964,7 @@ def scenario_autoload_audit_failure_after_rename_stays_applied(server):
     """An applied autoload edit whose audit line fails answers audit_failed."""
     fresh = Server(server.binary)
     try:
-        install_payload(fresh, "unlogged", b"unlogged build\n")
+        install_payload(fresh, "unlogged", healthy_build("unlogged-build"))
         approval, challenge = autoload_ask(fresh, "add", "unlogged")
         sign_and_grant(fresh, approval, challenge)
 
@@ -4945,7 +4984,7 @@ def scenario_autoload_audit_failure_after_rename_stays_applied(server):
 
 def scenario_audit_tail_order(server):
     """After a push, a grant and a commit, audit tail shows each one in order."""
-    data = b"audited bytes\n"
+    data = healthy_build("audited-build")
     digest = hashlib.sha256(data).hexdigest()
     staging, approval = approve_push(server, "audited", data)
     assert commit(server, staging) == [
@@ -5934,9 +5973,9 @@ def scenario_reboot_asks_the_owner(server):
 
 def scenario_reboot_granted_restarts_and_runs_autoload(server):
     """A granted reboot restarts Ariel: payloads stay listed and autoload runs."""
-    install_payload(server, "reboot_keep",
+    install_hanging(server, "reboot_keep",
                     compile_payload(HANG_SOURCE, "reboot_keep"))
-    install_payload(server, "reboot_boot",
+    install_hanging(server, "reboot_boot",
                     compile_payload(HANG_SOURCE, "reboot_boot"))
     approval = autoload_approve(server, "add", "reboot_boot")
     assert autoload_apply(server, "add", "reboot_boot", approval) == [
@@ -5960,9 +5999,9 @@ def scenario_reboot_granted_restarts_and_runs_autoload(server):
 
 def scenario_crash_restart_runs_no_autoload(server):
     """A crash restart runs no autoload entry and restarts nothing that was running."""
-    install_payload(server, "crashboot",
+    install_hanging(server, "crashboot",
                     compile_payload(HANG_SOURCE, "crashboot"))
-    install_payload(server, "crashrun", compile_payload(HANG_SOURCE, "crashrun"))
+    install_hanging(server, "crashrun", compile_payload(HANG_SOURCE, "crashrun"))
     approval = autoload_approve(server, "add", "crashboot")
     assert autoload_apply(server, "add", "crashboot", approval) == [
         "autoload add crashboot", "exit 0"], "the boot entry must be added"
@@ -5988,7 +6027,7 @@ def scenario_crash_restart_runs_no_autoload(server):
 
 def scenario_reboot_stale_list_answers_78(server):
     """A reboot granted for a boot list that has since changed is stale and does not restart."""
-    install_payload(server, "stale_add", b"stale add build\n")
+    install_payload(server, "stale_add", compile_payload(HELLO_SOURCE, "stale_add"))
     approval, challenge = gate_request(server, "reboot")
 
     other = autoload_approve(server, "add", "stale_add")
@@ -6038,12 +6077,249 @@ def scenario_reboot_signature_wrong_action(server):
 
 def scenario_reboot_is_audited(server):
     """A granted reboot is audited as its request, its grant and its done line."""
+    # Approval IDs restart with each boot, so only this reboot's lines count.
+    before = len(read_audit_log(server))
     approval = reboot_approve(server)
     reboot_and_wait(server)
-    ours = [line.split()[1] for line in audit_tail(server)
+    lines = read_audit_log(server)[before:].decode("ascii").splitlines()
+    ours = [line.split()[1] for line in lines
             if line.split()[3:4] == [approval]]
     assert ours == ["reboot.request", "grant", "reboot.done"], (
         "the reboot must be audited in order, got %r" % ours)
+
+
+# The one-shot timeout a payload gets until payload config sets one.
+DEFAULT_HEALTH_MS = 30_000
+
+
+def health_events(server):
+    """The newest audit lines as (kind, name, id, sha256) tuples, oldest first."""
+    return [tuple(line.split()[1:5]) for line in audit_tail(server, 64)
+            if line != "exit 0"]
+
+
+def health_starts(server, name):
+    return sum(1 for event in health_events(server)
+               if event[0] == "health.start" and event[1] == name)
+
+
+class Pending:
+    """A command sent on its own thread, so a health check can wait on the test clock."""
+
+    def __init__(self, fn, *args):
+        self.result = None
+        self.thread = threading.Thread(target=self._run, args=(fn, args),
+                                       daemon=True)
+        self.thread.start()
+
+    def _run(self, fn, args):
+        self.result = fn(*args)
+
+    def alive(self):
+        return self.thread.is_alive()
+
+    def finish(self):
+        self.thread.join(10.0)
+        assert not self.thread.is_alive(), "the command never answered"
+        return self.result
+
+
+def wait_for_health(server, name, before):
+    """Wait until a health check of name starts past the before count."""
+    deadline = time.monotonic() + 5.0
+    while health_starts(server, name) <= before:
+        assert time.monotonic() < deadline, (
+            "the health check of %s never started" % name)
+        time.sleep(0.02)
+
+
+def install_hanging(server, name, data):
+    """Commit a build that never exits: its check is cut at the default timeout."""
+    digest = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, name, data)
+    before = health_starts(server, name)
+    pending = Pending(commit, server, staging)
+    wait_for_health(server, name, before)
+    server.advance(DEFAULT_HEALTH_MS)
+    assert pending.finish() == [
+        "health_failed %s %s" % (name, digest), "exit 1"], (
+        "a build that never exits must fail its one-shot check")
+    return digest
+
+
+def config_one_shot(server, name, timeout_s):
+    """Ask, sign and apply payload config for a one-shot health check."""
+    command = "payload config %s kind=one-shot timeout=%d" % (name, timeout_s)
+    approval, challenge = gate_request(server, command)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, command) == [
+        "configured %s kind=one-shot timeout=%d" % (name, timeout_s),
+        "exit 0"], "a granted payload config must be applied"
+    return approval
+
+
+def scenario_failing_one_shot_is_replaced_by_previous(server):
+    """A one-shot that exits nonzero after commit is replaced by the previous version."""
+    good_hash = install_payload(
+        server, "healthy", compile_payload(HELLO_SOURCE, "healthy"))
+    bad = compile_payload(EXIT_SOURCE.replace("EXIT_CODE", "1"), "healthy-bad")
+    bad_hash = hashlib.sha256(bad).hexdigest()
+
+    staging, _ = approve_push(server, "healthy", bad)
+    assert commit(server, staging) == [
+        "health_failed healthy %s" % bad_hash, "exit 1"], (
+        "a one-shot that exits nonzero after commit must answer "
+        "health_failed and exit 1")
+    assert listed(payload_list(server), "healthy") == expected_listing(
+        "healthy", good_hash), (
+        "the previous version must be current again, with no previous")
+
+    lines = run_payload(server, "healthy")
+    assert "Hello, world from Ariel!" in lines and lines[-2:] == [
+        "status 0", "exit 0"], (
+        "the restored build must run, got %r" % lines)
+
+    events = health_events(server)
+    assert ("health.fail", "healthy", "1", bad_hash) in events, (
+        "the failed check must be audited, got %r" % events)
+    assert ("health.replace", "healthy", good_hash, bad_hash) in events, (
+        "the replacement must be audited, got %r" % events)
+
+
+def scenario_one_shot_past_its_timeout_fails(server):
+    """A one-shot past its timeout fails, and with no previous version it is marked failed."""
+    data = compile_payload(HANG_SOURCE, "hunglate")
+    digest = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "hunglate", data)
+
+    before = health_starts(server, "hunglate")
+    pending = Pending(commit, server, staging)
+    wait_for_health(server, "hunglate", before)
+    server.advance(DEFAULT_HEALTH_MS - 1000)
+    assert pending.alive(), "a one-shot must not fail before its timeout"
+    server.advance(1000)
+
+    assert pending.finish() == [
+        "health_failed hunglate %s" % digest, "exit 1"], (
+        "a one-shot past its timeout must answer health_failed and exit 1")
+    assert listed(payload_list(server), "hunglate") == expected_listing(
+        "hunglate", digest) + " failed=yes", (
+        "a build with no previous version must be marked failed")
+    assert any(event[0] == "health.timeout" and event[1] == "hunglate"
+               and event[3] == digest for event in health_events(server)), (
+        "the timeout must be audited")
+
+
+def scenario_failed_one_shot_leaves_autoload(server):
+    """With no previous version, a one-shot that fails is removed from autoload."""
+    data = compile_payload(SLEEP_SOURCE, "sleepy")
+    digest = install_payload(server, "sleepy", data)
+    approval = autoload_approve(server, "add", "sleepy")
+    assert autoload_apply(server, "add", "sleepy", approval) == [
+        "autoload add sleepy", "exit 0"], "a granted autoload add must apply"
+    config_one_shot(server, "sleepy", 1)
+    assert "autoload sleepy" in autoload_listing(server), (
+        "the payload must be in autoload before its check fails")
+
+    staging, _ = approve_push(server, "sleepy", data)
+    before = health_starts(server, "sleepy")
+    pending = Pending(commit, server, staging)
+    wait_for_health(server, "sleepy", before)
+    server.advance(1000)
+
+    assert pending.finish() == [
+        "health_failed sleepy %s" % digest, "exit 1"], (
+        "a one-shot past its timeout must answer health_failed and exit 1")
+    assert "autoload sleepy" not in autoload_listing(server), (
+        "a failed payload with no previous version must leave autoload")
+    assert listed(payload_list(server), "sleepy") == expected_listing(
+        "sleepy", digest) + " failed=yes", (
+        "a build with no previous version must be marked failed")
+    assert any(event[0] == "autoload_remove" and event[1] == "sleepy"
+               for event in health_events(server)), (
+        "the removal from autoload must be audited")
+
+
+def scenario_ad_hoc_run_starts_no_health_check(server):
+    """An ad-hoc payload run starts no health check, whatever its build did."""
+    data = compile_payload(EXIT_SOURCE.replace("EXIT_CODE", "1"), "adhoc")
+    digest = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "adhoc", data)
+    assert commit(server, staging) == [
+        "health_failed adhoc %s" % digest, "exit 1"], (
+        "a one-shot that exits nonzero after commit must answer health_failed")
+    assert payload_logs(server, "adhoc") == ["exiting 1", "exit 0"], (
+        "the health check's output must be in the payload's log")
+
+    checks = health_starts(server, "adhoc")
+    assert run_payload(server, "adhoc") == [
+        "exiting 1", "status 1", "exit 0"], (
+        "an ad-hoc run must answer the payload's own status")
+    assert health_starts(server, "adhoc") == checks, (
+        "an ad-hoc run must not start a health check")
+
+
+def scenario_health_output_stays_in_the_log(server):
+    """A healthy one-shot's output is in payload logs, and the commit reply holds none of it."""
+    install_payload(
+        server, "logged", compile_payload(HELLO_SOURCE, "logged"))
+    assert payload_logs(server, "logged") == [
+        "Hello, world from Ariel!", "exit 0"], (
+        "the health check's output must be in the payload's log")
+
+
+def scenario_payload_config_is_gated_and_audited(server):
+    """payload config waits for the owner, applies after a grant and is audited."""
+    install_payload(server, "tuned", compile_payload(HELLO_SOURCE, "tuned"))
+    command = "payload config tuned kind=one-shot timeout=5"
+    approval, challenge = gate_request(server, command)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, command) == [
+        "configured tuned kind=one-shot timeout=5", "exit 0"], (
+        "a granted payload config must be applied")
+
+    events = health_events(server)
+    assert ("payload.config.request", "tuned", approval, "none") in events, (
+        "the request must be audited, got %r" % events)
+    assert ("payload.config.done", "tuned", approval, "none") in events, (
+        "the applied config must be audited, got %r" % events)
+
+    assert run_command(server, "payload config nosuch kind=one-shot timeout=5") == [
+        "unknown_payload", "exit 1"], "an unknown payload must be refused"
+    assert run_command(server, "payload config tuned kind=service timeout=5") == [
+        "unsupported_kind", "exit 1"], "a kind that is not one-shot must be refused"
+    assert run_command(server, "payload config tuned kind=one-shot timeout=0") == [
+        "bad_argument", "exit 1"], "a timeout of 0 must be refused"
+
+
+def scenario_failed_rollback_restores_the_build_it_replaced(server):
+    """A rollback whose restored build fails its health check is replaced by the build it rolled back from."""
+    old_hash = install_payload(
+        server, "rollold", compile_payload(SLEEP_SOURCE, "rollold-sleep"))
+    new_hash = install_payload(
+        server, "rollold", compile_payload(HELLO_SOURCE, "rollold-hello"))
+    config_one_shot(server, "rollold", 1)
+
+    lines = rollback_request(server, "rollold")
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "a rollback without a grant must answer exit 75, got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0]).group(1)
+    server.next_line()
+    sign_and_grant(server, approval, challenge_of(lines))
+
+    before = health_starts(server, "rollold")
+    pending = Pending(send_command, server, "payload rollback rollold")
+    wait_for_health(server, "rollold", before)
+    server.advance(1000)
+
+    assert pending.finish() == [
+        "health_failed rollold %s" % old_hash, "exit 1"], (
+        "a rollback whose restored build fails must answer health_failed")
+    assert listed(payload_list(server), "rollold") == expected_listing(
+        "rollold", new_hash), (
+        "the build rolled back from must be current again, with no previous")
+    assert ("health.replace", "rollold", new_hash, old_hash) in health_events(
+        server), "the replacement must be audited"
 
 
 SCENARIOS = [
@@ -6494,6 +6770,25 @@ SCENARIOS = [
      scenario_reboot_signature_wrong_action, None),
     ("a granted reboot is audited as its request, grant and done",
      scenario_reboot_is_audited, HOST_RESTART_REASON),
+
+
+    ("a one-shot that exits nonzero after commit is replaced by the previous "
+     "version, and that version runs",
+     scenario_failing_one_shot_is_replaced_by_previous, None),
+    ("a one-shot past its timeout fails, and with no previous version it is "
+     "marked failed", scenario_one_shot_past_its_timeout_fails, CLOCK_REASON),
+    ("a failed one-shot with no previous version is removed from autoload",
+     scenario_failed_one_shot_leaves_autoload, CLOCK_REASON),
+    ("an ad-hoc payload run starts no health check",
+     scenario_ad_hoc_run_starts_no_health_check, None),
+    ("a healthy one-shot's output is in payload logs, never in the reply",
+     scenario_health_output_stays_in_the_log, None),
+    ("payload config is gated, applied after a grant and audited, and refuses "
+     "unknown payloads, other kinds and a zero timeout",
+     scenario_payload_config_is_gated_and_audited, CLOCK_REASON),
+    ("a rollback whose restored build fails its health check is replaced by "
+     "the build it rolled back from",
+     scenario_failed_rollback_restores_the_build_it_replaced, CLOCK_REASON),
 ]
 
 

@@ -253,6 +253,24 @@ int store_rollback(const char *name, char *approval_id, size_t idlen,
  **/
 int store_run_load(const char *name, store_object_t *object);
 
+/** The one-shot health timeout, in seconds, until payload config sets one. **/
+#define HEALTH_TIMEOUT_S 30
+
+/** What a failed one-shot health check changed. **/
+#define STORE_HEALTH_REPLACED 0
+#define STORE_HEALTH_MARKED   1
+#define STORE_HEALTH_FAILED   2
+
+/**
+ * Answer a failed one-shot health check of the build failed, which is the
+ * current build of name. With a previous build, that build becomes current
+ * and its hash is copied into restored (STORE_HEALTH_REPLACED). With none, the
+ * payload is marked failed and taken out of autoload when it is listed there
+ * (STORE_HEALTH_MARKED). STORE_HEALTH_FAILED leaves the store as it was.
+ **/
+int store_health_failed(const char *name, const char *failed, char *restored,
+                        size_t size);
+
 /** Free the bytes of an object store_run_load returned. **/
 void store_object_free(store_object_t *object);
 

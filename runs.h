@@ -39,6 +39,21 @@ along with this program; see the file COPYING. If not, see
 int runs_start(platform_t *platform, const char *name, const char *sha256,
                const unsigned char *bytes, size_t size, pid_t *pid);
 
+/** What a one-shot health check ended in. **/
+#define RUNS_HEALTHY   5
+#define RUNS_UNHEALTHY 6
+#define RUNS_TIMED_OUT 7
+
+/**
+ * Run verified bytes once, as a health check: the output goes to the
+ * payload's log and the run is cut at timeout_ms on the platform clock. Waits
+ * for the run to end and returns RUNS_HEALTHY for exit 0 within the timeout,
+ * RUNS_TIMED_OUT when it was cut, RUNS_UNHEALTHY for any other exit or a run
+ * that could not start, or RUNS_AUDIT when the audit log refused a line.
+ **/
+int runs_health(platform_t *platform, const char *name, const char *sha256,
+                const unsigned char *bytes, size_t size, uint64_t timeout_ms);
+
 /** Whether a background run of name is still going. Returns 1 or 0. **/
 int runs_running(const char *name);
 

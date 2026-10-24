@@ -200,6 +200,18 @@ static const char rollback_failed[] =
   "rollback_failed\n"
   "exit 1\n";
 
+static const char unsupported_kind[] =
+  "unsupported_kind\n"
+  "exit 1\n";
+
+static const char health_unrecorded[] =
+  "health_unrecorded\n"
+  "exit 1\n";
+
+static const char config_failed[] =
+  "config_failed\n"
+  "exit 1\n";
+
 static int
 write_all(int fd, const char *buf, size_t len) {
   while(len > 0) {
@@ -1516,8 +1528,70 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
 }
 
 
+/**
+ * The one-shot health check of the build an activation just made current.
+ * Returns 1 when it passed. Otherwise the store replaces or marks the build,
+ * the change is audited, the failure is answered and 0 is returned.
+ **/
+static int
+activation_healthy(agent_t *agent, int fd, const char *name) {
+  store_object_t object;
+  char failed[SHA256_HEX_LEN + 1];
+  char restored[SHA256_HEX_LEN + 1];
+  char answer[256];
+  uint64_t timeout = 0;
+  int flagged;
+  int run;
+  int outcome;
+
+  if(state_health_get(name, &timeout, &flagged) ||
+     store_run_load(name, &object) != STORE_RUN_OK) {
+    reply(fd, approval_stale);
+    return 0;
+  }
+  snprintf(failed, sizeof(failed), "%s", object.sha256);
+
+  run = runs_health(agent->platform, name, object.sha256, object.bytes,
+                    object.size,
+                    (timeout ? timeout : HEALTH_TIMEOUT_S) * 1000ULL);
+  store_object_free(&object);
+
+  if(run == RUNS_HEALTHY) {
+    return 1;
+  }
+  if(run == RUNS_AUDIT) {
+    reply(fd, audit_failed);
+    return 0;
+  }
+
+  outcome = store_health_failed(name, failed, restored, sizeof(restored));
+  switch(outcome) {
+  case STORE_HEALTH_REPLACED:
+    if(store_audit_append("health.replace", name, restored, failed)) {
+      reply(fd, audit_failed);
+      return 0;
+    }
+    break;
+  case STORE_HEALTH_MARKED:
+    if(store_audit_append("health.failed", name, "-", failed)) {
+      reply(fd, audit_failed);
+      return 0;
+    }
+    break;
+  default:
+    reply(fd, health_unrecorded);
+    return 0;
+  }
+
+  snprintf(answer, sizeof(answer), "health_failed %s %s\nexit 1\n", name,
+           failed);
+  reply(fd, answer);
+  return 0;
+}
+
+
 static void
-payload_commit(int fd, const char *staging_id) {
+payload_commit(agent_t *agent, int fd, const char *staging_id) {
   char approval_id[APPROVAL_ID_MAX];
   char answer[256];
   store_install_t install;
@@ -1535,6 +1609,9 @@ payload_commit(int fd, const char *staging_id) {
     // stands; the agent is told it was not recorded.
     if(store_audit_append("commit", install.name, staging_id, install.sha256)) {
       reply(fd, audit_failed);
+      return;
+    }
+    if(!activation_healthy(agent, fd, install.name)) {
       return;
     }
     snprintf(answer, sizeof(answer), "installed %s %s\nexit 0\n",
@@ -1593,11 +1670,12 @@ payload_list(int fd) {
     number_text(entries[i].asset, asset, sizeof(asset));
     snprintf(line, sizeof(line),
              "payload %s source=%s version=%s release=%s asset=%s sha256=%s "
-             "path=%s running=%s previous=%s\n",
+             "path=%s running=%s previous=%s%s\n",
              entries[i].name, entries[i].source,
              entries[i].version[0] ? entries[i].version : "-",
              release, asset, entries[i].sha256, entries[i].path,
-             entries[i].running ? "yes" : "no", entries[i].previous);
+             entries[i].running ? "yes" : "no", entries[i].previous,
+             entries[i].failed ? " failed=yes" : "");
     reply(fd, line);
   }
 
@@ -1769,6 +1847,81 @@ refuse(int fd, const char *name, const char *word, const char *answer) {
 }
 
 
+/** 1 when digits is a timeout in seconds from 1 to 999999999. **/
+static int
+timeout_seconds(const char *digits, uint64_t *seconds) {
+  size_t i;
+
+  if(!digits[0] || strlen(digits) > 9) {
+    return 0;
+  }
+  for(i=0; digits[i]; i++) {
+    if(digits[i] < '0' || digits[i] > '9') {
+      return 0;
+    }
+  }
+
+  *seconds = strtoull(digits, NULL, 10);
+  return *seconds > 0;
+}
+
+
+/**
+ * payload config <name> kind=one-shot timeout=<s>: sets the health check an
+ * activation runs. Gated: the owner signs the kind and timeout first.
+ **/
+static void
+payload_config(agent_t *agent, int fd, const char *name, const char *kind,
+               const char *timeout) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  uint64_t seconds = 0;
+  uint64_t stored = 0;
+  char answer[128];
+  int flagged;
+
+  if(!store_name_valid(name)) {
+    reply(fd, bad_name);
+    return;
+  }
+  if(state_health_get(name, &stored, &flagged)) {
+    refuse(fd, name, "unknown_payload", unknown_payload);
+    return;
+  }
+  if(strcmp(kind, "kind=one-shot")) {
+    refuse(fd, name, "unsupported_kind", unsupported_kind);
+    return;
+  }
+  if(strncmp(timeout, "timeout=", 8) || !timeout_seconds(timeout + 8, &seconds)) {
+    refuse(fd, name, "bad_argument", bad_argument);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "payload.config");
+  snprintf(facts.target, sizeof(facts.target), "%s", name);
+  facts.argc = seconds;
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  if(audit_line("payload.config", "done", name, challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  if(state_health_set(name, seconds)) {
+    audit_reply(fd, "payload.config", "failed", name, challenge.id,
+                config_failed);
+    return;
+  }
+
+  snprintf(answer, sizeof(answer),
+           "configured %s kind=one-shot timeout=%llu\nexit 0\n", name,
+           (unsigned long long)seconds);
+  reply(fd, answer);
+}
+
+
 static void
 payload_rollback(agent_t *agent, int fd, const char *name) {
   platform_t *platform = agent->platform;
@@ -1828,6 +1981,9 @@ payload_rollback(agent_t *agent, int fd, const char *name) {
     if(store_audit_append("rollback_done", install.name, approval_id,
                           install.sha256)) {
       reply(fd, audit_failed);
+      return;
+    }
+    if(!activation_healthy(agent, fd, install.name)) {
       return;
     }
     snprintf(answer, sizeof(answer), "rolled_back %s %s\nexit 0\n",
@@ -2493,7 +2649,7 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   }
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "commit")) {
-    payload_commit(fd, argv[2]);
+    payload_commit(agent, fd, argv[2]);
     return;
   }
 
@@ -2518,6 +2674,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "rollback")) {
     payload_rollback(agent, fd, argv[2]);
+    return;
+  }
+
+  if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "config")) {
+    payload_config(agent, fd, argv[2], argv[3], argv[4]);
     return;
   }
 
