@@ -109,6 +109,24 @@ int store_approval_request(const approval_facts_t *facts,
 #define STORE_GRANT_WRONG_CONSOLE 8
 
 /**
+ * What one approval is, as a question sees it. Consumed wins over the
+ * others: the action it allowed already ran. Expired wins over granted,
+ * because a window that closed is what a later question reports.
+ **/
+#define STORE_STATUS_UNKNOWN  0
+#define STORE_STATUS_PENDING  1
+#define STORE_STATUS_GRANTED  2
+#define STORE_STATUS_EXPIRED  3
+#define STORE_STATUS_CONSUMED 4
+
+/**
+ * Answer what state an approval is in. The record outlives the action it
+ * allowed and the window it was good for, so a consumed or expired approval
+ * still answers. Returns one of STORE_STATUS_*.
+ **/
+int store_approval_status(const char *id);
+
+/**
  * Grant an approval with the owner's signature. The platform verifies it
  * over the exact message of this approval's challenge. A valid signature
  * records the nonce as consumed on disk, then marks the approval decided;

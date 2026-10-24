@@ -1459,6 +1459,59 @@ def scenario_approval_expired(server):
         "once its object is gone, an expired approval is only stale")
 
 
+def approval_status(server, approval):
+    """Ask approval status and return the lines the server answered.
+
+    Status is a question, not an action: it carries no signature and grants
+    nothing, so a scenario sends it exactly as written.
+    """
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\napproval status %s\n"
+                      % (server.token, approval)).encode("ascii"))
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def scenario_approval_status(server):
+    """approval status names pending, granted, expired and consumed.
+
+    The record outlives the action it allowed, so a consumed approval still
+    answers consumed, and an id Ariel never issued is an error.
+    """
+    server.fresh()
+    data = b"status of this approval"
+    lines = push(server, "statused", data)
+    staging, approval = assert_staged(server, lines, "statused", data)
+    assert approval_status(server, approval) == [
+        "approval_status %s pending" % approval, "exit 0"], (
+        "a fresh approval must answer pending")
+
+    sign_and_grant(server, approval, challenge_of(lines))
+    assert approval_status(server, approval) == [
+        "approval_status %s granted" % approval, "exit 0"], (
+        "a granted approval must answer granted")
+
+    expected = "installed statused %s" % hashlib.sha256(data).hexdigest()
+    assert commit(server, staging) == [expected, "exit 0"], (
+        "the granted approval must still commit the build")
+    assert approval_status(server, approval) == [
+        "approval_status %s consumed" % approval, "exit 0"], (
+        "a consumed approval must answer consumed, not disappear")
+
+    lines = push(server, "statuslate", b"this one expires")
+    _, late = assert_staged(server, lines, "statuslate", b"this one expires")
+    server.advance(120_000)
+    assert approval_status(server, late) == [
+        "approval_status %s expired" % late, "exit 0"], (
+        "an approval past its window must answer expired")
+
+    unknown = approval_status(server, "a-0")
+    assert unknown == ["unknown_approval", "exit 1"], (
+        "an id Ariel never issued must be an error, got %r" % unknown)
+
+
 def scenario_expired_not_pending(server):
     """An expired approval does not count among the pending ones."""
     server.fresh()
@@ -2522,6 +2575,8 @@ SCENARIOS = [
      scenario_quick_start_unlabeled_block, False),
     ("an approval expires after 120 s of test clock and answers exit 88",
      scenario_approval_expired, True),
+    ("approval status answers pending, granted, expired and consumed, and an "
+     "unknown id is an error", scenario_approval_status, True),
     ("an expired approval does not count among the pending ones",
      scenario_expired_not_pending, True),
     ("an upload over 64 MiB answers staging_full and exit 80",

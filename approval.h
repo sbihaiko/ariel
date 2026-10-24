@@ -69,12 +69,13 @@ typedef struct {
 /**
  * Turn an action into the bytes the owner reads and signs. This is the one
  * function that does so. Anything that could read two ways is refused, not
- * normalized: a target with a '..', an empty or '.' segment, a leading or
- * trailing '/', bytes outside ASCII, a repeated option, an omitted field,
- * a hash that is not 64 lowercase hex digits, and any newline or space that
- * would smuggle in a line. Options are written in key order. Returns the
- * length of the NUL-terminated text in out, or -1 when the action is
- * refused or does not fit in size.
+ * normalized: a target with a '..', an empty or '.' segment, a trailing
+ * '/', a target of only '/', bytes outside ASCII, a repeated option, an
+ * omitted field, a hash that is not 64 lowercase hex digits, and any
+ * newline or space that would smuggle in a line. A leading '/' is one
+ * spelling of a path, so an absolute target encodes as written. Options are
+ * written in key order. Returns the length of the NUL-terminated text in
+ * out, or -1 when the action is refused or does not fit in size.
  **/
 int approval_canonical(const approval_action_t *action, char *out,
                        size_t size);

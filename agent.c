@@ -98,6 +98,9 @@ static const char approval_stale[] =
 static const char unknown_payload[] =
   "unknown_payload\n"
   "exit 1\n";
+static const char unknown_approval[] =
+  "unknown_approval\n"
+  "exit 1\n";
 static const char spawn_failed[] =
   "spawn_failed\n"
   "exit 1\n";
@@ -648,6 +651,41 @@ payload_list(int fd) {
 
 
 /**
+ * approval status <id>: what state one approval is in. It is a question, so
+ * it grants nothing and needs no approval of its own. An id Ariel never
+ * issued is an error.
+ **/
+static void
+approval_status(int fd, const char *id) {
+  char answer[APPROVAL_ID_MAX + 40];
+  const char *word;
+  int len;
+
+  switch(store_approval_status(id)) {
+  case STORE_STATUS_PENDING:
+    word = "pending";
+    break;
+  case STORE_STATUS_GRANTED:
+    word = "granted";
+    break;
+  case STORE_STATUS_EXPIRED:
+    word = "expired";
+    break;
+  case STORE_STATUS_CONSUMED:
+    word = "consumed";
+    break;
+  default:
+    reply(fd, unknown_approval);
+    return;
+  }
+
+  len = snprintf(answer, sizeof(answer), "approval_status %s %s\nexit 0\n",
+                 id, word);
+  write_all(fd, answer, (size_t)len);
+}
+
+
+/**
  * approval grant <id> <signature> [<console> <action-sha256>]: the owner's
  * signature arrives here, on whatever connection carries it, the agent's
  * included. It cannot be forged there, so relaying it is fine: the platform
@@ -843,6 +881,13 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
      !strcmp(argv[1], "grant")) {
     approval_grant(agent, fd, argv[2], argv[3], argc == 6 ? argv[4] : NULL,
                    argc == 6 ? argv[5] : NULL);
+    return;
+  }
+
+  // approval status <id>: a question, so it runs at once and grants nothing.
+  if(argc == 3 && !strcmp(argv[0], "approval") &&
+     !strcmp(argv[1], "status")) {
+    approval_status(fd, argv[2]);
     return;
   }
 

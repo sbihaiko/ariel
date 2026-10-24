@@ -195,6 +195,9 @@ class Session:
         return self.link.exchange("approval grant %s %s"
                                   % (approval_id, signature))
 
+    def status(self, approval_id):
+        return self.link.exchange("approval status %s" % approval_id)
+
     def request(self, approval_id, challenge, name, size, digest):
         """Show what the console displays, read the owner's signature, grant it."""
         notification = ("prompt %s payload %s (%d bytes, sha256 %s) will run"
@@ -310,6 +313,35 @@ def check_unsigned_commit(session, context):
         % lines)
 
 
+def check_approval_status(session, context):
+    """Status is a question: it needs no signature, and it survives the action."""
+    del context
+    data = b"console status\n"
+    digest = hashlib.sha256(data).hexdigest()
+    lines = session.push("consolestatus", data)
+    staging, approval, challenge = assert_staged(lines, "consolestatus", data)
+
+    assert session.status(approval) == [
+        "approval_status %s pending" % approval, "exit 0"], (
+        "a fresh approval must answer pending")
+
+    session.request(approval, challenge, "consolestatus", len(data), digest)
+    assert session.status(approval) == [
+        "approval_status %s granted" % approval, "exit 0"], (
+        "a granted approval must answer granted")
+
+    lines = session.commit(staging)
+    assert lines == ["installed consolestatus %s" % digest, "exit 0"], (
+        "the granted approval must still commit the build, got %r" % lines)
+    assert session.status(approval) == [
+        "approval_status %s consumed" % approval, "exit 0"], (
+        "a consumed approval must answer consumed")
+
+    unknown = session.status("a-0")
+    assert unknown == ["unknown_approval", "exit 1"], (
+        "an id Ariel never issued must be an error, got %r" % unknown)
+
+
 def check_quick_start(session, context):
     # The check before this one pushed, and the console shows one
     # notification every 10 s. The fixture pushes at once and takes
@@ -404,6 +436,9 @@ CHECKS = [
      "and the commit stays refused", check_unsigned_commit),
     ("after a push, a grant and a commit, audit tail shows each one in order "
      "and no agent-port command can clear the log", check_audit_tail),
+    ("approval status answers pending, granted and consumed without an "
+     "approval of its own, and an unknown id is an error",
+     check_approval_status),
     ("the quick start's 'After Stage 1' section passes against the console",
      check_quick_start),
 ]

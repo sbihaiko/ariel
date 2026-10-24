@@ -99,6 +99,7 @@ struct approval {
   int decided;
   int approved;
   int expired;
+  int consumed;
   char id[APPROVAL_ID_MAX];
   uint64_t created_ms;
   approval_challenge_t challenge;
@@ -215,9 +216,15 @@ staged_find(const char *id) {
 }
 
 
-/** An empty slot, or NULL when the table is full. **/
+/**
+ * An empty slot, or NULL when every slot holds an approval that is still
+ * pending or granted. A consumed, expired or denied approval has already
+ * answered, so the oldest of those gives its slot up when a new approval
+ * needs one; until then it stays, so a question can still name it.
+ **/
 static struct approval *
 approval_slot(void) {
+  struct approval *oldest = NULL;
   int i;
 
   for(i=0; i<APPROVALS_MAX; i++) {
@@ -225,7 +232,23 @@ approval_slot(void) {
       return &approvals[i];
     }
   }
-  return NULL;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    struct approval *slot = &approvals[i];
+
+    if(!slot->consumed && !slot->expired &&
+       !(slot->decided && !slot->approved)) {
+      continue;
+    }
+    if(!oldest || slot->created_ms < oldest->created_ms) {
+      oldest = slot;
+    }
+  }
+
+  if(oldest) {
+    memset(oldest, 0, sizeof(*oldest));
+  }
+  return oldest;
 }
 
 
@@ -248,7 +271,8 @@ pending_count(void) {
   int count = 0;
 
   for(i=0; i<APPROVALS_MAX; i++) {
-    if(approvals[i].used && !approvals[i].decided && !approvals[i].expired) {
+    if(approvals[i].used && !approvals[i].decided && !approvals[i].expired &&
+       !approvals[i].consumed) {
       count++;
     }
   }
@@ -459,10 +483,10 @@ staging_unlink(const char *staging_id) {
 
 /**
  * Drop what the clock has outlived. An approval stops counting as pending
- * after its expiry, but its row stays until a commit finds it or its
- * staging object leaves, so a late commit can say approval_expired. A
- * staging object nobody committed leaves after its TTL, together with its
- * approval. The caller holds the lock.
+ * after its expiry, but its row stays, so a later question can still say
+ * expired and a late commit can say approval_expired. A staging object
+ * nobody committed leaves after its TTL; its approval stays too, answered
+ * as expired rather than forgotten. The caller holds the lock.
  **/
 static void
 expire_locked(uint64_t now) {
@@ -482,15 +506,8 @@ expire_locked(uint64_t now) {
       continue;
     }
 
-    {
-      struct approval *request = approval_find(entry->approval_id);
-
-      staging_unlink(entry->id);
-      staged_release(entry);
-      if(request) {
-        memset(request, 0, sizeof(*request));
-      }
-    }
+    staging_unlink(entry->id);
+    staged_release(entry);
   }
 }
 
@@ -921,7 +938,7 @@ store_approval_deny(const char *id) {
   expire_locked(now_ms());
   request = approval_find(id);
 
-  if(!request || request->decided || request->expired) {
+  if(!request || request->decided || request->expired || request->consumed) {
     pthread_mutex_unlock(&lock);
     return -1;
   }
@@ -957,6 +974,35 @@ store_approval_facts(const char *id, approval_facts_t *facts) {
   pthread_mutex_unlock(&lock);
 
   return found ? 0 : -1;
+}
+
+
+int
+store_approval_status(const char *id) {
+  struct approval *request;
+  int status;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+  request = approval_find(id);
+
+  if(!request) {
+    status = STORE_STATUS_UNKNOWN;
+  } else if(request->consumed) {
+    status = STORE_STATUS_CONSUMED;
+  } else if(request->expired) {
+    status = STORE_STATUS_EXPIRED;
+  } else if(request->decided && request->approved) {
+    status = STORE_STATUS_GRANTED;
+  } else if(!request->decided) {
+    status = STORE_STATUS_PENDING;
+  } else {
+    // A denial is neither of the four states a question reports.
+    status = STORE_STATUS_UNKNOWN;
+  }
+
+  pthread_mutex_unlock(&lock);
+  return status;
 }
 
 
@@ -1183,8 +1229,9 @@ object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
 
 
 /**
- * Drop a staged entry and its approval: the staging object leaves the
- * disk and the tables forget both. The caller holds the lock.
+ * Drop a staged entry. The approval is marked consumed rather than
+ * forgotten: the action it allowed has happened, and a later question must
+ * still be able to say so. The caller holds the lock.
  **/
 static void
 staged_consume(struct staged *entry, struct approval *request) {
@@ -1192,7 +1239,7 @@ staged_consume(struct staged *entry, struct approval *request) {
   staged_release(entry);
 
   if(request) {
-    memset(request, 0, sizeof(*request));
+    request->consumed = 1;
   }
 }
 
@@ -1351,21 +1398,24 @@ store_commit(const char *staging_id, store_install_t *install,
   if(!request) {
     // An unknown staging ID and a lost approval both mean: push again.
     outcome = STORE_APPROVAL_STALE;
+  } else if(request->consumed) {
+    // The action this approval allowed already ran.
+    outcome = STORE_APPROVAL_STALE;
   } else if(request->expired) {
     // The owner's window closed: the object leaves the console and the
-    // agent pushes the build again.
+    // agent pushes the build again. The approval stays, so a later question
+    // can still say it expired.
     staging_unlink(entry->id);
     staged_release(entry);
-    memset(request, 0, sizeof(*request));
     outcome = STORE_APPROVAL_EXPIRED;
   } else if(!request->decided) {
     snprintf(approval_id, idlen, "%s", request->id);
     outcome = STORE_APPROVAL_REQUIRED;
   } else if(!request->approved) {
-    // A denial is terminal: the bytes leave the console for good.
+    // A denial is terminal: the bytes leave the console for good. The
+    // approval stays, answered as decided and not approved.
     staging_unlink(entry->id);
     staged_release(entry);
-    memset(request, 0, sizeof(*request));
     outcome = STORE_APPROVAL_DENIED;
   } else {
     outcome = staged_install(entry, request, install);

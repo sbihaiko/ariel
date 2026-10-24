@@ -100,10 +100,25 @@ main(void) {
   refused(&other, "a '.' segment in a target is refused");
   other.target = "a//b";
   refused(&other, "an empty segment in a target is refused");
-  other.target = "/etc/passwd";
-  refused(&other, "an absolute target is refused");
   other.target = "helloworld/";
   refused(&other, "a trailing slash in a target is refused");
+
+  // An absolute path is one spelling of a path, so it encodes, and it encodes
+  // as the owner wrote it. A path that is not canonical still reads two ways.
+  other.target = "/data/ariel/store/objects/helloworld";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=/data/ariel/store/objects/helloworld\n"),
+         "an absolute target encodes as written");
+  other.target = "/";
+  refused(&other, "a target of only '/' is refused");
+  other.target = "/etc/../passwd";
+  refused(&other, "a '..' in an absolute target is refused");
+  other.target = "/etc/./passwd";
+  refused(&other, "a '.' segment in an absolute target is refused");
+  other.target = "/etc//passwd";
+  refused(&other, "an empty segment in an absolute target is refused");
+  other.target = "/etc/passwd/";
+  refused(&other, "a trailing slash in an absolute target is refused");
 
   // Unicode has more than one spelling of the same text.
   other.target = "caf\xc3\xa9";

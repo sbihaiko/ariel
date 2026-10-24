@@ -102,18 +102,26 @@ command_ok(const char *command) {
 
 
 /** Segments of letters, digits, '_' and '-' joined by single slashes. A
-    '.' is not among them, so neither '.' nor '..' can be one. **/
+    '.' is not among them, so neither '.' nor '..' can be one. A leading
+    slash is one spelling of a path, not a segment, so an absolute target
+    encodes as written; an empty segment, a trailing slash or a target of
+    only '/' still reads two ways and is refused. **/
 static int
 target_ok(const char *target) {
   size_t seg = 0;
   size_t len;
   size_t i;
+  size_t start = 0;
 
   if(!target || !(len=strlen(target)) || len > TARGET_MAX) {
     return 0;
   }
 
-  for(i=0; i<=len; i++) {
+  if(target[0] == '/') {
+    start = 1;
+  }
+
+  for(i=start; i<=len; i++) {
     int c = (unsigned char)target[i];
 
     if(!c || c == '/') {
