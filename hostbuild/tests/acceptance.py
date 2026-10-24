@@ -140,8 +140,26 @@ class Server:
             line = self.lines.get(timeout=timeout)
         except queue.Empty:
             return None
-        assert line is not None, "the server closed its standard output"
+        assert line is not None, (
+            "the server closed its standard output; its standard error: %r"
+            % self.stderr_tail())
         return line
+
+    def stderr_tail(self):
+        """What Ariel wrote to standard error so far, without blocking: a
+        payload it started may still hold the pipe open."""
+        try:
+            self.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        fd = self.proc.stderr.fileno()
+        os.set_blocking(fd, False)
+        try:
+            return (os.read(fd, 4096) or b"").decode("ascii", "replace")
+        except OSError:
+            return ""
+        finally:
+            os.set_blocking(fd, True)
 
     def assert_no_line(self, timeout=0.4):
         line = self.next_line(timeout=timeout)
@@ -3110,9 +3128,9 @@ def scenario_unknown_command(server):
             server.next_line()
 
 
-def run_command(server, command):
+def run_command(server, command, timeout=5.0):
     """One command on its own connection; the reply as lines."""
-    sock = server.connect()
+    sock = server.connect(timeout=timeout)
     try:
         sock.sendall(
             ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
@@ -3371,11 +3389,16 @@ def rows_of(lines):
     return [line.split() for line in lines[:-1]]
 
 
+SYNC_TIMEOUT = 120.0
+
+
 def scenario_inspection_runs_at_once(server):
     """These commands need no approval, so each answers with its own output."""
     assert run_command(server, "echo hello from ariel") == [
         "hello from ariel", "exit 0"]
-    assert run_command(server, "sync") == ["exit 0"]
+    # sync flushes the whole machine, and a busy CI disk can take far longer
+    # than one reply's usual 5 s.
+    assert run_command(server, "sync", timeout=SYNC_TIMEOUT) == ["exit 0"]
     assert run_command(server, "sleep 0") == ["exit 0"]
     started = time.monotonic()
     assert run_command(server, "sleep 1") == ["exit 0"]
