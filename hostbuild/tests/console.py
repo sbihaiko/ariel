@@ -308,6 +308,12 @@ def check_unsigned_commit(session, context):
 
 
 def check_quick_start(session, context):
+    # The check before this one pushed, and the console shows one
+    # notification every 10 s. The fixture pushes at once and takes
+    # approval_busy for a failure, so the gap is waited out here.
+    session.operator.say(
+        "The console allows one notification every 10 s; waiting.")
+    session._sleep(NOTIFICATION_SPACING)
     quickstart.run_quick_start(
         doc_path=context.document,
         workdir=context.workdir,

@@ -1014,6 +1014,37 @@ def scenario_console_run_reaches_checks(server):
     assert not broken, "the harness itself is broken: %r" % broken
 
 
+def scenario_console_quick_start_waits_for_the_gap(server):
+    """The quick start's push waits out the gap since the last notification."""
+    del server  # the fixture is replaced; nothing reaches a console
+
+    import console
+
+    sleeps = []
+    seen = []
+    operator = console.Operator(read=lambda prompt="": "",
+                                write=lambda line="": None,
+                                sleep=sleeps.append)
+    session = console.Session(None, operator, sleep=sleeps.append)
+    context = console.Context(host="192.0.2.1", port=console.PORT,
+                              token="0" * 32, workdir="/nonexistent",
+                              cc=["prospero-clang"], document="quick-start.md")
+
+    real = console.quickstart.run_quick_start
+    console.quickstart.run_quick_start = lambda **kwargs: seen.append(
+        list(sleeps))
+    try:
+        console.check_quick_start(session, context)
+    finally:
+        console.quickstart.run_quick_start = real
+
+    # The check before it ends with a push the console notified; the fixture
+    # pushes at once and does not retry approval_busy, so the wait comes first.
+    assert seen == [[console.NOTIFICATION_SPACING]], (
+        "the quick start must wait %.0f s before its push, waited %r"
+        % (console.NOTIFICATION_SPACING, seen))
+
+
 def scenario_console_approval_prompts(server):
     """An approval step shows the notification and the challenge, and submits the signature."""
     del server  # the fake link stands in for the agent port
@@ -2165,6 +2196,8 @@ SCENARIOS = [
      scenario_console_approval_prompts, False),
     ("console mode runs its checks over an injected transport",
      scenario_console_run_reaches_checks, False),
+    ("console mode's quick start waits out the notification gap before its "
+     "push", scenario_console_quick_start_waits_for_the_gap, False),
 ]
 
 
