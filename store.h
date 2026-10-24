@@ -124,6 +124,9 @@ int store_approval_request(const approval_facts_t *facts,
 int store_approval_grant(const char *id, const unsigned char *signature,
                          const char *console, const char *action_sha256);
 
+/** Record a denial. Returns 0, or -1 for an unknown ID. **/
+int store_approval_deny(const char *id);
+
 /**
  * The facts an approval was bound to, for the audit log. Returns 0 when id
  * names an approval, or -1 when it does not.
@@ -155,6 +158,10 @@ int store_run_load(const char *name, store_object_t *object);
 /** Free the bytes of an object store_run_load returned. **/
 void store_object_free(store_object_t *object);
 
+/** One audit line is at most this long; a tail shows at most AUDIT_TAIL_MAX. **/
+#define AUDIT_LINE_MAX 256
+#define AUDIT_TAIL_MAX 64
+
 /**
  * The installed payloads, as the state file records them. Fills entries, at
  * most max of them, and sets count. Returns 0, or -1 when the record cannot
@@ -171,9 +178,11 @@ int store_audit_append(const char *kind, const char *name, const char *id,
                        const char *sha256);
 
 /**
- * Copy the newest n lines of the audit log into buf, or every line when n is
- * 0, each ending in a newline. The lines stay in the order they were
- * appended. Returns the number of bytes copied, or -1 on error.
+ * Copy the newest n lines of the audit log into buf, each ending in a
+ * newline, in the order they were appended. n is capped at AUDIT_TAIL_MAX,
+ * so 0 and any larger n both give the newest AUDIT_TAIL_MAX lines. Returns
+ * the number of bytes copied, or -1 on error, including a buf too small for
+ * them.
  **/
 int store_audit_tail(unsigned long n, char *buf, size_t size);
 

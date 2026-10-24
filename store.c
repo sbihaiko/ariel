@@ -93,10 +93,6 @@ struct staged {
 /** The audit log: one appended line per action Ariel takes. **/
 #define AUDIT_FILE "audit.log"
 
-/** One audit line is short; this covers the newest lines a tail asks for. **/
-#define AUDIT_LINE_MAX 256
-#define AUDIT_TAIL_MAX 64
-
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -1541,13 +1537,14 @@ store_audit_append(const char *kind, const char *name, const char *id,
   int fd;
   int state_fd;
 
+  pthread_mutex_lock(&lock);
   len = snprintf(line, sizeof(line), "%llu %s %s %s %s\n",
                  (unsigned long long)now_ms(), kind, name, id, sha256);
   if(len < 0 || len >= (int)sizeof(line)) {
+    pthread_mutex_unlock(&lock);
     return -1;
   }
 
-  pthread_mutex_lock(&lock);
   state_fd = state_open();
   if(state_fd >= 0) {
     fd = open_entry(state_fd, AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND);
@@ -1570,14 +1567,14 @@ store_audit_append(const char *kind, const char *name, const char *id,
 
 
 /**
- * The newest n complete lines of the audit log, or all of them when n is 0.
- * A line that does not end in a newline has not been flushed yet, so it is
- * not shown.
+ * Read the log's complete lines into the newest window of kept, and copy the
+ * window into buf. The caller holds the lock: the window is static, and no
+ * append can land half-written in the middle of the read.
  **/
-int
-store_audit_tail(unsigned long n, char *buf, size_t size) {
+static int
+audit_tail_locked(unsigned long n, char *buf, size_t size) {
+  static char kept[AUDIT_TAIL_MAX][AUDIT_LINE_MAX];
   char line[AUDIT_LINE_MAX];
-  char kept[AUDIT_TAIL_MAX][AUDIT_LINE_MAX];
   unsigned long count = 0;
   unsigned long start;
   unsigned long i;
@@ -1612,8 +1609,12 @@ store_audit_tail(unsigned long n, char *buf, size_t size) {
 
   while(fgets(line, sizeof(line), file)) {
     size_t len = strlen(line);
+    int c;
 
     if(len == 0 || line[len - 1] != '\n') {
+      // A line longer than the buffer: drop its rest, up to the newline.
+      while((c=fgetc(file)) != '\n' && c != EOF) {
+      }
       continue;
     }
     snprintf(kept[count % AUDIT_TAIL_MAX], AUDIT_LINE_MAX, "%s", line);
@@ -1643,4 +1644,16 @@ store_audit_tail(unsigned long n, char *buf, size_t size) {
     buf[used] = '\0';
   }
   return (int)used;
+}
+
+
+int
+store_audit_tail(unsigned long n, char *buf, size_t size) {
+  int rc;
+
+  pthread_mutex_lock(&lock);
+  rc = audit_tail_locked(n, buf, size);
+  pthread_mutex_unlock(&lock);
+
+  return rc;
 }

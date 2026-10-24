@@ -2201,19 +2201,19 @@ def scenario_ps5_has_no_pad(server):
 # ---------------------------------------------------------------------------
 
 AUDIT_LINE = re.compile(
-    r"^(\d+) (push|grant|commit) (\S+) (\S+) ([0-9a-f]{64})$")
+    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64})$")
 
 
-def audit_tail(server, n=None):
-    """Send one audit tail and return the lines the server answered."""
-    command = "audit tail" if n is None else "audit tail %d" % n
-    sock = server.connect()
+def audit_log_path(server):
+    return os.path.join(server.root, "data", "ariel", "audit.log")
+
+
+def read_audit_log(server):
     try:
-        sock.sendall(
-            ("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
-        return reply_lines(read_reply(sock))
-    finally:
-        sock.close()
+        with open(audit_log_path(server), "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return b""
 
 
 def send_command(server, command):
@@ -2225,6 +2225,12 @@ def send_command(server, command):
         return reply_lines(read_reply(sock))
     finally:
         sock.close()
+
+
+def audit_tail(server, n=None):
+    """Send one audit tail and return the lines the server answered."""
+    command = "audit tail" if n is None else "audit tail %d" % n
+    return send_command(server, command)
 
 
 def scenario_audit_tail_order(server):
@@ -2240,29 +2246,28 @@ def scenario_audit_tail_order(server):
     events = [line for line in lines if line != "exit 0"]
     assert lines and lines[-1] == "exit 0", (
         "audit tail must end with exit 0, got %r" % lines)
-    kinds = []
     for event in events:
+        assert AUDIT_LINE.match(event), (
+            "expected '<ms> <kind> <name> <id> <sha256>', got %r" % event)
+
+    # Other scenarios share this server's log: only this build's events count.
+    ours = [event for event in events if event.split()[3] in (staging, approval)]
+    kinds = [event.split()[1] for event in ours]
+    assert kinds == ["push", "grant", "commit"], (
+        "audit tail must show the push, then the grant, then the commit, "
+        "got %r" % ours)
+    for event in ours:
         match = AUDIT_LINE.match(event)
-        assert match, "expected '<ms> <kind> <name> <id> <sha256>', got %r" % event
-        kinds.append(match.group(2))
         assert match.group(3) == "audited", (
             "the event must name the payload, got %r" % event)
         assert match.group(5) == digest, (
             "the event must name the build's hash, got %r" % event)
-    found = [kind for kind in kinds if kind in ("push", "grant", "commit")]
-    assert found[-3:] == ["push", "grant", "commit"], (
-        "audit tail must show the push, then the grant, then the commit, "
-        "got %r" % kinds)
 
-    # The grant event names the approval that was granted.
-    grants = [event for event in events if " grant " in event]
-    assert approval in grants[-1], (
-        "the grant event must name the approval %s, got %r" % (approval, grants))
-
-    # The commit event names the staging object that was committed.
-    commits = [event for event in events if event.split()[1] == "commit"]
-    assert staging in commits[-1], (
-        "the commit event must name the staging ID %s, got %r" % (staging, commits))
+    # The grant event names the approval, the commit event the staging object.
+    assert ours[1].split()[3] == approval, (
+        "the grant event must name the approval %s, got %r" % (approval, ours[1]))
+    assert ours[2].split()[3] == staging, (
+        "the commit event must name the staging ID %s, got %r" % (staging, ours[2]))
 
     # [n] keeps the newest n events, still in order.
     last = audit_tail(server, 3)
@@ -2291,13 +2296,18 @@ def scenario_audit_tail_readonly(server):
     assert audit_tail(server) == before, (
         "reading the log with a count must not change it")
 
+    # A count is digits only and fits in a number: anything else is refused.
+    for command in ("audit tail x", "audit tail -1", "audit tail 1 2",
+                    "audit tail 99999999999999999999999999"):
+        lines = send_command(server, command)
+        assert lines and lines[-1] != "exit 0", (
+            "%r must not succeed, got %r" % (command, lines))
+    assert audit_tail(server) == before, (
+        "a refused count must not change the log")
+
 
 def scenario_audit_log_not_rewritable(server):
     """No agent-port command can clear or rewrite the audit log."""
-    before = audit_tail(server)
-    assert before and before[-1] == "exit 0", (
-        "the log must be readable before the attempt, got %r" % before)
-
     # Every way an agent could name the log, or ask to clear it. The telnet
     # shell is out of scope (ADR-0008): this is the agent port only.
     attempts = (
@@ -2316,16 +2326,89 @@ def scenario_audit_log_not_rewritable(server):
         "ln -s /data/ariel/audit.log /data/gone",
         "chmod 777 /data/ariel/audit.log",
     )
-    for command in attempts:
+
+    held = read_audit_log(server)
+    assert held, "the log must hold events before the attempts"
+
+    for index, command in enumerate(attempts):
+        if index == len(attempts) // 2:
+            # The server's own actions append, and the log must keep what it held.
+            approve_push(server, "rewritten", b"rewritten bytes\n")
+            grown = read_audit_log(server)
+            assert len(grown) > len(held) and grown.startswith(held), (
+                "an approved push must append to the log, not rewrite it")
+            held = grown
+
         lines = send_command(server, command)
         assert lines and lines[-1] != "exit 0", (
             "%r must not succeed: a successful command here would be a way to "
             "clear or rewrite the log, got %r" % (command, lines))
 
-    after = audit_tail(server)
-    assert after == before, (
-        "no agent-port command may change the audit log, before %r after %r"
-        % (before, after))
+        now = read_audit_log(server)
+        assert now.startswith(held), (
+            "%r rewrote the audit log: it no longer begins with what it held"
+            % command)
+        held = now
+
+    assert held.endswith(b"\n"), "the log must end in a whole line"
+    for line in held.decode("ascii").splitlines():
+        assert AUDIT_LINE.match(line), (
+            "the log must hold only whole event lines, got %r" % line)
+
+
+def scenario_audit_tail_drops_long_lines(server):
+    """A line too long to read whole is dropped, never shown in pieces."""
+    fresh = Server(server.binary)
+    try:
+        with open(audit_log_path(fresh), "ab") as handle:
+            handle.write(b"x" * 300 + b"\n")
+        approve_push(fresh, "longline", b"long line bytes\n")
+
+        lines = audit_tail(fresh)
+        assert lines and lines[-1] == "exit 0", (
+            "audit tail must answer exit 0, got %r" % lines)
+        for line in lines[:-1]:
+            assert AUDIT_LINE.match(line), (
+                "a fragment of a long line must not be shown, got %r" % line)
+    finally:
+        fresh.stop()
+
+
+def scenario_failed_audit_append_is_refused(server):
+    """An action whose audit line cannot be written answers audit_failed."""
+    fresh = Server(server.binary)
+    try:
+        # A directory where the log goes makes every append fail.
+        os.mkdir(audit_log_path(fresh))
+        lines = push(fresh, "unrecorded", b"unrecorded bytes\n")
+        assert lines == ["audit_failed", "exit 1"], (
+            "a push the log cannot record must be refused, got %r" % lines)
+        staging_dir = os.path.join(fresh.root, "data", "ariel", "staging")
+        assert not os.listdir(staging_dir), (
+            "a refused push must stage nothing, found %r" % os.listdir(staging_dir))
+    finally:
+        fresh.stop()
+
+
+def scenario_failed_audit_append_after_the_action(server):
+    """A grant or commit that cannot be logged answers audit_failed, not success."""
+    fresh = Server(server.binary)
+    try:
+        data = b"late audit bytes\n"
+        lines = push(fresh, "lateaudit", data)
+        staging, approval = assert_staged(fresh, lines, "lateaudit", data)
+
+        log = audit_log_path(fresh)
+        os.rename(log, log + ".saved")
+        os.mkdir(log)
+
+        signature = sign_challenge(fresh, challenge_of(lines))
+        assert grant(fresh, approval, signature) == ["audit_failed", "exit 1"], (
+            "a grant the log cannot record must answer audit_failed")
+        assert commit(fresh, staging) == ["audit_failed", "exit 1"], (
+            "a commit the log cannot record must answer audit_failed")
+    finally:
+        fresh.stop()
 
 
 def scenario_one_canonical_function(server):
@@ -2486,6 +2569,12 @@ SCENARIOS = [
     ("audit tail is read-only", scenario_audit_tail_readonly, False),
     ("no agent-port command can clear or rewrite the audit log",
      scenario_audit_log_not_rewritable, False),
+    ("a long audit line is dropped whole, never shown in pieces",
+     scenario_audit_tail_drops_long_lines, False),
+    ("a push the audit log cannot record is refused and stages nothing",
+     scenario_failed_audit_append_is_refused, False),
+    ("a grant or commit the audit log cannot record answers audit_failed",
+     scenario_failed_audit_append_after_the_action, False),
     ("console mode with PS5_HOST set names the console scenarios and every "
      "scenario that needs the test clock", scenario_console_mode_plan, False),
     ("console mode prints what the owner should see on the console and "

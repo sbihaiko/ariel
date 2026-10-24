@@ -61,7 +61,7 @@ New commands in this stage (see [Command coverage](#command-coverage)):
 - `unzip` and `tar`, because many GitHub releases ship payloads inside an archive.
 - `reboot`, gated, to test that installed payloads survive a restart.
 - `approval status <id>`, to poll a pending approval.
-- `audit tail`, to read the audit log.
+- `audit tail [n]`, to read the audit log: the newest `n` lines, at most 64.
 
 ### Stage 3: an interface agents can rely on
 

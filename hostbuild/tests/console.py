@@ -359,18 +359,20 @@ def check_audit_tail(session, context):
     events = [line for line in lines if line != "exit 0"]
     assert lines and lines[-1] == "exit 0", (
         "audit tail must end with exit 0, got %r" % lines)
-    kinds = []
     for event in events:
-        parts = event.split()
-        assert len(parts) == 5 and parts[1] in ("push", "grant", "commit"), (
+        assert len(event.split()) == 5, (
             "expected '<ms> <kind> <name> <id> <sha256>', got %r" % event)
+
+    # The console's log keeps earlier events: only this build's count.
+    ours = [event for event in events if event.split()[3] in (staging, approval)]
+    kinds = [event.split()[1] for event in ours]
+    assert kinds == ["push", "grant", "commit"], (
+        "audit tail must show the push, then the grant, then the commit, "
+        "got %r" % ours)
+    for event in ours:
+        parts = event.split()
         assert parts[2] == "consoleaudit" and parts[4] == digest, (
             "the event must name the payload and its hash, got %r" % event)
-        kinds.append(parts[1])
-    found = [kind for kind in kinds if kind in ("push", "grant", "commit")]
-    assert found[-3:] == ["push", "grant", "commit"], (
-        "audit tail must show the push, then the grant, then the commit, "
-        "got %r" % kinds)
 
     # Reading the log changes nothing, and no agent-port command clears it.
     assert session.link.exchange("audit tail") == lines, (

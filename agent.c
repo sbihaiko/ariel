@@ -101,6 +101,9 @@ static const char unknown_payload[] =
 static const char spawn_failed[] =
   "spawn_failed\n"
   "exit 1\n";
+static const char audit_failed[] =
+  "audit_failed\n"
+  "exit 1\n";
 
 static int
 write_all(int fd, const char *buf, size_t len) {
@@ -529,7 +532,14 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
     }
 
     store_stage(staging_id, &facts, challenge.id);
-  store_audit_append("push", name, staging_id, computed);
+
+    // A push the log cannot record is refused: nothing stays staged or pending.
+    if(store_audit_append("push", name, staging_id, computed)) {
+      store_approval_deny(challenge.id);
+      store_staging_discard(staging_id);
+      reply(fd, audit_failed);
+      return;
+    }
 
     // The challenge is everything the owner's signer needs: the canonical
     // action as bytes in hex, so no byte of it can be reshaped on the way.
@@ -563,7 +573,12 @@ payload_commit(int fd, const char *staging_id) {
 
   switch(outcome) {
   case STORE_INSTALLED:
-    store_audit_append("commit", install.name, staging_id, install.sha256);
+    // The install already happened, so a commit that cannot be logged still
+    // stands; the agent is told it was not recorded.
+    if(store_audit_append("commit", install.name, staging_id, install.sha256)) {
+      reply(fd, audit_failed);
+      return;
+    }
     snprintf(answer, sizeof(answer), "installed %s %s\nexit 0\n",
              install.name, install.sha256);
     reply(fd, answer);
@@ -646,6 +661,7 @@ approval_grant(agent_t *agent, int fd, const char *id,
                const char *action_sha256) {
   unsigned char signature[APPROVAL_SIG_LEN];
   unsigned char digest[SHA256_DIGEST_LEN];
+  approval_facts_t facts;
   char answer[APPROVAL_ID_MAX + 32];
 
   if(approval_hex_decode(signature_text, signature, sizeof(signature)) ||
@@ -659,6 +675,13 @@ approval_grant(agent_t *agent, int fd, const char *id,
   switch(agent->platform->approval_grant(agent->platform, id, signature,
                                          console, action_sha256)) {
   case STORE_GRANT_OK:
+    // The grant stands once recorded, so a grant the log cannot record is
+    // reported as such and is not undone.
+    if(store_approval_facts(id, &facts) ||
+       store_audit_append("grant", facts.name, id, facts.sha256)) {
+      reply(fd, audit_failed);
+      return;
+    }
     snprintf(answer, sizeof(answer), "approval_granted %s\nexit 0\n", id);
     reply(fd, answer);
     return;
@@ -754,6 +777,40 @@ run_command(agent_t *agent, int fd, int argc, char *argv[]) {
 }
 
 
+/**
+ * audit tail [n]: the newest n lines of the audit log, at most AUDIT_TAIL_MAX.
+ * Reading the log writes nothing to it.
+ **/
+static void
+audit_tail_reply(int fd, const char *count_text) {
+  size_t size = AUDIT_TAIL_MAX * AUDIT_LINE_MAX;
+  uint64_t count = 0;
+  char *buf;
+  int len;
+
+  if(count_text && parse_size(count_text, &count)) {
+    reply(fd, unknown);
+    return;
+  }
+
+  if(!(buf=malloc(size))) {
+    reply(fd, audit_failed);
+    return;
+  }
+
+  len = store_audit_tail((unsigned long)count, buf, size);
+  if(len < 0) {
+    free(buf);
+    reply(fd, audit_failed);
+    return;
+  }
+
+  write_all(fd, buf, (size_t)len);
+  free(buf);
+  reply(fd, "exit 0\n");
+}
+
+
 static void
 handle_command(agent_t *agent, int fd, int wake, char *line) {
   char *argv[MAX_ARGS + 1];
@@ -795,6 +852,12 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
      !strcmp(argv[2], "--wait")) {
     argv[argc] = NULL;
     payload_run(agent, fd, argv[3], &argv[3]);
+    return;
+  }
+
+  if((argc == 2 || argc == 3) && !strcmp(argv[0], "audit") &&
+     !strcmp(argv[1], "tail")) {
+    audit_tail_reply(fd, argc == 3 ? argv[2] : NULL);
     return;
   }
 
