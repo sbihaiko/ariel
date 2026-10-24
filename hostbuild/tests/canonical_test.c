@@ -236,6 +236,20 @@ main(void) {
   other.destination = "/data/xfer.dst";
   refused(&other, "a '.' in a destination is refused");
 
+  // A built-in's name may hold an underscore, and must still start with a letter.
+  other = action;
+  other.command = "pkg_install";
+  expect(encode(&other, out, sizeof(out)) > 0 && !strcmp(out,
+         "ariel-action-v1\n"
+         "command=pkg_install\n"
+         "target=helloworld\n"
+         "sha256=" HASH "\n"
+         "option.run=1\n"
+         "option.size=12\n"),
+         "pkg_install encodes its underscore as written");
+  other.command = "_pkg_install";
+  refused(&other, "a command that starts with an underscore is refused");
+
   printf(failures ? "\n%d check(s) failed\n" : "\nall checks passed\n",
          failures);
   return failures ? 1 : 0;

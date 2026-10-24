@@ -1089,6 +1089,14 @@ HOST_FIXTURE_REASON = ("needs a process only the host build starts, which "
 CLOCK_SCENARIOS = {
     "rollbacks that end, and requests left to expire, free their approval "
     "rows, so a push still asks for approval",
+    "each gated built-in answers 75 and its challenge before anything runs",
+    "a granted built-in on the host answers not available once and audits "
+    "the grant and the run",
+    "a built-in asked with another argument asks again instead of reusing "
+    "the grant",
+    "reptyr of a restarted process answers approval_stale and exit 78 and "
+    "touches nothing",
+    "a file replaced after a built-in grant answers approval_stale and exit 78",
     "missing auth after 5 s of test clock closes with exit 70",
     "a stalled upload does not block another connection",
     "a hung background payload is listed as running, then cut at its "
@@ -1154,11 +1162,16 @@ CLOCK_SCENARIOS = {
 # Ariel's own pid. A console has neither to act on.
 HOST_FIXTURE_SCENARIOS = {
     "kill of Ariel's own process answers protected and exit 87",
+    "reptyr of a restarted process answers approval_stale and exit 78 and "
+    "touches nothing",
 }
 
 # The read-only scenarios that need the host test root: they write scratch
 # files or links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
+    "each gated built-in answers 75 and its challenge before anything runs",
+    "a built-in that names Ariel's token answers protected and asks nothing",
+    "a file replaced after a built-in grant answers approval_stale and exit 78",
     "each read-only command runs with no approval and exits 0 with its output",
     "sha256sum prints the digest openssl dgst -sha256 prints",
     "the token, approval state and nonces answer protected and exit 87 when "
@@ -5047,6 +5060,160 @@ def scenario_kill_retarget_refused(server):
         victim.wait()
 
 
+BUILTIN_PROMPT_LINE = re.compile(r"^prompt (a-[0-9a-f]+) (.+) will run$")
+
+
+def builtin_scenario(scenario):
+    """Clear the approval table and unread output, pass or fail, so no scenario leaks."""
+    def run(server):
+        server.fresh()
+        try:
+            scenario(server)
+        finally:
+            while server.next_line(timeout=0.2) is not None:
+                pass
+            server.fresh()
+            while server.next_line(timeout=0.2) is not None:
+                pass
+    return run
+
+
+def builtin_approval(server, line, command, target):
+    """Request a gated built-in and check its 75, challenge and prompt.
+
+    Returns the approval ID and the challenge line.
+    """
+    server.fresh()
+    lines = run_command(server, line)
+    prompt = BUILTIN_PROMPT_LINE.match(server.next_line() or "")
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "%r must answer 75 before it runs, got %r" % (line, lines))
+    approval = APPROVAL_LINE.match(lines[0])
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert approval and challenge and challenge.group(1) == approval.group(1), (
+        "expected approval_required and a matching challenge, got %r" % lines)
+    action = challenge_action(lines[1]).split("\n")
+    assert "command=%s" % command in action and "target=%s" % target in action, (
+        "the challenge of %r must name its command and target: %r"
+        % (line, action))
+    assert prompt and prompt.group(1) == approval.group(1), (
+        "expected the prompt for %r, got %r" % (line, lines))
+    return approval.group(1), lines[1]
+
+
+@builtin_scenario
+def scenario_builtins_ask_before_they_run(server):
+    """Each gated built-in answers 75 with its challenge before anything runs."""
+    app = write_scratch(server, "app", b"app\n")
+    cases = [
+        ("launch PPSA01234", "launch", "PPSA01234"),
+        ("pkg_install %s" % app, "pkg_install", app),
+        ("hbldr %s" % app, "hbldr", app),
+        ("hbdbg %s" % app, "hbdbg", app),
+        ("sfocreate %s" % app, "sfocreate", app),
+        ("suspend", "suspend", "suspend"),
+        ("notify hello", "notify", "hello"),
+    ]
+    for line, command, target in cases:
+        builtin_approval(server, line, command, target)
+
+
+@builtin_scenario
+def scenario_builtin_grant_runs_once_on_host(server):
+    """A granted launch runs once; the host build answers it as unavailable."""
+    approval, challenge = builtin_approval(
+        server, "launch PPSA01234", "launch", "PPSA01234")
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "launch PPSA01234") == [
+        "not available on this platform", "exit 1"], (
+        "the granted launch must reach the platform once")
+    ours = [event.split()[1] for event in audit_tail(server)
+            if AUDIT_LINE.match(event) and event.split()[3] == approval]
+    assert ours == ["launch.request", "grant", "launch.done"], (
+        "the audit log must show the request, the grant and the run: %r" % ours)
+
+
+@builtin_scenario
+def scenario_builtin_arguments_are_bound(server):
+    """A grant for one argument does not run a built-in with another."""
+    approval, challenge = builtin_approval(
+        server, "launch PPSA01234 one", "launch", "PPSA01234")
+    sign_and_grant(server, approval, challenge)
+    other, _ = builtin_approval(
+        server, "launch PPSA01234 two", "launch", "PPSA01234")
+    assert other != approval, (
+        "a changed argument must ask for its own approval, not reuse the grant")
+
+
+@builtin_scenario
+def scenario_builtin_bad_arguments_are_refused_without_asking(server):
+    """A missing operand, a relative path or a bad value answers without asking."""
+    for command, answer in (
+            ("hbldr", ["missing_operand", "exit 1"]),
+            ("hbldr app", ["relative_path", "exit 1"]),
+            ("notify a=b", ["bad_argument", "exit 1"])):
+        lines = run_command(server, command)
+        assert lines == answer, (
+            "%r must answer %r without asking, got %r" % (command, answer, lines))
+    server.assert_no_line()
+
+
+@builtin_scenario
+def scenario_builtin_protected_is_refused_without_asking(server):
+    """A built-in that names Ariel's token answers protected and asks nothing."""
+    token = secret_path(server, "token")
+    assert_protected(server, "hbldr %s" % token)
+    assert_protected(server, "pkg_install %s" % token)
+    server.assert_no_line()
+    assert kill_audit(server, "hbldr.protected", token), (
+        "the refusal must be in the audit log")
+
+
+@builtin_scenario
+def scenario_reptyr_restarted_process_is_stale(server):
+    """A process restarted under the same pid answers 78 and is not reattached."""
+    victim = spawn_victim()
+    try:
+        pid = victim.pid
+        approval, challenge = builtin_approval(
+            server, "reptyr %d" % pid, "reptyr", str(pid))
+        sign_and_grant(server, approval, challenge)
+        server.controller("restart %d" % pid, "restarted %d" % pid)
+        assert run_command(server, "reptyr %d" % pid) == [
+            "approval_stale", "exit 78"], (
+            "a restarted process must answer approval_stale")
+        assert victim.poll() is None, "a stale approval must touch nothing"
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+@builtin_scenario
+def scenario_reptyr_critical_is_refused(server):
+    """reptyr of a critical process answers protected and exit 87, asking nothing."""
+    pid = critical_pid(server)
+    assert run_command(server, "reptyr %d" % pid) == [
+        "protected", "exit 87"], "a critical process must be refused"
+    server.assert_no_line()
+    assert kill_audit(server, "reptyr.protected", pid), (
+        "the refusal must be in the audit log")
+
+
+@builtin_scenario
+def scenario_builtin_file_replaced_is_stale(server):
+    """A file replaced after approval answers approval_stale and exit 78."""
+    app = write_scratch(server, "replaced", b"first\n")
+    approval, challenge = builtin_approval(
+        server, "hbldr %s" % app, "hbldr", app)
+    sign_and_grant(server, approval, challenge)
+    staged = app + "-new"
+    with open(staged, "wb") as f:
+        f.write(b"second\n")
+    os.replace(staged, app)
+    assert run_command(server, "hbldr %s" % app) == [
+        "approval_stale", "exit 78"], "a replaced file must answer 78"
+
+
 SERVER_BINARY = "./ariel-host"
 
 
@@ -5509,6 +5676,24 @@ SCENARIOS = [
     ("env, export and exec refuse a bad name, a relative or missing path and "
      "the token without asking, and audit each refusal",
      scenario_env_export_exec_refusals, False),
+    ("each gated built-in answers 75 and its challenge before anything runs",
+     scenario_builtins_ask_before_they_run, HOST_ROOT_REASON),
+    ("a granted built-in on the host answers not available once and audits "
+     "the grant and the run", scenario_builtin_grant_runs_once_on_host, True),
+    ("a built-in asked with another argument asks again instead of reusing "
+     "the grant", scenario_builtin_arguments_are_bound, True),
+    ("a built-in with a missing operand, a relative path or a bad value "
+     "answers without asking", scenario_builtin_bad_arguments_are_refused_without_asking,
+     False),
+    ("a built-in that names Ariel's token answers protected and asks nothing",
+     scenario_builtin_protected_is_refused_without_asking, HOST_ROOT_REASON),
+    ("reptyr of a restarted process answers approval_stale and exit 78 and "
+     "touches nothing", scenario_reptyr_restarted_process_is_stale,
+     HOST_FIXTURE_REASON),
+    ("reptyr of a critical process answers protected and exit 87 and asks "
+     "no approval", scenario_reptyr_critical_is_refused, False),
+    ("a file replaced after a built-in grant answers approval_stale and exit 78",
+     scenario_builtin_file_replaced_is_stale, HOST_ROOT_REASON),
     ("the PS5 build rejects the host test key",
      scenario_ps5_rejects_test_key, None),
     ("the PS5 platform no longer reads the controller",
