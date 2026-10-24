@@ -343,6 +343,46 @@ class Context:
         self.document = document
 
 
+def check_audit_tail(session, context):
+    """A push, a grant and a commit each land in the audit log, in that order."""
+    del context
+    data = b"console audit\n"
+    digest = hashlib.sha256(data).hexdigest()
+    lines = session.push("consoleaudit", data)
+    staging, approval, challenge = assert_staged(lines, "consoleaudit", data)
+    session.request(approval, challenge, "consoleaudit", len(data), digest)
+    lines = session.commit(staging)
+    assert lines == ["installed consoleaudit %s" % digest, "exit 0"], (
+        "an approved commit must install the build, got %r" % lines)
+
+    lines = session.link.exchange("audit tail")
+    events = [line for line in lines if line != "exit 0"]
+    assert lines and lines[-1] == "exit 0", (
+        "audit tail must end with exit 0, got %r" % lines)
+    kinds = []
+    for event in events:
+        parts = event.split()
+        assert len(parts) == 5 and parts[1] in ("push", "grant", "commit"), (
+            "expected '<ms> <kind> <name> <id> <sha256>', got %r" % event)
+        assert parts[2] == "consoleaudit" and parts[4] == digest, (
+            "the event must name the payload and its hash, got %r" % event)
+        kinds.append(parts[1])
+    found = [kind for kind in kinds if kind in ("push", "grant", "commit")]
+    assert found[-3:] == ["push", "grant", "commit"], (
+        "audit tail must show the push, then the grant, then the commit, "
+        "got %r" % kinds)
+
+    # Reading the log changes nothing, and no agent-port command clears it.
+    assert session.link.exchange("audit tail") == lines, (
+        "audit tail must not change the log it reads")
+    for command in ("audit clear", "rm /data/ariel/audit.log"):
+        refused = session.link.exchange(command)
+        assert refused and refused[-1] != "exit 0", (
+            "%r must not succeed, got %r" % (command, refused))
+    assert session.link.exchange("audit tail") == lines, (
+        "no agent-port command may change the audit log")
+
+
 # Every check console mode runs. Each is a scenario that needs no test clock.
 CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
@@ -360,6 +400,8 @@ CHECKS = [
      check_approval_then_install),
     ("a grant that is not the owner's signature answers signature_invalid "
      "and the commit stays refused", check_unsigned_commit),
+    ("after a push, a grant and a commit, audit tail shows each one in order "
+     "and no agent-port command can clear the log", check_audit_tail),
     ("the quick start's 'After Stage 1' section passes against the console",
      check_quick_start),
 ]

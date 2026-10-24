@@ -2196,6 +2196,138 @@ def scenario_ps5_has_no_pad(server):
         assert name not in source, "platform_ps5.c still uses %s" % name
 
 
+# ---------------------------------------------------------------------------
+# The audit log (issue #21). Ariel appends every action; audit tail reads it.
+# ---------------------------------------------------------------------------
+
+AUDIT_LINE = re.compile(
+    r"^(\d+) (push|grant|commit) (\S+) (\S+) ([0-9a-f]{64})$")
+
+
+def audit_tail(server, n=None):
+    """Send one audit tail and return the lines the server answered."""
+    command = "audit tail" if n is None else "audit tail %d" % n
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def send_command(server, command):
+    """Send one command and return the lines the server answered."""
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def scenario_audit_tail_order(server):
+    """After a push, a grant and a commit, audit tail shows each one in order."""
+    data = b"audited bytes\n"
+    digest = hashlib.sha256(data).hexdigest()
+    staging, approval = approve_push(server, "audited", data)
+    assert commit(server, staging) == [
+        "installed audited %s" % digest, "exit 0"], (
+        "an approved commit must install the build")
+
+    lines = audit_tail(server)
+    events = [line for line in lines if line != "exit 0"]
+    assert lines and lines[-1] == "exit 0", (
+        "audit tail must end with exit 0, got %r" % lines)
+    kinds = []
+    for event in events:
+        match = AUDIT_LINE.match(event)
+        assert match, "expected '<ms> <kind> <name> <id> <sha256>', got %r" % event
+        kinds.append(match.group(2))
+        assert match.group(3) == "audited", (
+            "the event must name the payload, got %r" % event)
+        assert match.group(5) == digest, (
+            "the event must name the build's hash, got %r" % event)
+    found = [kind for kind in kinds if kind in ("push", "grant", "commit")]
+    assert found[-3:] == ["push", "grant", "commit"], (
+        "audit tail must show the push, then the grant, then the commit, "
+        "got %r" % kinds)
+
+    # The grant event names the approval that was granted.
+    grants = [event for event in events if " grant " in event]
+    assert approval in grants[-1], (
+        "the grant event must name the approval %s, got %r" % (approval, grants))
+
+    # The commit event names the staging object that was committed.
+    commits = [event for event in events if event.split()[1] == "commit"]
+    assert staging in commits[-1], (
+        "the commit event must name the staging ID %s, got %r" % (staging, commits))
+
+    # [n] keeps the newest n events, still in order.
+    last = audit_tail(server, 3)
+    assert last == events[-3:] + ["exit 0"], (
+        "audit tail 3 must show the three newest events in order, got %r" % last)
+
+    # The log is append-only through the port: reading it changes nothing.
+    again = audit_tail(server)
+    assert again == lines, "reading the log must not change it, got %r" % again
+
+
+def scenario_audit_tail_readonly(server):
+    """audit tail reads the log and never writes to it."""
+    before = audit_tail(server)
+    assert before and before[-1] == "exit 0", (
+        "audit tail must answer the log and exit 0, got %r" % before)
+    after = audit_tail(server)
+    assert after == before, (
+        "audit tail must not append anything, before %r after %r" % (before, after))
+
+    # A tail with no count, a count and a count of one are all reads.
+    for command in ("audit tail", "audit tail 1", "audit tail 0"):
+        lines = send_command(server, command)
+        assert lines and lines[-1] == "exit 0", (
+            "%r must succeed as a read, got %r" % (command, lines))
+    assert audit_tail(server) == before, (
+        "reading the log with a count must not change it")
+
+
+def scenario_audit_log_not_rewritable(server):
+    """No agent-port command can clear or rewrite the audit log."""
+    before = audit_tail(server)
+    assert before and before[-1] == "exit 0", (
+        "the log must be readable before the attempt, got %r" % before)
+
+    # Every way an agent could name the log, or ask to clear it. The telnet
+    # shell is out of scope (ADR-0008): this is the agent port only.
+    attempts = (
+        "audit clear",
+        "audit reset",
+        "audit rm",
+        "audit delete",
+        "audit truncate",
+        "audit write hello",
+        "audit tail --clear",
+        "rm /data/ariel/audit",
+        "rm /data/ariel/audit.log",
+        "echo gone > /data/ariel/audit.log",
+        "truncate /data/ariel/audit.log",
+        "mv /data/ariel/audit.log /data/ariel/audit.log.bak",
+        "ln -s /data/ariel/audit.log /data/gone",
+        "chmod 777 /data/ariel/audit.log",
+    )
+    for command in attempts:
+        lines = send_command(server, command)
+        assert lines and lines[-1] != "exit 0", (
+            "%r must not succeed: a successful command here would be a way to "
+            "clear or rewrite the log, got %r" % (command, lines))
+
+    after = audit_tail(server)
+    assert after == before, (
+        "no agent-port command may change the audit log, before %r after %r"
+        % (before, after))
+
+
 def scenario_one_canonical_function(server):
     """Exactly one source file builds the canonical action text."""
     del server
@@ -2349,6 +2481,11 @@ SCENARIOS = [
      scenario_one_canonical_function, False),
     ("the canonical encoder refuses ambiguous inputs",
      scenario_canonical_encoder, False),
+    ("after a push, a grant and a commit, audit tail shows each one in order",
+     scenario_audit_tail_order, False),
+    ("audit tail is read-only", scenario_audit_tail_readonly, False),
+    ("no agent-port command can clear or rewrite the audit log",
+     scenario_audit_log_not_rewritable, False),
     ("console mode with PS5_HOST set names the console scenarios and every "
      "scenario that needs the test clock", scenario_console_mode_plan, False),
     ("console mode prints what the owner should see on the console and "

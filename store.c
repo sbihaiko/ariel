@@ -90,6 +90,13 @@ struct staged {
 /** The file in Ariel's directory that holds the consumed nonces. **/
 #define NONCES_FILE "nonces"
 
+/** The audit log: one appended line per action Ariel takes. **/
+#define AUDIT_FILE "audit.log"
+
+/** One audit line is short; this covers the newest lines a tail asks for. **/
+#define AUDIT_LINE_MAX 256
+#define AUDIT_TAIL_MAX 64
+
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -931,6 +938,32 @@ store_approval_deny(const char *id) {
 }
 
 
+int
+store_approval_facts(const char *id, approval_facts_t *facts) {
+  struct approval *request;
+  struct staged *entry;
+  int found = 0;
+  int i;
+
+  pthread_mutex_lock(&lock);
+  request = approval_find(id);
+
+  if(request) {
+    for(i=0; i<STAGING_MAX; i++) {
+      entry = &staged[i];
+      if(entry->used && !strcmp(entry->approval_id, id)) {
+        *facts = entry->facts;
+        found = 1;
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&lock);
+
+  return found ? 0 : -1;
+}
+
+
 void
 store_stage(const char *staging_id, const approval_facts_t *facts,
             const char *approval_id) {
@@ -1493,4 +1526,121 @@ store_object_free(store_object_t *object) {
 int
 store_list(state_payload_t *entries, size_t max, size_t *count) {
   return state_list(entries, max, count);
+}
+
+
+/**
+ * Append one action to the audit log. The line is flushed before it returns,
+ * so a crash cannot lose an action that already happened.
+ **/
+int
+store_audit_append(const char *kind, const char *name, const char *id,
+                   const char *sha256) {
+  char line[AUDIT_LINE_MAX];
+  int len;
+  int fd;
+  int state_fd;
+
+  len = snprintf(line, sizeof(line), "%llu %s %s %s %s\n",
+                 (unsigned long long)now_ms(), kind, name, id, sha256);
+  if(len < 0 || len >= (int)sizeof(line)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&lock);
+  state_fd = state_open();
+  if(state_fd >= 0) {
+    fd = open_entry(state_fd, AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND);
+    close(state_fd);
+  } else {
+    fd = -1;
+  }
+
+  if(fd >= 0 && !write_all(fd, line, (size_t)len) && !fsync(fd) && !close(fd)) {
+    pthread_mutex_unlock(&lock);
+    return 0;
+  }
+
+  if(fd >= 0) {
+    close(fd);
+  }
+  pthread_mutex_unlock(&lock);
+  return -1;
+}
+
+
+/**
+ * The newest n complete lines of the audit log, or all of them when n is 0.
+ * A line that does not end in a newline has not been flushed yet, so it is
+ * not shown.
+ **/
+int
+store_audit_tail(unsigned long n, char *buf, size_t size) {
+  char line[AUDIT_LINE_MAX];
+  char kept[AUDIT_TAIL_MAX][AUDIT_LINE_MAX];
+  unsigned long count = 0;
+  unsigned long start;
+  unsigned long i;
+  size_t used = 0;
+  FILE *file;
+  int state_fd;
+  int fd;
+
+  if((state_fd=state_open()) < 0) {
+    return -1;
+  }
+
+  fd = open_entry(state_fd, AUDIT_FILE, O_RDONLY);
+  close(state_fd);
+
+  // A log that does not exist yet has no events.
+  if(fd < 0) {
+    if(size > 0) {
+      buf[0] = '\0';
+    }
+    return 0;
+  }
+
+  if(!(file=fdopen(fd, "r"))) {
+    close(fd);
+    return -1;
+  }
+
+  if(n == 0 || n > AUDIT_TAIL_MAX) {
+    n = AUDIT_TAIL_MAX;
+  }
+
+  while(fgets(line, sizeof(line), file)) {
+    size_t len = strlen(line);
+
+    if(len == 0 || line[len - 1] != '\n') {
+      continue;
+    }
+    snprintf(kept[count % AUDIT_TAIL_MAX], AUDIT_LINE_MAX, "%s", line);
+    count++;
+  }
+
+  fclose(file);
+
+  if(count > n) {
+    start = count - n;
+  } else {
+    start = 0;
+  }
+
+  for(i=start; i<count; i++) {
+    const char *text = kept[i % AUDIT_TAIL_MAX];
+    size_t len = strlen(text);
+
+    if(used + len >= size) {
+      return -1;
+    }
+    memcpy(buf + used, text, len);
+    used += len;
+  }
+
+  if(used < size) {
+    buf[used] = '\0';
+  }
+  return (int)used;
 }

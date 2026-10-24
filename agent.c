@@ -529,6 +529,7 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
     }
 
     store_stage(staging_id, &facts, challenge.id);
+  store_audit_append("push", name, staging_id, computed);
 
     // The challenge is everything the owner's signer needs: the canonical
     // action as bytes in hex, so no byte of it can be reshaped on the way.
@@ -562,6 +563,7 @@ payload_commit(int fd, const char *staging_id) {
 
   switch(outcome) {
   case STORE_INSTALLED:
+    store_audit_append("commit", install.name, staging_id, install.sha256);
     snprintf(answer, sizeof(answer), "installed %s %s\nexit 0\n",
              install.name, install.sha256);
     reply(fd, answer);

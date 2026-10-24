@@ -124,8 +124,11 @@ int store_approval_request(const approval_facts_t *facts,
 int store_approval_grant(const char *id, const unsigned char *signature,
                          const char *console, const char *action_sha256);
 
-/** Record a denial. Returns 0, or -1 for an unknown ID. **/
-int store_approval_deny(const char *id);
+/**
+ * The facts an approval was bound to, for the audit log. Returns 0 when id
+ * names an approval, or -1 when it does not.
+ **/
+int store_approval_facts(const char *id, approval_facts_t *facts);
 
 /** Bind a staged object to the approval that names it. **/
 void store_stage(const char *staging_id, const approval_facts_t *facts,
@@ -158,5 +161,20 @@ void store_object_free(store_object_t *object);
  * be read.
  **/
 int store_list(state_payload_t *entries, size_t max, size_t *count);
+
+/**
+ * Append one line to the audit log: "<ms> <kind> <name> <id> <sha256>". The
+ * log is append-only; nothing here can clear or rewrite it. Returns 0, or -1
+ * when the line could not be recorded.
+ **/
+int store_audit_append(const char *kind, const char *name, const char *id,
+                       const char *sha256);
+
+/**
+ * Copy the newest n lines of the audit log into buf, or every line when n is
+ * 0, each ending in a newline. The lines stay in the order they were
+ * appended. Returns the number of bytes copied, or -1 on error.
+ **/
+int store_audit_tail(unsigned long n, char *buf, size_t size);
 
 #endif /* ARIEL_STORE_H */
