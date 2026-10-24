@@ -103,10 +103,11 @@ Once the agent can operate the console safely, make the shell easy for it to use
 
 New and extended commands in this stage:
 
-- Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`.
+- Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`, including a way to pull a binary file back, such as a screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)).
 - Writing files without redirection: `write <path>`, which reads the content from stdin.
 - Missing flags on existing commands: `ls -l -a`, `grep -r -l -c`, more `find` predicates, `rm -r` and `cp -r`.
 - Diagnostics: `date`, `dmesg`, `du`, a `sysinfo` command that aggregates `uname`, `uptime` and memory, and `timeout` so a command cannot hang the connection.
+- Sight: `screenshot`, gated like every command that does more than read, which captures the screen to a file under `/data` that the reader above returns. One capture, one signature, because the screen can show personal content ([#53](https://github.com/sbihaiko/ariel/issues/53)).
 - Optional: `diff` and network diagnostics (`ifconfig`, `netstat`, `ping`).
 
 ### Stage 4 (optional): sessions
