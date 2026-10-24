@@ -2239,6 +2239,23 @@ def scenario_wrong_token(server):
         sock.close()
 
 
+def assert_unlisted_gated(server, command):
+    """A command outside the allowlist asks the owner (75) or waits out the gap (76)."""
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
+        lines = reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+    assert lines[-1] in ("exit 75", "exit 76") and lines[0] != (
+        "unknown_command"), (
+        "%r must be gated, answered %r" % (command, lines))
+    if lines[-1] == "exit 75":
+        assert APPROVAL_LINE.match(lines[0]), (
+            "%r must name its approval, got %r" % (command, lines))
+        server.next_line()
+
+
 def scenario_unknown_command(server):
     """A command outside the allowlist is gated, never answered unknown_command.
 
@@ -2566,14 +2583,7 @@ def scenario_sysctl_reads_and_refuses_writes(server):
     name, value = OSTYPE[platform.system()]
     assert run_command(server, "sysctl %s" % name) == [value, "exit 0"]
     assert run_command(server, "sysctl") == ["missing_operand", "exit 1"]
-    sock = server.connect()
-    try:
-        sock.sendall(
-            ("auth %s\nsysctl %s=Other\n" % (server.token, name)).encode("ascii")
-        )
-        assert_unknown(read_reply(sock))
-    finally:
-        sock.close()
+    assert_unlisted_gated(server, "sysctl %s=Other" % name)
     assert run_command(server, "sysctl %s" % name) == [value, "exit 0"], (
         "a refused sysctl write must change nothing")
 
@@ -2605,14 +2615,7 @@ def scenario_authid_is_not_available_on_the_host(server):
     """authid reads the console's kernel credentials: a PS5-only reader."""
     assert run_command(server, "authid") == [
         "not available on this platform", "exit 1"]
-    sock = server.connect()
-    try:
-        sock.sendall(
-            ("auth %s\nauthid 0x4800000000010003\n" % server.token).encode("ascii")
-        )
-        assert_unknown(read_reply(sock))
-    finally:
-        sock.close()
+    assert_unlisted_gated(server, "authid 0x4800000000010003")
 
 
 GATE_PROMPT = re.compile(r"^prompt (a-[0-9a-f]+) ")
