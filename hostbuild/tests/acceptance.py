@@ -1144,6 +1144,10 @@ CLOCK_SCENARIOS = {
     "a signature over another generation's message is refused",
     "a challenge issued before a rotation stops verifying after it",
     "a nonce consumed before a rotation stays consumed after a restart",
+    "key rotate refuses a retired primary and the current primary, also "
+    "after a restart",
+    "an unused approval granted under a retired primary answers "
+    "approval_stale",
     "a one-shot past its timeout fails, and with no previous version it is "
     "marked failed",
     "a failed one-shot with no previous version is removed from autoload",
@@ -4740,10 +4744,11 @@ def with_generation(challenge, generation):
     return " ".join(fields)
 
 
-def rotate_primary(server, new_pub, generation, signer):
+def rotate_primary(server, new_pub, generation, signer, wait_ms=120000):
     """Request, sign with signer, grant and perform one rotation."""
     approval, challenge = gated_request(
-        server, "key rotate " + new_pub, rotation_action(new_pub), ROTATE_PROMPT)
+        server, "key rotate " + new_pub, rotation_action(new_pub), ROTATE_PROMPT,
+        wait_ms=wait_ms)
     assert generation_of(challenge) == str(generation - 1), (
         "the rotation must be signed under generation %d" % (generation - 1))
     signature = sign_challenge(server, challenge, key=signer)
@@ -4848,25 +4853,30 @@ def scenario_signature_from_another_generation_is_refused(server):
 
 
 def scenario_pending_approval_stops_after_rotation(server):
+    """A challenge issued before a rotation is refused after it, whichever
+    key signs it. The rotation waits 11 s: past the notification gap, and
+    well inside the early challenge's 120 s, so only the generation can
+    refuse it. The early challenge is for env, since a new rotation request
+    replaces a pending rotation question."""
     del server
     keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "pending"})
     try:
-        second = public_key(keys, SECOND_PRIMARY_KEY)
+        name = "PATH"
         approval_a, challenge_a = gated_request(
-            keys, "key rotate " + second, rotation_action(second), ROTATE_PROMPT)
-        early = sign_challenge(keys, challenge_a, key=test_key())
+            keys, "env " + name,
+            ["command=env", "target=%s" % name, "sha256=none"],
+            "env %s will run" % name)
         with tempfile.TemporaryDirectory() as scratch:
-            third = public_key(keys, make_key(scratch, "third.key"))
-        rotate_primary(keys, third, 1, test_key())
-        # The rotation's gated request advances the clock by the full approval
-        # window, so the early challenge answers expired (or stale, or
-        # invalid, depending on which check runs first); it is refused on
-        # every path and never granted.
-        assert grant(keys, approval_a, early) in (
-            ["signature_invalid", "exit 79"],
-            ["approval_stale", "exit 78"],
-            ["approval_expired", "exit 88"]), (
-            "a challenge issued before the rotation must not verify after it")
+            third_key = make_key(scratch, "third.key")
+            third = public_key(keys, third_key)
+            rotate_primary(keys, third, 1, test_key(), wait_ms=11000)
+            for what, key in [("the retired primary", test_key()),
+                              ("the new primary", third_key)]:
+                early = sign_challenge(keys, challenge_a, key=key)
+                assert grant(keys, approval_a, early) == [
+                    "signature_invalid", "exit 79"], (
+                    "a challenge issued before the rotation must not verify "
+                    "after it, signed by %s" % what)
     finally:
         keys.stop()
 
@@ -4894,6 +4904,124 @@ def scenario_consumed_nonce_survives_rotation_restart(server):
         keys.stop()
 
 
+def scenario_key_rotate_refuses_revoked_keys(server):
+    """A retired primary stays revoked: rotating back to it, or to the
+    current primary, is refused before the owner is asked, also after a
+    restart and after a second rotation."""
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoked"})
+    try:
+        test_pub = public_key(keys, test_key())
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        assert run_command(keys, "key rotate " + second) == [
+            "key_refused", "exit 1"], (
+            "rotating to the current primary must be refused")
+        assert run_command(keys, "key rotate " + test_pub) == [
+            "key_refused", "exit 1"], (
+            "rotating back to the retired primary must be refused")
+        keys.restart()
+        assert run_command(keys, "key rotate " + test_pub) == [
+            "key_refused", "exit 1"], (
+            "a retired key must stay refused after a restart")
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+        rotate_primary(keys, third, 2, SECOND_PRIMARY_KEY)
+        for what, target in [("the first retired primary", test_pub),
+                             ("the second retired primary", second)]:
+            assert run_command(keys, "key rotate " + target) == [
+                "key_refused", "exit 1"], (
+                "rotating back to %s must be refused" % what)
+    finally:
+        keys.stop()
+
+
+def scenario_unused_approval_stops_after_rotation(server):
+    """An approval granted under a retired primary and not yet used answers
+    approval_stale, and the command asks the owner again."""
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "unused"})
+    try:
+        name = "PATH"
+        approval, challenge = gated_request(
+            keys, "env " + name,
+            ["command=env", "target=%s" % name, "sha256=none"],
+            "env %s will run" % name)
+        sign_and_grant(keys, approval, challenge)
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key(), wait_ms=11000)
+        assert run_command(keys, "env " + name) == [
+            "approval_stale", "exit 78"], (
+            "a grant made under a retired primary must not run its command")
+        assert_asks_again(keys, "env " + name)
+    finally:
+        keys.stop()
+
+
+def scenario_ps5_pubkey_needs_recovery(server):
+    """A PS5 build that pins the owner's key without its recovery key is
+    refused by make, not left to refuse every grant at run time."""
+    pub = public_key(server, SECOND_PRIMARY_KEY)
+    alone = subprocess.run(
+        ["make", "-n", "-f", os.path.join(repo_dir(), "Makefile"),
+         "PS5_PAYLOAD_SDK=/nonexistent", "ARIEL_PUBKEY=" + pub],
+        capture_output=True, text=True)
+    assert alone.returncode != 0 and "ARIEL_RECOVERY_PUBKEY" in alone.stderr, (
+        "the PS5 makefile must name ARIEL_RECOVERY_PUBKEY when only the owner's "
+        "key is set, got %r" % alone.stderr)
+    paired = subprocess.run(
+        ["make", "-n", "-f", os.path.join(repo_dir(), "Makefile"),
+         "PS5_PAYLOAD_SDK=/nonexistent", "ARIEL_PUBKEY=" + pub,
+         "ARIEL_RECOVERY_PUBKEY=" + public_key(server, RECOVERY_KEY)],
+        capture_output=True, text=True)
+    assert "ARIEL_RECOVERY_PUBKEY" not in paired.stderr, (
+        "a build that pins both keys must not be refused for the pair, got %r"
+        % paired.stderr)
+
+
+def scenario_recovery_pubkey_is_documented(server):
+    """The PS5 build instructions and the quick start name both pinned keys."""
+    del server
+    for doc in ["README.md", os.path.join("docs", "quick-start.md")]:
+        with open(os.path.join(repo_dir(), doc), encoding="utf-8") as handle:
+            text = handle.read()
+        assert "ARIEL_PUBKEY" in text and "ARIEL_RECOVERY_PUBKEY" in text, (
+            "%s must document ARIEL_PUBKEY and ARIEL_RECOVERY_PUBKEY" % doc)
+
+
+def scenario_ps5_refuses_test_key_as_primary(server):
+    """The admission rule store_key_check applies to a new primary refuses the
+    host test key in the PS5 configuration, and nothing else of the owner's."""
+    test_pub = public_key(server, test_key())
+    owner = public_key(server, SECOND_PRIMARY_KEY)
+    recovery = public_key(server, RECOVERY_KEY)
+    with tempfile.TemporaryDirectory() as scratch:
+        anchor = public_key(server, make_key(scratch, "anchor.key"))
+        ps5 = compile_probe(scratch, "admit-ps5", [],
+                            source="admissible_probe.c")
+        host = compile_probe(scratch, "admit-host", ["-DARIEL_HOST_BUILD=1"],
+                             source="admissible_probe.c")
+
+        def admitted(probe, key, primary, recovery_key):
+            done = subprocess.run([probe, key, primary, recovery_key],
+                                  capture_output=True, text=True)
+            assert done.returncode in (0, 1), done.stderr
+            return done.returncode == 0
+
+        assert not admitted(ps5, test_pub, anchor, recovery), (
+            "the PS5 configuration must refuse the host test key as primary")
+        assert admitted(ps5, owner, anchor, recovery), (
+            "the PS5 configuration must admit the owner's key")
+        assert not admitted(ps5, recovery, anchor, recovery), (
+            "the recovery key must not be admitted as primary")
+        assert not admitted(ps5, anchor, anchor, recovery), (
+            "the current primary must not be admitted as its own successor")
+        assert admitted(host, test_pub, anchor, recovery), (
+            "the host configuration admits the host test key")
+    with open(os.path.join(repo_dir(), "store.c"), encoding="utf-8") as handle:
+        assert "approval_key_admissible(" in handle.read(), (
+            "store_key_check must apply the admission rule")
+
+
 def scenario_keyring_is_protected(server):
     path = secret_path(server, "keyring")
     for template in SECRET_READS:
@@ -4916,13 +5044,13 @@ def scenario_adr_names_the_key_hierarchy(server):
             "the ADR index must list ADR-0009")
 
 
-def compile_probe(scratch, name, defines):
+def compile_probe(scratch, name, defines, source="pin_probe.c"):
     root = repo_dir()
     probe = os.path.join(scratch, name)
     done = subprocess.run(
         [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Werror", "-w",
          "-I" + root, "-o", probe,
-         os.path.join(tests_dir(), "pin_probe.c"),
+         os.path.join(tests_dir(), source),
          os.path.join(root, "approval.c"), os.path.join(root, "tweetnacl.c")]
         + defines, capture_output=True, text=True)
     assert done.returncode == 0, "the probe must build: %r" % done.stderr
@@ -5890,12 +6018,12 @@ def args_hash(*args):
         b"".join(arg.encode("ascii") + b"\0" for arg in args)).hexdigest()
 
 
-def gated_request(server, command, expected_action, prompt):
+def gated_request(server, command, expected_action, prompt, wait_ms=120000):
     """Request a gated command and check its 75, challenge, action and prompt.
 
     Returns the approval ID and the challenge line.
     """
-    server.advance(120000)
+    server.advance(wait_ms)
     lines = run_command(server, command)
     assert len(lines) == 3 and lines[2] == "exit 75", (
         "%s must answer approval_required and exit 75, got %r" % (command, lines))
@@ -7089,6 +7217,17 @@ SCENARIOS = [
      scenario_pending_approval_stops_after_rotation, CLOCK_REASON),
     ("a nonce consumed before a rotation stays consumed after a restart",
      scenario_consumed_nonce_survives_rotation_restart, CLOCK_REASON),
+    ("key rotate refuses a retired primary and the current primary, also "
+     "after a restart", scenario_key_rotate_refuses_revoked_keys, CLOCK_REASON),
+    ("an unused approval granted under a retired primary answers "
+     "approval_stale", scenario_unused_approval_stops_after_rotation,
+     CLOCK_REASON),
+    ("the PS5 makefile refuses an owner key pinned without its recovery key",
+     scenario_ps5_pubkey_needs_recovery, None),
+    ("the README and the quick start document ARIEL_RECOVERY_PUBKEY",
+     scenario_recovery_pubkey_is_documented, None),
+    ("the PS5 admission rule refuses the host test key as a new primary",
+     scenario_ps5_refuses_test_key_as_primary, None),
     ("the keyring is a protected object", scenario_keyring_is_protected,
      HOST_ROOT_REASON),
     ("kill with a bad signal, a bad pid or no such process answers an "
