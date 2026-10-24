@@ -2753,9 +2753,16 @@ def scenario_audit_log_not_rewritable(server):
             held = grown
 
         lines = send_command(server, command)
-        assert lines and lines[-1] != "exit 0", (
-            "%r must not succeed: a successful command here would be a way to "
-            "clear or rewrite the log, got %r" % (command, lines))
+        if command.startswith("echo "):
+            # The agent port has no redirection: echo prints its operands,
+            # '>' included, and writes no file.
+            assert lines == [command[len("echo "):], "exit 0"], (
+                "%r must print its operands and write nothing, got %r"
+                % (command, lines))
+        else:
+            assert lines and lines[-1] != "exit 0", (
+                "%r must not succeed: a successful command here would be a "
+                "way to clear or rewrite the log, got %r" % (command, lines))
 
         now = read_audit_log(server)
         assert now.startswith(held), (
