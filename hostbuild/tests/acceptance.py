@@ -8948,6 +8948,12 @@ def scenario_find_predicates(server):
         tree, sub, empty}, "find -type d must print the directories"
     assert set(run_exit_zero(server, "find %s -type f" % tree)) == {a, b}, (
         "find -type f must print the regular files")
+    assert set(run_exit_zero(server, "find %s -name '*.txt'" % tree)) == {
+        a, b}, "find -name must expand a glob against the name, as bash does"
+    assert run_exit_zero(server, "find %s -name '[a-z].txt'" % tree) == [a], (
+        "find -name must accept a bracket expression")
+    assert run_exit_zero(server, "find %s -name '*.log'" % tree) == [], (
+        "a glob that matches nothing prints nothing and exits 0")
     link = os.path.join(tree, "a-link")
     make_link(link, a, hard=False)
     assert set(run_exit_zero(server, "find %s -type l" % tree)) == {link}, (

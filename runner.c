@@ -21,6 +21,7 @@ along with this program; see the file COPYING. If not, see
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <regex.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1369,7 +1370,9 @@ find_wanted(const char *path, const struct stat *st, const char *name, char type
   if(name) {
     base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    if(strcmp(base, name)) {
+    // A glob is expanded here, as bash's find does: `-name '*.log'` matches
+    // by name, and a value with no metacharacter matches exactly.
+    if(fnmatch(name, base, 0)) {
       return 0;
     }
   }
