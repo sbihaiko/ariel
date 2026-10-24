@@ -2,13 +2,13 @@
 
 Notes from running `controller-spike.elf` on a real console (shsrv 0.20, elfldr on port 9021, read back on port 9150). Each item below was observed on the console, not inferred. The runbook for the spike stays in [controller-spike.md](controller-spike.md).
 
-**Status: the foreground title reads the pad. The payload process does not. No button edge was captured.**
+**Status: the foreground title reads the pad, including Cross. The payload process does not.**
 
 ## The question
 
 Can a payload read the controller while another app is in the foreground? (Issue [#3](https://github.com/sbihaiko/ariel/issues/3), the approval source in [ADR-0006](adr/0006-the-controller-is-the-approval-source.md).)
 
-**What is confirmed:** with a title in front, `scePadReadState` inside that title returns 0 and `connected` is 1. The same handle is rejected in the payload process. No button went down during the samples, so a live button edge is still missing.
+**What is confirmed:** with `PPSA99177` in front, `scePadReadState` inside that title returns 0, `connected` is 1, and a held Cross shows up as `0x00004000`. The same handle is rejected in the payload process (`0x80920003`). A second in-title sample after that press did not return, so the 30 second deadline never ran.
 
 ## Where the work lives
 
@@ -95,9 +95,9 @@ Note: `pt_resolve` cannot find these functions. It only looks at library handles
 
 ## Next steps, in order
 
-1. **See a button edge from the foreground title.** The title read already returns 0 with `connected` 1. What is missing is one sample where a face button is down, so the bits are known to track the pad. Hold Cross for the whole 30 seconds.
-2. **If that fails, reproduce the PoorDS4 path**: the context setters (`scePadSetLoginUserNumber`, `scePadSetUserNumber`, `scePadSetProcessFocus`) before the handle probe, and port type 3 with indexes 0–7. The spike still only tries port types 0 and 2, index 0.
-3. **Only then consider a virtual device.** That creates a controller rather than reading the real one, so it does not answer #3 — it is a different design.
+1. **Done for the question.** The foreground title's own `scePadReadState` sees the real pad and Cross. The payload process does not.
+2. **Do not sample by attaching again.** After the Cross line, the next `pt_call` into pid 109 did not return, and the 30 second clock never ran. A second attach is what froze the run.
+3. **PoorDS4 and a virtual device stay unused.** The title already has a real handle. Those paths create or retarget a device, which is a different design.
 
 ## What this build does
 
@@ -145,5 +145,28 @@ stop after 30 s, presses 0, errors 0, title handle left open
 - `scePadReadState` of that handle inside pid 109 returns 0. `connected` is 1. Buttons stayed 0 for the whole window, and the later samples reported no errors, so those reads also returned 0.
 - In the payload process, `scePadInit` returns 0 and `scePadReadState` of the same handle returns `0x80920003`. The payload does not read the title's pad by borrowing the integer.
 - The elfldr connection again printed `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while a big app was running. That line does not mean the foreground title is absent.
+
+## Run with Cross held
+
+Same console, same title, commit `6099943`. The operator held Cross (the X button) before the payload was sent. The transcript, read while the socket was still open:
+
+```
+connected, 9 s elapsed, 21 s left
+running big app 0x00000018
+eboot pid 109 app 0x00000018 title PPSA99177 off 16
+eboot pid 66 app 0x0000000d title NPXS40039 off 16
+user candidates 1 362804492 268435456
+title pid 109 getHandle 8009f1560 readState 8009f2a80
+title getHandle user 1 type 0 -> 0x80920008
+title getHandle user 1 type 2 -> 0x80920008
+title getHandle user 362804492 type 0 -> 0x03e50700
+title readState -> 0x00000000 buttons 0x00004000 connected 1
+payload init 0x00000000 readState 0x80920003 buttons 0x00000000 connected 0
+press CROSS
+```
+
+- `0x00004000` is `PAD_BUTTON_CROSS`. The spike named the edge `press CROSS`. The button bits track the pad.
+- The payload process still gets `0x80920003`.
+- No `stop after 30 s` line followed. More than 30 seconds after the press, port 9150 was still accepting connections and the transcript had not grown. The next in-title read did not return. The deadline is only checked between probes.
 
 The worktree is `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`.
