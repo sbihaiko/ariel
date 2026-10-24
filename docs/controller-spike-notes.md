@@ -1,52 +1,49 @@
 # Controller spike: what the console actually does
 
-Notes from running `controller-spike.elf` on a real console (shsrv 0.20, elfldr on port 9021, read back on port 9150). Each item below was observed on the console, not inferred. The runbook for the spike stays in [controller-spike.md](controller-spike.md).
+Notes from running `controller-spike.elf` on a real console (shsrv 0.20, elfldr on port 9021, read back on port 9150). Each item below was observed on the console, not inferred. The runbook for how to operate the spike stays in [controller-spike.md](controller-spike.md).
 
-**Status: the foreground title reads the pad, including Cross. The payload process does not.**
+**Answer: the foreground title can read the pad. The payload process cannot.**
 
-## The question
+Issue [#3](https://github.com/sbihaiko/ariel/issues/3), the approval source in [ADR-0006](adr/0006-the-controller-is-the-approval-source.md).
 
-Can a payload read the controller while another app is in the foreground? (Issue [#3](https://github.com/sbihaiko/ariel/issues/3), the approval source in [ADR-0006](adr/0006-the-controller-is-the-approval-source.md).)
+With `PPSA99177` in front, `scePadReadState` inside that title's `eboot.bin` returns 0, `connected` is 1, and a held Cross (the X button) shows up as `0x00004000`. The same handle, read with `scePadReadState` in the payload, returns `0x80920003`.
 
-**What is confirmed:** with `PPSA99177` in front, `scePadReadState` inside that title returns 0, `connected` is 1, and a held Cross shows up as `0x00004000`. The same handle is rejected in the payload process (`0x80920003`). A second in-title sample after that press did not return, so the 30 second deadline never ran.
+## The working path
 
-## Where the work lives
+1. Raise credentials, or `sceUserService` refuses the payload.
+2. `sceSystemServiceGetAppIdOfRunningBigApp` returns the foreground app id. It was `0x18` for this title.
+3. Walk the process list for `eboot.bin`. `sceKernelGetAppInfo` on pid 109 wrote app id `0x18` and title id `PPSA99177`. The same walk also saw pid 66, app id `0x0d`, title `NPXS40039`. The probe attached only to the pid whose app id matched.
+4. Resolve `libScePad.sprx` in that pid with `kernel_dynlib_handle` by name, then `kernel_dynlib_resolve`. In pid 109 the addresses were `scePadGetHandle` at `0x8009f1560` and `scePadReadState` at `0x8009f2a80`.
+5. Attach and call `scePadGetHandle`. User id `1` returns `0x80920008` (`DEVICE_NO_HANDLE`) for port types 0 and 2. User id `362804492`, port type 0, index 0, returns handle `0x03e50700`.
+6. Call `scePadReadState` on that handle inside the same attached process. One sample with no button held returned `buttons 0x00000000`, `connected 1`. One sample with Cross held returned `buttons 0x00004000`, `connected 1`, and the spike reported `press CROSS`. Both calls returned 0.
 
-All changes are in a run worktree:
+`0x00004000` is `PAD_BUTTON_CROSS`. The button bits track the pad.
 
-```
-worktrees/run/20261023-181518-99180-89b2ed/
-  controller_spike.c      the payload
-  pad.h                   pad, user service and RegMgr declarations
-  pt.h                    added pt_call declaration
-  Makefile                links pt.o and -lSceRegMgr
-  docs/controller-spike-notes.md   this file
-```
+The title id string sits at offset 16 in the `sceKernelGetAppInfo` buffer. That is the layout with `app_type` before the title id. Both `PPSA99177` and `NPXS40039` were found there.
 
-### Build
+`pt_resolve` does not find these pad exports. It only looks at library handles `0x1` and `0x2001`, and `libScePad` is in neither.
 
-`llvm-config` must be on `PATH` and the SDK must be exported, otherwise the SDK's clang wrapper fails with `/llvm-clang: No such file or directory`:
+## What the payload process cannot do
 
-```sh
-export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-export PS5_PAYLOAD_SDK="$HOME/.local/share/ps5-payload-sdk"
-make controller-spike.elf
-```
+`scePadInit` in the payload returns 0. `scePadReadState` of handle `0x03e50700` in the payload returns `0x80920003`. The handle is valid only inside the title that owns it. Copying the integer across is not a read.
 
-### Deploy
+`scePadOpen` in the payload returns `0x809b0081` (`USER_NOT_LOGIN`) for this account on port types 0 and 2. Port type 1 returns `0x80920001` (`INVALID_ARG`).
 
-`socat` is not installed, so `prospero-deploy` fails. Send the ELF straight through `nc`:
+On the home screen, with nothing in front, `scePadGetHandle` inside `SceShellCore` (pid 59) returns `DEVICE_NO_HANDLE` for user ids `1`, `362804492` and `0x10000000`. The shell's `libScePad` resolved at `0x829bd9560` and `0x829bdaa80`. Attach to the shell works. The shell has no pad open.
 
-```sh
-nc 192.168.68.77 9021 < controller-spike.elf &
-nc -G 5 192.168.68.77 9150    # read the transcript
-```
+## Ruled out
 
-The console was at `192.168.68.77` (elfldr on 9021, spike on 9150). The spike runs 30 seconds and leaves the port free afterwards. `nc -z ... 9150` tells you whether a run is still in progress. The 30 second clock is checked between probes. It does not interrupt a `pt_call` that is already single-stepping inside the title.
+These were tried on the home screen. None of them opened the pad.
 
-## What the console confirmed
+- **Credentials alone.** Raising them makes the user service answer. It does not make `scePadOpen` succeed. The spike follows ProsperoMgr `EscalatePrivileges`: `kernel_get_proc`, uid/ruid/svuid/rgid/svgid 0, root and jail vnodes, authid `0x4801000000000013`, 16 capability bytes `0xff`, attribute byte 0 `0x80`. GhostControl's authid `0x3800000000010003` was tried as well. Same pad result.
+- **Call order.** Initialising the user service before or after raising credentials changes nothing.
+- **The registry sign-in flag.** Key `125874185`, plus `65536` per slot. All 16 slots read back empty.
+- **`np-fake-signin`.** It wrote `auth.dat`, 1200 bytes, into the bihaiko home directory. `scePadOpen` still returns `0x809b0081`. The sign-in flag still reads empty. The PSN sign-in state is not what the pad checks.
+- **User id `1` and `0x10000000`.** Inside the title, user id `1` is still `DEVICE_NO_HANDLE`. `0x10000000` was not reached on the successful probe because user id `362804492` already returned a handle.
 
-### The account
+Port type 3, pad indexes other than 0, the PoorDS4 context setters, and `scePadVirtualDeviceAddDevice` were not run. The title already holds a real handle, so those paths were left alone.
+
+## The account
 
 | Source | Result |
 | --- | --- |
@@ -56,117 +53,55 @@ The console was at `192.168.68.77` (elfldr on 9021, spike on 9150). The spike ru
 | `/system_data/priv/home/` | one directory, `159ff50c` |
 | `sceUserServiceGetUserName(362804492)` | `bihaiko` |
 
-`0x159ff50c` is `362804492`. One account, named bihaiko. The home directory is only readable after the credentials are raised.
+`0x159ff50c` is `362804492`. One account. The home directory is readable only after credentials are raised.
 
-### The error codes
+A payload starts with the ELF loader's parent credentials. `sceUserService` refuses it until they are raised.
 
-- `0x809b0081` — `USER_NOT_LOGIN`. What `scePadOpen` returns for this account on port types 0 and 2.
-- `0x80920008` — `DEVICE_NO_HANDLE`. What `scePadGetHandle` returns, in this process and inside `SceShellCore`, for every user id tried.
-- `0x80920001` — `INVALID_ARG`. Port type 1 is not a port type.
+## Error codes
+
+- `0x809b0081` — `USER_NOT_LOGIN`. `scePadOpen` in the payload, port types 0 and 2.
+- `0x80920008` — `DEVICE_NO_HANDLE`. `scePadGetHandle` in the payload, in `SceShellCore`, and in the title for user id `1`.
+- `0x80920003` — the payload's `scePadReadState` of a handle that is valid inside the title.
+- `0x80920001` — `INVALID_ARG`. Port type 1.
 - `0x80940004` — `SCE_LNC_UTIL_ERROR_NO_APP_INFO`, from `sceUserServiceGetInitialUser`.
 
-### Credentials are necessary but not sufficient
+The elfldr connection also prints `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while a payload is starting. It printed that line on the run where the big app id was `0x18`. The line does not mean the foreground title is absent.
 
-A payload starts with the credentials of the ELF loader's parent and `sceUserService` refuses it until they are raised. The spike does what ProsperoMgr does in `EscalatePrivileges` (`source/backend/src/jailbreak.cpp`):
+## Attaching again can fail to return
 
-- `kernel_get_proc` first, to confirm kernel read/write works.
-- uid, ruid, svuid, rgid, svgid to 0.
-- root and jail directories to `kernel_get_root_vnode`.
-- authid `0x4801000000000013` (GhostControl uses `0x3800000000010003`; both were tried, same result).
-- all 16 capability bytes `0xff`, attribute byte 0 `0x80`.
+`pt_call` single-steps the target. The 30 second deadline is checked between probes. It does not interrupt a call that is already inside the title.
 
-This makes the user service answer. It does not make the pad open.
+One run read the title about once a second with no button held, reported no errors, and printed `stop after 30 s, presses 0`. The Cross run got one good sample (`press CROSS`) and the next in-title read never returned. Port 9150 stayed open and the transcript stopped growing. The operator has had to reboot out of a stuck probe. A reboot ends the payload.
 
-### Everything else ruled out
+The first send of the 120 second build, before any of the successful reads, also produced no transcript. Port 9150 accepted a connection and the payload wrote nothing. That boot was rebooted. The same probe returned on the next boot.
 
-- **Port type.** 0 and 2 give `USER_NOT_LOGIN`; 1 is `INVALID_ARG`.
-- **Authid and call order.** Initialising the user service before or after raising credentials, and either authid, change nothing.
-- **The registry sign-in flag.** Key `125874185`, plus `65536` per slot. All 16 slots read back as nothing.
-- **`np-fake-signin`.** It did run: it wrote `auth.dat`, 1200 bytes, into the bihaiko home directory. `scePadOpen` still returns `0x809b0081`, and the sign-in flag still reads back empty. The PSN sign-in state is not what the pad checks.
-- **Borrowing a handle inside `SceShellCore`.** Attach works (pid 59). `kernel_dynlib_handle(pid, "libScePad.sprx", &h)` plus `kernel_dynlib_resolve` gives real addresses (`scePadGetHandle` at `0x829bd9560`, `scePadReadState` at `0x829bdaa80`). Calling it there with user ids `1`, `362804492` and `0x10000000` returns `DEVICE_NO_HANDLE` for all three. The shell has no pad open because nothing is in the foreground.
+## Build and deploy
 
-Note: `pt_resolve` cannot find these functions. It only looks at library handles `0x1` and `0x2001`, and `libScePad` is in neither. Use `kernel_dynlib_handle` by name.
+Worktree `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`. The payload is `controller_spike.c`. The Makefile links `pt.o`, `-lScePad`, `-lSceUserService`, `-lSceSystemService` and `-lSceRegMgr`.
 
-## What the projects say
-
-- **`jmelovich/ps5-gyroaim`**, `docs/CONSOLE_NOTES.md` (firmware 13.200.006): a payload is not a registered pad client, so it cannot open the controller whether or not a title is running. Their solution is to inject into the game, where the pad data already arrives.
-- **`erickdavestech/ps5-dualsense-overlay`**, `probe/pad_rpc.c`: attaches with `ptrace` to the foreground title (or `SceShellCore`) and calls `scePadGetHandle` (`u1GRHp+oWoY`) / `scePadReadState` (`YndgXqQVV7c`) there.
-- **`a-ddr/PoorDS4`** (the GhostControl payload), `payload/shellui_pad.c`: does not borrow a handle. Injects a stub into `SceShellUI` that calls `scePadSetLoginUserNumber(1)`, `scePadSetUserNumber(1)`, `scePadSetProcessFocus`, creates a virtual device with `scePadVirtualDeviceAddDevice`, then probes `scePadGetHandle` with user ids `1`, the real id and `0x10000000`, port type 3, indexes 0–7. It also needs `scePadSetProcessPrivilege(1)`.
-
-## Next steps, in order
-
-1. **Done for the question.** The foreground title's own `scePadReadState` sees the real pad and Cross. The payload process does not.
-2. **Do not sample by attaching again.** After the Cross line, the next `pt_call` into pid 109 did not return, and the 30 second clock never ran. A second attach is what froze the run.
-3. **PoorDS4 and a virtual device stay unused.** The title already has a real handle. Those paths create or retarget a device, which is a different design.
-
-## What this build does
-
-Not a console result. The home-screen attempts (local `scePadOpen`, the registry sign-in flag, `np-fake-signin`, and `SceShellCore`) are no longer in the loop.
-
-- A big app id at or below 0 means nothing is in front. The spike says so once and retries until the 30 seconds are up, so the title can come to the foreground during the run.
-- It lists every `eboot.bin` with the app id `sceKernelGetAppInfo` writes and any title id string in that buffer. The title id offset is logged because the two SDK samples disagree on the struct layout.
-- It attaches to the eboot whose app id equals the big app. If none equals it, it attaches to eboots whose title id is not `NPXS`.
-- Inside that process it calls `scePadGetHandle` for user ids `1`, the foreground user and `0x10000000`, port types 0 and 2, index 0, then `scePadReadState`.
-- It also tries `scePadReadState` in the payload with that handle. When the payload read works, later samples stay in the payload. When it does not, the spike attaches about once a second and reads inside the title. The title's handle is not closed.
-
-## Caveat for whoever continues
-
-Attaching stops the title for the duration of the call. `pt_call` single-steps the target function, and that call is not bounded by the 30 second window. Hold a button while the spike is running. `nc -z ... 9150` tells you whether a run is still in progress.
-
-## Run with a title claimed in front
-
-Sent `controller-spike.elf` (commit `f173589`, 120 second build) to `192.168.68.77:9021` after the operator said a game was in the foreground.
-
-- The elfldr connection printed `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while the payload was starting. `0x80940004` is the same code the notes already have for "no app info".
-- Port 9150 accepted a TCP connection. The payload wrote no line. The first probe inside the title had not returned.
-- The operator rebooted the console from that state. A reboot ends the payload. Nothing was read from the pad.
-
-## Run with PPSA99177 in front
-
-Sent the 30 second build (commit `6099943`) to `192.168.68.77:9021`. The operator had a game in the foreground. The transcript:
-
-```
-running big app 0x00000018
-eboot pid 109 app 0x00000018 title PPSA99177 off 16
-eboot pid 66 app 0x0000000d title NPXS40039 off 16
-user candidates 1 362804492 268435456
-title pid 109 getHandle 8009f1560 readState 8009f2a80
-title getHandle user 1 type 0 -> 0x80920008
-title getHandle user 1 type 2 -> 0x80920008
-title getHandle user 362804492 type 0 -> 0x03e50700
-title readState -> 0x00000000 buttons 0x00000000 connected 1
-payload init 0x00000000 readState 0x80920003 buttons 0x00000000 connected 0
-stop after 30 s, presses 0, errors 0, title handle left open
+```sh
+export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+export PS5_PAYLOAD_SDK="$HOME/.local/share/ps5-payload-sdk"
+make controller-spike.elf
 ```
 
-- `sceSystemServiceGetAppIdOfRunningBigApp` returned `0x18`. That matched `eboot.bin` pid 109. The title id `PPSA99177` sits at offset 16 in the `sceKernelGetAppInfo` buffer, which is the layout with `app_type` before the title id.
-- Another eboot, pid 66, is the system title `NPXS40039`. The probe did not attach to it.
-- User id `1` still gets `DEVICE_NO_HANDLE` for port types 0 and 2. User id `362804492`, port type 0, returns handle `0x03e50700`.
-- `scePadReadState` of that handle inside pid 109 returns 0. `connected` is 1. Buttons stayed 0 for the whole window, and the later samples reported no errors, so those reads also returned 0.
-- In the payload process, `scePadInit` returns 0 and `scePadReadState` of the same handle returns `0x80920003`. The payload does not read the title's pad by borrowing the integer.
-- The elfldr connection again printed `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while a big app was running. That line does not mean the foreground title is absent.
+`llvm-config` has to be on `PATH`. Without it the SDK clang wrapper fails with `/llvm-clang: No such file or directory`.
 
-## Run with Cross held
+`socat` is not installed, so `prospero-deploy` fails. The console in these runs was `192.168.68.77`.
 
-Same console, same title, commit `6099943`. The operator held Cross (the X button) before the payload was sent. The transcript, read while the socket was still open:
-
-```
-connected, 9 s elapsed, 21 s left
-running big app 0x00000018
-eboot pid 109 app 0x00000018 title PPSA99177 off 16
-eboot pid 66 app 0x0000000d title NPXS40039 off 16
-user candidates 1 362804492 268435456
-title pid 109 getHandle 8009f1560 readState 8009f2a80
-title getHandle user 1 type 0 -> 0x80920008
-title getHandle user 1 type 2 -> 0x80920008
-title getHandle user 362804492 type 0 -> 0x03e50700
-title readState -> 0x00000000 buttons 0x00004000 connected 1
-payload init 0x00000000 readState 0x80920003 buttons 0x00000000 connected 0
-press CROSS
+```sh
+nc 192.168.68.77 9021 < controller-spike.elf &
+nc -G 5 192.168.68.77 9150
 ```
 
-- `0x00004000` is `PAD_BUTTON_CROSS`. The spike named the edge `press CROSS`. The button bits track the pad.
-- The payload process still gets `0x80920003`.
-- No `stop after 30 s` line followed. More than 30 seconds after the press, port 9150 was still accepting connections and the transcript had not grown. The next in-title read did not return. The deadline is only checked between probes.
+The current build runs 30 seconds and then closes port 9150, unless a `pt_call` is still inside the title. `nc -z ... 9150` tells you whether a run is still in progress. If the IP changes, scan the subnet for port 9021.
 
-The worktree is `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`.
+The current loop does not repeat the ruled-out home-screen attempts. It waits for a big app, attaches to the matching `eboot.bin`, probes `scePadGetHandle` for user ids `1`, the foreground user and `0x10000000` on port types 0 and 2, reads once inside the title, tries the same handle in the payload, and, when that fails, attaches about once a second for another read. It does not close the title's handle.
+
+## What other projects do
+
+Recorded here so the next change does not rediscover them. These are other people's notes, not results from this console, except where this console has since agreed.
+
+- **`jmelovich/ps5-gyroaim`**, `docs/CONSOLE_NOTES.md` (firmware 13.200.006): a payload is not a registered pad client, so it cannot open the controller whether or not a title is running. Their solution is to inject into the game, where the pad data already arrives. This console agrees that the payload cannot open or borrow the pad, and that the title can read it.
+- **`erickdavestech/ps5-dualsense-overlay`**, `probe/pad_rpc.c`: attaches to the foreground title and calls `scePadGetHandle` (`u1GRHp+oWoY`) and `scePadReadState` (`YndgXqQVV7c`) there. Those name ids are the ones this spike resolved.
+- **`a-ddr/PoorDS4`** (GhostControl), `payload/shellui_pad.c`: injects into `SceShellUI`, calls `scePadSetLoginUserNumber(1)`, `scePadSetUserNumber(1)`, `scePadSetProcessFocus`, creates a virtual device with `scePadVirtualDeviceAddDevice`, then probes `scePadGetHandle` with user ids `1`, the real id and `0x10000000`, port type 3, indexes 0–7. It also needs `scePadSetProcessPrivilege(1)`. Not run here.
