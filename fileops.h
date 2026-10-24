@@ -38,6 +38,8 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_BAD_GROUP 14
 #define FILEOPS_BAD_ARG   15
 #define FILEOPS_TOO_LARGE 16
+#define FILEOPS_UNSAFE_MEMBER 17
+#define FILEOPS_BAD_ARCHIVE   18
 
 /**
  * Check one file command without acting. path must be absolute and inside a
@@ -106,6 +108,33 @@ int fileops_system_recheck(const char *root, const approval_facts_t *expected);
  **/
 int fileops_program(const char *root, const char *path, unsigned char **bytes,
                     size_t *size);
+
+/**
+ * List the members of the archive at archive, one "<size> <name>" line each,
+ * into a buffer of *len bytes that the caller frees. Nothing is written. Returns
+ * FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_unzip_list(const char *root, const char *archive, char **text,
+                       size_t *len);
+
+/**
+ * Check one unzip of the archive at archive into destination without acting.
+ * The destination must be an existing directory in a writable root. The archive
+ * must be a stored zip whose every member stays under destination and replaces
+ * nothing. The archive's kind, device, inode and sha256 go into facts. Returns
+ * FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_unzip_check(const char *root, const char *archive,
+                        const char *destination, approval_facts_t *facts);
+
+/**
+ * Perform one unzip after checking that the archive is still the one expected
+ * names, by identity and sha256. Every member is checked before the first one is
+ * written. Returns FILEOPS_OK, FILEOPS_CHANGED or the refusal that stops it.
+ **/
+int fileops_unzip_act(const char *root, const char *archive,
+                      const char *destination,
+                      const approval_facts_t *expected);
 
 /** The protocol word of a refusal, and its exit status. **/
 const char *fileops_word(int rc);

@@ -793,6 +793,70 @@ transfer_command(agent_t *agent, int fd, const char *command,
 }
 
 
+/** unzip -l ARCHIVE: the members and their sizes, at once. Nothing is written, so nothing is asked. **/
+static void
+unzip_list(agent_t *agent, int fd, const char *archive) {
+  const char *root = agent->platform->fs_root;
+  char *text = NULL;
+  size_t len = 0;
+  int rc;
+
+  rc = fileops_unzip_list(root, archive, &text, &len);
+  if(rc) {
+    free(text);
+    file_outcome(fd, "unzip", archive, "-", rc);
+    return;
+  }
+
+  if(audit_line("unzip", "list", archive, "-")) {
+    reply(fd, audit_failed);
+  } else {
+    write_all(fd, text, len);
+    reply(fd, "exit 0\n");
+  }
+  free(text);
+}
+
+
+/**
+ * unzip ARCHIVE DEST: extract a stored archive under DEST, after the owner signs
+ * its hash and DEST. Every member is checked before the first one is written.
+ **/
+static void
+unzip_command(agent_t *agent, int fd, const char *archive,
+              const char *destination) {
+  const char *root = agent->platform->fs_root;
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int rc;
+
+  if(strlen(archive) + strlen(destination) + 1 > TRANSFER_SUBJECT_MAX) {
+    file_outcome(fd, "unzip", "-", "-", FILEOPS_BAD_PATH);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_unzip_check(root, archive, destination, &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, "unzip", subject_of(archive, destination, subject), "-",
+                 rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "unzip");
+  snprintf(facts.target, sizeof(facts.target), "%s", archive);
+  snprintf(facts.dest, sizeof(facts.dest), "%s", destination);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_unzip_act(root, archive, destination, &facts);
+  file_outcome(fd, "unzip", subject_of(archive, destination, subject),
+               challenge.id, rc);
+}
+
+
 /**
  * A command nothing implements. The owner is asked about it like any other;
  * once signed it still does nothing, and the answer is unknown_command.
@@ -2059,6 +2123,15 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc >= 2 && !strcmp(argv[0], "exec")) {
     argv[argc] = NULL;
     exec_command(agent, fd, argc, argv);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "unzip")) {
+    if(!strcmp(argv[1], "-l")) {
+      unzip_list(agent, fd, argv[2]);
+    } else {
+      unzip_command(agent, fd, argv[1], argv[2]);
+    }
     return;
   }
 

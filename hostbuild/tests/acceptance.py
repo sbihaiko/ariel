@@ -20,6 +20,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 
 HOST = "127.0.0.1"
 TOKEN_LINE = re.compile(r"^token ([0-9a-f]{32})$")
@@ -72,7 +74,7 @@ class Server:
     def __init__(self, binary, env=None):
         self.binary = binary
         self.env = env
-        self.root = tempfile.mkdtemp(prefix="ariel-host-")
+        self.root = tempfile.mkdtemp(prefix="ariel-host-", dir=os.path.realpath("/tmp"))
         self.token = None
         self._start()
 
@@ -1186,6 +1188,16 @@ HOST_ROOT_SCENARIOS = {
     "identity",
     "a system command on Ariel's token or outside the writable roots answers "
     "protected and exit 87 without asking",
+    "unzip -l lists the members at once, and a file that is no zip answers "
+    "bad_archive",
+    "unzip asks the owner first, extracts after the signature, and asks again",
+    "a member with ../ or an absolute path refuses the whole archive with "
+    "unsafe_member, asked of no one and written nowhere",
+    "an archive replaced or rewritten after approval answers approval_stale "
+    "and exit 78",
+    "unzip refuses the token, approval state, nonces and the state directory "
+    "through any alias with protected and exit 87, even when approved",
+    "unzip lists, runs and refusals reach audit tail under their paths",
 }
 
 
@@ -3576,6 +3588,194 @@ def scenario_system_commands_are_audited(server):
     for kind in ("umount.request", "umount.unavailable", "mknod.protected"):
         assert kind in kinds, "audit tail must show %s, got %r" % (
             kind, sorted(kinds))
+def make_archive(server, name, members):
+    """A stored zip in the host test root's data directory, members in order.
+
+    Each member is (name, bytes); a name ending in '/' is a directory entry.
+    """
+    path = os.path.join(server.root, "data", name)
+    with zipfile.ZipFile(path, "w") as archive:
+        for member, data in members:
+            info = zipfile.ZipInfo(member)
+            info.compress_type = zipfile.ZIP_STORED
+            archive.writestr(info, data)
+    return path
+
+
+def unzip_destination(server, name):
+    """An empty directory in the host test root's data directory."""
+    path = os.path.join(server.root, "data", name)
+    os.makedirs(path)
+    return path
+
+
+def tree(path):
+    """Every entry under path, relative to it, sorted."""
+    found = []
+    for base, dirs, files in os.walk(path):
+        for entry in dirs + files:
+            found.append(os.path.relpath(os.path.join(base, entry), path))
+    return sorted(found)
+
+
+def unzip_line(archive, destination):
+    return "unzip %s %s" % (archive, destination)
+
+
+def scenario_unzip_list_runs_at_once(server):
+    """unzip -l lists the members at once, with their sizes, and asks nothing."""
+    archive = make_archive(server, "unzip-list", [
+        ("bundle/", b""), ("bundle/hello.txt", b"hello\n"), ("top.txt", b"0123456789")])
+    assert run_command(server, "unzip -l " + archive) == [
+        "0 bundle/", "6 bundle/hello.txt", "10 top.txt", "exit 0"], (
+        "unzip -l must list the members at once")
+
+    garbage = os.path.join(server.root, "data", "unzip-garbage")
+    with open(garbage, "wb") as handle:
+        handle.write(b"not a zip archive\n")
+    assert run_command(server, "unzip -l " + garbage) == [
+        "bad_archive", "exit 1"], "a file that is no zip must answer bad_archive"
+
+
+def scenario_unzip_extract_needs_the_owner(server):
+    """unzip asks first, extracts after the owner signs, and asks again once cleared."""
+    archive = make_archive(server, "unzip-bundle", [
+        ("nested/", b""), ("nested/hello.txt", b"hello\n"), ("top.txt", b"top\n")])
+    destination = unzip_destination(server, "unzip-out")
+    line = unzip_line(archive, destination)
+
+    approval, challenge = transfer_request(server, line)
+    assert tree(destination) == [], "an unsigned unzip must not extract"
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], "a signed unzip must run"
+    assert read_bytes(os.path.join(destination, "nested", "hello.txt")) == b"hello\n"
+    assert read_bytes(os.path.join(destination, "top.txt")) == b"top\n"
+
+    assert run_command(server, line) == ["exists", "exit 1"], (
+        "an unzip into a filled destination must refuse before any approval")
+
+    shutil.rmtree(destination)
+    os.makedirs(destination)
+    spent, _ = transfer_request(server, line)
+    assert spent != approval, "a spent unzip approval must not be asked again"
+
+
+def scenario_unzip_refuses_escaping_members(server):
+    """A member with ../ or an absolute path refuses the whole archive, unasked and unwritten."""
+    destination = unzip_destination(server, "unzip-escape")
+    cases = (
+        ("parent", [("ok.txt", b"ok\n"), ("../unzip-parent.txt", b"x\n")]),
+        ("absolute", [("/data/unzip-absolute.txt", b"x\n")]),
+        ("nested", [("a/../../unzip-nested.txt", b"x\n")]),
+    )
+    for label, members in cases:
+        archive = make_archive(server, "unzip-esc-" + label, members)
+        assert run_command(server, unzip_line(archive, destination)) == [
+            "unsafe_member", "exit 1"], (
+            "a %s member must refuse the archive with unsafe_member" % label)
+    assert tree(destination) == [], "a refused archive must write nothing"
+    assert not os.path.lexists(os.path.join(server.root, "data", "unzip-parent.txt"))
+    assert not os.path.lexists(os.path.join(server.root, "data", "unzip-absolute.txt"))
+    assert not os.path.lexists(os.path.join(server.root, "data", "unzip-nested.txt"))
+
+
+def scenario_unzip_archive_changed_answers_78(server):
+    """An archive replaced or rewritten after the owner signs answers approval_stale."""
+    for mode in ("replaced", "rewritten"):
+        archive = make_archive(server, "unzip-swap-" + mode, [("swap.txt", b"signed\n")])
+        destination = unzip_destination(server, "unzip-swap-out-" + mode)
+        line = unzip_line(archive, destination)
+        approval, challenge = transfer_request(server, line)
+        sign_and_grant(server, approval, challenge)
+
+        other = make_archive(server, "unzip-swap-other", [("swap.txt", b"swapped\n")])
+        if mode == "replaced":
+            replacement = archive + "-new"
+            os.replace(other, replacement)
+            os.replace(replacement, archive)
+        else:
+            with open(other, "rb") as handle:
+                data = handle.read()
+            with open(archive, "wb") as handle:
+                handle.write(data)
+
+        assert run_command(server, line) == ["approval_stale", "exit 78"], (
+            "an archive %s after approval must answer approval_stale" % mode)
+        assert tree(destination) == [], (
+            "a changed archive (%s) must not extract" % mode)
+
+
+def scenario_unzip_protected_objects_answer_87(server):
+    """unzip refuses Ariel's own objects as archive or destination through any alias."""
+    token = secret_path(server, "token")
+    before = read_bytes(token)
+    state = os.path.dirname(token)
+    destination = unzip_destination(server, "unzip-prot-out")
+    hard = os.path.join(server.root, "data", "unzip-prot-hard")
+    soft = os.path.join(server.root, "data", "unzip-prot-soft")
+    make_link(hard, token, hard=True)
+    make_link(soft, token, hard=False)
+
+    for archive in (token, hard, soft):
+        assert run_command(server, "unzip -l " + archive) == [
+            "protected", "exit 87"], "listing %s must answer protected" % archive
+        assert run_command(server, unzip_line(archive, destination)) == [
+            "protected", "exit 87"], "extracting %s must answer protected" % archive
+
+    good = make_archive(server, "unzip-prot-src", [("p.txt", b"p\n")])
+    assert run_command(server, unzip_line(good, state)) == [
+        "protected", "exit 87"], "unzip into the state directory must answer protected"
+
+    line = unzip_line(good, destination)
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    os.unlink(good)
+    os.link(token, good)
+    assert run_command(server, line) == ["protected", "exit 87"], (
+        "an approved unzip of an archive that became the token must answer protected")
+    assert tree(destination) == [], "a protected archive must extract nothing"
+    assert read_bytes(token) == before, "a protected token must not change"
+
+
+def scenario_unzip_outside_writable_roots_answers_87(server):
+    """unzip refuses a destination outside /data, /user and /mnt/usb* without asking."""
+    for line in (
+        "unzip /data/unzip-src /system/unzip-out",
+        "unzip /system/unzip-src /system/unzip-out",
+    ):
+        assert run_command(server, line) == ["protected", "exit 87"], (
+            "%s must answer protected and exit 87" % line)
+
+
+def scenario_unzip_actions_are_audited(server):
+    """unzip lists, runs and refusals reach audit tail under their paths."""
+    archive = make_archive(server, "unzip-audit", [("a.txt", b"a\n")])
+    destination = unzip_destination(server, "unzip-audit-out")
+    bad = make_archive(server, "unzip-audit-bad", [("../unzip-audit-escape.txt", b"x\n")])
+    line = unzip_line(archive, destination)
+
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"]
+    assert run_exit_zero(server, "unzip -l " + archive) == ["2 a.txt"]
+    assert run_command(server, unzip_line(bad, destination)) == [
+        "unsafe_member", "exit 1"]
+
+    events = set()
+    for line_text in run_exit_zero(server, "audit tail 64"):
+        fields = line_text.split()
+        if len(fields) == 5:
+            events.add((fields[1], fields[2]))
+    subject = "%s>%s" % (archive, destination)
+    expected = (
+        ("unzip.request", subject),
+        ("unzip.done", subject),
+        ("unzip.list", archive),
+        ("unzip.refused", "%s>%s" % (bad, destination)),
+    )
+    for event in expected:
+        assert event in events, (
+            "audit tail must show %r, got %r" % (event, sorted(events)))
 
 
 def scenario_two_connections(server):
@@ -5118,6 +5318,25 @@ SCENARIOS = [
      scenario_system_command_names_its_facts, CLOCK_REASON),
     ("a system command's audit lines reach audit tail",
      scenario_system_commands_are_audited, CLOCK_REASON),
+
+
+    ("unzip -l lists the members at once, and a file that is no zip answers "
+     "bad_archive", scenario_unzip_list_runs_at_once, HOST_ROOT_REASON),
+    ("unzip asks the owner first, extracts after the signature, and asks again",
+     scenario_unzip_extract_needs_the_owner, HOST_ROOT_REASON),
+    ("a member with ../ or an absolute path refuses the whole archive with "
+     "unsafe_member, asked of no one and written nowhere",
+     scenario_unzip_refuses_escaping_members, HOST_ROOT_REASON),
+    ("an archive replaced or rewritten after approval answers approval_stale "
+     "and exit 78", scenario_unzip_archive_changed_answers_78, HOST_ROOT_REASON),
+    ("unzip refuses the token, approval state, nonces and the state directory "
+     "through any alias with protected and exit 87, even when approved",
+     scenario_unzip_protected_objects_answer_87, HOST_ROOT_REASON),
+    ("unzip refuses a destination outside /data, /user and /mnt/usb* with "
+     "protected and exit 87 without asking",
+     scenario_unzip_outside_writable_roots_answers_87, None),
+    ("unzip lists, runs and refusals reach audit tail under their paths",
+     scenario_unzip_actions_are_audited, HOST_ROOT_REASON),
     ("pwd and ls <absolute path> run through the agent port",
      scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",

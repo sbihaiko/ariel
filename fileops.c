@@ -33,6 +33,8 @@ along with this program; see the file COPYING. If not, see
 #include "fileops.h"
 #include "protected.h"
 #include "ps5_at.h"
+#include "sha256.h"
+#include "zip.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -979,6 +981,418 @@ fileops_system_recheck(const char *root, const approval_facts_t *expected) {
 }
 
 
+/** The largest archive unzip reads into memory. **/
+#define UNZIP_ARCHIVE_MAX (16UL * 1024 * 1024)
+
+
+/**
+ * Read the archive at archive under root into memory, and record its kind,
+ * device, inode and sha256 in facts. The archive is followed through links, so
+ * a link to a protected object answers protected before anything is read.
+ **/
+static int
+archive_read(const char *root, const char *archive, approval_facts_t *facts,
+             unsigned char **bytes, size_t *len) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  struct stat st;
+  sha256_t ctx;
+  size_t got = 0;
+  ssize_t n;
+  int fd;
+
+  *bytes = NULL;
+  if(archive[0] != '/') {
+    return FILEOPS_RELATIVE;
+  }
+  if(!approval_target_valid(archive)) {
+    return FILEOPS_BAD_PATH;
+  }
+  if(!below(root, archive)) {
+    return FILEOPS_NO_FILE;
+  }
+
+  fd = open(archive, O_RDONLY | O_CLOEXEC);
+  if(fd < 0) {
+    return walk_refusal(errno);
+  }
+  if(fstat(fd, &st)) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    close(fd);
+    return FILEOPS_PROTECTED;
+  }
+  if(!S_ISREG(st.st_mode)) {
+    close(fd);
+    return S_ISDIR(st.st_mode) ? FILEOPS_IS_DIR : FILEOPS_NOT_FILE;
+  }
+  if(st.st_size <= 0 || (unsigned long long)st.st_size > UNZIP_ARCHIVE_MAX) {
+    close(fd);
+    return FILEOPS_BAD_ARCHIVE;
+  }
+
+  *len = (size_t)st.st_size;
+  *bytes = malloc(*len);
+  if(!*bytes) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  while(got < *len) {
+    n = read(fd, *bytes + got, *len - got);
+    if(n <= 0) {
+      free(*bytes);
+      *bytes = NULL;
+      close(fd);
+      return FILEOPS_FAILED;
+    }
+    got += (size_t)n;
+  }
+  close(fd);
+
+  sha256_init(&ctx);
+  sha256_update(&ctx, *bytes, *len);
+  sha256_final(&ctx, digest);
+  sha256_hex(digest, facts->sha256);
+
+  snprintf(facts->kind, sizeof(facts->kind), "%s", "file");
+  facts->dev = (uint64_t)st.st_dev;
+  facts->ino = (uint64_t)st.st_ino;
+  return FILEOPS_OK;
+}
+
+
+/** Read the archive's central directory into members. **/
+static int
+archive_members(const unsigned char *bytes, size_t len,
+                zip_member_t **members, size_t *count) {
+  *members = malloc(ZIP_MEMBERS_MAX * sizeof(**members));
+  if(!*members) {
+    return FILEOPS_FAILED;
+  }
+  if(zip_members(bytes, len, *members, ZIP_MEMBERS_MAX, count)) {
+    free(*members);
+    *members = NULL;
+    return FILEOPS_BAD_ARCHIVE;
+  }
+  return FILEOPS_OK;
+}
+
+
+/** Whether every member's name stays under the destination. **/
+static int
+members_safe(const zip_member_t *members, size_t count) {
+  size_t i;
+
+  for(i = 0; i < count; i++) {
+    if(!zip_name_safe(members[i].name)) {
+      return FILEOPS_UNSAFE_MEMBER;
+    }
+  }
+  return FILEOPS_OK;
+}
+
+
+/**
+ * Open the destination directory of an unzip. It must exist, be a directory
+ * and sit in a writable root; the directory stays open in dirfd.
+ **/
+static int
+destination_open(const char *root, const char *destination, int *dirfd) {
+  approval_facts_t facts;
+  char leaf[PATH_MAX];
+  int parent;
+  int rc;
+
+  memset(&facts, 0, sizeof(facts));
+  rc = inspect(root, destination, &facts, &parent, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(facts.kind, "dir")) {
+    close(parent);
+    return !strcmp(facts.kind, "absent") ? FILEOPS_NO_FILE :
+           !strcmp(facts.kind, "link") ? FILEOPS_LINK : FILEOPS_NOT_DIR;
+  }
+
+  *dirfd = openat(parent, leaf,
+                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  close(parent);
+  return *dirfd < 0 ? walk_refusal(errno) : FILEOPS_OK;
+}
+
+
+/**
+ * Step from directory fd into its child part. A missing child is made when
+ * make is set, and otherwise leaves child at -1. A symbolic link or a protected
+ * object on the way is refused, so nothing is written through it.
+ **/
+static int
+descend(int fd, const char *part, int make, int *child) {
+  struct stat st;
+
+  *child = -1;
+  if(fstatat(fd, part, &st, AT_SYMLINK_NOFOLLOW)) {
+    if(errno != ENOENT) {
+      return FILEOPS_FAILED;
+    }
+    if(!make) {
+      return FILEOPS_OK;
+    }
+    if(mkdirat(fd, part, 0755)) {
+      return FILEOPS_FAILED;
+    }
+  } else if(S_ISLNK(st.st_mode)) {
+    return FILEOPS_UNSAFE_MEMBER;
+  } else if(!S_ISDIR(st.st_mode)) {
+    return FILEOPS_NOT_DIR;
+  } else if(protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
+  }
+
+  *child = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  return *child < 0 ? walk_refusal(errno) : FILEOPS_OK;
+}
+
+
+/** Create one file member with O_EXCL, so nothing that exists is replaced. **/
+static int
+write_member(int fd, const char *leaf, const zip_member_t *member) {
+  size_t done = 0;
+  ssize_t n;
+  int out;
+
+  out = openat(fd, leaf,
+               O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+  if(out < 0) {
+    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+  while(done < member->size) {
+    n = write(out, member->data + done, member->size - done);
+    if(n <= 0) {
+      close(out);
+      return FILEOPS_FAILED;
+    }
+    done += (size_t)n;
+  }
+  return close(out) ? FILEOPS_FAILED : FILEOPS_OK;
+}
+
+
+/**
+ * The last name of one member, in directory fd. An existing entry is never
+ * replaced: a directory member may meet a directory, anything else is exists.
+ **/
+static int
+member_leaf(int fd, const char *leaf, const zip_member_t *member, int make) {
+  struct stat st;
+
+  if(fstatat(fd, leaf, &st, AT_SYMLINK_NOFOLLOW)) {
+    if(errno != ENOENT) {
+      return FILEOPS_FAILED;
+    }
+    if(!make) {
+      return FILEOPS_OK;
+    }
+    if(member->dir) {
+      return mkdirat(fd, leaf, 0755) ? FILEOPS_FAILED : FILEOPS_OK;
+    }
+    return write_member(fd, leaf, member);
+  }
+  if(protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
+  }
+  if(member->dir && S_ISDIR(st.st_mode)) {
+    return FILEOPS_OK;
+  }
+  return FILEOPS_EXISTS;
+}
+
+
+/**
+ * Check one member under the destination directory dest, and when make is set
+ * create it. Names are checked by the caller; each parent is walked one part at
+ * a time from dest, so no link can lead the walk out of it.
+ **/
+static int
+member_apply(int dest, const zip_member_t *member, int make) {
+  char key[ZIP_NAME_MAX + 1];
+  char *part;
+  char *slash;
+  int fd;
+  int next;
+  int rc;
+
+  snprintf(key, sizeof(key), "%s", member->name);
+  if(member->dir) {
+    key[strlen(key) - 1] = '\0';
+  }
+
+  fd = dup(dest);
+  if(fd < 0) {
+    return FILEOPS_FAILED;
+  }
+  part = key;
+  while((slash = strchr(part, '/'))) {
+    *slash = '\0';
+    rc = descend(fd, part, make, &next);
+    close(fd);
+    if(rc || next < 0) {
+      return rc;
+    }
+    fd = next;
+    part = slash + 1;
+  }
+
+  rc = member_leaf(fd, part, member, make);
+  close(fd);
+  return rc;
+}
+
+
+/**
+ * Check every member before the first is written: a member that exists or
+ * sits under a link or a protected object refuses the whole archive. With make
+ * set, the members are then created in order.
+ **/
+static int
+members_apply(int dest, const zip_member_t *members, size_t count, int make) {
+  size_t i;
+  int rc;
+
+  for(i = 0; i < count; i++) {
+    rc = member_apply(dest, &members[i], 0);
+    if(rc) {
+      return rc;
+    }
+  }
+  if(!make) {
+    return FILEOPS_OK;
+  }
+  for(i = 0; i < count; i++) {
+    rc = member_apply(dest, &members[i], 1);
+    if(rc) {
+      return rc;
+    }
+  }
+  return FILEOPS_OK;
+}
+
+
+int
+fileops_unzip_list(const char *root, const char *archive, char **text,
+                   size_t *len) {
+  unsigned char *bytes = NULL;
+  zip_member_t *members = NULL;
+  approval_facts_t facts;
+  size_t size = 0;
+  size_t count = 0;
+  size_t cap;
+  size_t i;
+  int rc;
+
+  *text = NULL;
+  *len = 0;
+  memset(&facts, 0, sizeof(facts));
+  rc = archive_read(root, archive, &facts, &bytes, &size);
+  if(rc) {
+    return rc;
+  }
+  rc = archive_members(bytes, size, &members, &count);
+  free(bytes);
+  if(rc) {
+    return rc;
+  }
+
+  cap = count * (ZIP_NAME_MAX + 32) + 1;
+  *text = malloc(cap);
+  if(!*text) {
+    free(members);
+    return FILEOPS_FAILED;
+  }
+  for(i = 0; i < count; i++) {
+    *len += (size_t)snprintf(*text + *len, cap - *len, "%llu %s\n",
+                             (unsigned long long)members[i].size,
+                             members[i].name);
+  }
+  free(members);
+  return FILEOPS_OK;
+}
+
+
+int
+fileops_unzip_check(const char *root, const char *archive,
+                    const char *destination, approval_facts_t *facts) {
+  zip_member_t *members = NULL;
+  unsigned char *bytes = NULL;
+  size_t size = 0;
+  size_t count = 0;
+  int dest;
+  int rc;
+
+  rc = destination_open(root, destination, &dest);
+  if(rc) {
+    return rc;
+  }
+
+  memset(facts, 0, sizeof(*facts));
+  rc = archive_read(root, archive, facts, &bytes, &size);
+  if(!rc) {
+    rc = archive_members(bytes, size, &members, &count);
+  }
+  if(!rc) {
+    rc = members_safe(members, count);
+  }
+  if(!rc) {
+    rc = members_apply(dest, members, count, 0);
+  }
+
+  free(members);
+  free(bytes);
+  close(dest);
+  return rc;
+}
+
+
+int
+fileops_unzip_act(const char *root, const char *archive,
+                  const char *destination, const approval_facts_t *expected) {
+  zip_member_t *members = NULL;
+  approval_facts_t now;
+  unsigned char *bytes = NULL;
+  size_t size = 0;
+  size_t count = 0;
+  int dest;
+  int rc;
+
+  rc = destination_open(root, destination, &dest);
+  if(rc) {
+    return rc;
+  }
+
+  memset(&now, 0, sizeof(now));
+  rc = archive_read(root, archive, &now, &bytes, &size);
+  if(!rc && (now.dev != expected->dev || now.ino != expected->ino ||
+             strcmp(now.sha256, expected->sha256))) {
+    rc = FILEOPS_CHANGED;
+  }
+  if(!rc) {
+    rc = archive_members(bytes, size, &members, &count);
+  }
+  if(!rc) {
+    rc = members_safe(members, count);
+  }
+  if(!rc) {
+    rc = members_apply(dest, members, count, 1);
+  }
+
+  free(members);
+  free(bytes);
+  close(dest);
+  return rc;
+}
+
+
 const char *
 fileops_word(int rc) {
   switch(rc) {
@@ -1014,6 +1428,10 @@ fileops_word(int rc) {
     return "bad_owner";
   case FILEOPS_BAD_GROUP:
     return "bad_group";
+  case FILEOPS_UNSAFE_MEMBER:
+    return "unsafe_member";
+  case FILEOPS_BAD_ARCHIVE:
+    return "bad_archive";
   default:
     return "ok";
   }
