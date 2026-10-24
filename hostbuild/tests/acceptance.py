@@ -1124,6 +1124,11 @@ HOST_FILE_SCENARIOS = {
 HOST_FIXTURE_REASON = ("needs a process only the host build starts, which "
                        "console mode cannot name")
 
+# The release scenarios start a fake release server and write its allowlist into
+# the test root. A console can reach neither, so console mode names them as skipped.
+RELEASE_FIXTURE_REASON = ("needs the fake release server and an allowlist the "
+                          "host test root writes")
+
 # A granted reboot restarts Ariel's own process, and a crash restart ends it.
 # On a console the same grant would reboot the console, so these never run there.
 HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console "
@@ -1343,7 +1348,7 @@ def scenario_console_mode_plan(server):
 
     expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
                       | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS
-                      | HOST_RESTART_SCENARIOS)
+                      | HOST_RESTART_SCENARIOS | RELEASE_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
         "clock, the host test root, the fault injector or the host's files:"
@@ -7026,7 +7031,11 @@ CDN_SUFFIX = "localhost"
 
 
 class FakeRelease:
-    """A local release API and CDN. mode picks how the asset download misbehaves.
+    """A local release API and CDN, with one release per tag.
+
+    The first release added is the default; add_release(latest=True) moves
+    the latest pointer. Adding a tag again moves that tag to the new release.
+    mode picks how the asset download misbehaves.
 
     ok: the asset redirects once to the CDN host and is served there.
     off_cdn: the redirect goes to a host outside the CDN suffix.
@@ -7035,11 +7044,13 @@ class FakeRelease:
     """
 
     def __init__(self, data, mode="ok", url_id=ASSET_ID, asset_id=ASSET_ID):
-        self.data = data
         self.mode = mode
-        self.url_id = url_id
-        self.asset_id = asset_id
         self.requests = []
+        self.tags = {}
+        self.blobs = {}
+        self.latest = None
+        self.add_release(INSTALL_TAG, RELEASE_ID, asset_id, url_id, data,
+                         latest=True)
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -7054,43 +7065,67 @@ class FakeRelease:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def reply_release(self, release):
+                body = json.dumps(fake.release_json(release)).encode("ascii")
+                return self.reply(200, body)
+
             def do_GET(self):
                 fake.requests.append(self.path)
                 cdn = "http://%s:%d" % (CDN_SUFFIX, fake.port)
-                releases = ("/repos/%s/releases/latest" % INSTALL_REPO,
-                            "/repos/%s/releases/tags/%s" % (INSTALL_REPO, INSTALL_TAG))
-                if self.path in releases:
-                    body = json.dumps(fake.release_json()).encode("ascii")
-                    return self.reply(200, body)
-                if self.path == "/assets/%d" % fake.url_id:
-                    if fake.mode == "fail":
-                        return self.reply(500)
-                    if fake.mode == "off_cdn":
-                        return self.reply(302, location="http://127.0.0.1:%d/cdn/%d"
-                                          % (fake.port, fake.url_id))
-                    if fake.mode == "second_hop":
-                        return self.reply(302, location="%s/hop/%d" % (cdn, fake.url_id))
-                    return self.reply(302, location="%s/cdn/%d" % (cdn, fake.url_id))
-                if self.path == "/hop/%d" % fake.url_id:
-                    return self.reply(302, location="%s/cdn/%d" % (cdn, fake.url_id))
-                if self.path == "/cdn/%d" % fake.url_id:
-                    return self.reply(200, fake.data)
-                return self.reply(404)
+                if self.path == "/repos/%s/releases/latest" % INSTALL_REPO:
+                    return self.reply_release(fake.tags[fake.latest])
+                tag_prefix = "/repos/%s/releases/tags/" % INSTALL_REPO
+                if self.path.startswith(tag_prefix):
+                    release = fake.tags.get(self.path[len(tag_prefix):])
+                    if release is None:
+                        return self.reply(404)
+                    return self.reply_release(release)
+                asset = re.fullmatch(r"/(assets|hop|cdn)/(\d+)", self.path)
+                if asset is None or int(asset.group(2)) not in fake.blobs:
+                    return self.reply(404)
+                kind, url_id = asset.group(1), int(asset.group(2))
+                if kind == "cdn":
+                    return self.reply(200, fake.blobs[url_id])
+                if kind == "hop":
+                    return self.reply(302, location="%s/cdn/%d" % (cdn, url_id))
+                if fake.mode == "fail":
+                    return self.reply(500)
+                if fake.mode == "off_cdn":
+                    return self.reply(302, location="http://127.0.0.1:%d/cdn/%d"
+                                      % (fake.port, url_id))
+                if fake.mode == "second_hop":
+                    return self.reply(302, location="%s/hop/%d" % (cdn, url_id))
+                return self.reply(302, location="%s/cdn/%d" % (cdn, url_id))
 
         self.httpd = http.server.ThreadingHTTPServer((HOST, 0), Handler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
-    def release_json(self):
+    def add_release(self, tag, release_id, asset_id, url_id, data,
+                    tag_name=None, latest=False):
+        """Name the release a tag resolves to; tag_name overrides what it answers."""
+        self.tags[tag] = {
+            "id": release_id,
+            "tag_name": tag_name or tag,
+            "asset_id": asset_id,
+            "url_id": url_id,
+            "data": data,
+        }
+        self.blobs[url_id] = data
+        if latest or self.latest is None:
+            self.latest = tag
+
+    def release_json(self, release):
         return {
-            "id": RELEASE_ID,
-            "tag_name": INSTALL_TAG,
+            "id": release["id"],
+            "tag_name": release["tag_name"],
             "assets": [{
-                "id": self.asset_id,
+                "id": release["asset_id"],
                 "name": INSTALL_ASSET,
-                "size": len(self.data),
-                "url": "http://%s:%d/assets/%d" % (HOST, self.port, self.url_id),
+                "size": len(release["data"]),
+                "url": "http://%s:%d/assets/%d" % (HOST, self.port,
+                                                   release["url_id"]),
             }],
         }
 
@@ -7102,19 +7137,19 @@ class FakeRelease:
 class InstallFixture:
     """A fresh Ariel whose allowlist names the fake release server.
 
-    allowlist=None writes no allowlist at all. pin, when given, is a
-    (name, sha256) pair the allowlist pins.
+    allowlist=None writes no allowlist at all. pin, when given, and each
+    (name, sha256) pair in pins, is a hash the allowlist pins.
     """
 
     def __init__(self, data, mode="ok", url_id=ASSET_ID, asset_id=ASSET_ID,
-                 allowlist="default", pin=None):
+                 allowlist="default", pin=None, pins=()):
         self.fake = FakeRelease(data, mode=mode, url_id=url_id, asset_id=asset_id)
         if allowlist == "default":
             lines = ["host %s:%d" % (HOST, self.fake.port),
                      "cdn %s" % CDN_SUFFIX,
                      "repo %s" % INSTALL_REPO]
-            if pin is not None:
-                lines.append("pin %s %s" % pin)
+            for pair in ([pin] if pin is not None else []) + list(pins):
+                lines.append("pin %s %s" % pair)
             allowlist = "\n".join(lines) + "\n"
         self.allowlist = allowlist
         self.server = Server(SERVER_BINARY, setup=self._setup)
@@ -7312,36 +7347,169 @@ def scenario_install_actions_reach_audit_tail(_server):
     with_install(data, run, pin=(INSTALL_NAME, digest))
 
 
+NEWEST_TAG = "v2"
+NEWEST_RELEASE_ID = 8
+NEWEST_ASSET_ID = 12
+MOVED_RELEASE_ID = 9
+MOVED_ASSET_ID = 13
+
+
+def release_listing(name, tag, release, asset, digest):
+    return ("payload %s source=release version=%s release=%d asset=%d "
+            "sha256=%s path=/data/ariel/store/objects/%s running=no "
+            "failed=no previous=-" % (name, tag, release, asset, digest, digest))
+
+
+def install_audit(server):
+    """The install actions and refusals in audit tail as (kind, name, id)."""
+    return [event[:3] for event in audit_events(server)
+            if event[0].startswith("payload.install.")]
+
+
+def scenario_install_latest_and_pinned_tag_record_their_ids(_server):
+    """Latest and a pinned tag each install the release and asset they name."""
+    pinned = healthy_build("pinned-tag")
+    newest = healthy_build("newest-release")
+    pinned_digest = hashlib.sha256(pinned).hexdigest()
+    newest_digest = hashlib.sha256(newest).hexdigest()
+
+    def run(fx):
+        fx.fake.add_release(NEWEST_TAG, NEWEST_RELEASE_ID, NEWEST_ASSET_ID,
+                            NEWEST_ASSET_ID, newest, latest=True)
+        lines = install_request(fx.server, "newest")
+        assert lines == ["installed newest %s" % newest_digest, "exit 0"], lines
+        lines = install_request(fx.server, "pinned", tag=INSTALL_TAG)
+        assert lines == ["installed pinned %s" % pinned_digest, "exit 0"], lines
+
+        listing = payload_list(fx.server)
+        assert listed(listing, "newest") == release_listing(
+            "newest", NEWEST_TAG, NEWEST_RELEASE_ID, NEWEST_ASSET_ID,
+            newest_digest), listing
+        assert listed(listing, "pinned") == release_listing(
+            "pinned", INSTALL_TAG, RELEASE_ID, ASSET_ID, pinned_digest), listing
+        assert ("payload.install.done", "newest", str(NEWEST_RELEASE_ID)) in (
+            install_audit(fx.server)), install_audit(fx.server)
+        assert ("payload.install.done", "pinned", str(RELEASE_ID)) in (
+            install_audit(fx.server)), install_audit(fx.server)
+    with_install(pinned, run,
+                 pins=[("newest", newest_digest), ("pinned", pinned_digest)])
+
+
+def scenario_moved_tag_keeps_the_installed_release(_server):
+    """A tag that moves after an install does not change what was installed."""
+    data = healthy_build(INSTALL_NAME)
+    moved = healthy_build("moved-tag")
+    digest = hashlib.sha256(data).hexdigest()
+    moved_digest = hashlib.sha256(moved).hexdigest()
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME, tag=INSTALL_TAG)
+        assert lines == ["installed %s %s" % (INSTALL_NAME, digest), "exit 0"], lines
+        fx.fake.add_release(INSTALL_TAG, MOVED_RELEASE_ID, MOVED_ASSET_ID,
+                            MOVED_ASSET_ID, moved)
+        expected = release_listing(INSTALL_NAME, INSTALL_TAG, RELEASE_ID,
+                                   ASSET_ID, digest)
+
+        lines = install_request(fx.server, INSTALL_NAME, tag=INSTALL_TAG)
+        assert lines == ["hash_mismatch", "exit 1"], (
+            "the moved tag's build differs from the pin, got %r" % lines)
+        listing = payload_list(fx.server)
+        assert listed(listing, INSTALL_NAME) == expected, (
+            "the install must keep its release and asset, got %r" % listing)
+        assert ("payload.install.refused", INSTALL_NAME, "hash_mismatch") in (
+            install_audit(fx.server)), install_audit(fx.server)
+    with_install(data, run, pins=[(INSTALL_NAME, digest)])
+
+
+def scenario_install_tag_naming_another_release_is_refused(_server):
+    """A tag whose release names another tag is refused before its asset is fetched."""
+    data = healthy_build(INSTALL_NAME)
+
+    def run(fx):
+        fx.fake.add_release(INSTALL_TAG, RELEASE_ID, ASSET_ID, ASSET_ID, data,
+                            tag_name="v9")
+        lines = install_request(fx.server, INSTALL_NAME, tag=INSTALL_TAG)
+        assert lines == ["tag_mismatch", "exit 1"], lines
+        assert all(path.startswith("/repos/") for path in fx.fake.requests), (
+            "no asset may be fetched for a mismatched tag, got %r"
+            % fx.fake.requests)
+        assert listed(payload_list(fx.server), INSTALL_NAME) is None, (
+            "a mismatched tag must not be recorded")
+        assert ("payload.install.refused", INSTALL_NAME, "tag_mismatch") in (
+            install_audit(fx.server)), install_audit(fx.server)
+    with_install(data, run)
+
+
+def scenario_install_invalid_tag_is_refused_and_audited(_server):
+    """A tag with a slash is refused before anything is fetched, and audited."""
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME, tag="../v1")
+        assert lines == ["unknown_command", "exit 1"], lines
+        assert fx.fake.requests == [], "an invalid tag must fetch nothing"
+        assert ("payload.install.refused", INSTALL_NAME, "unknown_command") in (
+            install_audit(fx.server)), install_audit(fx.server)
+    with_install(healthy_build(INSTALL_NAME), run)
+
+
+def scenario_install_tag_not_on_the_server_is_refused_and_audited(_server):
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME, tag="v9")
+        assert lines == ["download_failed", "exit 1"], lines
+        assert ("payload.install.refused", INSTALL_NAME, "download_failed") in (
+            install_audit(fx.server)), install_audit(fx.server)
+    with_install(healthy_build(INSTALL_NAME), run)
+
+
 INSTALL_SCENARIOS = [
     ("install refuses a host outside the allowlist",
-     scenario_install_refused_outside_the_allowlist_host, None),
+     scenario_install_refused_outside_the_allowlist_host, RELEASE_FIXTURE_REASON),
     ("install refuses without an allowlist",
-     scenario_install_refused_without_allowlist, None),
+     scenario_install_refused_without_allowlist, RELEASE_FIXTURE_REASON),
     ("install refuses a repository outside the allowlist",
-     scenario_install_refused_outside_the_allowlist_repository, None),
+     scenario_install_refused_outside_the_allowlist_repository,
+     RELEASE_FIXTURE_REASON),
     ("install refuses a failed download",
-     scenario_install_failed_download_is_refused, None),
+     scenario_install_failed_download_is_refused, RELEASE_FIXTURE_REASON),
     ("install refuses a redirect off the CDN suffix",
-     scenario_install_redirect_off_the_cdn_is_refused, None),
+     scenario_install_redirect_off_the_cdn_is_refused, RELEASE_FIXTURE_REASON),
     ("install refuses a second redirect hop",
-     scenario_install_second_redirect_hop_is_refused, None),
+     scenario_install_second_redirect_hop_is_refused, RELEASE_FIXTURE_REASON),
     ("install refuses an asset ID mismatch",
-     scenario_install_asset_id_mismatch_is_refused, None),
+     scenario_install_asset_id_mismatch_is_refused, RELEASE_FIXTURE_REASON),
     ("a pinned install records release and asset IDs and joins autoload",
-     scenario_install_pinned_hash_installs_and_joins_autoload, None),
+     scenario_install_pinned_hash_installs_and_joins_autoload,
+     RELEASE_FIXTURE_REASON),
     ("a different hash than the pin is refused and nothing is kept",
-     scenario_install_different_hash_is_refused_and_nothing_kept, None),
+     scenario_install_different_hash_is_refused_and_nothing_kept,
+     RELEASE_FIXTURE_REASON),
     ("an install runs the health check",
-     scenario_install_runs_the_health_check, None),
+     scenario_install_runs_the_health_check, RELEASE_FIXTURE_REASON),
     ("Ariel never installs itself",
-     scenario_ariel_never_installs_itself, None),
+     scenario_ariel_never_installs_itself, RELEASE_FIXTURE_REASON),
     ("an unpinned install asks, then commit pins the hash and joins autoload",
-     scenario_unpinned_install_asks_then_commit_pins_and_joins, None),
+     scenario_unpinned_install_asks_then_commit_pins_and_joins,
+     RELEASE_FIXTURE_REASON),
     ("the allowlist answers protected even when asked",
-     scenario_protected_allowlist_answers_87_even_when_asked, None),
+     scenario_protected_allowlist_answers_87_even_when_asked,
+     RELEASE_FIXTURE_REASON),
     ("install refusals and installs reach audit tail",
-     scenario_install_actions_reach_audit_tail, None),
+     scenario_install_actions_reach_audit_tail, RELEASE_FIXTURE_REASON),
+    ("latest and a pinned tag record the release and asset IDs they resolved",
+     scenario_install_latest_and_pinned_tag_record_their_ids,
+     RELEASE_FIXTURE_REASON),
+    ("a tag that moves after an install does not change the installed release",
+     scenario_moved_tag_keeps_the_installed_release, RELEASE_FIXTURE_REASON),
+    ("a tag whose release names another tag is refused and audited",
+     scenario_install_tag_naming_another_release_is_refused,
+     RELEASE_FIXTURE_REASON),
+    ("an invalid tag is refused and audited, and fetches nothing",
+     scenario_install_invalid_tag_is_refused_and_audited, RELEASE_FIXTURE_REASON),
+    ("a tag the server does not name is refused and audited",
+     scenario_install_tag_not_on_the_server_is_refused_and_audited,
+     RELEASE_FIXTURE_REASON),
 ]
+
+RELEASE_SCENARIOS = {title for title, _check, _reason in INSTALL_SCENARIOS}
 
 SCENARIOS.extend(INSTALL_SCENARIOS)
 

@@ -1860,7 +1860,7 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
   }
 
   if(tag && !approval_value_valid(tag)) {
-    reply(fd, unknown);
+    install_refuse(fd, name, "unknown_command");
     return;
   }
 
@@ -1907,6 +1907,11 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
   }
   if(rc || !work->release.tag[0] || !approval_value_valid(work->release.tag)) {
     install_refuse(fd, name, "download_failed");
+    goto out;
+  }
+
+  if(tag && strcmp(work->release.tag, tag)) {
+    install_refuse(fd, name, "tag_mismatch");
     goto out;
   }
 
