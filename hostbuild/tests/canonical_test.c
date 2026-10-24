@@ -119,6 +119,8 @@ main(void) {
   refused(&other, "an empty segment in an absolute target is refused");
   other.target = "/etc/passwd/";
   refused(&other, "a trailing slash in an absolute target is refused");
+  other.target = "//etc/passwd";
+  refused(&other, "a doubled leading slash is refused");
 
   // Unicode has more than one spelling of the same text.
   other.target = "caf\xc3\xa9";

@@ -882,6 +882,12 @@ CLOCK_SCENARIOS = {
     "a malformed signature answers signature_malformed and exit 83",
     "the same signature twice is refused the second time",
     "a consumed nonce is refused after Ariel restarts",
+    "approval status answers pending, granted, denied, expired and consumed, "
+    "and an unknown id is an error",
+    "a full approval table gives up an approval with no staged object first, "
+    "and an expired staged object still answers approval_expired",
+    "the challenge names the command, target, hash, size and run of the "
+    "approval",
 }
 
 
@@ -1475,7 +1481,7 @@ def approval_status(server, approval):
 
 
 def scenario_approval_status(server):
-    """approval status names pending, granted, expired and consumed.
+    """approval status names pending, granted, denied, expired and consumed.
 
     The record outlives the action it allowed, so a consumed approval still
     answers consumed, and an id Ariel never issued is an error.
@@ -1507,9 +1513,77 @@ def scenario_approval_status(server):
         "approval_status %s expired" % late, "exit 0"], (
         "an approval past its window must answer expired")
 
+    lines = push(server, "statusdenied", b"refused, then asked about")
+    staging_refused, refused = assert_staged(
+        server, lines, "statusdenied", b"refused, then asked about")
+    server.controller("deny %s" % refused, "denied %s" % refused)
+    assert approval_status(server, refused) == [
+        "approval_status %s denied" % refused, "exit 0"], (
+        "a denied approval must answer denied, not unknown_approval")
+    assert commit(server, staging_refused) == ["approval_denied", "exit 77"], (
+        "a denied commit must still answer approval_denied")
+    assert approval_status(server, refused) == [
+        "approval_status %s denied" % refused, "exit 0"], (
+        "a denial must still answer denied once its staging object is gone")
+
     unknown = approval_status(server, "a-0")
     assert unknown == ["unknown_approval", "exit 1"], (
         "an id Ariel never issued must be an error, got %r" % unknown)
+
+
+def scenario_approval_slot_reclaim(server):
+    """A full approval table gives up an approval with no staged object first.
+
+    An approval whose staged object still waits keeps its row, so the commit
+    of that object answers approval_expired rather than approval_stale.
+    """
+    server.fresh()
+    victim = b"waits in staging after its window closed"
+    lines = push(server, "victim", victim)
+    victim_staging, victim_approval = assert_staged(
+        server, lines, "victim", victim)
+    server.advance(120_000)
+
+    # Fifteen approvals, each denied and committed, fill the table beside the
+    # expired one. A committed denial leaves no staged object behind.
+    for i in range(15):
+        data = b"filler %d" % i
+        name = "filler%d" % i
+        lines = push(server, name, data)
+        staging, approval = assert_staged(server, lines, name, data)
+        server.controller("deny %s" % approval, "denied %s" % approval)
+        assert commit(server, staging) == ["approval_denied", "exit 77"], (
+            "a denied filler must answer approval_denied")
+
+    # The table is full, so this request has to give up one row.
+    data = b"needs a slot"
+    lines = push(server, "needslot", data)
+    assert_staged(server, lines, "needslot", data)
+
+    assert commit(server, victim_staging) == ["approval_expired", "exit 88"], (
+        "an expired approval whose staged object waits must keep its row, so "
+        "its commit answers approval_expired, not approval_stale")
+    assert approval_status(server, victim_approval) == [
+        "approval_status %s expired" % victim_approval, "exit 0"], (
+        "the expired approval must still answer expired")
+
+
+def scenario_challenge_fields(server):
+    """The challenge names each fact of the approval in canonical form."""
+    server.fresh()
+    data = b"every fact of the action"
+    lines = push(server, "fields", data)
+    assert_staged(server, lines, "fields", data)
+    expected = ("ariel-action-v1\n"
+                "command=payload.commit\n"
+                "target=fields\n"
+                "sha256=%s\n"
+                "option.run=1\n"
+                "option.size=%d\n"
+                % (hashlib.sha256(data).hexdigest(), len(data)))
+    assert challenge_action(challenge_of(lines)) == expected, (
+        "the challenge must name the command, target, hash, size and run, "
+        "got %r" % challenge_action(challenge_of(lines)))
 
 
 def scenario_expired_not_pending(server):
@@ -2575,8 +2649,13 @@ SCENARIOS = [
      scenario_quick_start_unlabeled_block, False),
     ("an approval expires after 120 s of test clock and answers exit 88",
      scenario_approval_expired, True),
-    ("approval status answers pending, granted, expired and consumed, and an "
-     "unknown id is an error", scenario_approval_status, True),
+    ("approval status answers pending, granted, denied, expired and consumed, "
+     "and an unknown id is an error", scenario_approval_status, True),
+    ("a full approval table gives up an approval with no staged object first, "
+     "and an expired staged object still answers approval_expired",
+     scenario_approval_slot_reclaim, True),
+    ("the challenge names the command, target, hash, size and run of the "
+     "approval", scenario_challenge_fields, True),
     ("an expired approval does not count among the pending ones",
      scenario_expired_not_pending, True),
     ("an upload over 64 MiB answers staging_full and exit 80",
