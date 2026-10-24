@@ -176,6 +176,8 @@ Payloads placed in a folder on the `PATH` (initialized to `/user/homebrew/bin` a
 
 Ariel builds exactly like shsrv, with the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) installed on a Debian-based system: install `xxd`, point `PS5_PAYLOAD_SDK` at the SDK and run `make`.
 
+To pin the owner's keys into the build, set both `ARIEL_PUBKEY` (the primary key that signs everyday approvals) and `ARIEL_RECOVERY_PUBKEY` (the offline recovery key), as 64 hex digits each: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`. The two must differ, and setting `ARIEL_PUBKEY` without `ARIEL_RECOVERY_PUBKEY` stops the build, because the console would otherwise refuse every grant. The host build's test key is refused on the PS5 build.
+
 ### Known limitations (inherited from shsrv)
 
 The session is not attached to a TTY, so homebrew that changes terminal properties will not work, and most commands are only partially implemented. Stage 3 addresses the limitations that matter most to agents.

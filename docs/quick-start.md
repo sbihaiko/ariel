@@ -32,6 +32,8 @@ $ make
 $ $PS5_PAYLOAD_SDK/bin/prospero-deploy -h $PS5_HOST -p 9021 shsrv-ps5.elf
 ```
 
+To pin your approval keys into the build, pass both `ARIEL_PUBKEY` (your primary key) and `ARIEL_RECOVERY_PUBKEY` (your offline recovery key) to `make`, as 64 hex digits each. Setting only `ARIEL_PUBKEY` stops the build.
+
 The console shows a "Serving shell on <ip>:2323" notification when the shell server is up.
 
 ## 3. Build helloworld.elf
