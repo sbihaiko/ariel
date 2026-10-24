@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -52,7 +53,9 @@ APPROVAL_LINE = re.compile(r"^approval_required (a-[0-9a-f]+)$")
 # console's own limits; console mode waits in real time, since it can move
 # no clock.
 NOTIFICATION_SPACING = 10.0
-BUSY_RETRIES = 6
+# Ariel keeps at most three approvals open, each until it expires after
+# 120 s, and the console has no refusal: an ask can wait out a full expiry.
+BUSY_RETRIES = 13
 
 
 class ConsoleError(AssertionError):
@@ -387,8 +390,7 @@ def check_commit_stale_is_audited(session, context):
 
 
 def check_approval_then_install(session, context):
-    del context
-    data = b"console approval\n"
+    data = context.build("approve")
     digest = hashlib.sha256(data).hexdigest()
     lines = session.push("consoleapprove", data)
     staging, approval, challenge = assert_staged(lines, "consoleapprove", data)
@@ -426,8 +428,7 @@ def check_unsigned_commit(session, context):
 
 def check_approval_status(session, context):
     """Status is a question: it needs no signature, and it survives the action."""
-    del context
-    data = b"console status\n"
+    data = context.build("status")
     digest = hashlib.sha256(data).hexdigest()
     lines = session.push("consolestatus", data)
     staging, approval, challenge = assert_staged(lines, "consolestatus", data)
@@ -524,12 +525,38 @@ class Context:
         self.workdir = workdir
         self.cc = cc
         self.document = document
+        self._builds = {}
+
+    def build(self, label):
+        """A runnable build of the quick start's helloworld, one per label.
+
+        Every commit and rollback runs the build as its health check, so a
+        check activates only a build that exits 0. The label is kept in the
+        binary, so two labels give two builds with different hashes.
+        """
+        if label not in self._builds:
+            with open(self.document) as handle:
+                source = quickstart.hello_source(handle.read())
+            source += ('\n__attribute__((used)) static const char '
+                       'console_build[] = "%s";\n' % label)
+            name = "console-%s" % label
+            with open(os.path.join(self.workdir, name + ".c"), "w") as handle:
+                handle.write(source)
+            result = subprocess.run(
+                list(self.cc) + ["-Wall", "-Werror", "-o", name + ".elf",
+                                 name + ".c"],
+                cwd=self.workdir, capture_output=True)
+            if result.returncode:
+                raise ConsoleError("cannot build %s.elf: %s" % (
+                    name, result.stderr.decode("utf-8", "replace").strip()))
+            with open(os.path.join(self.workdir, name + ".elf"), "rb") as handle:
+                self._builds[label] = handle.read()
+        return self._builds[label]
 
 
 def check_audit_tail(session, context):
     """A push, a grant and a commit each land in the audit log, in that order."""
-    del context
-    data = b"console audit\n"
+    data = context.build("audit")
     digest = hashlib.sha256(data).hexdigest()
     lines = session.push("consoleaudit", data)
     staging, approval, challenge = assert_staged(lines, "consoleaudit", data)
@@ -637,9 +664,8 @@ def check_inspection_commands(session, context):
     lines = link.exchange("authid")
     assert lines[-1] == "exit 0" and lines[0].startswith("0x"), (
         "authid must print the console's authid and exit 0, got %r" % lines)
-    lines = link.exchange("sysctl kern.ostype=Other")
-    assert lines[:-1] == ["unknown_command"] and lines[-1] != "exit 0", (
-        "a sysctl write must be refused, got %r" % lines)
+    # A sysctl write is outside the read-only set, so it is gated (#24).
+    ask_without_grant(session, "sysctl kern.ostype=Other")
 
 
 def check_background_refusals(session, context):
@@ -662,7 +688,8 @@ def autoload_listing(session):
 def autoload_ask(session, op, name):
     """Ask for an autoload edit and return its approval ID and challenge."""
     session.operator.pause(NOTIFICATION_SPACING)
-    lines = session.link.exchange("autoload edit %s %s" % (op, name))
+    lines = session.until_not_busy(
+        lambda: session.link.exchange("autoload edit %s %s" % (op, name)))
     assert len(lines) == 3 and lines[2] == "exit 75", (
         "an autoload edit without a grant must answer 75, got %r" % lines)
     approval = APPROVAL_LINE.match(lines[0])
@@ -720,10 +747,9 @@ def install_build(session, name, data):
 
 def check_rollback_restores_previous(session, context):
     """A rollback waits for the owner, then restores the previous build and is audited."""
-    del context
     name = "rollb" + uuid.uuid4().hex[:8]
-    previous = install_build(session, name, b"console rollback first\n")
-    current = install_build(session, name, b"console rollback second\n")
+    previous = install_build(session, name, context.build("rollback-first"))
+    current = install_build(session, name, context.build("rollback-second"))
 
     lines = session.rollback(name)
     assert len(lines) == 3 and lines[2] == "exit 75", (
@@ -755,9 +781,8 @@ def check_rollback_restores_previous(session, context):
 
 def check_rollback_refusals(session, context):
     """A payload with no previous build and an unknown name answer their words."""
-    del context
     name = "rollfirst" + uuid.uuid4().hex[:8]
-    install_build(session, name, b"console rollback only build\n")
+    install_build(session, name, context.build("rollback-only"))
 
     lines = session.rollback(name)
     assert lines == ["no_previous_version", "exit 1"], (
@@ -787,30 +812,35 @@ def check_autoload_show(session, context):
 
 def check_autoload_edit_asks_before_it_applies(session, context):
     """An autoload edit without a grant answers 75 and the list does not change."""
-    del context
     name = "consoleasks"
+    install_autoload_payload(session, name, context.build("asks"))
     before = autoload_listing(session)
     autoload_ask(session, "add", name)
     assert autoload_listing(session) == before, (
         "an edit that was asked for must not be applied before its grant")
 
 
+def ask_without_grant(session, command):
+    """A gated command asks the owner once the console may notify, and runs nothing."""
+    lines = session.until_not_busy(lambda: session.link.exchange(command))
+    assert lines and lines[-1] == "exit 75" and APPROVAL_LINE.match(lines[0]), (
+        "%s without a grant must answer approval_required and exit 75, got %r"
+        % (command, lines))
+    return lines
+
+
 def check_reboot_asks_the_owner(session, context):
     """reboot without a grant answers 75 and asks the owner, and restarts nothing."""
     del context
-    lines = session.link.exchange("reboot")
-    assert lines and lines[-1] == "exit 75" and APPROVAL_LINE.match(lines[0]), (
-        "reboot without a grant must answer approval_required and exit 75, "
-        "got %r" % lines)
+    lines = ask_without_grant(session, "reboot")
     assert not any(line.startswith("rebooting") for line in lines), (
         "a reboot without a grant must not restart the console")
 
 
 def check_autoload_edit_applies_after_grant(session, context):
     """A granted autoload add is applied, shown by autoload show and audited."""
-    del context
     name = "consoleboot"
-    install_autoload_payload(session, name, b"console boot\n")
+    install_autoload_payload(session, name, context.build("boot"))
     approval = autoload_approve(session, "add", name)
     try:
         assert autoload_apply(session, "add", name, approval) == [
@@ -854,9 +884,8 @@ def check_autoload_refusals_answer_their_words(session, context):
 
 def check_autoload_stale_grant_answers_78(session, context):
     """A grant for a list that has since changed answers approval_stale, 78."""
-    del context
     first, second = "consolestale", "consoleother"
-    install_autoload_payload(session, second, b"console other\n")
+    install_autoload_payload(session, second, context.build("other"))
     listing = autoload_listing(session)
     stale, challenge = autoload_ask(session, "add", first)
     try:
