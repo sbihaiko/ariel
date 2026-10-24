@@ -130,7 +130,7 @@ auth <token>
 approval grant a-81d0e3 <signature> <console> <action-sha256>
 ```
 
-Ariel answers `approval_granted a-81d0e3` and `exit 0`. Each of these is refused with its own error, and nothing runs: a signature that does not verify (`signature_invalid`), one made for another action (`signature_action_mismatch`) or another console (`signature_console_mismatch`), one that arrives after the window (`approval_expired`), a malformed one (`signature_malformed`) and a second use (`approval_replayed`). The console and hash after the signature are the signer's claim and only name what is wrong; a bare signature is also accepted and answers `signature_invalid` for any mismatch. Then commit the staged upload:
+Ariel answers `approval_granted a-81d0e3` and `exit 0`. Each of these is refused with its own error, and nothing runs: a signature that does not verify (`signature_invalid`), one made for another action (`signature_action_mismatch`) or another console (`signature_console_mismatch`), one that arrives after the window (`approval_expired`, `exit 88`), a malformed one (`signature_malformed`) and a second use (`approval_replayed`). `exit 88` means the window closed, so push the build again; a refusal from the host build's virtual source is `approval_denied` and `exit 77`, and that one is terminal. The console and hash after the signature are the signer's claim and only name what is wrong; a bare signature is also accepted and answers `signature_invalid` for any mismatch. Then commit the staged upload:
 
 ```console
 $ printf 'auth %s\npayload commit s-4f2a9c\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324

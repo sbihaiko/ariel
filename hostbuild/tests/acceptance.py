@@ -866,7 +866,7 @@ PLAN_SKIP = re.compile(r"^skip (\S.*) \(needs the test clock\)$")
 CLOCK_SCENARIOS = {
     "missing auth after 5 s of test clock closes with exit 70",
     "a stalled upload does not block another connection",
-    "an approval expires after 120 s of test clock",
+    "an approval expires after 120 s of test clock and answers exit 88",
     "an expired approval does not count among the pending ones",
     "an unanswered staging object disappears after 15 min",
     "a second notification within 10 s answers approval_busy with no prompt",
@@ -877,7 +877,8 @@ CLOCK_SCENARIOS = {
     "signature_action_mismatch",
     "a signature for another console answers signature_console_mismatch",
     "the signer refuses an action with bytes it cannot show",
-    "a signature after the challenge expired is refused",
+    "a signature after the challenge expired answers approval_expired and "
+    "exit 88",
     "a malformed signature answers signature_malformed and exit 83",
     "the same signature twice is refused the second time",
     "a consumed nonce is refused after Ariel restarts",
@@ -1339,9 +1340,9 @@ def scenario_approval_expired(server):
     lines = push(server, "expired", data)
     staging, _ = assert_staged(server, lines, "expired", data)
     server.advance(120_000)
-    assert commit(server, staging) == ["approval_expired", "exit 77"], (
+    assert commit(server, staging) == ["approval_expired", "exit 88"], (
         "a commit after its approval expired must answer approval_expired "
-        "and exit 77")
+        "and exit 88, so 77 stays a refusal")
     assert not os.path.exists(staging_path(server, staging)), (
         "an expired approval's staging object must be deleted")
     assert commit(server, staging) == ["approval_stale", "exit 78"], (
@@ -1908,8 +1909,8 @@ def scenario_signature_expired(server):
     signature = sign_challenge(server, challenge)
     server.advance(120000)
     assert grant(server, approval, signature) == ["approval_expired",
-                                                  "exit 77"]
-    assert commit(server, staging) == ["approval_expired", "exit 77"]
+                                                  "exit 88"]
+    assert commit(server, staging) == ["approval_expired", "exit 88"]
     assert run_payload(server, "latesign") == ["unknown_payload", "exit 1"]
 
 
@@ -2145,7 +2146,7 @@ SCENARIOS = [
      "fail", scenario_quick_start_broken_setup, False),
     ("a failing '$' command in a block of any label makes the fixture fail",
      scenario_quick_start_unlabeled_block, False),
-    ("an approval expires after 120 s of test clock",
+    ("an approval expires after 120 s of test clock and answers exit 88",
      scenario_approval_expired, True),
     ("an expired approval does not count among the pending ones",
      scenario_expired_not_pending, True),
@@ -2173,8 +2174,8 @@ SCENARIOS = [
      scenario_signature_wrong_console, True),
     ("the signer refuses an action with bytes it cannot show",
      scenario_signer_refuses_hidden_bytes, True),
-    ("a signature after the challenge expired is refused",
-     scenario_signature_expired, True),
+    ("a signature after the challenge expired answers approval_expired and "
+     "exit 88", scenario_signature_expired, True),
     ("a malformed signature answers signature_malformed and exit 83",
      scenario_signature_malformed, True),
     ("the same signature twice is refused the second time",

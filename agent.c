@@ -70,7 +70,7 @@ static const char approval_denied[] =
   "exit 77\n";
 static const char approval_expired[] =
   "approval_expired\n"
-  "exit 77\n";
+  "exit 88\n";
 static const char signature_invalid[] =
   "signature_invalid\n"
   "exit 79\n";

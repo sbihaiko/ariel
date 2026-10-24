@@ -8,8 +8,11 @@ harness reads the access token from the owner, builds `helloworld.elf` with
 console shows and waits for the owner to sign the challenge.
 
 The console has no test clock, so every scenario that moves time is skipped
-and named. Console mode is a manual run: it is not part of CI and not part of
-the Stage 1 gate, and the headless suite takes this path only when PS5_HOST is
+and named. An approval the owner leaves unsigned expires on the console's own
+clock and answers `approval_expired` with `exit 88`, which means push again;
+the console has no refusal, so `exit 77` (`approval_denied`) never comes from
+it. Console mode is a manual run: it is not part of CI and not part of the
+Stage 1 gate, and the headless suite takes this path only when PS5_HOST is
 set.
 
 `--plan` lists the selection without reading the token, building anything or
