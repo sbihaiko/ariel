@@ -63,6 +63,7 @@ clean:
 
 test: $(BIN) $(SIGNER) $(CANONICAL_TEST)
 	./$(CANONICAL_TEST)
+	sh tests/deploy_guard.sh
 	python3 tests/acceptance.py ./$(BIN)
 
 .PHONY: all clean test
