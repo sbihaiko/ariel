@@ -158,8 +158,8 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `pwd`, `cd` | | ✅ | S5: working directory kept across connections with sessions |
 | `ls` | | ⚠️ no flags | S3: `-l`, `-a`, `--json`, pagination |
 | `stat`, `file` | | ✅ | S3: `--json` |
-| `cat` | | ✅ | S3: size limit |
-| `head`, `tail`, `wc` | | ❌ | S3 |
+| `cat` | | ✅ | |
+| `head`, `tail`, `wc` | | ❌ | |
 | `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c` |
 | `find` | | ⚠️ only `-name`, `-type` | S3: more predicates |
 | `cmp`, `hexdump` | | ✅ | |

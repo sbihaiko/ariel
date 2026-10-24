@@ -3321,8 +3321,11 @@ def scenario_a_large_file_is_cut(server):
     small = write_scratch(server, "small.txt", b"one\ntwo\nthree\n")
     assert run_command(server, "head 10 " + small) == [
         "one", "two", "three", "exit 0"], "head under the cap keeps its shape"
+    assert run_command(server, "tail 3 " + small) == [
+        "one", "two", "three", "exit 0"], "tail under the cap keeps its shape"
     assert run_command(server, "tail 2 " + small) == [
-        "two", "three", "exit 0"], "tail under the cap keeps its shape"
+        "two", "three", "truncated 2 of 3", "exit 0"], (
+        "tail that omits a line must say how many there are")
     assert run_command(server, "wc " + small) == [
         "3 3 14 " + small, "exit 0"], "wc must count the small file"
     assert run_command(server, "head x " + small) == [

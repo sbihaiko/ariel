@@ -39,6 +39,42 @@ put(int fd, const char *buf, size_t len) {
 }
 
 
+static void
+emit(char *out, size_t cap, size_t *n, const char *what, size_t len) {
+  size_t have = *n < cap ? cap - *n : 0;
+  size_t m = len < have ? len : have;
+
+  if(m > 0) {
+    memcpy(out + *n, what, m);
+  }
+  *n += len;
+}
+
+
+size_t
+json_format_string(char *out, size_t cap, const char *text) {
+  const unsigned char *p = (const unsigned char *)text;
+  char escape[8];
+  size_t n = 0;
+
+  emit(out, cap, &n, "\"", 1);
+  for(; *p; p++) {
+    if(*p == '"') {
+      emit(out, cap, &n, "\\\"", 2);
+    } else if(*p == '\\') {
+      emit(out, cap, &n, "\\\\", 2);
+    } else if(*p < 0x20) {
+      snprintf(escape, sizeof(escape), "\\u%04x", (unsigned)*p);
+      emit(out, cap, &n, escape, 6);
+    } else {
+      emit(out, cap, &n, (const char *)p, 1);
+    }
+  }
+  emit(out, cap, &n, "\"", 1);
+  return n;
+}
+
+
 void
 json_say_string(int fd, const char *text) {
   const unsigned char *p = (const unsigned char *)text;
