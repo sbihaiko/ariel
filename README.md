@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** Stage 1 is done and validated on a real PS5. Stage 2 is nearly done: its commands are on the `dev` branch, and the key hierarchy and the console validation are being finished. Stages 3 to 5 have not started. See [Progress](#progress).
+> **Status:** Stage 1 is done and validated on a real PS5. Stage 2 is nearly done: its commands are on the `dev` branch, and the key hierarchy and the console validation are being finished. Stages 3 to 6 have not started. See [Progress](#progress).
 
 ---
 
@@ -103,16 +103,23 @@ Once the agent can operate the console safely, make the shell easy for it to use
 
 New and extended commands in this stage:
 
-- Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`, including a way to pull a binary file back, such as a screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)).
+- Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`, including a way to pull a binary file back for Stage 4's screenshot.
 - Writing files without redirection: `write <path>`, which reads the content from stdin.
 - Missing flags on existing commands: `ls -l -a`, `grep -r -l -c`, more `find` predicates, `rm -r` and `cp -r`.
 - Diagnostics: `date`, `dmesg`, `du`, a `sysinfo` command that aggregates `uname`, `uptime` and memory, and `timeout` so a command cannot hang the connection.
-- Sight: `screenshot`, gated like every command that does more than read, which captures the screen to a file under `/data` that the reader above returns. One capture, one signature, because the screen can show personal content ([#53](https://github.com/sbihaiko/ariel/issues/53)).
 - Optional: `diff` and network diagnostics (`ifconfig`, `netstat`, `ping`).
 
-### Stage 4 (optional): sessions
+### Stage 4: see the console
 
-Stages 1 to 3 are enough for an agent to operate the console. Stages 4 and 5 are optional conveniences on top of them.
+An agent that can see the screen can diagnose what no text tells it: a game stuck on a menu, a system dialog waiting for an answer, a crash screen. This stage gives it sight, and the pixels always travel as a file, never as a stream on the agent port.
+
+- `screenshot`, gated like every command that does more than read: one capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash ([#53](https://github.com/sbihaiko/ariel/issues/53)).
+- A shot lands under `/data`, never in Ariel's protected state directory, and Stage 3's reader returns it under its size limit.
+- The capture API is measured on a real console before anything is built on it, including a capture while a game runs and a capture of a protected screen.
+
+### Stage 5 (optional): sessions
+
+Stages 1 to 4 are enough for an agent to operate and see the console. Stages 5 and 6 are optional conveniences on top of them.
 
 Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
 
@@ -124,19 +131,19 @@ Agents usually reach the console through one-shot connections (one command per c
 - Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 2 operations such as installing and rolling back take a global lock.
 - Sessions are a convenience, not a requirement. Every command also works without one, using absolute paths.
 
-### Stage 5 (optional): MCP
+### Stage 6 (optional): MCP
 
-Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 4 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
+Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
 
 ## Command coverage
 
 Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S4 are Stages 1 to 4; S1 and S2 items are on `dev` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
+**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S5 are Stages 1 to 5; S1 and S2 items are on `dev` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
-| `pwd`, `cd` | | ✅ | S4: working directory kept across connections with sessions |
+| `pwd`, `cd` | | ✅ | S5: working directory kept across connections with sessions |
 | `ls` | | ⚠️ no flags | S3: `-l`, `-a`, `--json`, pagination |
 | `stat`, `file` | | ✅ | S3: `--json` |
 | `cat` | | ✅ | S3: size limit |
@@ -170,7 +177,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
 | `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional |
 
-PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid`, `sfoinfo` and `sfocreate` are gated, and `sfocreate` joins them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) and `session` (Stage 4).
+PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid`, `sfoinfo` and `sfocreate` are gated, and `sfocreate` joins them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) `session` (Stage 5) and `screenshot` (Stage 4).
 
 Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `ssh`, `top` and package managers. The agent composes logic on its own side, on the computer it runs on.
 
@@ -189,7 +196,7 @@ An agent that can download, write and execute code on a console with kernel priv
 - **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. Approval by a key the agent does not hold ensures that injected instructions cannot silently turn into code execution.
 - **Auditable.** Ariel is open source and every action it takes is logged on the console.
 
-From Stage 5, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
+From Stage 6, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
 
 ## Quick start
 
@@ -246,7 +253,7 @@ That is exactly the role of this project. Ariel is the servant that lives on Pro
 
 **Protocols**
 
-- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 5.
+- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 6.
 
 ## Legal
 
