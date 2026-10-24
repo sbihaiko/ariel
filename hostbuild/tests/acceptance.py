@@ -14,6 +14,7 @@ their own until payload run arrives.
 """
 
 import contextlib
+import datetime
 import hashlib
 import http.server
 import io
@@ -1135,6 +1136,10 @@ PLAN_RUN = "run  "
 # cannot create them, so it runs its own checks of the same commands instead.
 HOST_ROOT_REASON = ("needs files or links in the host test root, which console "
                     "mode cannot create")
+# Scenarios that compare an answer with the machine the suite runs on. Console
+# mode talks to another machine, so the same answer has no oracle there.
+HOST_MACHINE_REASON = ("needs the host's own clock, machine and kernel log, "
+                       "which console mode cannot compare")
 PLAN_SKIP = re.compile(r"^skip (\S.*) \((needs [^()]+)\)$")
 CLOCK_REASON = "needs the test clock"
 FAULT_REASON = "needs the fault injector"
@@ -1449,7 +1454,8 @@ def scenario_console_mode_plan(server):
 
     expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
                       | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS
-                      | HOST_RESTART_SCENARIOS | RELEASE_SCENARIOS)
+                      | HOST_RESTART_SCENARIOS | RELEASE_SCENARIOS
+                      | HOST_MACHINE_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
         "clock, the host test root, the fault injector or the host's files:"
@@ -3382,6 +3388,168 @@ def scenario_a_limit_of_zero_shows_nothing(server):
         "an empty directory has nothing to cut, so no marker")
     assert run_command(server, "ls --limit many " + folder) == [
         "bad_option", "exit 1"], "a limit that is not a whole number is bad_option"
+
+
+DATE_LINE = re.compile(r"^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) UTC$")
+SYSINFO_KEYS = {"sysname", "release", "machine", "uptime_seconds",
+                "memory_total_bytes", "memory_free_bytes"}
+
+
+def host_uptime_seconds():
+    """The host's uptime as it stands now, read without Ariel."""
+    if platform.system() == "Darwin":
+        out = subprocess.check_output(["sysctl", "-n", "kern.boottime"])
+        match = re.search(r"sec = (\d+)", out.decode("ascii"))
+        assert match, "kern.boottime must carry a sec field, got %r" % out
+        return int(time.time()) - int(match.group(1))
+    with open("/proc/uptime") as file:
+        return int(float(file.read().split()[0]))
+
+
+def host_memory_total_bytes():
+    """The host's total memory, read without Ariel."""
+    if platform.system() == "Darwin":
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"])
+        return int(out.strip())
+    with open("/proc/meminfo") as file:
+        for line in file:
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    raise AssertionError("MemTotal is absent from /proc/meminfo")
+
+
+def scenario_date_answers_the_wall_clock(server):
+    """date answers one UTC line that matches the host's clock, and takes no operand."""
+    lines = run_command(server, "date")
+    assert len(lines) == 2 and lines[1] == "exit 0", (
+        "date must answer one line and exit 0, got %r" % lines)
+    match = DATE_LINE.match(lines[0])
+    assert match, "date must answer YYYY-MM-DD HH:MM:SS UTC, got %r" % lines[0]
+    shown = datetime.datetime(
+        *[int(part) for part in match.groups()],
+        tzinfo=datetime.timezone.utc).timestamp()
+    assert abs(shown - time.time()) < 120, (
+        "date must answer the wall clock, got %r" % lines[0])
+
+    assert run_command(server, "date now") == ["bad_argument", "exit 1"], (
+        "date takes no operand")
+    assert run_command(server, "date --json") == ["bad_option", "exit 1"], (
+        "date has no JSON form")
+
+
+def scenario_du_totals_a_tree(server):
+    """du totals each directory's regular files, children before their parent."""
+    folder = os.path.join(scratch_dir(server), "du")
+    sub = os.path.join(folder, "sub")
+    empty = os.path.join(folder, "empty")
+    os.makedirs(sub)
+    os.makedirs(empty)
+    with open(os.path.join(folder, "a.txt"), "wb") as file:
+        file.write(b"12345")
+    with open(os.path.join(sub, "b.txt"), "wb") as file:
+        file.write(b"abc")
+
+    assert run_command(server, "du " + folder) == [
+        "0 " + empty, "3 " + sub, "8 " + folder, "exit 0"], (
+        "du must total each directory, children first, and the root last")
+
+    path = os.path.join(folder, "a.txt")
+    assert run_command(server, "du " + path) == ["5 " + path, "exit 0"], (
+        "du of a regular file answers its own size")
+
+    assert run_command(server, "du " + os.path.join(folder, "nope")) == [
+        "no_such_file", "exit 1"], "du of a missing path names the word"
+    assert run_command(server, "du relative") == ["relative_path", "exit 1"], (
+        "du takes an absolute path")
+    assert run_command(server, "du " + folder + " " + sub) == [
+        "bad_argument", "exit 1"], "du takes one path"
+    assert run_command(server, "du -s " + folder) == ["bad_option", "exit 1"], (
+        "du takes no option")
+
+
+def scenario_du_is_cut_past_the_cap(server):
+    """du over more directories than 64 KiB holds is cut, and still exits 0."""
+    folder = os.path.join(scratch_dir(server), "du-big")
+    os.makedirs(folder)
+    count = 3000
+    names = ["d-%05d-%s" % (i, "z" * 40) for i in range(count)]
+    for name in names:
+        os.makedirs(os.path.join(folder, name))
+
+    body, shown, total = cut_answer(run_command_raw(server, "du " + folder))
+    assert total == count + 1, (
+        "du must count every directory and the root, got %d" % total)
+    assert 0 < shown < count + 1, (
+        "du must cut a walk over 64 KiB, got shown %d of %d" % (shown, total))
+    assert body == ["0 " + os.path.join(folder, name) for name in names[:shown]], (
+        "a cut du shows the first directories in sorted order")
+
+
+def scenario_dmesg_names_the_platform_refusal(server):
+    """The host cannot read a kernel log, so dmesg names that rather than answer empty."""
+    assert run_command(server, "dmesg") == [
+        "not available on this platform", "exit 1"], (
+        "the host build must refuse dmesg by name")
+    assert run_command(server, "dmesg -c") == ["bad_option", "exit 1"], (
+        "dmesg takes no option")
+    assert run_command(server, "dmesg now") == ["bad_argument", "exit 1"], (
+        "dmesg takes no operand")
+
+
+def scenario_sysinfo_aggregates_the_machine(server):
+    """sysinfo answers uname, uptime and memory, plainly and as one JSON object."""
+    lines = run_command(server, "sysinfo")
+    assert len(lines) == 4 and lines[3] == "exit 0", (
+        "sysinfo must answer three lines and exit 0, got %r" % lines)
+
+    uname = lines[0].split(" ")
+    assert uname[0] == "uname" and len(uname) == 4 and all(uname[1:]), (
+        "sysinfo must name the sysname, release and machine, got %r" % lines[0])
+    expected = platform.uname()
+    assert uname[1] == expected.system, (
+        "sysinfo must report the host's sysname, got %r" % uname[1])
+    assert uname[2] == expected.release, (
+        "sysinfo must report the host's release, got %r" % uname[2])
+    assert uname[3] == expected.machine, (
+        "sysinfo must report the host's machine, got %r" % uname[3])
+
+    uptime = lines[1].split(" ")
+    assert uptime[0] == "uptime" and len(uptime) == 2 and uptime[1].isdigit(), (
+        "sysinfo must answer uptime in seconds, got %r" % lines[1])
+    assert abs(int(uptime[1]) - host_uptime_seconds()) < 300, (
+        "sysinfo's uptime must match the host's, got %r" % lines[1])
+
+    memory = lines[2].split(" ")
+    assert memory[0] == "memory" and len(memory) == 3, (
+        "sysinfo must answer total and free memory, got %r" % lines[2])
+    assert memory[1].isdigit() and memory[2].isdigit(), (
+        "memory figures must be whole bytes, got %r" % lines[2])
+    total, free = int(memory[1]), int(memory[2])
+    assert total == host_memory_total_bytes(), (
+        "sysinfo's total memory must match the host's, got %d" % total)
+    assert 0 < free <= total, "free memory must be within the total, got %d" % free
+
+    raw = run_command_raw(server, "sysinfo --json")
+    assert raw.endswith("exit 0\n"), (
+        "a JSON answer ends with the exit line, got %r" % raw[-40:])
+    objects = raw[:-len("exit 0\n")].splitlines()
+    assert len(objects) == 1, (
+        "sysinfo --json answers exactly one object, got %r" % objects)
+    info = json.loads(objects[0])
+    assert set(info) == SYSINFO_KEYS, (
+        "the JSON keys are stable, got %r" % sorted(info))
+    assert [info["sysname"], info["release"], info["machine"]] == uname[1:], (
+        "the JSON uname fields must match the plain answer")
+    assert info["uptime_seconds"] == int(uptime[1]), (
+        "the JSON uptime must match the plain answer")
+    assert [info["memory_total_bytes"], info["memory_free_bytes"]] == [total, free], (
+        "the JSON memory must match the plain answer")
+    assert len(raw.encode("ascii")) <= CAP_BYTES, "an answer holds at most 64 KiB"
+
+    assert run_command(server, "sysinfo extra") == ["bad_argument", "exit 1"], (
+        "sysinfo takes no operand")
+    assert run_command(server, "sysinfo --limit 2") == ["bad_option", "exit 1"], (
+        "sysinfo takes no option but --json")
 
 
 def scenario_wrong_token(server):
@@ -8944,6 +9112,16 @@ SCENARIOS = [
      scenario_a_grep_with_many_matches_is_cut, HOST_ROOT_REASON),
     ("a limit of zero shows no line and says how many there are",
      scenario_a_limit_of_zero_shows_nothing, HOST_ROOT_REASON),
+    ("date answers the host's wall clock as one UTC line",
+     scenario_date_answers_the_wall_clock, HOST_MACHINE_REASON),
+    ("du totals each directory's regular files, children before their parent",
+     scenario_du_totals_a_tree, HOST_ROOT_REASON),
+    ("du over more directories than 64 KiB holds is cut and exits 0",
+     scenario_du_is_cut_past_the_cap, HOST_ROOT_REASON),
+    ("the host build's dmesg names the platform refusal instead of an empty "
+     "success", scenario_dmesg_names_the_platform_refusal, HOST_MACHINE_REASON),
+    ("sysinfo aggregates uname, uptime and memory, plainly and as JSON",
+     scenario_sysinfo_aggregates_the_machine, HOST_MACHINE_REASON),
     ("wrong token closes with exit 70", scenario_wrong_token, None),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, None),
@@ -9544,6 +9722,13 @@ BOUNDED_READER_TITLES = {
     "a limit of zero shows no line and says how many there are",
 }
 HOST_ROOT_SCENARIOS.update(BOUNDED_READER_TITLES)
+
+HOST_MACHINE_SCENARIOS = {
+    "date answers the host's wall clock as one UTC line",
+    "the host build's dmesg names the platform refusal instead of an empty "
+    "success",
+    "sysinfo aggregates uname, uptime and memory, plainly and as JSON",
+}
 
 
 # Payload install from an allowlisted release (SPEC 2, #42). The fake release
