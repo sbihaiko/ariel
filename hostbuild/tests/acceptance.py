@@ -1354,6 +1354,11 @@ HOST_ROOT_SCENARIOS = {
     "health.fail",
     "each read-only command runs with no approval and exits 0 with its output",
     "sha256sum prints the digest openssl dgst -sha256 prints",
+    "read answers the file's size and SHA-256, its raw bytes, then exit 0",
+    "read of a file over the cap returns ranges that reassemble and verify "
+    "by the whole file's hash",
+    "read past the end answers bad_range and exit 1, and a bad option "
+    "answers bad_option",
     "the token, approval state and nonces answer protected and exit 87 when "
     "read directly",
     "the token, approval state and nonces answer protected and exit 87 "
@@ -3328,6 +3333,7 @@ SECRET_READS = (
     "grep . {p}",
     "hexdump {p}",
     "sha256sum {p}",
+    "read {p}",
     "cmp {p} {p}",
 )
 
@@ -3412,7 +3418,7 @@ def scenario_read_only_relative_paths(server):
     for command in ("cat notes.txt", "stat notes.txt", "file notes.txt",
                     "grep world notes.txt", "find notes.txt",
                     "cmp a.txt b.txt", "hexdump notes.txt", "df notes.txt",
-                    "sha256sum notes.txt"):
+                    "sha256sum notes.txt", "read notes.txt"):
         lines = run_command(server, command)
         assert lines == ["relative_path", "exit 1"], (
             "%r must refuse a relative path, got %r" % (command, lines))
@@ -3432,6 +3438,98 @@ def scenario_sha256sum_matches_openssl(server):
     assert digest == expected, (
         "sha256sum must match openssl dgst -sha256: got %s, want %s"
         % (digest, expected))
+
+
+READ_CAP = 64 * 1024
+
+
+def read_raw(server, command):
+    """One command on its own connection; the reply as bytes, binary intact."""
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                return data
+            data += chunk
+    finally:
+        sock.close()
+
+
+def split_read(reply):
+    """The size, hash, body and trailing lines of one read answer."""
+    head, sep, rest = reply.partition(b"\n")
+    assert sep, "read must answer a header line, got %r" % reply[:80]
+    fields = head.decode("ascii").split(" ")
+    assert len(fields) == 4 and fields[0] == "bytes", (
+        "read's header must be 'bytes <size> <sha256> <length>', got %r" % head)
+    size, digest, length = int(fields[1]), fields[2], int(fields[3])
+    return size, digest, rest[:length], rest[length:]
+
+
+def openssl_sha256(path):
+    done = subprocess.run(["openssl", "dgst", "-sha256", path],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, "openssl dgst failed: %s" % done.stderr
+    return done.stdout.strip().rsplit("= ", 1)[-1]
+
+
+def scenario_read_small_file(server):
+    """read answers the file's size and SHA-256, then its raw bytes, then exit 0."""
+    data = bytes(range(256)) + b"\nhello\r\n\x00\xff"
+    path = write_scratch(server, "small.bin", data)
+    size, digest, body, tail = split_read(read_raw(server, "read " + path))
+    assert size == len(data), "read must report the file's size, got %d" % size
+    assert digest == openssl_sha256(path), (
+        "read must report the file's SHA-256 as openssl dgst does")
+    assert body == data, "read must return the file's raw bytes"
+    assert tail == b"exit 0\n", "read must end with exit 0, got %r" % tail
+
+
+def scenario_read_ranges_over_the_cap(server):
+    """A file over the cap reads in ranges that reassemble and verify by hash."""
+    data = bytes((i * 131 + 7) % 256 for i in range(READ_CAP * 3 + 1000))
+    path = write_scratch(server, "large.bin", data)
+    digest = openssl_sha256(path)
+
+    size, got, body, tail = split_read(read_raw(server, "read " + path))
+    assert (size, got) == (len(data), digest), (
+        "a whole read must report the whole file's size and hash")
+    assert body == data[:READ_CAP], "a read over the cap must return the cap"
+    assert tail == ("truncated %d of %d\nexit 0\n" % (READ_CAP, len(data))
+                    ).encode("ascii"), "a cut read must say so, got %r" % tail
+
+    assembled = b""
+    while len(assembled) < len(data):
+        offset = len(assembled)
+        command = "read %s --offset %d --limit %d" % (path, offset, READ_CAP)
+        size, got, body, tail = split_read(read_raw(server, command))
+        assert (size, got) == (len(data), digest), (
+            "every range must report the whole file's size and hash")
+        assert 0 < len(body) <= READ_CAP, (
+            "a range must return at most the cap, got %d bytes" % len(body))
+        assert tail == b"exit 0\n", "a range must end with exit 0, got %r" % tail
+        assembled += body
+    assert assembled == data, "the ranges must reassemble the file"
+    assert hashlib.sha256(assembled).hexdigest() == digest, (
+        "the reassembled bytes must verify against the whole file's hash")
+
+
+def scenario_read_bad_range(server):
+    """A range past the end answers bad_range; a bad option answers bad_option."""
+    path = write_scratch(server, "short.txt", b"0123456789")
+    assert run_command(server, "read %s --offset 11" % path) == [
+        "bad_range", "exit 1"], "an offset past the end must answer bad_range"
+    size, digest, body, tail = split_read(
+        read_raw(server, "read %s --offset 10" % path))
+    assert (size, body, tail) == (10, b"", b"exit 0\n"), (
+        "an offset at the end must read nothing, got %r" % body)
+    assert run_command(server, "read %s --offset ten" % path) == [
+        "bad_option", "exit 1"], "a non-numeric offset must answer bad_option"
+    assert run_command(server, "read %s --whence 0" % path) == [
+        "bad_option", "exit 1"], "an unknown option must answer bad_option"
 
 
 def scenario_secrets_read_directly(server):
@@ -8368,6 +8466,13 @@ SCENARIOS = [
      scenario_read_only_relative_paths, False),
     ("sha256sum prints the digest openssl dgst -sha256 prints",
      scenario_sha256sum_matches_openssl, HOST_ROOT_REASON),
+    ("read answers the file's size and SHA-256, its raw bytes, then exit 0",
+     scenario_read_small_file, HOST_ROOT_REASON),
+    ("read of a file over the cap returns ranges that reassemble and verify "
+     "by the whole file's hash", scenario_read_ranges_over_the_cap,
+     HOST_ROOT_REASON),
+    ("read past the end answers bad_range and exit 1, and a bad option "
+     "answers bad_option", scenario_read_bad_range, HOST_ROOT_REASON),
     ("the token, approval state and nonces answer protected and exit 87 when "
      "read directly", scenario_secrets_read_directly, HOST_ROOT_REASON),
     ("the token, approval state and nonces answer protected and exit 87 "
