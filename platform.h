@@ -141,6 +141,15 @@ struct platform {
    **/
   int (*spawn)(platform_t *self, const unsigned char *bytes, size_t size,
                char *const argv[], int outfd, int *status);
+
+  /**
+   * Run one shell command in the foreground: no shell, no working directory,
+   * output on outfd, the command's exit status in status. argc and argv are
+   * the command and its arguments, with no trailing NULL. Returns 0 when the
+   * command ran, or -1 when this platform cannot run it.
+   **/
+  int (*command)(platform_t *self, int argc, char *const argv[], int outfd,
+                 int *status);
 };
 
 /**

@@ -25,6 +25,7 @@ along with this program; see the file COPYING. If not, see
 #endif
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -35,6 +36,7 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -530,6 +532,116 @@ out:
 }
 
 
+/**
+ * One directory entry as ls prints it: ten mode characters, a space, the name.
+ * A name that is not one word would split a reply line, so it is skipped.
+ **/
+static int
+list_entry(int outfd, const char *dir, const char *name) {
+  char path[PATH_MAX];
+  char line[PATH_MAX + 16];
+  struct stat st;
+  char mode[11];
+  int i;
+  int len;
+
+  if(strchr(name, ' ') || strchr(name, '\n') || strchr(name, '\r')) {
+    return 0;
+  }
+
+  if(snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path)) {
+    return -1;
+  }
+
+  if(lstat(path, &st)) {
+    return 0;
+  }
+
+  mode[0] = S_ISDIR(st.st_mode) ? 'd' :
+            S_ISLNK(st.st_mode) ? 'l' :
+            S_ISFIFO(st.st_mode) ? 'p' :
+            S_ISSOCK(st.st_mode) ? 's' :
+            S_ISCHR(st.st_mode) ? 'c' :
+            S_ISBLK(st.st_mode) ? 'b' : '-';
+  for(i=0; i<9; i++) {
+    int bit = st.st_mode & (1 << i);
+    int kind = i % 3;
+    char c;
+
+    if(!kind && (st.st_mode & (1 << ((i / 3) + 9)))) {
+      c = "tss"[i / 3];
+      if(!bit) {
+        c = (char)(c & ~0x20);
+      }
+    } else {
+      c = bit ? "xwr"[kind] : '-';
+    }
+    mode[9 - i] = c;
+  }
+  mode[10] = '\0';
+
+  len = snprintf(line, sizeof(line), "%s %s\n", mode, name);
+  if(len < 0 || len >= (int)sizeof(line)) {
+    return -1;
+  }
+
+  return write_all(outfd, (const unsigned char*)line, (size_t)len);
+}
+
+
+/**
+ * List one absolute directory the way the shell's ls does: one entry per
+ * line, mode first. The host build runs no shell, so this is its own ls.
+ **/
+static int
+host_ls(const char *dir, int outfd, int *status) {
+  struct dirent *entry;
+  DIR *list;
+  int rc = 0;
+
+  if(!(list=opendir(dir))) {
+    *status = 1;
+    return 0;
+  }
+
+  while((entry=readdir(list))) {
+    if(list_entry(outfd, dir, entry->d_name)) {
+      rc = -1;
+      break;
+    }
+  }
+
+  closedir(list);
+  *status = 0;
+  return rc;
+}
+
+
+/**
+ * The host build's command runner: no shell and no working directory. pwd
+ * reports the filesystem root, ls lists one absolute directory, and every
+ * other command is one this platform cannot run.
+ **/
+static int
+host_command(platform_t *self, int argc, char *const argv[], int outfd,
+             int *status) {
+  static const char root[] = "/\n";
+
+  (void)self;
+
+  if(argc == 1 && !strcmp(argv[0], "pwd")) {
+    *status = 0;
+    return write_all(outfd, (const unsigned char*)root, sizeof(root) - 1);
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "ls") && argv[1][0] == '/') {
+    return host_ls(argv[1], outfd, status);
+  }
+
+  return -1;
+}
+
+
 static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
@@ -543,6 +655,7 @@ static platform_t host_platform = {
   .approval_request = host_approval_request,
   .approval_grant = host_approval_grant,
   .spawn = host_spawn,
+  .command = host_command,
 };
 
 

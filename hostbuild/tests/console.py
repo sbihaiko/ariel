@@ -246,6 +246,26 @@ def check_wrong_token(session, context):
         "a wrong token must close with exit 70")
 
 
+def check_shell_commands(session, context):
+    """pwd and ls run on the console; cd has no working directory."""
+    del context
+    lines = session.link.exchange("pwd")
+    assert lines == ["/", "exit 0"], (
+        "pwd must report the filesystem root and exit 0, got %r" % lines)
+
+    lines = session.link.exchange("ls /data")
+    assert lines[-1] == "exit 0", "ls of an absolute path must exit 0, got %r" % lines
+    assert len(lines) > 1, "ls /data must list the directory, got %r" % lines
+    for line in lines[:-1]:
+        parts = line.split(" ", 1)
+        assert len(parts) == 2 and len(parts[0]) == 10 and parts[1], (
+            "ls must answer one mode and one name per line, got %r" % lines)
+
+    lines = session.link.exchange("cd /data")
+    assert lines == ["no_working_directory", "exit 1"], (
+        "cd has no working directory on the agent port, got %r" % lines)
+
+
 def check_unknown_command(session, context):
     del context
     for command in ("payload status", "nonsense"):
@@ -348,6 +368,8 @@ CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
     ("a line over 1 KiB closes the connection", check_line_limit),
     ("a wrong token closes with exit 70", check_wrong_token),
+    ("pwd and ls run on the agent port and cd answers an error",
+     check_shell_commands),
     ("an unknown command answers unknown_command and exits nonzero",
      check_unknown_command),
     ("a truncated upload answers upload_mismatch and exit 81",

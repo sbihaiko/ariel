@@ -98,6 +98,9 @@ static const char unknown_payload[] =
 static const char spawn_failed[] =
   "spawn_failed\n"
   "exit 1\n";
+static const char no_working_directory[] =
+  "no_working_directory\n"
+  "exit 1\n";
 
 static int
 write_all(int fd, const char *buf, size_t len) {
@@ -684,6 +687,33 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
 }
 
 
+/**
+ * One shell command on the agent port. A connection keeps no working
+ * directory, so cd means nothing here and every path is absolute. The
+ * platform runs the command with this connection as its output, and the
+ * reply ends with the command's own status.
+ **/
+static void
+shell_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  char answer[64];
+  int status = 0;
+  int len;
+
+  if(!strcmp(argv[0], "cd")) {
+    reply(fd, no_working_directory);
+    return;
+  }
+
+  if(agent->platform->command(agent->platform, argc, argv, fd, &status)) {
+    reply(fd, unknown);
+    return;
+  }
+
+  len = snprintf(answer, sizeof(answer), "exit %d\n", status);
+  write_all(fd, answer, (size_t)len);
+}
+
+
 static void
 handle_command(agent_t *agent, int fd, int wake, char *line) {
   char *argv[MAX_ARGS + 1];
@@ -720,6 +750,13 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
      !strcmp(argv[2], "--wait")) {
     argv[argc] = NULL;
     payload_run(agent, fd, argv[3], &argv[3]);
+    return;
+  }
+
+  // A shell command: one per connection, run by the platform port.
+  if(argc >= 1 && (!strcmp(argv[0], "pwd") || !strcmp(argv[0], "ls") ||
+                   !strcmp(argv[0], "cd"))) {
+    shell_command(agent, fd, argc, argv);
     return;
   }
 

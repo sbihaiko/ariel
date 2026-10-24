@@ -1448,6 +1448,46 @@ def scenario_wrong_token(server):
         sock.close()
 
 
+def exchange(server, command):
+    """Send one command after auth and return the reply lines."""
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def scenario_shell_commands(server):
+    """pwd and ls run on the agent port; cd has no working directory.
+
+    A connection runs one command and keeps no directory of its own, so pwd
+    reports the filesystem root and every path ls takes is absolute. cd cannot
+    mean anything here and answers an error.
+    """
+    lines = exchange(server, "pwd")
+    assert lines == ["/", "exit 0"], (
+        "pwd must report the filesystem root and exit 0, got %r" % lines)
+
+    directory = tempfile.mkdtemp(prefix="ariel-ls-")
+    try:
+        open(os.path.join(directory, "marker"), "w").close()
+        lines = exchange(server, "ls %s" % directory)
+    finally:
+        os.remove(os.path.join(directory, "marker"))
+        os.rmdir(directory)
+    assert sorted(lines) == sorted(
+        ["drwx------ .", "drwx------ ..", "-rw-r--r-- marker", "exit 0"]), (
+        "ls of an absolute path must list the directory and exit 0, got %r"
+        % lines)
+
+    for command in ("cd /", "cd /tmp"):
+        lines = exchange(server, command)
+        assert lines == ["no_working_directory", "exit 1"], (
+            "cd has no working directory on the agent port, got %r for %r"
+            % (lines, command))
+
+
 def scenario_unknown_command(server):
     for command in (
         "payload run helloworld",
@@ -2079,6 +2119,8 @@ SCENARIOS = [
      scenario_auth_deadline, True),
     ("a line over 1 KiB closes the connection", scenario_line_limit, False),
     ("wrong token closes with exit 70", scenario_wrong_token, False),
+    ("pwd and ls run on the agent port and cd answers an error",
+     scenario_shell_commands, False),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, False),
     ("the agent port opens no system change outside the gate and the "
