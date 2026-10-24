@@ -32,6 +32,17 @@ import quickstart
 PORT = 2324
 BANNER = "console mode: %s:%d"
 CLOCK_REASON = "needs the test clock"
+CONSOLE_STATE_DIR = "/data/ariel"
+SECRET_FILES = ("token", "approvals", "nonces")
+SECRET_READS = (
+    "cat {p}",
+    "stat {p}",
+    "file {p}",
+    "grep . {p}",
+    "hexdump {p}",
+    "sha256sum {p}",
+    "cmp {p} {p}",
+)
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 STAGED_LINE = re.compile(r"^staged (s-[0-9a-f]+)$")
 APPROVAL_LINE = re.compile(r"^approval_required (a-[0-9a-f]+)$")
@@ -295,6 +306,10 @@ def check_approval_then_install(session, context):
     lines = session.commit(staging)
     assert lines == ["installed consoleapprove %s" % digest, "exit 0"], (
         "an approved commit must install the build, got %r" % lines)
+    lines = session.link.exchange(
+        "sha256sum %s/store/objects/%s" % (CONSOLE_STATE_DIR, digest))
+    assert lines[-1] == "exit 0" and lines[0].split()[0] == digest, (
+        "the installed object must hash to its digest, got %r" % lines)
 
 
 def check_unsigned_commit(session, context):
@@ -340,6 +355,34 @@ def check_approval_status(session, context):
     unknown = session.status("a-0")
     assert unknown == ["unknown_approval", "exit 1"], (
         "an id Ariel never issued must be an error, got %r" % unknown)
+
+
+def check_read_only_relative(session, context):
+    del context
+    for command in ("cat notes.txt", "sha256sum notes.txt", "ls relative"):
+        assert session.link.exchange(command) == ["relative_path", "exit 1"], (
+            "%r must refuse a relative path" % command)
+
+
+def check_read_only_on_console(session, context):
+    del context
+    for command in ("ls /", "stat /", "file /", "df /",
+                    "ls %s" % CONSOLE_STATE_DIR,
+                    "find %s" % CONSOLE_STATE_DIR):
+        lines = session.link.exchange(command)
+        assert lines and lines[-1] == "exit 0", (
+            "%s must exit 0, got %r" % (command, lines))
+
+
+def check_secrets_read_directly(session, context):
+    del context
+    for name in SECRET_FILES:
+        path = "%s/%s" % (CONSOLE_STATE_DIR, name)
+        for template in SECRET_READS:
+            lines = session.link.exchange(template.format(p=path))
+            assert lines == ["protected", "exit 87"], (
+                "%s must answer protected and exit 87, got %r"
+                % (template.format(p=path), lines))
 
 
 def check_quick_start(session, context):
@@ -439,16 +482,27 @@ CHECKS = [
     ("approval status answers pending, granted and consumed without an "
      "approval of its own, and an unknown id is an error",
      check_approval_status),
+    ("a read-only command with a relative path answers relative_path and "
+     "exit 1", check_read_only_relative),
+    ("the read-only commands on the console's root and data directory exit 0",
+     check_read_only_on_console),
+    ("the token, approval state and nonces answer protected and exit 87 when "
+     "read directly on the console", check_secrets_read_directly),
     ("the quick start's 'After Stage 1' section passes against the console",
      check_quick_start),
 ]
+
+
+def skip_reason(clock):
+    """A scenario's clock flag is True for the test clock, or a reason string."""
+    return clock if isinstance(clock, str) else CLOCK_REASON
 
 
 def plan_lines(host, scenarios):
     """The selection console mode makes, without touching the console."""
     lines = [BANNER % (host, PORT)]
     lines += ["run  " + title for title, _check in CHECKS]
-    lines += ["skip %s (%s)" % (title, CLOCK_REASON)
+    lines += ["skip %s (%s)" % (title, skip_reason(clock))
               for title, _check, clock in scenarios if clock]
     lines.append("console mode is not part of CI or of the Stage 1 gate.")
     return lines
@@ -477,10 +531,10 @@ def run(host, scenarios, operator=None, connect=None):
             results.append((title, True, ""))
             print("PASS %s" % title)
 
-    skipped = [title for title, _check, clock in scenarios if clock]
-    print("\nskipped %d scenario(s) that %s:" % (len(skipped), CLOCK_REASON))
-    for title in skipped:
-        print("  %s" % title)
+    skipped = [(title, clock) for title, _check, clock in scenarios if clock]
+    print("\nskipped %d scenario(s):" % len(skipped))
+    for title, clock in skipped:
+        print("  %s (%s)" % (title, skip_reason(clock)))
     return results
 
 

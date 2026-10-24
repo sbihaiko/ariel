@@ -4,7 +4,7 @@ The registry of every `exit <n>` value the agent port answers. A number is assig
 
 `payload run --wait` reports the payload's own status on a `status <n>` line, then `exit 0`. A payload's status never appears on the `exit` line.
 
-A shell command (`pwd`, `ls <absolute path>`, `cd`) writes its output and its error word to the connection and ends with `exit <n>`, where `n` is the command's own status: 0 for success, 1 for an error such as `relative_path` or `no_working_directory`. A connection has no working directory, so every path is absolute and `cd` always fails.
+A shell command (`pwd`, `cd`, or a read-only command that takes a path: `ls`, `stat`, `file`, `cat`, `grep`, `find`, `cmp`, `hexdump`, `df`, `sha256sum`) writes its output and its error word to the connection and ends with `exit <n>`, where `n` is the command's own status: 0 for success, 1 for an error such as `relative_path` or `no_working_directory`. `grep` and `cmp` also exit 1 when nothing matches or the files differ. A connection has no working directory, so every path is absolute and `cd` always fails.
 
 ## Assigned
 
@@ -25,12 +25,7 @@ A shell command (`pwd`, `ls <absolute path>`, `cd`) writes its output and its er
 | 84 | `approval_replayed` | The signature's nonce was already consumed | Push again for a fresh challenge |
 | 85 | `signature_action_mismatch` | The signer signed a different action than this approval | Sign this approval's challenge |
 | 86 | `signature_console_mismatch` | The signer signed for another console | Sign with this console's identity |
+| 87 | `protected` | The command reads one of Ariel's protected objects: the token, the approval state or the consumed nonces, directly, through a symbolic link or through a hard link. Refused even with an approval | Do not retry; these files are Ariel's own |
 | 88 | `approval_expired` | The approval passed its expiry before it was granted or used | Push again |
-
-## Reserved for Stage 2 (#2)
-
-| Exit | Word | Meaning |
-|---|---|---|
-| 87 | `protected` | The command touches one of Ariel's protected objects, a critical process, or a path outside the writable roots. Refused even with an approval |
 
 Free from 89. The `status <n>` line is outside this registry.

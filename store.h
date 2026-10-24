@@ -65,7 +65,8 @@ int store_name_valid(const char *name);
 
 /**
  * Record the state directory and the platform clock, delete the staging
- * objects a previous process left behind and make the store's directories.
+ * objects a previous process left behind, make the store's directories and
+ * create the approval state and nonce files if they are missing.
  * Returns 0 on success, -1 on error.
  **/
 int store_init(const char *state_dir, struct platform *platform);

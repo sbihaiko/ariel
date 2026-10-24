@@ -1,0 +1,34 @@
+/* Ariel: the objects no agent-port command may touch.
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation; either version 3, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; see the file COPYING. If not, see
+<http://www.gnu.org/licenses/>.  */
+
+#ifndef ARIEL_PROTECTED_H
+#define ARIEL_PROTECTED_H
+
+/**
+ * Record Ariel's state directory. The token, the approval state and the
+ * consumed nonces below it are protected. Call once, before any command.
+ **/
+void protected_init(const char *state_dir);
+
+/**
+ * Whether the file behind fd is a protected object. The check compares the
+ * device and inode of the open file, so a symbolic link or a hard link to a
+ * protected file is the same object. Returns 1 when it is, 0 when it is not,
+ * -1 on error.
+ **/
+int protected_object(int fd);
+
+#endif /* ARIEL_PROTECTED_H */

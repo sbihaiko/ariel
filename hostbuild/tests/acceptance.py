@@ -859,7 +859,12 @@ def scenario_notification_rate(server):
 CONSOLE_SENTINEL = "192.0.2.1"
 CONSOLE_BANNER = "console mode: %s:2324"
 PLAN_RUN = "run  "
-PLAN_SKIP = re.compile(r"^skip (\S.*) \(needs the test clock\)$")
+# Scenarios that create files or links under the host test root. Console mode
+# cannot create them, so it runs its own checks of the same commands instead.
+HOST_ROOT_REASON = ("needs files or links in the host test root, which console "
+                    "mode cannot create")
+PLAN_SKIP = re.compile(r"^skip (\S.*) \((needs the test clock|%s)\)$"
+                       % re.escape(HOST_ROOT_REASON))
 
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
@@ -888,6 +893,19 @@ CLOCK_SCENARIOS = {
     "and an expired staged object still answers approval_expired",
     "the challenge names the command, target, hash, size and run of the "
     "approval",
+}
+
+# The read-only scenarios that need the host test root: they write scratch
+# files or links there, and the token, approval state and nonces live there.
+HOST_ROOT_SCENARIOS = {
+    "each read-only command runs with no approval and exits 0 with its output",
+    "sha256sum prints the digest openssl dgst -sha256 prints",
+    "the token, approval state and nonces answer protected and exit 87 when "
+    "read directly",
+    "the token, approval state and nonces answer protected and exit 87 "
+    "through a symbolic link",
+    "the token, approval state and nonces answer protected and exit 87 "
+    "through a hard link",
 }
 
 
@@ -922,11 +940,12 @@ def scenario_console_mode_plan(server):
         assert match, "a skipped scenario must name its reason: %r" % line
         skipped.append(match.group(1))
 
-    assert set(skipped) == CLOCK_SCENARIOS, (
+    expected_skips = CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS
+    assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
-        "clock:\nmissing %r\nunexpected %r"
-        % (sorted(CLOCK_SCENARIOS - set(skipped)),
-           sorted(set(skipped) - CLOCK_SCENARIOS)))
+        "clock or the host test root:\nmissing %r\nunexpected %r"
+        % (sorted(expected_skips - set(skipped)),
+           sorted(set(skipped) - expected_skips)))
     assert run, "console mode must run its scenarios against the console"
     assert not set(run) & set(skipped), (
         "a scenario cannot be both run and skipped: %r"
@@ -1741,6 +1760,147 @@ def scenario_cd_is_an_error(server):
         assert lines == ["no_working_directory", "exit 1"], (
             "%r must answer no_working_directory, got %r" % (command, lines)
         )
+
+
+# Every command that opens a secret's contents or its metadata. ls, find and df
+# only list names or space, so they are not protected reads.
+SECRET_NAMES = ("token", "approvals", "nonces")
+SECRET_READS = (
+    "cat {p}",
+    "stat {p}",
+    "file {p}",
+    "grep . {p}",
+    "hexdump {p}",
+    "sha256sum {p}",
+    "cmp {p} {p}",
+)
+
+
+def scratch_dir(server):
+    path = os.path.join(server.root, "readonly")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def write_scratch(server, name, data):
+    path = os.path.join(scratch_dir(server), name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def secret_path(server, name):
+    path = os.path.join(server.root, "data", "ariel", name)
+    assert os.path.exists(path), (
+        "Ariel must keep its %s file at %s" % (name, path))
+    return path
+
+
+def make_link(path, target, hard):
+    if os.path.lexists(path):
+        os.unlink(path)
+    if hard:
+        os.link(target, path)
+    else:
+        os.symlink(target, path)
+
+
+def run_exit_zero(server, command):
+    """The output lines of a command that must exit 0, without the exit line."""
+    lines = run_command(server, command)
+    assert lines and lines[-1] == "exit 0", (
+        "%s must exit 0, got %r" % (command, lines))
+    return lines[:-1]
+
+
+def assert_protected(server, command):
+    lines = run_command(server, command)
+    assert lines == ["protected", "exit 87"], (
+        "%s must answer protected and exit 87, got %r" % (command, lines))
+
+
+def scenario_read_only_commands(server):
+    """Each read-only command runs with no approval and exits 0 with its output."""
+    notes = write_scratch(server, "notes.txt", b"hello\nworld\n")
+    copy = write_scratch(server, "copy.txt", b"hello\nworld\n")
+    differ = write_scratch(server, "differ.txt", b"hello\nWorld\n")
+    folder = scratch_dir(server)
+
+    assert "notes.txt" in run_exit_zero(server, "ls " + folder), (
+        "ls must list notes.txt")
+    assert run_exit_zero(server, "stat " + notes), "stat must describe the file"
+    assert run_exit_zero(server, "file " + notes), "file must name the type"
+    assert run_exit_zero(server, "cat " + notes) == ["hello", "world"], (
+        "cat must print the file's lines")
+    assert run_exit_zero(server, "grep world " + notes) == ["world"], (
+        "grep must print the matching line")
+    lines = run_command(server, "grep absent " + notes)
+    assert lines == ["exit 1"], (
+        "grep with no match must exit 1 and print nothing, got %r" % lines)
+    found = set(run_exit_zero(server, "find " + folder))
+    assert {folder, notes, copy} <= found, (
+        "find must list the directory and its files, got %r" % sorted(found))
+    assert run_exit_zero(server, "cmp %s %s" % (notes, copy)) == [], (
+        "cmp of equal files must print nothing")
+    lines = run_command(server, "cmp %s %s" % (notes, differ))
+    assert lines[-1] == "exit 1", (
+        "cmp of different files must exit 1, got %r" % lines)
+    assert any("68 65 6c 6c 6f" in line
+               for line in run_exit_zero(server, "hexdump " + notes)), (
+        "hexdump must show the bytes of hello")
+    assert run_exit_zero(server, "df " + folder), "df must describe the space"
+
+
+def scenario_read_only_relative_paths(server):
+    """A connection has no working directory, so every path must be absolute."""
+    for command in ("cat notes.txt", "stat notes.txt", "file notes.txt",
+                    "grep world notes.txt", "find notes.txt",
+                    "cmp a.txt b.txt", "hexdump notes.txt", "df notes.txt",
+                    "sha256sum notes.txt"):
+        lines = run_command(server, command)
+        assert lines == ["relative_path", "exit 1"], (
+            "%r must refuse a relative path, got %r" % (command, lines))
+
+
+def scenario_sha256sum_matches_openssl(server):
+    """sha256sum prints the digest that openssl dgst -sha256 prints on the host."""
+    data = bytes(range(256)) * 300
+    path = write_scratch(server, "digest.bin", data)
+    lines = run_exit_zero(server, "sha256sum " + path)
+    assert lines, "sha256sum must print a digest line"
+    digest = lines[0].split()[0]
+    done = subprocess.run(["openssl", "dgst", "-sha256", path],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, "openssl dgst failed: %s" % done.stderr
+    expected = done.stdout.strip().rsplit("= ", 1)[-1]
+    assert digest == expected, (
+        "sha256sum must match openssl dgst -sha256: got %s, want %s"
+        % (digest, expected))
+
+
+def scenario_secrets_read_directly(server):
+    for name in SECRET_NAMES:
+        path = secret_path(server, name)
+        for template in SECRET_READS:
+            assert_protected(server, template.format(p=path))
+
+
+def scenario_secrets_read_through_symlink(server):
+    for name in SECRET_NAMES:
+        target = secret_path(server, name)
+        link = os.path.join(scratch_dir(server), "link-" + name)
+        make_link(link, target, hard=False)
+        for template in SECRET_READS:
+            assert_protected(server, template.format(p=link))
+
+
+def scenario_secrets_read_through_hard_link(server):
+    for name in SECRET_NAMES:
+        target = secret_path(server, name)
+        link = os.path.join(scratch_dir(server), "hard-" + name)
+        make_link(link, target, hard=True)
+        for template in SECRET_READS:
+            assert_protected(server, template.format(p=link))
 
 
 def scenario_no_system_change_on_agent_port(server):
@@ -2584,6 +2744,20 @@ SCENARIOS = [
      scenario_pwd_and_ls, False),
     ("cd on the agent port answers an error: no working directory",
      scenario_cd_is_an_error, False),
+    ("each read-only command runs with no approval and exits 0 with its output",
+     scenario_read_only_commands, HOST_ROOT_REASON),
+    ("a read-only command refuses a relative path",
+     scenario_read_only_relative_paths, False),
+    ("sha256sum prints the digest openssl dgst -sha256 prints",
+     scenario_sha256sum_matches_openssl, HOST_ROOT_REASON),
+    ("the token, approval state and nonces answer protected and exit 87 when "
+     "read directly", scenario_secrets_read_directly, HOST_ROOT_REASON),
+    ("the token, approval state and nonces answer protected and exit 87 "
+     "through a symbolic link", scenario_secrets_read_through_symlink,
+     HOST_ROOT_REASON),
+    ("the token, approval state and nonces answer protected and exit 87 "
+     "through a hard link", scenario_secrets_read_through_hard_link,
+     HOST_ROOT_REASON),
     ("two connections are served at the same time",
      scenario_two_connections, False),
     ("a fifth concurrent connection answers busy and exit 82",

@@ -33,6 +33,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "approval.h"
+#include "protected.h"
 #include "sha256.h"
 #include "store.h"
 #include "ps5_at.h"
@@ -305,6 +306,21 @@ open_entry(int dirfd, const char *name, int flags) {
 }
 
 
+/**
+ * Make an empty file below dirfd if none exists, so the protected-object
+ * check has an inode to compare. An existing file is kept as it is.
+ **/
+static int
+file_make(int dirfd, const char *name) {
+  int fd = open_entry(dirfd, name, O_WRONLY | O_CREAT);
+
+  if(fd < 0) {
+    return -1;
+  }
+  return close(fd);
+}
+
+
 int
 store_init(const char *dir, platform_t *p) {
   pthread_t thread;
@@ -315,6 +331,7 @@ store_init(const char *dir, platform_t *p) {
 
   pthread_mutex_lock(&lock);
   snprintf(state_dir, sizeof(state_dir), "%s", dir);
+  protected_init(dir);
   platform = p;
   staging_bytes = 0;
   notified = 0;
@@ -334,6 +351,11 @@ store_init(const char *dir, platform_t *p) {
   // A nonce consumed before this start must stay consumed: an unreadable
   // record is an error, never an empty one.
   if(nonces_load()) {
+    close(state_fd);
+    return -1;
+  }
+
+  if(file_make(state_fd, "approvals") || file_make(state_fd, "nonces")) {
     close(state_fd);
     return -1;
   }
