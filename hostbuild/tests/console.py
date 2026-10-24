@@ -362,6 +362,17 @@ def check_bad_name(session, context):
         "a name outside the grammar must answer bad_name and exit 1")
 
 
+def check_install_bad_name_is_audited(session, context):
+    del context
+    assert session.link.exchange("payload install ../x owner/app app.elf") == [
+        "bad_name", "exit 1"], "an install with a bad name must answer bad_name"
+    events = [line.split() for line in session.link.exchange("audit tail")
+              if line != "exit 0"]
+    assert any(event[1:4] == ["payload.install.refused", "-", "bad_name"]
+               for event in events), (
+        "a refused install must reach audit tail, got %r" % events)
+
+
 def check_approval_then_install(session, context):
     del context
     data = b"console approval\n"
@@ -858,6 +869,8 @@ CHECKS = [
     ("a hash mismatch answers upload_mismatch and exit 81",
      check_hash_mismatch),
     ("a name outside the grammar answers bad_name", check_bad_name),
+    ("an install with a name outside the grammar answers bad_name and is "
+     "audited", check_install_bad_name_is_audited),
     ("a commit before the decision answers approval_required and exit 75, the "
      "owner signs the challenge, and the commit installs the build",
      check_approval_then_install),

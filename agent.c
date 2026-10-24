@@ -1849,7 +1849,7 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
   int rc;
 
   if(!store_name_valid(name)) {
-    reply(fd, bad_name);
+    install_refuse(fd, name, "bad_name");
     return;
   }
 
@@ -1989,7 +1989,8 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
 
     if(platform->approval_request(platform, &facts, &challenge)) {
       store_staging_discard(staging_id);
-      reply(fd, approval_busy);
+      audit_reply(fd, "payload", "install.refused", name, "approval_busy",
+                  approval_busy);
       goto out;
     }
 
@@ -2050,14 +2051,17 @@ payload_commit(agent_t *agent, int fd, const char *staging_id) {
     reply(fd, answer);
     return;
   case STORE_APPROVAL_DENIED:
-    reply(fd, approval_denied);
+    audit_reply(fd, "payload", "commit.denied", install.name, staging_id,
+                approval_denied);
     return;
   case STORE_APPROVAL_EXPIRED:
-    reply(fd, approval_expired);
+    audit_reply(fd, "payload", "commit.expired", install.name, staging_id,
+                approval_expired);
     return;
   default:
     // An approval that is gone is not an approval: push the build again.
-    reply(fd, approval_stale);
+    audit_reply(fd, "payload", "commit.stale", install.name, staging_id,
+                approval_stale);
     return;
   }
 }

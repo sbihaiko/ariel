@@ -7468,6 +7468,150 @@ def scenario_install_tag_not_on_the_server_is_refused_and_audited(_server):
     with_install(healthy_build(INSTALL_NAME), run)
 
 
+# An unpinned install's signed action (SPEC 2, #44): the release facts, the
+# hash, and the two facts the approval grants, that the hash will be pinned
+# and that the payload joins autoload.
+def install_action_facts(data):
+    return [
+        "command=payload.install\n",
+        "target=%s\n" % INSTALL_REPO,
+        "sha256=%s\n" % hashlib.sha256(data).hexdigest(),
+        "option.asset=%d\n" % ASSET_ID,
+        "option.autoload=yes\n",
+        "option.name=%s\n" % INSTALL_NAME,
+        "option.pinned=yes\n",
+        "option.release=%d\n" % RELEASE_ID,
+        "option.tag=%s\n" % INSTALL_TAG,
+    ]
+
+
+def scenario_unknown_hash_asks_with_release_facts(_server):
+    """An unpinned release answers 75, and its challenge carries every release fact."""
+    data = healthy_build(INSTALL_NAME)
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert_staged(fx.server, lines, INSTALL_NAME, data)
+        action = challenge_action(challenge_of(lines))
+        for fact in install_action_facts(data):
+            assert fact in action, (
+                "the challenge must carry %r, got %r" % (fact, action))
+    with_install(data, run, allowlist="default")
+
+
+def scenario_signature_over_a_challenge_missing_a_fact_is_refused(_server):
+    """A signature over an action without one of its facts is refused, and nothing installs."""
+    data = healthy_build(INSTALL_NAME)
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        staging, approval = assert_staged(fx.server, lines, INSTALL_NAME, data)
+        challenge = challenge_of(lines)
+        for fact in install_action_facts(data):
+            signature = sign_challenge(fx.server, retarget(challenge, fact, ""))
+            assert grant(fx.server, approval, signature) == [
+                "signature_action_mismatch", "exit 85"], (
+                "a signature over an action without %r must be refused" % fact)
+            assert grant(fx.server, approval, signature_of(signature)) == [
+                "signature_invalid", "exit 79"], (
+                "a bare signature over an action without %r must be refused"
+                % fact)
+        assert commit(fx.server, staging) == [
+            "approval_required %s" % approval, "exit 75"], (
+            "refused grants must leave the approval pending")
+        assert listed(payload_list(fx.server), INSTALL_NAME) is None, (
+            "a refused grant must install nothing")
+
+        sign_and_grant(fx.server, approval, challenge)
+        digest = hashlib.sha256(data).hexdigest()
+        assert commit(fx.server, staging) == [
+            "installed %s %s" % (INSTALL_NAME, digest), "exit 0"], (
+            "the full challenge, once signed, must still install")
+    with_install(data, run, allowlist="default")
+
+
+def scenario_granted_install_pins_and_the_next_needs_no_approval(_server):
+    data = healthy_build(INSTALL_NAME)
+    digest = hashlib.sha256(data).hexdigest()
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        staging, approval = assert_staged(fx.server, lines, INSTALL_NAME, data)
+        sign_and_grant(fx.server, approval, challenge_of(lines))
+        assert commit(fx.server, staging) == [
+            "installed %s %s" % (INSTALL_NAME, digest), "exit 0"]
+        again = install_request(fx.server, INSTALL_NAME)
+        assert again == ["installed %s %s" % (INSTALL_NAME, digest), "exit 0"], (
+            "the pinned hash must install at once, got %r" % again)
+        events = [event[0] for event in audit_events(fx.server)]
+        for kind in ("payload.install.staged", "grant", "payload.install.done"):
+            assert kind in events, "%s must reach audit tail, got %r" % (kind, events)
+    with_install(data, run, allowlist="default")
+
+
+def scenario_commit_after_its_pin_moved_answers_78(_server):
+    """Two unpinned builds of one name wait; once the first is pinned, the second's approval is stale."""
+    first = healthy_build(INSTALL_NAME)
+    second = healthy_build("second-build")
+    first_digest = hashlib.sha256(first).hexdigest()
+
+    def run(fx):
+        lines_one = install_request(fx.server, INSTALL_NAME)
+        staging_one, approval_one = assert_staged(
+            fx.server, lines_one, INSTALL_NAME, first)
+        fx.fake.data = second
+        lines_two = install_request(fx.server, INSTALL_NAME)
+        staging_two, approval_two = assert_staged(
+            fx.server, lines_two, INSTALL_NAME, second)
+
+        sign_and_grant(fx.server, approval_one, challenge_of(lines_one))
+        assert commit(fx.server, staging_one) == [
+            "installed %s %s" % (INSTALL_NAME, first_digest), "exit 0"]
+
+        sign_and_grant(fx.server, approval_two, challenge_of(lines_two))
+        assert commit(fx.server, staging_two) == ["approval_stale", "exit 78"], (
+            "a build whose hash can no longer be pinned must answer approval_stale")
+        assert commit(fx.server, staging_two) == ["approval_stale", "exit 78"], (
+            "the refused object must have left the console")
+
+        listing = listed(payload_list(fx.server), INSTALL_NAME)
+        assert listing is not None and "sha256=%s" % first_digest in listing, (
+            "the refused build must not become current, got %r" % listing)
+        events = audit_events(fx.server)
+        assert any(event[0] == "payload.commit.stale" for event in events), (
+            "a stale commit must reach audit tail, got %r" % events)
+    with_install(first, run, allowlist="default")
+
+
+def scenario_install_bad_name_is_refused_and_audited(_server):
+    def run(fx):
+        lines = send_command(fx.server, "payload install ../escape %s %s"
+                             % (INSTALL_REPO, INSTALL_ASSET))
+        assert lines == ["bad_name", "exit 1"], lines
+        events = [event[0] for event in audit_events(fx.server)]
+        assert "payload.install.refused" in events, (
+            "a refused install must reach audit tail, got %r" % events)
+    with_install(healthy_build(INSTALL_NAME), run)
+
+
+def scenario_install_refused_while_approvals_are_full_is_audited(_server):
+    data = healthy_build(INSTALL_NAME)
+
+    def run(fx):
+        fx.server.fresh()
+        for i in range(3):
+            name = "pinstall%d" % i
+            pending = b"pending install %d" % i
+            assert_staged(fx.server, push(fx.server, name, pending), name, pending)
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["approval_busy", "exit 76"], lines
+        events = audit_events(fx.server)
+        assert any(event[:2] == ("payload.install.refused", INSTALL_NAME)
+                   for event in events), (
+            "a refused install must reach audit tail, got %r" % events)
+    with_install(data, run, allowlist="default")
+
+
 INSTALL_SCENARIOS = [
     ("install refuses a host outside the allowlist",
      scenario_install_refused_outside_the_allowlist_host, RELEASE_FIXTURE_REASON),
@@ -7515,6 +7659,18 @@ INSTALL_SCENARIOS = [
     ("a tag the server does not name is refused and audited",
      scenario_install_tag_not_on_the_server_is_refused_and_audited,
      RELEASE_FIXTURE_REASON),
+    ("an unknown hash answers 75 with the release facts in the challenge",
+     scenario_unknown_hash_asks_with_release_facts, RELEASE_FIXTURE_REASON),
+    ("a signature over a challenge missing a fact is refused",
+     scenario_signature_over_a_challenge_missing_a_fact_is_refused, RELEASE_FIXTURE_REASON),
+    ("a granted install pins, and the next install needs no approval",
+     scenario_granted_install_pins_and_the_next_needs_no_approval, RELEASE_FIXTURE_REASON),
+    ("a commit after its pin moved answers approval_stale, 78",
+     scenario_commit_after_its_pin_moved_answers_78, RELEASE_FIXTURE_REASON),
+    ("an install refused for its name is audited",
+     scenario_install_bad_name_is_refused_and_audited, RELEASE_FIXTURE_REASON),
+    ("an install refused while approvals are full is audited",
+     scenario_install_refused_while_approvals_are_full_is_audited, RELEASE_FIXTURE_REASON),
 ]
 
 RELEASE_SCENARIOS = {title for title, _check, _reason in INSTALL_SCENARIOS}

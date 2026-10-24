@@ -907,7 +907,11 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     options[2].value = text[0];
     options[3].key = "asset";
     options[3].value = text[1];
-    action->noptions = 4;
+    options[4].key = "pinned";
+    options[4].value = "yes";
+    options[5].key = "autoload";
+    options[5].value = "yes";
+    action->noptions = 6;
   } else if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
@@ -2327,9 +2331,42 @@ out:
   return rc;
 }
 
+/**
+ * Whether the allowlist pins name to a hash other than sha256 now. An allowlist
+ * that cannot be read counts as a conflict: the pin cannot be shown unchanged.
+ **/
+static int
+pin_conflicts(const char *name, const char *sha256) {
+  allowlist_t *list;
+  char *text;
+  const char *pinned;
+  int conflict = 1;
+
+  text = calloc(1, ALLOWLIST_TEXT_MAX);
+  list = calloc(1, sizeof(*list));
+  if(!text || !list) {
+    goto out;
+  }
+
+  if(store_allowlist_read(text, ALLOWLIST_TEXT_MAX) ||
+     allowlist_parse(text, list)) {
+    goto out;
+  }
+
+  pinned = allowlist_pin(list, name);
+  conflict = pinned && strcmp(pinned, sha256) ? 1 : 0;
+
+out:
+  free(text);
+  free(list);
+  return conflict;
+}
+
+
 static void
 install_provenance(const approval_facts_t *facts,
                     store_install_t *install) {
+  snprintf(install->name, sizeof(install->name), "%s", facts->name);
   snprintf(install->tag, sizeof(install->tag), "%s", facts->tag);
   install->release = facts->release;
   install->asset = facts->asset;
@@ -2371,7 +2408,13 @@ store_commit(const char *staging_id, store_install_t *install,
     outcome = STORE_APPROVAL_DENIED;
   } else {
     install_provenance(&entry->facts, install);
-    outcome = staged_install(entry, request, install);
+    if(pin_conflicts(entry->facts.name, entry->facts.sha256)) {
+      // Another build of this name was pinned after the owner was asked.
+      staged_leave(entry);
+      outcome = STORE_APPROVAL_STALE;
+    } else {
+      outcome = staged_install(entry, request, install);
+    }
   }
 
   pthread_mutex_unlock(&lock);
