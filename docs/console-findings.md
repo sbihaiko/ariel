@@ -201,6 +201,27 @@ The audit log recorded `key_revoke` and `key_unfreeze` with their approval IDs, 
 
 The keyring copy and the test folders were removed from `/data` after the run. The console's primary is now P3.
 
+## Issue #61, #64 and #49: Stage 3 on the console
+
+Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014), with the `dev` build at `03eef1c`, deployed by sending `shsrv-ps5.elf` to the loader on 9021. Each gated command was asked on the agent port, signed with the keyring's current primary (generation 2, `owner3.key`) and granted; nothing was signed by hand.
+
+| What ran | Console reply |
+| --- | --- |
+| `read /data/prosperoeden/config/prosperoeden.json` | `bytes <size> <sha256>` naming the file's size and the hash of the same bytes `cat` returns, then the bytes, `exit 0` |
+| `read … --offset 12 --limit 24` | the range's 24 bytes and the whole file's hash, `exit 0` |
+| `read … --offset <size>` and `--offset <size+1>` | `bytes 0 <sha256>` with exit 0, and `bad_range` with exit 1 |
+| `mkdir`, `touch`, `cp -r`, `rm -r` of a throwaway tree | 75 with a challenge, then `exit 0` once, for each |
+| `sfocreate -i APP_VER=1 -s32 TITLE=Hello …` | 75, then `exit 0`; `sfoinfo` read back `APP_VER(0x00000001)` and `TITLE('Hello')` |
+| `rm` of the SFO | 75, then `exit 0`; `stat` then answered `no_such_file` |
+
+Three things the console taught that the host build cannot:
+
+- **A payload built without the anchor pinned refuses everything gated.** `make` with `ARIEL_PUBKEY` and `ARIEL_RECOVERY_PUBKEY` empty produces a binary that answers `key_refused` (exit 1) to `mkdir`, to `cp -r` and even to `key status`, because the keyring's generation chain does not verify against the build's anchor. Fail-closed as #48 designed it, and the reason a console build must be made with both keys: `make ARIEL_PUBKEY=<owner primary> ARIEL_RECOVERY_PUBKEY=<recovery> all`.
+- **`ariel-sign` must be built from the branch under test.** The signer on `master` answers `not a challenge line` to a challenge from `dev`, whose line carries a generation field the older parser does not read. Signing with the wrong binary fails before a signature is made, not after, which is the good failure.
+- **One notification at a time.** A second gated command inside the 10 s notification window answers `approval_busy` (76) and asks nothing; the client retries. The driver that ran these checks waits 11 s and tries again.
+
+One more, from the deploy rather than the commands: sending the ELF with a plain `nc` that closed early crashed the console into a reboot, and the payloads that had been running did not come back (only the loader did). The working shape is to send every byte, shut the writing side, and read until the peer closes.
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.

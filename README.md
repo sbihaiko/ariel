@@ -29,7 +29,7 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 |---|---|---|
 | 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.20: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
 | 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done. 37 sub-issues closed; console suite 36/36 on firmware 11.20, with the key hierarchy exercised on the console ([#46](https://github.com/sbihaiko/ariel/issues/46), [#48](https://github.com/sbihaiko/ariel/issues/48)). |
-| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | In progress. The line grammar of [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md) is in: one parser, quotes, escaped canonical actions and the 60 s connection deadline ([#59](https://github.com/sbihaiko/ariel/issues/59), `02e9f0e`); `--json` on `ps`, `ls`, `stat`, `df` and `find` ([#63](https://github.com/sbihaiko/ariel/issues/63), `cd62866`); the bounded readers, the 64 KiB cut and the `truncated` marker ([#60](https://github.com/sbihaiko/ariel/issues/60), `c0080ba`); and the diagnostics `date`, `du`, `dmesg` and `sysinfo`, with `--json` on `sysinfo` ([#65](https://github.com/sbihaiko/ariel/issues/65), `457da97`). The optional `diff` and the network diagnostics were not built. The remaining flags and `timeout` follow. |
+| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done on `dev`. All nine sub-issues closed: the grammar [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md) ([#58](https://github.com/sbihaiko/ariel/issues/58), `8e87996`); one parser, quotes, escaped canonical actions and the 60 s connection deadline ([#59](https://github.com/sbihaiko/ariel/issues/59), `02e9f0e`); the bounded readers and the `truncated` marker ([#60](https://github.com/sbihaiko/ariel/issues/60), `cadf9ec`); the binary `read` ([#61](https://github.com/sbihaiko/ariel/issues/61), `641f2f9`); the gated `write` ([#62](https://github.com/sbihaiko/ariel/issues/62), `9c2380e`); `--json` on `ps`, `ls`, `stat`, `df` and `find` ([#63](https://github.com/sbihaiko/ariel/issues/63), `cd62866`); the missing flags on `ls`, `grep`, `find`, `rm` and `cp` ([#64](https://github.com/sbihaiko/ariel/issues/64), `03eef1c`); the diagnostics `date`, `du`, `dmesg` and `sysinfo` ([#65](https://github.com/sbihaiko/ariel/issues/65), `e99af35`); and `sfocreate` under the gate ([#49](https://github.com/sbihaiko/ariel/issues/49), `5afbb06`). The optional `diff` and the network diagnostics were not built. |
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | Not started. |
 | 5. Sessions (optional) | | Not started. |
 | 6. MCP (optional) | | Not started. |
@@ -46,6 +46,17 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 - ✅ The owner's key hierarchy: a primary and an offline recovery key pinned as the anchor, a keyring with a generation, `key rotate` and `key rotate-recovery`, crash-safe ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)).
 - ✅ Freezing the console when a key leaks ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a compromised lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)).
 - ✅ Validation on a real PS5 ([#46](https://github.com/sbihaiko/ariel/issues/46)): the telnet boundary check passed, and the console suite passes 36/36. The key run on 2026-10-24 rotated, revoked, froze, unfroze, started without the keyring and restored it; it is recorded in [docs/console-findings.md](docs/console-findings.md).
+
+**Stage 3, complete on `dev`:**
+
+- ✅ One grammar for every command: the tokenizer that refuses `bad_quoting` and a line over 64 tokens, the escaped canonical action the owner signs, one `bad_option` for a word a command does not take, and the 60 s connection deadline that answers `timed_out`.
+- ✅ One output frame and one cap: no answer carries more than 64 KiB, a cut one ends with `truncated <shown> of <total>`, and `read` is the binary frame — `bytes <size> <sha256>`, then exactly that many bytes.
+- ✅ An error channel of its own and an exit status the agent can branch on (`docs/exit-codes.md`).
+- ✅ Optional JSON: `ps`, `ls`, `stat`, `df`, `find` and `sysinfo` answer one object per line (`docs/json-output.md`).
+- ✅ No pipes and no redirection: `grep -r -l -c -e`, `--limit` everywhere a listing can flood, `head`, `tail`, `wc`, and `ls -l -a`, `find -name -type`.
+- ✅ `write` and `sfocreate` run only after the owner signs, and the two recursive file commands, `cp -r` and `rm -r`, are gated like every other file command.
+- ✅ Diagnostics: `date`, `dmesg`, `du` and `sysinfo`, and no separate `timeout` — the connection deadline is the timeout.
+- ✅ 356 host scenarios, and the console evidence for this stage (read ranges, `cp -r`/`rm -r`, `sfocreate`/`sfoinfo`) is recorded in [docs/console-findings.md](docs/console-findings.md).
 
 ## Goals
 
@@ -156,19 +167,20 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
 | `pwd`, `cd` | | ✅ | S5: working directory kept across connections with sessions |
-| `ls` | | ⚠️ `--json` only | S3: `-l`, `-a`, pagination |
+| `ls` | | ⚠️ no `-l` or `-a` | S3: `-l`, `-a`, `--limit` and `--json`, cut at 64 KiB |
 | `stat`, `file` | | ✅ | |
-| `cat` | | ✅ | |
+| `cat` | | ✅ | S3: `--limit`, and a file over 64 KiB is cut |
+| `read <path>` | `dd`, `head -c` | ❌ | S3: the binary frame of ADR-0012, `bytes <size> <sha256>`, with `--offset` and `--limit` |
 | `head`, `tail`, `wc` | | ✅ | |
-| `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c` |
-| `find` | | ⚠️ only `-name`, `-type` | S3: more predicates |
+| `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c`, `-e`, `--`, `--limit` |
+| `find` | | ⚠️ only `-name`, `-type` | S3: `-name`, `-type f\|d\|l`, `--limit`, `--json` |
 | `cmp`, `hexdump` | | ✅ | |
 | `diff` | | ❌ | S3, optional; not built |
 | `df` | | ✅ | |
 | `du` | | ✅ | |
 | `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S2: gated |
-| `cp`, `mv` | | ⚠️ no `-r` | S2: gated. S3: `-r` |
-| `rm` | | ⚠️ one file, no `-r` | S2: gated. S3: `-r` |
+| `cp`, `mv` | | ⚠️ no `-r` | S2: gated. S3: `cp -r`, which asks once for the whole tree |
+| `rm` | | ⚠️ one file, no `-r` | S2: gated. S3: `rm -r`, which asks once for the whole tree |
 | `chmod`, `chown`, `chgrp` | | ✅ | S2: gated |
 | `write <path>` | `echo > file`, `tee` | ✅ | S3: gated, one frame |
 | `tar`, `unzip` | | ❌ | S2 |
@@ -177,7 +189,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `kill` | | ✅ | S2: gated, critical processes protected |
 | `payload run` | `cmd &`, `nohup` | ❌ | S1: `--wait` runs an approved build in the foreground. S2: background runs with a log |
 | `payload push`, `payload commit` | `scp`, `curl -T` | ❌ | S1, hash approved by the owner |
-| `timeout` | | ❌ | S3 |
+| `timeout` | | ❌ | Not built: the 60 s connection deadline answers `timed_out` instead |
 | `sleep`, `id`, `sync` | | ✅ | |
 | `env`, `export`, `exec` | | ✅ | S2: gated |
 | `sysinfo` | `uname`, `uptime`, `free` | ✅ | |
