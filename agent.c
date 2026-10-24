@@ -14,6 +14,7 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -204,6 +205,15 @@ static const char value_too_long[] =
 static pthread_mutex_t environ_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char bad_argument[] =
   "bad_argument\n"
+  "exit 1\n";
+static const char bad_option[] =
+  "bad_option\n"
+  "exit 1\n";
+static const char too_large[] =
+  "too_large\n"
+  "exit 1\n";
+static const char operation_failed[] =
+  "operation_failed\n"
   "exit 1\n";
 
 /** The signals kill accepts, by the name the owner reads. **/
@@ -3604,19 +3614,19 @@ autoload_show(int fd) {
 
 
 /**
- * Copy a built-in's arguments from argv[first] on into facts, as the text the
- * owner reads. Returns -1 when there are more than the action can name, or
- * one is longer than an option value, and -2 when one carries a byte outside
- * printable ASCII.
+ * Copy argv[first] to argv[last - 1] into facts, as the text the owner reads.
+ * Returns -1 when there are more than the action can name, or one is longer
+ * than an option value, and -2 when one carries a byte outside printable
+ * ASCII.
  **/
 static int
-builtin_args(int argc, char *argv[], int first, approval_facts_t *facts) {
+builtin_bind(int first, int last, char *argv[], approval_facts_t *facts) {
   int i;
 
-  if(argc - first > BUILTIN_ARGS_MAX) {
+  if(last - first > BUILTIN_ARGS_MAX) {
     return -1;
   }
-  for(i=first; i<argc; i++) {
+  for(i=first; i<last; i++) {
     if(strlen(argv[i]) > APPROVAL_VALUE_MAX) {
       return -1;
     }
@@ -3626,6 +3636,352 @@ builtin_args(int argc, char *argv[], int first, approval_facts_t *facts) {
     snprintf(facts->arg[i - first], sizeof(facts->arg[0]), "%s", argv[i]);
   }
   return 0;
+}
+
+
+/**
+ * Copy a built-in's arguments from argv[first] on into facts, as the text the
+ * owner reads. Returns -1 when there are more than the action can name, or
+ * one is longer than an option value, and -2 when one carries a byte outside
+ * printable ASCII.
+ **/
+static int
+builtin_args(int argc, char *argv[], int first, approval_facts_t *facts) {
+  return builtin_bind(first, argc, argv, facts);
+}
+
+
+/** A key-value pair of an sfocreate output, built before the owner is asked. **/
+typedef struct sfocreate_item {
+  char *key;
+  unsigned char *val;
+  uint32_t type;
+  uint32_t val_len;
+  uint32_t val_size;
+} sfocreate_item_t;
+
+
+/** A PARAM.SFO is small; an output past this is refused. **/
+#define SFOCREATE_MAX_SIZE (1024UL * 1024)
+#define SFOCREATE_HEADER   20
+#define SFOCREATE_ENTRY    16
+#define SFOCREATE_TYPE_STR 2
+#define SFOCREATE_TYPE_INT 4
+#define SFOCREATE_MAGIC    0x46535000u
+#define SFOCREATE_VERSION  0x00000101u
+
+
+static void
+put_le16(unsigned char *p, uint16_t value) {
+  p[0] = (unsigned char)(value & 0xff);
+  p[1] = (unsigned char)((value >> 8) & 0xff);
+}
+
+
+static void
+put_le32(unsigned char *p, uint32_t value) {
+  p[0] = (unsigned char)(value & 0xff);
+  p[1] = (unsigned char)((value >> 8) & 0xff);
+  p[2] = (unsigned char)((value >> 16) & 0xff);
+  p[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
+
+static void
+sfocreate_free(sfocreate_item_t *items, int count) {
+  int i;
+
+  for(i=0; i<count; i++) {
+    free(items[i].key);
+    free(items[i].val);
+  }
+}
+
+
+/**
+ * Parse one KEY=VALUE operand. An integer is four little-endian bytes; a
+ * string is size bytes zero-filled, its NUL included when it fits. Returns 0,
+ * or -1 when the pair has no key or no usable value.
+ **/
+static int
+sfocreate_item_parse(const char *text, uint32_t type, uint32_t size,
+                     sfocreate_item_t *item) {
+  const char *delim = strchr(text, '=');
+  const char *value;
+  size_t key_len;
+  size_t text_len;
+
+  if(!delim || delim == text) {
+    return -1;
+  }
+  key_len = (size_t)(delim - text);
+  value = delim + 1;
+
+  item->key = malloc(key_len + 1);
+  if(!item->key) {
+    return -1;
+  }
+  memcpy(item->key, text, key_len);
+  item->key[key_len] = '\0';
+  item->type = type;
+
+  if(type == SFOCREATE_TYPE_INT) {
+    char *end = NULL;
+    long number;
+
+    errno = 0;
+    number = strtol(value, &end, 10);
+    if(errno || end == value || *end ||
+       number < INT32_MIN || number > INT32_MAX) {
+      free(item->key);
+      item->key = NULL;
+      return -1;
+    }
+    item->val = malloc(4);
+    if(!item->val) {
+      free(item->key);
+      item->key = NULL;
+      return -1;
+    }
+    put_le32(item->val, (uint32_t)(int32_t)number);
+    item->val_len = 4;
+    item->val_size = 4;
+    return 0;
+  }
+
+  text_len = strlen(value);
+  item->val = calloc(size, 1);
+  if(!item->val) {
+    free(item->key);
+    item->key = NULL;
+    return -1;
+  }
+  memcpy(item->val, value, text_len < (size_t)size ? text_len : (size_t)size);
+  item->val_size = size;
+  item->val_len = text_len + 1 <= (size_t)size ? (uint32_t)(text_len + 1)
+                                               : size;
+  return 0;
+}
+
+
+/**
+ * Parse the operands before the output path: "-i KEY=VALUE" and
+ * "-sSIZE KEY=VALUE". Returns NULL, or the refusal word to answer.
+ **/
+static const char *
+sfocreate_parse(int argc, char *argv[], sfocreate_item_t *items, int *count) {
+  int i;
+  int n = 0;
+
+  for(i=1; i<argc-1; i++) {
+    sfocreate_item_t *item = &items[n];
+
+    if(!strcmp(argv[i], "-i")) {
+      if(i + 1 >= argc - 1) {
+        *count = n;
+        return bad_argument;
+      }
+      if(sfocreate_item_parse(argv[++i], SFOCREATE_TYPE_INT, 0, item)) {
+        *count = n;
+        return bad_argument;
+      }
+    } else if(!strncmp(argv[i], "-s", 2) && isdigit((unsigned char)argv[i][2])) {
+      char *end = NULL;
+      unsigned long size;
+
+      errno = 0;
+      size = strtoul(argv[i] + 2, &end, 10);
+      if(errno || *end || size == 0) {
+        *count = n;
+        return bad_option;
+      }
+      if(size > SFOCREATE_MAX_SIZE) {
+        *count = n;
+        return too_large;
+      }
+      if(i + 1 >= argc - 1) {
+        *count = n;
+        return bad_argument;
+      }
+      if(sfocreate_item_parse(argv[++i], SFOCREATE_TYPE_STR, (uint32_t)size,
+                              item)) {
+        *count = n;
+        return bad_argument;
+      }
+    } else {
+      *count = n;
+      return bad_option;
+    }
+    n++;
+  }
+  *count = n;
+  return NULL;
+}
+
+
+/**
+ * Lay the pairs out as a PARAM.SFO in bytes the caller frees. The keys are
+ * sorted, as the shell built-in sorts them. Returns 0, -1 when the file would
+ * be too large, or -2 when it cannot be allocated.
+ **/
+static int
+sfocreate_emit(sfocreate_item_t *items, int count, unsigned char **bytes,
+               size_t *size) {
+  uint64_t keys_size = 0;
+  uint64_t data_size = 0;
+  uint64_t keys_offset;
+  uint64_t data_offset;
+  uint64_t total;
+  size_t key_at;
+  size_t data_at;
+  unsigned char *out;
+  int i;
+  int j;
+
+  for(i=1; i<count; i++) {
+    sfocreate_item_t item = items[i];
+
+    for(j=i; j>0 && strcmp(items[j-1].key, item.key) > 0; j--) {
+      items[j] = items[j-1];
+    }
+    items[j] = item;
+  }
+
+  for(i=0; i<count; i++) {
+    keys_size += strlen(items[i].key) + 1;
+    data_size += items[i].val_size;
+  }
+  if(keys_size > UINT16_MAX) {
+    return -1;
+  }
+  total = SFOCREATE_HEADER + (uint64_t)SFOCREATE_ENTRY * (uint64_t)count +
+          keys_size + data_size;
+  if(total > SFOCREATE_MAX_SIZE) {
+    return -1;
+  }
+  out = calloc((size_t)total, 1);
+  if(!out) {
+    return -2;
+  }
+
+  keys_offset = SFOCREATE_HEADER + (uint64_t)SFOCREATE_ENTRY * (uint64_t)count;
+  data_offset = keys_offset + keys_size;
+  put_le32(out, SFOCREATE_MAGIC);
+  put_le32(out + 4, SFOCREATE_VERSION);
+  put_le32(out + 8, (uint32_t)keys_offset);
+  put_le32(out + 12, (uint32_t)data_offset);
+  put_le32(out + 16, (uint32_t)count);
+
+  key_at = (size_t)keys_offset;
+  data_at = (size_t)data_offset;
+  for(i=0; i<count; i++) {
+    unsigned char *entry = out + SFOCREATE_HEADER + (size_t)i * SFOCREATE_ENTRY;
+    size_t key_len = strlen(items[i].key) + 1;
+
+    put_le16(entry, (uint16_t)(key_at - keys_offset));
+    entry[2] = 4;
+    entry[3] = (unsigned char)items[i].type;
+    put_le32(entry + 4, items[i].val_len);
+    put_le32(entry + 8, items[i].val_size);
+    put_le32(entry + 12, (uint32_t)(data_at - data_offset));
+
+    memcpy(out + key_at, items[i].key, key_len);
+    memcpy(out + data_at, items[i].val, items[i].val_size);
+    key_at += key_len;
+    data_at += items[i].val_size;
+  }
+
+  *bytes = out;
+  *size = (size_t)total;
+  return 0;
+}
+
+
+static int
+sfocreate_vet(void *ctx) {
+  const approval_facts_t *facts = ctx;
+
+  return strcmp(facts->kind, "absent") ? FILEOPS_EXISTS : FILEOPS_OK;
+}
+
+
+/**
+ * sfocreate [-i KEY=VALUE] [-sSIZE KEY=VALUE]... PATH: the last operand is
+ * the output path, and every operand before it is bound as text the owner
+ * reads. The file is built before the owner is asked and created
+ * exclusively, so an existing output is never replaced.
+ **/
+static void
+sfocreate_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  const char *root = agent->platform->fs_root;
+  sfocreate_item_t *items;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  unsigned char *bytes = NULL;
+  const char *path;
+  const char *word;
+  size_t size = 0;
+  int count = 0;
+  int arg_error;
+  int rc;
+
+  if(argc < 2) {
+    audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+    return;
+  }
+  path = argv[argc - 1];
+
+  items = calloc((size_t)argc, sizeof(*items));
+  if(!items) {
+    audit_reply(fd, argv[0], "refused", path, "-", operation_failed);
+    return;
+  }
+  word = sfocreate_parse(argc, argv, items, &count);
+  if(!word) {
+    switch(sfocreate_emit(items, count, &bytes, &size)) {
+    case 0:
+      break;
+    case -1:
+      word = too_large;
+      break;
+    default:
+      word = operation_failed;
+      break;
+    }
+  }
+  sfocreate_free(items, count);
+  free(items);
+  if(word) {
+    audit_reply(fd, argv[0], "refused", path, "-", word);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_write_check(root, path, &facts);
+  if(rc != FILEOPS_OK) {
+    free(bytes);
+    file_outcome(fd, argv[0], path, "-", rc);
+    return;
+  }
+
+  arg_error = builtin_bind(1, argc - 1, argv, &facts);
+  if(arg_error) {
+    free(bytes);
+    audit_reply(fd, argv[0], "refused", path, "-",
+                arg_error == -2 ? bad_path : bad_argument);
+    return;
+  }
+  snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
+  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  facts.argc = (uint64_t)argc;
+  if(!gate_pass_with(agent, fd, &facts, &challenge, sfocreate_vet, &facts)) {
+    free(bytes);
+    return;
+  }
+
+  rc = fileops_write_act(root, path, bytes, size);
+  free(bytes);
+  file_outcome(fd, argv[0], path, challenge.id, rc);
 }
 
 
@@ -3872,6 +4228,8 @@ static void
 builtin_command(agent_t *agent, int fd, int argc, char *argv[]) {
   if(!strcmp(argv[0], "reptyr")) {
     reptyr_command(agent, fd, argc, argv);
+  } else if(!strcmp(argv[0], "sfocreate")) {
+    sfocreate_command(agent, fd, argc, argv);
   } else if(!strcmp(argv[0], "pkg_install") || !strcmp(argv[0], "hbldr") ||
             !strcmp(argv[0], "hbdbg")) {
     builtin_file_command(agent, fd, argc, argv);

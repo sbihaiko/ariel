@@ -4819,6 +4819,116 @@ def scenario_write_denied_answers_77(server):
         "audit tail must show the denied write")
 
 
+def sfocreate_path(server, name="PARAM.SFO"):
+    return os.path.join(server.root, "data", name)
+
+
+def sfocreate_line(options, path):
+    """One sfocreate command line: every option, then the output path."""
+    return " ".join(["sfocreate"] + ([options] if options else []) + [path])
+
+
+def sfocreate_request(server, line):
+    """An sfocreate that must ask the owner: 75, a challenge, a prompt."""
+    server.advance(120_000)
+    lines = run_command(server, line)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "sfocreate must answer approval_required and exit 75, got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0])
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert approval and challenge and challenge.group(1) == approval.group(1), (
+        "expected approval_required and a matching challenge, got %r" % lines)
+    prompt = GATE_PROMPT.match(server.next_line() or "")
+    assert prompt and prompt.group(1) == approval.group(1), (
+        "the owner must be asked about the create")
+    return approval.group(1), lines[1]
+
+
+def sfocreate_events(server, path):
+    return {kind for kind, name, _, _ in audit_events(server) if name == path
+            and kind.startswith("sfocreate.")}
+
+
+def scenario_sfocreate_is_gated_and_lands(server):
+    """sfocreate asks first, binds each option as text, and writes the SFO once."""
+    path = sfocreate_path(server)
+    options = "-i APP_VER=1 -s32 TITLE=Hello"
+    approval, challenge = sfocreate_request(
+        server, sfocreate_line(options, path))
+    assert not os.path.lexists(path), "an unsigned sfocreate must not run"
+
+    action = decoded_action(challenge_action(challenge))
+    assert action.startswith("ariel-action-v1\ncommand=sfocreate\n"), action
+    assert "\ntarget=%s\n" % path in action, action
+    assert "\noption.kind=absent\n" in action, action
+    for index, arg in enumerate(("-i", "APP_VER=1", "-s32", "TITLE=Hello"), 1):
+        assert "\noption.arg%d=%s\n" % (index, arg) in action, action
+
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, sfocreate_line(options, path)) == ["exit 0"], (
+        "a signed sfocreate must run")
+    assert os.path.isfile(path), "sfocreate must create the output"
+    assert run_command(server, "sfoinfo %s" % path) == [
+        "APP_VER(0x00000001)", "TITLE('Hello')", "exit 0"], (
+        "sfoinfo must read back what sfocreate wrote")
+    assert {"sfocreate.request", "sfocreate.done"} <= sfocreate_events(
+        server, path), "audit tail must show the request and the create"
+
+
+def scenario_sfocreate_outside_data_answers_87(server):
+    """An output path outside the writable roots answers protected without asking."""
+    for target in ("/system/PARAM.SFO", "/etc/PARAM.SFO"):
+        assert run_command(server, sfocreate_line("-i APP_VER=1", target)) == [
+            "protected", "exit 87"], (
+            "sfocreate to %s must answer protected and exit 87" % target)
+    server.assert_no_line()
+    assert kill_audit(server, "sfocreate.protected", "/system/PARAM.SFO"), (
+        "the refusal must be in the audit log")
+
+
+def scenario_sfocreate_bad_arguments_answer_without_asking(server):
+    """A missing, relative or existing output and a bad option answer before asking."""
+    kept = sfocreate_path(server, "exists.sfo")
+    with open(kept, "wb") as handle:
+        handle.write(b"keep me\n")
+    for line, answer in (
+            ("sfocreate", ["missing_operand", "exit 1"]),
+            ("sfocreate relative.sfo", ["relative_path", "exit 1"]),
+            (sfocreate_line("-q APP_VER=1",
+                            sfocreate_path(server, "q.sfo")),
+             ["bad_option", "exit 1"]),
+            (sfocreate_line("-i APP_VER", sfocreate_path(server, "i.sfo")),
+             ["bad_argument", "exit 1"]),
+            (sfocreate_line("-i APP_VER=1", kept), ["exists", "exit 1"])):
+        lines = run_command(server, line)
+        assert lines == answer, (
+            "%r must answer %r without asking, got %r" % (line, answer, lines))
+    server.assert_no_line()
+    with open(kept, "rb") as handle:
+        assert handle.read() == b"keep me\n", (
+            "an existing output must not be replaced")
+
+
+def scenario_sfocreate_changed_destination_answers_78(server):
+    """An output that appeared after the grant answers approval_stale and is left alone."""
+    path = sfocreate_path(server, "stale.sfo")
+    approval, challenge = sfocreate_request(
+        server, sfocreate_line("-i APP_VER=1", path))
+    sign_and_grant(server, approval, challenge)
+
+    with open(path, "wb") as handle:
+        handle.write(b"appeared after approval\n")
+
+    assert run_command(server, sfocreate_line("-i APP_VER=1", path)) == [
+        "approval_stale", "exit 78"], (
+        "an output changed after the grant must answer approval_stale")
+    with open(path, "rb") as handle:
+        assert handle.read() == b"appeared after approval\n", (
+            "a stale sfocreate must not replace the output")
+    assert "sfocreate.stale" in sfocreate_events(server, path), (
+        "audit tail must show the stale create")
+
+
 WRITE_SCENARIOS = [
     ("write asks the owner with path, size and hash, lands once after a grant",
      scenario_write_is_gated_and_lands, HOST_ROOT_REASON),
@@ -4838,6 +4948,22 @@ WRITE_SCENARIOS = [
      scenario_write_changed_destination_answers_78, HOST_ROOT_REASON),
     ("write the owner denies answers approval_denied and is audited",
      scenario_write_denied_answers_77, HOST_ROOT_REASON),
+]
+
+
+SFOCREATE_SCENARIOS = [
+    ("sfocreate asks the owner, binds its options as text, and writes the SFO "
+     "once after a grant", scenario_sfocreate_is_gated_and_lands,
+     HOST_ROOT_REASON),
+    ("sfocreate to a path outside /data, /user and /mnt/usb* answers protected "
+     "and exit 87 without asking", scenario_sfocreate_outside_data_answers_87,
+     HOST_ROOT_REASON),
+    ("sfocreate refuses a missing, relative or existing output and a bad "
+     "option with its word, exit 1, before asking",
+     scenario_sfocreate_bad_arguments_answer_without_asking, HOST_ROOT_REASON),
+    ("an sfocreate output that appeared after the grant answers "
+     "approval_stale and exit 78",
+     scenario_sfocreate_changed_destination_answers_78, HOST_ROOT_REASON),
 ]
 
 
@@ -10936,6 +11062,8 @@ RELEASE_SCENARIOS.add(REVOKE_PIN_TITLE)
 SCENARIOS.extend(REVOKE_SCENARIOS)
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in WRITE_SCENARIOS)
 SCENARIOS.extend(WRITE_SCENARIOS)
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in SFOCREATE_SCENARIOS)
+SCENARIOS.extend(SFOCREATE_SCENARIOS)
 
 
 def main():
