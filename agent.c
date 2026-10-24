@@ -117,6 +117,15 @@ static const char key_refused[] =
 static const char key_failed[] =
   "key_failed\n"
   "exit 1\n";
+static const char frozen_reply[] =
+  "frozen\n"
+  "exit 89\n";
+
+/** The answer to an approval that could not be requested: a frozen console says so. **/
+static const char *
+approval_refused(void) {
+  return store_frozen() ? frozen_reply : approval_busy;
+}
 static const char unknown_payload[] =
   "unknown_payload\n"
   "exit 1\n";
@@ -754,6 +763,9 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
   case STORE_GATE_KEYRING:
     audit_reply(fd, facts->command, "refused", target, "-", key_refused);
     return 0;
+  case STORE_GATE_FROZEN:
+    audit_reply(fd, facts->command, "refused", target, "-", frozen_reply);
+    return 0;
   default:
     break;
   }
@@ -767,7 +779,7 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
   }
 
   if(agent->platform->approval_request(agent->platform, facts, challenge)) {
-    reply(fd, approval_busy);
+    reply(fd, approval_refused());
     return 0;
   }
 
@@ -1421,6 +1433,42 @@ key_adopt_command(agent_t *agent, int fd) {
 }
 
 
+/** key unfreeze: lifts the owner's freeze, signed by the recovery key. **/
+static void
+key_unfreeze_command(agent_t *agent, int fd) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  char answer[32];
+  uint32_t generation = 0;
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "key.unfreeze");
+  snprintf(facts.target, sizeof(facts.target), "%s", "keyring");
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  switch(store_key_unfreeze(&challenge, &generation)) {
+  case STORE_UNFREEZE_OK:
+    snprintf(answer, sizeof(answer), "key_unfrozen %u\nexit 0\n",
+             (unsigned)generation);
+    reply(fd, answer);
+    return;
+  case STORE_UNFREEZE_STALE:
+    audit_reply(fd, "key.unfreeze", "stale", "keyring", challenge.id,
+                approval_stale);
+    return;
+  case STORE_UNFREEZE_UNRECORDED:
+    reply(fd, audit_failed);
+    return;
+  default:
+    audit_reply(fd, "key.unfreeze", "failed", "keyring", challenge.id,
+                key_failed);
+    return;
+  }
+}
+
+
 /** env NAME: reveals the one variable the owner signed for. **/
 static void
 env_command(agent_t *agent, int fd, const char *name) {
@@ -1631,13 +1679,19 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
   snprintf(facts.staging_id, sizeof(facts.staging_id), "%s", staging_id);
   facts.run = 1;
 
+  if(store_frozen()) {
+    store_staging_discard(staging_id);
+    audit_reply(fd, "payload", "push.refused", name, staging_id, frozen_reply);
+    return;
+  }
+
   {
     approval_challenge_t challenge;
     char answer[64];
 
     if(platform->approval_request(platform, &facts, &challenge)) {
       store_staging_discard(staging_id);
-      reply(fd, approval_busy);
+      reply(fd, approval_refused());
       return;
     }
 
@@ -2086,9 +2140,17 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
   facts.asset = work->release.asset_id;
 
   if(pinned) {
+    int pinned_outcome;
+
     memset(&install, 0, sizeof(install));
     store_stage(staging_id, &facts, "");
-    if(store_commit_pinned(staging_id, &install) != STORE_INSTALLED) {
+    pinned_outcome = store_commit_pinned(staging_id, &install);
+    if(pinned_outcome == STORE_APPROVAL_FROZEN) {
+      audit_reply(fd, "payload", "install.refused", name, "frozen",
+                  frozen_reply);
+      goto out;
+    }
+    if(pinned_outcome != STORE_INSTALLED) {
       install_refuse(fd, name, "install_failed");
       goto out;
     }
@@ -2100,10 +2162,17 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
     approval_challenge_t challenge;
     char answer[64];
 
+    if(store_frozen()) {
+      store_staging_discard(staging_id);
+      audit_reply(fd, "payload", "install.refused", name, "frozen",
+                  frozen_reply);
+      goto out;
+    }
+
     if(platform->approval_request(platform, &facts, &challenge)) {
       store_staging_discard(staging_id);
       audit_reply(fd, "payload", "install.refused", name, "approval_busy",
-                  approval_busy);
+                  approval_refused());
       goto out;
     }
 
@@ -2170,6 +2239,10 @@ payload_commit(agent_t *agent, int fd, const char *staging_id) {
   case STORE_APPROVAL_EXPIRED:
     audit_reply(fd, "payload", "commit.expired", install.name, staging_id,
                 approval_expired);
+    return;
+  case STORE_APPROVAL_FROZEN:
+    audit_reply(fd, "payload", "commit.refused", install.name, staging_id,
+                frozen_reply);
     return;
   default:
     // An approval that is gone is not an approval: push the build again.
@@ -2322,6 +2395,9 @@ approval_grant(agent_t *agent, int fd, const char *id,
   case STORE_GRANT_REPLAYED:
     reply(fd, approval_replayed);
     return;
+  case STORE_GRANT_FROZEN:
+    reply(fd, frozen_reply);
+    return;
   case STORE_GRANT_DENIED:
     reply(fd, approval_denied);
     return;
@@ -2352,6 +2428,11 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
   // Read the object once and hash those bytes. Only the verified bytes are
   // ever spawned: run never hashes one path and loads another.
   outcome = store_run_load(name, &object);
+
+  if(outcome == STORE_RUN_FROZEN) {
+    reply(fd, frozen_reply);
+    return;
+  }
 
   if(outcome == STORE_RUN_UNKNOWN) {
     reply(fd, unknown_payload);
@@ -2499,7 +2580,7 @@ payload_rollback(agent_t *agent, int fd, const char *name) {
   switch(outcome) {
   case STORE_APPROVAL_NEW:
     if(platform->approval_request(platform, &facts, &challenge)) {
-      refuse(fd, name, "approval_busy", approval_busy);
+      refuse(fd, name, "approval_busy", approval_refused());
       return;
     }
     if(store_audit_append("request", name, challenge.id, facts.sha256)) {
@@ -2584,6 +2665,11 @@ payload_start(agent_t *agent, int fd, const char *name) {
   }
 
   outcome = store_run_load(name, &object);
+
+  if(outcome == STORE_RUN_FROZEN) {
+    refuse(fd, name, "frozen", frozen_reply);
+    return;
+  }
 
   if(outcome == STORE_RUN_UNKNOWN) {
     refuse(fd, name, "unknown_payload", unknown_payload);
@@ -3234,7 +3320,7 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
 
   if(agent->platform->approval_request(agent->platform, &facts, &challenge)) {
-    refuse(fd, name, "approval_busy", approval_busy);
+    refuse(fd, name, "approval_busy", approval_refused());
     return;
   }
 
@@ -3530,6 +3616,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "key") && !strcmp(argv[1], "adopt-anchor")) {
     key_adopt_command(agent, fd);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "key") && !strcmp(argv[1], "unfreeze")) {
+    key_unfreeze_command(agent, fd);
     return;
   }
 

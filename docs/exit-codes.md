@@ -63,5 +63,6 @@ The payload list line is `payload <name> source=... version=... release=... asse
 | 86 | `signature_console_mismatch` | The signer signed for another console | Sign with this console's identity |
 | 87 | `protected` | The command reads or writes one of Ariel's protected objects: the token, the approval state, the consumed nonces, the audit log, the state file or the state directory itself, directly, through a symbolic link or through a hard link. A file or system command that writes outside `/data`, `/user` and `/mnt/usb*` is also refused here. Refused even with an approval | Do not retry; these files are Ariel's own |
 | 88 | `approval_expired` | The approval passed its expiry before it was granted or used | Push again |
+| 89 | `frozen` | The owner has frozen Ariel (`/data/ariel/freeze`). Approvals, commits, payload runs and installs are refused, including ones granted or installed before the freeze | Only a recovery-signed `key unfreeze` lifts the freeze; deleting the freeze file does not |
 
-Free from 89. The `status <n>` line is outside this registry.
+Free from 90. The `status <n>` line is outside this registry.

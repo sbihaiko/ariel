@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 /** What one rollback request ended in; STORE_INSTALLED is a rollback done. **/
 #define STORE_APPROVAL_NEW      5
 #define STORE_ROLLBACK_FAILED   6
+#define STORE_APPROVAL_FROZEN   7
 
 /** What a rollback target was: the build it restores, or why there is none. **/
 #define STORE_ROLLBACK_OK          0
@@ -66,6 +67,7 @@ typedef struct {
 #define STORE_RUN_OK      0
 #define STORE_RUN_UNKNOWN 1
 #define STORE_RUN_STALE   2
+#define STORE_RUN_FROZEN  3
 
 /** The verified bytes of one payload, held in memory until they are freed. **/
 typedef struct {
@@ -120,6 +122,7 @@ int store_approval_request(const approval_facts_t *facts,
 #define STORE_GATE_DENIED  4
 #define STORE_GATE_REFUSED 5
 #define STORE_GATE_KEYRING 6
+#define STORE_GATE_FROZEN  7
 
 /**
  * Check a gated command against its approval, and spend the approval when it
@@ -144,6 +147,7 @@ int store_gate_check(const approval_facts_t *facts,
 #define STORE_GRANT_ERROR    6
 #define STORE_GRANT_WRONG_ACTION  7
 #define STORE_GRANT_WRONG_CONSOLE 8
+#define STORE_GRANT_FROZEN   9
 
 /**
  * What one approval is, as a question sees it. Consumed wins over the
@@ -213,6 +217,11 @@ int store_approval_facts(const char *id, approval_facts_t *facts);
 #define STORE_KEY_ROLE_PRIMARY  0
 #define STORE_KEY_ROLE_RECOVERY 1
 
+#define STORE_UNFREEZE_OK         0
+#define STORE_UNFREEZE_STALE      1
+#define STORE_UNFREEZE_FAILED     2
+#define STORE_UNFREEZE_UNRECORDED 3
+
 /**
  * Whether hex is a public key this build accepts as a new primary or recovery
  * key: 64 hex digits, a key the pinning checks allow, and neither the active
@@ -228,6 +237,15 @@ int store_key_check(const char *hex);
  **/
 int store_key_rotate(const approval_challenge_t *challenge, const char *hex,
                      int role, uint32_t *generation);
+
+/** Whether the owner's freeze is in force. A freeze file not yet recorded is recorded now. **/
+int store_frozen(void);
+
+/**
+ * Lift the freeze for the granted recovery-signed challenge, and remove the
+ * freeze file. Returns one of STORE_UNFREEZE_*; generation is the current one.
+ **/
+int store_key_unfreeze(const approval_challenge_t *challenge, uint32_t *generation);
 
 /**
  * Adopt the build's anchor as the keyring, for the granted approval challenge

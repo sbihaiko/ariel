@@ -9090,6 +9090,9 @@ def pending_challenge(server, command):
     challenge = CHALLENGE_LINE.match(lines[1])
     assert approval and challenge and challenge.group(1) == approval.group(1), (
         "expected approval_required and a matching challenge, got %r" % lines)
+    prompt = server.next_line(timeout=5.0)
+    assert prompt and prompt.startswith("prompt %s " % approval.group(1)), (
+        "%s must show its approval prompt, got %r" % (command, prompt))
     return approval.group(1), lines[1]
 
 
@@ -9268,19 +9271,32 @@ def scenario_freeze_racing_admissions(server):
                 admit("run", lambda: run_payload(keys, "racerun"))
                 time.sleep(0.005)
 
+        def admitted_runs(after=None):
+            with results_lock:
+                return [start for start, kind, _ in results
+                        if kind == "run" and (after is None or start > after)]
+
+        def wait_until(predicate, what, timeout=30.0):
+            deadline = time.monotonic() + timeout
+            while not predicate():
+                assert time.monotonic() < deadline, "timed out waiting for %s" % what
+                time.sleep(0.005)
+
         workers = [threading.Thread(target=run_until_stopped) for _ in range(2)]
-        workers.append(threading.Thread(
-            target=admit, args=("commit", lambda: commit(keys, staging))))
-        workers.append(threading.Thread(
-            target=admit, args=("grant", lambda: grant(keys, approval, signature))))
         for worker in workers:
             worker.start()
-        time.sleep(0.05)
+        wait_until(lambda: admitted_runs(), "a run before the freeze")
         set_freeze(keys)
         cutoff = time.monotonic_ns()
-        time.sleep(0.05)
+        late_workers = [
+            threading.Thread(target=admit, args=("commit", lambda: commit(keys, staging))),
+            threading.Thread(target=admit, args=("grant", lambda: grant(keys, approval, signature))),
+        ]
+        for worker in late_workers:
+            worker.start()
+        wait_until(lambda: len(admitted_runs(cutoff)) >= 2, "runs after the freeze")
         stop.set()
-        for worker in workers:
+        for worker in workers + late_workers:
             worker.join(timeout=30)
 
         late = [(kind, lines) for start, kind, lines in results if start > cutoff]

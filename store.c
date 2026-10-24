@@ -110,11 +110,15 @@ static unsigned char keyring_revoked[KEYRING_REVOKED_MAX][APPROVAL_PUBKEY_LEN];
 static size_t keyring_revoked_count;
 static char keyring_anchor[SHA256_HEX_LEN + 1];
 static int keyring_state;
+static int keyring_frozen;
 
 /** The build's pinned anchor: the keyring is READY only when built from it. **/
 static unsigned char anchor_primary[APPROVAL_PUBKEY_LEN];
 static unsigned char anchor_recovery[APPROVAL_PUBKEY_LEN];
 static char anchor_hash[SHA256_HEX_LEN + 1];
+
+/** The owner's freeze: the file that asks for it, and the keyring line that records it. **/
+#define FREEZE_FILE "freeze"
 
 /** The audit log: one appended line per action Ariel takes. **/
 #define AUDIT_FILE "audit.log"
@@ -183,6 +187,7 @@ static int audit_append_locked(const char *kind, const char *name,
 static int transaction_recover_locked(int state_fd, int store_fd);
 static int recover_at_start(int state_fd);
 static int keyring_open(int state_fd);
+static int frozen_locked(void);
 static int autoload_make(int state_fd);
 
 
@@ -288,8 +293,9 @@ approval_slot(void) {
   for(i=0; i<APPROVALS_MAX; i++) {
     struct approval *slot = &approvals[i];
 
-    if(!(slot->released || slot->gated) ||
-       !(slot->consumed || slot->expired || (slot->decided && !slot->approved))) {
+    if(!keyring_frozen &&
+       (!(slot->released || slot->gated) ||
+        !(slot->consumed || slot->expired || (slot->decided && !slot->approved)))) {
       continue;
     }
     if(!oldest || slot->created_ms < oldest->created_ms) {
@@ -940,6 +946,12 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     options[5].key = "autoload";
     options[5].value = "yes";
     action->noptions = 6;
+  } else if(!strcmp(facts->command, "key.unfreeze")) {
+    action->command = facts->command;
+    action->target = facts->target;
+    action->destination = NULL;
+    action->sha256 = APPROVAL_NO_HASH;
+    action->noptions = 0;
   } else if(!strcmp(facts->command, "key.rotate") ||
             !strcmp(facts->command, "key.rotate-recovery")) {
     action->command = facts->command;
@@ -1112,6 +1124,14 @@ run_prompt(char *prompt, size_t promptlen, const approval_facts_t *facts) {
 }
 
 
+/** The commands a freeze lets through: the recovery-signed key commands. **/
+static int
+freeze_exempt(const char *command) {
+  return !strcmp(command, "key.unfreeze") ||
+         !strcmp(command, "key.rotate-recovery");
+}
+
+
 int
 store_approval_request(const approval_facts_t *facts,
                        approval_challenge_t *challenge, char *prompt,
@@ -1123,6 +1143,8 @@ store_approval_request(const approval_facts_t *facts,
   struct approval *slot;
   const char *console;
   uint64_t now;
+  int exempt;
+  int frozen;
   int rollback;
   int tries;
   int len;
@@ -1139,10 +1161,15 @@ store_approval_request(const approval_facts_t *facts,
   pthread_mutex_lock(&lock);
   now = now_ms();
   expire_locked(now);
+  exempt = freeze_exempt(facts->command);
+  frozen = frozen_locked();
 
   // Two requests for one rollback can both have found none open before
   // either inserted; the second must not open a second approval for it.
-  if(pending_count() >= PENDING_MAX ||
+  // While frozen only the recovery-signed key commands may ask, and they do
+  // not wait behind the pending limit.
+  if((!exempt && frozen) ||
+     (!exempt && pending_count() >= PENDING_MAX) ||
      (rollback && rollback_open_find(facts->name)) ||
      !(slot=approval_slot())) {
     pthread_mutex_unlock(&lock);
@@ -1212,6 +1239,8 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen, "key rotate-recovery will run");
   } else if(!strcmp(facts->command, "key.adopt-anchor")) {
     snprintf(prompt, promptlen, "key adopt-anchor will run");
+  } else if(!strcmp(facts->command, "key.unfreeze")) {
+    snprintf(prompt, promptlen, "key unfreeze will run");
   } else if(rollback) {
     snprintf(prompt, promptlen,
              "payload %s rolls back to %s, replacing %s",
@@ -1329,7 +1358,8 @@ grant_key(const char *command) {
   if(!strcmp(command, "key.adopt-anchor")) {
     return anchor_recovery;
   }
-  if(!strcmp(command, "key.rotate-recovery")) {
+  if(!strcmp(command, "key.rotate-recovery") ||
+     !strcmp(command, "key.unfreeze")) {
     return keyring_recovery;
   }
   return keyring_primary;
@@ -1356,6 +1386,10 @@ store_gate_check(const approval_facts_t *facts,
   if(!keyring_allows(facts->command)) {
     pthread_mutex_unlock(&lock);
     return STORE_GATE_KEYRING;
+  }
+  if(!freeze_exempt(facts->command) && frozen_locked()) {
+    pthread_mutex_unlock(&lock);
+    return STORE_GATE_FROZEN;
   }
   row = gate_row(facts);
 
@@ -1409,6 +1443,8 @@ store_approval_grant(const char *id, const unsigned char *signature,
   if(!request || request->consumed || request->released) {
     // Spent, or its staged object has left: a signature for it answers stale.
     rc = STORE_GRANT_UNKNOWN;
+  } else if(!freeze_exempt(request->facts.command) && frozen_locked()) {
+    rc = STORE_GRANT_FROZEN;
   } else if(request->expired) {
     rc = STORE_GRANT_EXPIRED;
   } else if(nonce_consumed(request->challenge.nonce) ||
@@ -2029,7 +2065,7 @@ keyring_render(char *text, size_t size, uint32_t generation,
                const unsigned char primary[APPROVAL_PUBKEY_LEN],
                const unsigned char recovery[APPROVAL_PUBKEY_LEN],
                unsigned char (*revoked)[APPROVAL_PUBKEY_LEN], size_t count,
-               const char *anchor) {
+               const char *anchor, int frozen) {
   char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char revoked_hex[2 * APPROVAL_PUBKEY_LEN + 1];
@@ -2040,8 +2076,9 @@ keyring_render(char *text, size_t size, uint32_t generation,
   approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, primary_hex);
   approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, recovery_hex);
 
-  n = snprintf(text, size, "generation %lu\nprimary %s\nrecovery %s\nanchor %s\n",
-               (unsigned long)generation, primary_hex, recovery_hex, anchor);
+  n = snprintf(text, size, "generation %lu\nprimary %s\nrecovery %s\nanchor %s\n%s",
+               (unsigned long)generation, primary_hex, recovery_hex, anchor,
+               frozen ? "frozen\n" : "");
   if(n < 0 || (size_t)n >= size) {
     return -1;
   }
@@ -2069,7 +2106,7 @@ keyring_parse(const char *text, uint32_t *generation,
               unsigned char primary[APPROVAL_PUBKEY_LEN],
               unsigned char recovery[APPROVAL_PUBKEY_LEN],
               unsigned char (*revoked)[APPROVAL_PUBKEY_LEN], size_t *count,
-              char anchor[SHA256_HEX_LEN + 1]) {
+              char anchor[SHA256_HEX_LEN + 1], int *frozen) {
   char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char revoked_hex[2 * APPROVAL_PUBKEY_LEN + 1];
@@ -2086,6 +2123,10 @@ keyring_parse(const char *text, uint32_t *generation,
   }
 
   cursor = text + used;
+  *frozen = !strncmp(cursor, "frozen\n", 7);
+  if(*frozen) {
+    cursor += 7;
+  }
   *count = 0;
   while(sscanf(cursor, "revoked %64s\n%n", revoked_hex, &used) == 1) {
     if(*count == KEYRING_REVOKED_MAX ||
@@ -2120,6 +2161,7 @@ keyring_open(int state_fd) {
   uint32_t recorded = 0;
   uint32_t generation = 0;
   size_t count = 0;
+  int frozen = 0;
   struct stat st;
 
   keyring_state = KEYRING_REFUSED;
@@ -2144,7 +2186,7 @@ keyring_open(int state_fd) {
     memcpy(recovery, anchor_recovery, sizeof(recovery));
     memcpy(anchor, anchor_hash, sizeof(anchor));
     if(keyring_render(expect, sizeof(expect), 0, primary, recovery, revoked,
-                      0, anchor) ||
+                      0, anchor, 0) ||
        tmp_write(state_fd, KEYRING_TMP, expect, strlen(expect)) ||
        renameat(state_fd, KEYRING_TMP, state_fd, KEYRING_FILE) ||
        fsync(state_fd)) {
@@ -2153,9 +2195,9 @@ keyring_open(int state_fd) {
     }
   } else if(text_read(state_fd, KEYRING_FILE, text, sizeof(text)) < 0 ||
             keyring_parse(text, &generation, primary, recovery, revoked,
-                          &count, anchor) ||
+                          &count, anchor, &frozen) ||
             keyring_render(expect, sizeof(expect), generation, primary,
-                           recovery, revoked, count, anchor) ||
+                           recovery, revoked, count, anchor, frozen) ||
             strcmp(text, expect)) {
     return recorded ? 0 : -1;
   }
@@ -2167,6 +2209,7 @@ keyring_open(int state_fd) {
     return -1;
   }
 
+  keyring_frozen = frozen;
   keyring_generation = generation;
   memcpy(keyring_primary, primary, sizeof(keyring_primary));
   memcpy(keyring_recovery, recovery, sizeof(keyring_recovery));
@@ -2697,7 +2740,9 @@ store_commit(const char *staging_id, store_install_t *install,
     install_provenance(&entry->facts, install);
   }
 
-  if(!request) {
+  if(frozen_locked()) {
+    outcome = STORE_APPROVAL_FROZEN;
+  } else if(!request) {
     // An unknown staging ID and a lost approval both mean: push again.
     outcome = STORE_APPROVAL_STALE;
   } else if(request->consumed) {
@@ -2741,7 +2786,9 @@ store_commit_pinned(const char *staging_id, store_install_t *install) {
   expire_locked(now_ms());
 
   entry = staged_find(staging_id);
-  if(entry) {
+  if(frozen_locked()) {
+    outcome = STORE_APPROVAL_FROZEN;
+  } else if(entry) {
     install_provenance(&entry->facts, install);
     outcome = staged_install(entry, NULL, install);
   } else {
@@ -3141,6 +3188,132 @@ autoload_apply_locked(struct approval *request) {
 }
 
 
+/**
+ * Whether the owner's freeze is in force. A freeze file that the keyring does
+ * not record yet is recorded now, in its own journal transaction, so the
+ * freeze survives a restart. A freeze that cannot be recorded still refuses.
+ * The caller holds the lock.
+ **/
+static int
+frozen_locked(void) {
+  char current[KEYRING_MAX];
+  char text[KEYRING_MAX];
+  char old_hash[SHA256_HEX_LEN + 1];
+  char new_hash[SHA256_HEX_LEN + 1];
+  struct stat st;
+  int state_fd;
+  int store_fd;
+  int applied;
+  int rc;
+
+  if(keyring_frozen) {
+    return 1;
+  }
+
+  if((state_fd=root_open()) < 0) {
+    return 1;
+  }
+  if(fstatat(state_fd, FREEZE_FILE, &st, AT_SYMLINK_NOFOLLOW)) {
+    rc = errno != ENOENT;
+    close(state_fd);
+    return rc;
+  }
+
+  if(keyring_state != KEYRING_READY ||
+     keyring_render(current, sizeof(current), keyring_generation,
+                    keyring_primary, keyring_recovery, keyring_revoked,
+                    keyring_revoked_count, keyring_anchor, 0) ||
+     keyring_render(text, sizeof(text), keyring_generation, keyring_primary,
+                    keyring_recovery, keyring_revoked, keyring_revoked_count,
+                    keyring_anchor, 1) ||
+     (store_fd=dir_open(state_fd, "store")) < 0) {
+    close(state_fd);
+    return 1;
+  }
+
+  text_hash(current, strlen(current), old_hash);
+  text_hash(text, strlen(text), new_hash);
+  applied = file_transaction_locked(state_fd, store_fd, text, old_hash,
+                                    new_hash, KEYRING_FILE, KEYRING_TMP,
+                                    "freeze", KEYRING_FILE, "-");
+  close(store_fd);
+  close(state_fd);
+  if(applied >= 0) {
+    keyring_frozen = 1;
+  }
+  return 1;
+}
+
+
+int
+store_frozen(void) {
+  int rc;
+
+  pthread_mutex_lock(&lock);
+  rc = frozen_locked();
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
+store_key_unfreeze(const approval_challenge_t *challenge, uint32_t *generation) {
+  char current[KEYRING_MAX];
+  char text[KEYRING_MAX];
+  char old_hash[SHA256_HEX_LEN + 1];
+  char new_hash[SHA256_HEX_LEN + 1];
+  int state_fd;
+  int store_fd;
+  int applied;
+  int outcome = STORE_UNFREEZE_FAILED;
+
+  pthread_mutex_lock(&lock);
+  if(keyring_state != KEYRING_READY ||
+     challenge->generation != keyring_generation) {
+    outcome = STORE_UNFREEZE_STALE;
+  } else if((state_fd=root_open()) >= 0) {
+    // The file goes first: a crash after this leaves the keyring frozen, and
+    // a file that is still there would only record the freeze again.
+    outcome = STORE_UNFREEZE_OK;
+    if(unlinkat(state_fd, FREEZE_FILE, 0) && errno != ENOENT) {
+      outcome = STORE_UNFREEZE_FAILED;
+    }
+
+    if(outcome == STORE_UNFREEZE_OK && keyring_frozen) {
+      if(!keyring_render(current, sizeof(current), keyring_generation,
+                         keyring_primary, keyring_recovery, keyring_revoked,
+                         keyring_revoked_count, keyring_anchor, 1) &&
+         !keyring_render(text, sizeof(text), keyring_generation, keyring_primary,
+                         keyring_recovery, keyring_revoked,
+                         keyring_revoked_count, keyring_anchor, 0) &&
+         (store_fd=dir_open(state_fd, "store")) >= 0) {
+        text_hash(current, strlen(current), old_hash);
+        text_hash(text, strlen(text), new_hash);
+        applied = file_transaction_locked(state_fd, store_fd, text, old_hash,
+                                          new_hash, KEYRING_FILE, KEYRING_TMP,
+                                          "key_unfreeze", KEYRING_FILE,
+                                          challenge->id);
+        close(store_fd);
+        if(applied < 0) {
+          outcome = STORE_UNFREEZE_FAILED;
+        } else {
+          keyring_frozen = 0;
+          outcome = applied ? STORE_UNFREEZE_UNRECORDED : STORE_UNFREEZE_OK;
+        }
+      } else {
+        outcome = STORE_UNFREEZE_FAILED;
+      }
+    }
+
+    *generation = keyring_generation;
+    close(state_fd);
+  }
+
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
 int
 store_key_check(const char *hex) {
   unsigned char key[APPROVAL_PUBKEY_LEN];
@@ -3206,9 +3379,9 @@ store_key_rotate(const approval_challenge_t *challenge, const char *hex,
     count++;
     if(!keyring_render(current, sizeof(current), keyring_generation,
                        keyring_primary, keyring_recovery, keyring_revoked,
-                       keyring_revoked_count, keyring_anchor) &&
+                       keyring_revoked_count, keyring_anchor, keyring_frozen) &&
        !keyring_render(text, sizeof(text), keyring_generation + 1, primary,
-                       recovery, revoked, count, keyring_anchor) &&
+                       recovery, revoked, count, keyring_anchor, keyring_frozen) &&
        (state_fd=root_open()) >= 0) {
       if((store_fd=dir_open(state_fd, "store")) >= 0) {
         text_hash(current, strlen(current), old_hash);
@@ -3270,10 +3443,10 @@ store_key_adopt(const approval_challenge_t *challenge, uint32_t *generation) {
     memcpy(revoked[count++], keyring_recovery, APPROVAL_PUBKEY_LEN);
     if(!keyring_render(current, sizeof(current), keyring_generation,
                        keyring_primary, keyring_recovery, keyring_revoked,
-                       keyring_revoked_count, keyring_anchor) &&
+                       keyring_revoked_count, keyring_anchor, keyring_frozen) &&
        !keyring_render(text, sizeof(text), keyring_generation + 1,
                        anchor_primary, anchor_recovery, revoked, count,
-                       anchor_hash) &&
+                       anchor_hash, keyring_frozen) &&
        (state_fd=root_open()) >= 0) {
       if((store_fd=dir_open(state_fd, "store")) >= 0) {
         text_hash(current, strlen(current), old_hash);
@@ -3757,6 +3930,11 @@ store_run_load(const char *name, store_object_t *object) {
   }
 
   pthread_mutex_lock(&lock);
+
+  if(frozen_locked()) {
+    rc = STORE_RUN_FROZEN;
+    goto out;
+  }
 
   if((state_fd=root_open()) < 0 ||
      (store_fd=dir_open(state_fd, "store")) < 0 ||
