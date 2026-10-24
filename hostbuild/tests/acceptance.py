@@ -4395,7 +4395,7 @@ def scenario_denied_push(server):
 # ---------------------------------------------------------------------------
 
 CHALLENGE_LINE = re.compile(
-    r"^challenge (a-[0-9a-f]+) (\S+) ([0-9a-f]{32}) (\d+) (\d+) ([0-9a-f]+)$")
+    r"^challenge (a-[0-9a-f]+) (\S+) ([0-9a-f]{32}) (\d+) (\d+) ([0-9a-f]+) (\d+)$")
 
 
 def tests_dir():

@@ -103,6 +103,7 @@ typedef struct {
   char console[APPROVAL_CONSOLE_MAX + 1];
   char action[APPROVAL_ACTION_MAX + 1];
   size_t action_len;
+  uint32_t generation;
   unsigned char nonce[APPROVAL_NONCE_LEN];
   uint64_t issued_ms;
   uint64_t expires_ms;

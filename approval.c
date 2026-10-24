@@ -316,6 +316,7 @@ put_be(unsigned char *out, uint64_t value, size_t bytes) {
 
 int
 approval_message(const char *console, const char *action, size_t action_len,
+                 uint32_t generation,
                  const unsigned char nonce[APPROVAL_NONCE_LEN],
                  uint64_t issued_ms, uint64_t expires_ms,
                  unsigned char *out, size_t size) {
@@ -333,7 +334,7 @@ approval_message(const char *console, const char *action, size_t action_len,
     return -1;
   }
 
-  need = sizeof(MESSAGE_TAG) + 2 + console_len + 4 + action_len +
+  need = sizeof(MESSAGE_TAG) + 2 + console_len + 4 + action_len + 4 +
          APPROVAL_NONCE_LEN + 8 + 8;
   if(need > size || need > APPROVAL_MESSAGE_MAX) {
     return -1;
@@ -350,6 +351,8 @@ approval_message(const char *console, const char *action, size_t action_len,
   pos += 4;
   memcpy(out + pos, action, action_len);
   pos += action_len;
+  put_be(out + pos, generation, 4);
+  pos += 4;
   memcpy(out + pos, nonce, APPROVAL_NONCE_LEN);
   pos += APPROVAL_NONCE_LEN;
   put_be(out + pos, issued_ms, 8);

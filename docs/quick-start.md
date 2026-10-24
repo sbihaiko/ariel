@@ -119,11 +119,11 @@ $ { printf 'auth %s\npayload push helloworld %s %s\n' "$ARIEL_TOKEN" \
       "$(openssl dgst -sha256 -r helloworld.elf | cut -d' ' -f1)"; cat helloworld.elf; } | nc $PS5_HOST 2324
 staged s-4f2a9c
 approval_required a-81d0e3
-challenge a-81d0e3 ps5-living-room 0c5e9d1a7b3f4e62a8d0c1b9e7f35a24 120000 240000 6172...
+challenge a-81d0e3 ps5-living-room 0c5e9d1a7b3f4e62a8d0c1b9e7f35a24 120000 240000 6172... 0
 exit 75
 ```
 
-Approve it. The `challenge` line is what the owner signs: the approval ID, the console, a nonce, the window in milliseconds, and the canonical action as hex. Copy it to the owner's signer, which prints the action exactly as it signs it, shows it for confirmation, and refuses an action with a NUL or other byte it cannot show. It prints one line: the signature, the console and the action's SHA-256 (`ariel-sign sign <keyfile>`). The signer is offline and holds the owner's key; the agent only relays the line it prints. Submit it on the agent port, with the whole line after the approval ID:
+Approve it. The `challenge` line is what the owner signs: the approval ID, the console, a nonce, the window in milliseconds, the canonical action as hex, and the keyring generation the approval is made under. Copy it to the owner's signer, which prints the action exactly as it signs it, shows it for confirmation, and refuses an action with a NUL or other byte it cannot show. It prints one line: the signature, the console and the action's SHA-256 (`ariel-sign sign <keyfile>`). The signer is offline and holds the owner's key; the agent only relays the line it prints. Submit it on the agent port, with the whole line after the approval ID:
 
 ```text
 auth <token>

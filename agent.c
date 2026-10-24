@@ -589,10 +589,11 @@ challenge_reply(int fd, const approval_challenge_t *challenge) {
 
   len = snprintf(answer, sizeof(answer),
                  "approval_required %s\n"
-                 "challenge %s %s %s %llu %llu %s\nexit 75\n",
+                 "challenge %s %s %s %llu %llu %s %u\nexit 75\n",
                  challenge->id, challenge->id, challenge->console, nonce_hex,
                  (unsigned long long)challenge->issued_ms,
-                 (unsigned long long)challenge->expires_ms, action_hex);
+                 (unsigned long long)challenge->expires_ms, action_hex,
+                 (unsigned)challenge->generation);
   write_all(fd, answer, (size_t)len);
 }
 

@@ -225,11 +225,12 @@ cmd_sign(const char *path, int assume_yes) {
   char digest_hex[2 * SHA256_DIGEST_LEN + 1];
   char sig_hex[2 * APPROVAL_SIG_LEN + 1];
   sha256_t hash;
-  char *fields[7];
+  char *fields[8];
   char *save = NULL;
   char *end = NULL;
   unsigned long long issued;
   unsigned long long expires;
+  unsigned long long generation;
   size_t action_len;
   size_t i;
   int len;
@@ -244,11 +245,11 @@ cmd_sign(const char *path, int assume_yes) {
   }
 
   fields[0] = strtok_r(line, " \r\n", &save);
-  for(i=1; i<7; i++) {
+  for(i=1; i<8; i++) {
     fields[i] = fields[i-1] ? strtok_r(NULL, " \r\n", &save) : NULL;
   }
 
-  if(!fields[6] || strtok_r(NULL, " \r\n", &save) ||
+  if(!fields[7] || strtok_r(NULL, " \r\n", &save) ||
      strcmp(fields[0], "challenge") ||
      approval_hex_decode(fields[3], nonce, APPROVAL_NONCE_LEN)) {
     fprintf(stderr, "not a challenge line\n");
@@ -282,8 +283,16 @@ cmd_sign(const char *path, int assume_yes) {
     return 1;
   }
 
+  errno = 0;
+  generation = strtoull(fields[7], &end, 10);
+  if(errno || !*fields[7] || *end || generation > UINT32_MAX) {
+    fprintf(stderr, "not a challenge line: generation\n");
+    return 1;
+  }
+
   len = approval_message(fields[2], (const char*)action_bytes, action_len,
-                         nonce, issued, expires, message, sizeof(message));
+                         (uint32_t)generation, nonce, issued, expires,
+                         message, sizeof(message));
   if(len < 0) {
     fprintf(stderr, "the challenge does not fit a message\n");
     return 1;

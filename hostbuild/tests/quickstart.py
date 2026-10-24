@@ -34,8 +34,8 @@ ANY_ID = re.compile(r"(?<![0-9a-z])[sa]-[0-9a-f]+(?![0-9a-z])")
 HASH = re.compile(r"(?<![0-9a-f])[0-9a-f]{6,}(?:\.\.\.)?(?![0-9a-f])")
 APPROVAL_REPLY = re.compile(r"^approval_required (a-[0-9a-f]+)$")
 CHALLENGE = re.compile(
-    r"^challenge (a-[0-9a-f]+) (\S+) ([0-9a-f]{32}) (\d+) (\d+) ([0-9a-f]+)$")
-CHALLENGE_SHAPE = re.compile(r"^challenge \S+ \S+ \S+ \S+ \S+ \S+$")
+    r"^challenge (a-[0-9a-f]+) (\S+) ([0-9a-f]{32}) (\d+) (\d+) ([0-9a-f]+) (\d+)$")
+CHALLENGE_SHAPE = re.compile(r"^challenge \S+ \S+ \S+ \S+ \S+ \S+ \S+$")
 PROMPT = re.compile(
     r"^prompt (a-[0-9a-f]+) payload (\S+) \((\d+) bytes, sha256 ([0-9a-f]{64})\)"
     r" will run$"
@@ -138,7 +138,7 @@ def normalize(line):
     # A challenge line is one record whose every field after the word is
     # specific to the console and the moment: only its shape is compared.
     if CHALLENGE_SHAPE.match(line):
-        return "challenge <id> <console> <nonce> <ms> <ms> <action>"
+        return "challenge <id> <console> <nonce> <ms> <ms> <action> <generation>"
     line = ANY_ID.sub("<id>", line)
     return HASH.sub("<hash>", line)
 

@@ -103,12 +103,12 @@ int approval_value_valid(const char *value);
 
 /**
  * Build the message a signature covers: a domain tag, the console
- * identity, the canonical action bytes, the nonce, issued-at and expiry
- * (both in milliseconds on the platform clock), each field framed by its
- * length. Returns the length written to out, or -1.
+ * identity, the canonical action bytes, the keyring generation, the nonce,
+ * issued-at and expiry (both in milliseconds on the platform clock), each
+ * field framed by its length. Returns the length written to out, or -1.
  **/
 int approval_message(const char *console, const char *action,
-                     size_t action_len,
+                     size_t action_len, uint32_t generation,
                      const unsigned char nonce[APPROVAL_NONCE_LEN],
                      uint64_t issued_ms, uint64_t expires_ms,
                      unsigned char *out, size_t size);

@@ -1147,6 +1147,7 @@ store_approval_request(const approval_facts_t *facts,
   snprintf(slot->challenge.console, sizeof(slot->challenge.console), "%s",
            console);
   slot->challenge.action_len = (size_t)len;
+  slot->challenge.generation = 0;
   slot->challenge.issued_ms = now;
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
 
@@ -1346,6 +1347,7 @@ store_approval_grant(const char *id, const unsigned char *signature,
     len = approval_message(request->challenge.console,
                            request->challenge.action,
                            request->challenge.action_len,
+                           request->challenge.generation,
                            request->challenge.nonce,
                            request->challenge.issued_ms,
                            request->challenge.expires_ms,
