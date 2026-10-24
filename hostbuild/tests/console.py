@@ -56,6 +56,8 @@ NOTIFICATION_SPACING = 10.0
 # Ariel keeps at most three approvals open, each until it expires after
 # 120 s, and the console has no refusal: an ask can wait out a full expiry.
 BUSY_RETRIES = 13
+# The newest lines audit tail shows at most (AUDIT_TAIL_MAX in store.h).
+AUDIT_TAIL_MAX = 64
 
 
 class ConsoleError(AssertionError):
@@ -565,7 +567,7 @@ def check_audit_tail(session, context):
     assert lines == ["installed consoleaudit %s" % digest, "exit 0"], (
         "an approved commit must install the build, got %r" % lines)
 
-    lines = session.link.exchange("audit tail")
+    lines = session.link.exchange("audit tail %d" % AUDIT_TAIL_MAX)
     events = [line for line in lines if line != "exit 0"]
     assert lines and lines[-1] == "exit 0", (
         "audit tail must end with exit 0, got %r" % lines)
@@ -585,14 +587,39 @@ def check_audit_tail(session, context):
             "the event must name the payload and its hash, got %r" % event)
 
     # Reading the log changes nothing, and no agent-port command clears it.
-    assert session.link.exchange("audit tail") == lines, (
+    assert session.link.exchange("audit tail %d" % AUDIT_TAIL_MAX) == lines, (
         "audit tail must not change the log it reads")
     for command in ("audit clear", "rm /data/ariel/audit.log"):
         refused = session.link.exchange(command)
         assert refused and refused[-1] != "exit 0", (
             "%r must not succeed, got %r" % (command, refused))
-    assert session.link.exchange("audit tail") == lines, (
-        "no agent-port command may change the audit log")
+    # Both deletes are gated, so each audits its own request or refusal:
+    # the log may grow, and nothing already in it may go.
+    later = session.link.exchange("audit tail %d" % AUDIT_TAIL_MAX)
+    assert later and later[-1] == "exit 0", (
+        "audit tail must end with exit 0, got %r" % later)
+    assert [event for event in later if event in ours] == ours, (
+        "this build's push, grant and commit must stay in the log, got %r"
+        % later)
+    assert appended_only(events, later[:-1]), (
+        "no agent-port command may remove or change an audit line, got %r"
+        % later)
+
+
+def appended_only(earlier, later):
+    """True when later is a window of earlier with lines appended, none removed.
+
+    Both are the newest lines of the same log, so the lines of earlier that
+    are still in later's window are a prefix of later, in order.
+    """
+    for dropped in range(len(earlier) + 1):
+        kept = earlier[dropped:]
+        appended = len(later) - len(kept)
+        # Only lines appended past the window may push old ones out of it.
+        if later[:len(kept)] == kept and dropped == max(
+                0, len(earlier) + appended - AUDIT_TAIL_MAX):
+            return True
+    return False
 
 
 def check_kill_refusals(session, context):
@@ -885,6 +912,9 @@ def check_autoload_refusals_answer_their_words(session, context):
 def check_autoload_stale_grant_answers_78(session, context):
     """A grant for a list that has since changed answers approval_stale, 78."""
     first, second = "consolestale", "consoleother"
+    # An edit of a name that is not installed answers unknown_payload before
+    # it asks, so both are installed first.
+    install_autoload_payload(session, first, context.build("stale"))
     install_autoload_payload(session, second, context.build("other"))
     listing = autoload_listing(session)
     stale, challenge = autoload_ask(session, "add", first)
