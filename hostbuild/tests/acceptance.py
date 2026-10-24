@@ -1662,6 +1662,82 @@ def scenario_console_gated_asks_wait_out_busy(server):
         % (waited, expiry))
 
 
+def scenario_console_stale_check_installs_both_names(server):
+    """The stale autoload check installs both names before it asks for either edit."""
+    del server  # the fake link stands in for the agent port
+
+    import console
+
+    link = ActivatingLink()
+    operator = console.Operator(read=lambda prompt="": "",
+                                write=lambda line="": None,
+                                sleep=lambda s: None)
+    session = console.Session(link, operator, sleep=lambda s: None)
+    context = console.Context(host="192.0.2.1", port=console.PORT,
+                              token="0" * 32, workdir="/nonexistent",
+                              cc=["prospero-clang"], document="quick-start.md")
+    context.build = lambda label: b"\x7fELF runnable " + label.encode("ascii")
+    try:
+        console.check_autoload_stale_grant_answers_78(session, context)
+    except Exception:  # noqa: BLE001 - the fake stops at the first autoload read
+        pass
+    names = [name for name, _data in link.pushes]
+    assert {"consolestale", "consoleother"} <= set(names), (
+        "an autoload edit of a name that is not installed answers "
+        "unknown_payload before it asks; installed %r" % names)
+
+
+def audit_script(later):
+    """Replies for the audit check: install, two equal reads, two gated deletes, a read."""
+    data = b"\x7fELF runnable audit"
+    digest = hashlib.sha256(data).hexdigest()
+    old = ["%d push older o-%d %s" % (1000 + i, i, "0" * 64) for i in range(61)]
+    ours = ["2001 push consoleaudit s-1 %s" % digest,
+            "2002 grant consoleaudit a-1 %s" % digest,
+            "2003 commit consoleaudit s-1 %s" % digest]
+    tail = old + ours
+    gated = ["approval_required a-2", "challenge a-2 00", "exit 75"]
+    replies = [
+        ["staged s-1", "approval_required a-1", "challenge a-1 00", "exit 75"],
+        ["approval_granted a-1", "exit 0"],
+        ["installed consoleaudit %s" % digest, "exit 0"],
+        tail + ["exit 0"],
+        tail + ["exit 0"],
+        gated,
+        ["approval_busy", "exit 76"],
+        later(tail) + ["exit 0"],
+    ]
+    return data, replies
+
+
+def run_audit_check(replies, data):
+    console, _link, _operator, session, _events, _shown = scripted_session(replies)
+    context = console.Context(host="192.0.2.1", port=console.PORT,
+                              token="0" * 32, workdir="/nonexistent",
+                              cc=["prospero-clang"], document="quick-start.md")
+    context.build = lambda label: data
+    console.check_audit_tail(session, context)
+
+
+def scenario_console_audit_check_allows_appended_lines(server):
+    """The audit check accepts lines appended by the gated deletes, and nothing removed."""
+    del server  # the scripted link stands in for the agent port
+
+    # The two refused deletes are audited: the window moves on by two lines.
+    data, replies = audit_script(lambda tail: tail[2:] + [
+        "3001 request audit - a-2 -", "3002 refuse rm - - -"])
+    run_audit_check(replies, data)
+
+    # A line removed from the middle of the log is a cleared event.
+    data, replies = audit_script(lambda tail: tail[:10] + tail[11:])
+    try:
+        run_audit_check(replies, data)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a removed audit line must fail the audit check")
+
+
 def scenario_console_approval_prompts(server):
     """An approval step shows the notification and the challenge, and submits the signature."""
     del server  # the fake link stands in for the agent port
@@ -7679,6 +7755,10 @@ SCENARIOS = [
      scenario_console_checks_push_runnable_builds, None),
     ("console mode's reboot and sysctl write wait out approval_busy",
      scenario_console_gated_asks_wait_out_busy, None),
+    ("console mode's stale autoload check installs both names before it asks",
+     scenario_console_stale_check_installs_both_names, None),
+    ("console mode's audit check allows appended lines and refuses a removed "
+     "one", scenario_console_audit_check_allows_appended_lines, None),
     ("a crash in prepared leaves the old version in payload list after restart",
      scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
     ("a crash in committed leaves the new version in payload list after restart",
