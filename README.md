@@ -156,8 +156,8 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
 | `pwd`, `cd` | | ✅ | S5: working directory kept across connections with sessions |
-| `ls` | | ⚠️ no flags | S3: `-l`, `-a`, `--json`, pagination |
-| `stat`, `file` | | ✅ | S3: `--json` |
+| `ls` | | ⚠️ `--json` only | S3: `-l`, `-a`, pagination |
+| `stat`, `file` | | ✅ | |
 | `cat` | | ✅ | S3: size limit |
 | `head`, `tail`, `wc` | | ❌ | S3 |
 | `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c` |
@@ -170,9 +170,9 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `cp`, `mv` | | ⚠️ no `-r` | S2: gated. S3: `-r` |
 | `rm` | | ⚠️ one file, no `-r` | S2: gated. S3: `-r` |
 | `chmod`, `chown`, `chgrp` | | ✅ | S2: gated |
-| `write <path>` | `echo > file`, `tee` | ❌ | S3, gated |
+| `write <path>` | `echo > file`, `tee` | ✅ | S3: gated, one frame |
 | `tar`, `unzip` | | ❌ | S2 |
-| `ps` | | ✅ | S3: `--json` |
+| `ps` | | ✅ | |
 | `procstat` | `/proc/<pid>/*` | ✅ | |
 | `kill` | | ✅ | S2: gated, critical processes protected |
 | `payload run` | `cmd &`, `nohup` | ❌ | S1: `--wait` runs an approved build in the foreground. S2: background runs with a log |
