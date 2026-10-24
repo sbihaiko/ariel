@@ -4329,6 +4329,200 @@ def scenario_transfer_action_names_its_facts(server):
     assert "\nsha256=none\n" in action, action
 
 
+WRITE_BYTES = b"written through the shell\n"
+WRITE_CAP = 64 * 1024 * 1024
+
+
+def write_path(server, name):
+    return os.path.join(server.root, "data", name)
+
+
+def write_frame(server, path, data, declared_size=None, declared_hash=None,
+                timeout=5.0):
+    """One write on its own connection: the command line, then the body."""
+    size = len(data) if declared_size is None else declared_size
+    digest = (hashlib.sha256(data).hexdigest() if declared_hash is None
+              else declared_hash)
+    sock = server.connect(timeout=timeout)
+    try:
+        sock.sendall(("auth %s\nwrite %s %d %s\n"
+                      % (server.token, path, size, digest)).encode("ascii"))
+        try:
+            sock.sendall(data)
+            sock.shutdown(socket.SHUT_WR)
+        except (BrokenPipeError, ConnectionResetError):
+            # A refusal before the body is read can close the connection first.
+            pass
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def write_request(server, path, data):
+    """A write that must ask the owner: 75, a challenge, a prompt. Returns the approval and the challenge."""
+    server.advance(120_000)
+    lines = write_frame(server, path, data)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "write must answer approval_required and exit 75, got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0])
+    assert approval, "expected approval_required, got %r" % lines[0]
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert challenge and challenge.group(1) == approval.group(1), (
+        "the challenge must name the approval, got %r" % lines[1])
+    prompt = GATE_PROMPT.match(server.next_line() or "")
+    assert prompt and prompt.group(1) == approval.group(1), (
+        "the owner must be asked about the write")
+    return approval.group(1), lines[1]
+
+
+def write_events(server, path):
+    return {kind for kind, name, _, _ in audit_events(server) if name == path
+            and kind.startswith("write.")}
+
+
+def scenario_write_is_gated_and_lands(server):
+    """write asks first, binds path, size and hash, runs once, and asks again after."""
+    path = write_path(server, "wgate.bin")
+    approval, challenge = write_request(server, path, WRITE_BYTES)
+    assert not os.path.lexists(path), "an unsigned write must not run"
+
+    action = decoded_action(challenge_action(challenge))
+    assert action.startswith("ariel-action-v1\ncommand=write\n"), action
+    assert "\ntarget=%s\n" % path in action, action
+    assert "\nsha256=%s\n" % hashlib.sha256(WRITE_BYTES).hexdigest() in action, action
+    assert "\noption.size=%d\n" % len(WRITE_BYTES) in action, action
+
+    sign_and_grant(server, approval, challenge)
+    assert write_frame(server, path, WRITE_BYTES) == ["exit 0"], (
+        "a signed write must run")
+    assert read_bytes(path) == WRITE_BYTES, "write must land the bytes"
+
+    os.unlink(path)
+    again, _ = write_request(server, path, WRITE_BYTES)
+    assert again != approval, "a spent write approval must not be asked again"
+    assert {"write.request", "write.done"} <= write_events(server, path), (
+        "audit tail must show the request and the write")
+
+
+def scenario_write_mismatch_answers_like_push(server):
+    """A body short of its size, past it, or with another hash answers upload_mismatch."""
+    path = write_path(server, "wmismatch.bin")
+    for declared in (
+        {"declared_size": len(WRITE_BYTES) + 1},
+        {"declared_size": len(WRITE_BYTES) - 1},
+        {"declared_hash": "0" * 64},
+    ):
+        assert write_frame(server, path, WRITE_BYTES, **declared) == [
+            "upload_mismatch", "exit 81"], (
+            "a write that does not match its frame must answer upload_mismatch")
+    assert not os.path.lexists(path), "a mismatched write must not land"
+    server.assert_no_line()
+
+
+def scenario_write_over_cap_is_refused_before_asking(server):
+    """A file over 64 MiB answers too_large before the owner is asked."""
+    path = write_path(server, "wbig.bin")
+    assert write_frame(server, path, b"", declared_size=WRITE_CAP + 1) == [
+        "too_large", "exit 1"], "a write over 64 MiB must answer too_large"
+    assert not os.path.lexists(path), "an over-cap write must not land"
+    server.assert_no_line()
+
+
+def scenario_write_existing_destination_answers_exists(server):
+    """An existing destination answers exists without asking, and is left alone."""
+    path = make_transfer_file(server, "wexists.bin", b"keep me\n")
+    assert write_frame(server, path, WRITE_BYTES) == ["exists", "exit 1"], (
+        "a write onto an existing destination must answer exists")
+    server.assert_no_line()
+    assert read_bytes(path) == b"keep me\n", "an existing destination must not be replaced"
+    assert "write.refused" in write_events(server, path), (
+        "audit tail must show the refused write")
+
+
+def scenario_write_protected_destinations_answer_87(server):
+    """The token, a hard or symbolic link to it, the state directory and /system answer protected."""
+    token = secret_path(server, "token")
+    before = read_bytes(token)
+    hard = write_path(server, "wprot-hard")
+    soft = write_path(server, "wprot-soft")
+    make_link(hard, token, hard=True)
+    make_link(soft, token, hard=False)
+    state_entry = os.path.join(os.path.dirname(token), "wprot-new")
+
+    for target in (token, hard, soft, state_entry, "/system/wprot.bin"):
+        assert write_frame(server, target, WRITE_BYTES) == [
+            "protected", "exit 87"], (
+            "write to %s must answer protected and exit 87" % target)
+    server.assert_no_line()
+    assert read_bytes(token) == before, "a protected token must not change"
+
+
+def scenario_write_protected_after_grant_answers_87(server):
+    """A destination that became a link to the token after the grant answers protected and writes nothing."""
+    token = secret_path(server, "token")
+    before = read_bytes(token)
+    path = write_path(server, "wprot-late.bin")
+    approval, challenge = write_request(server, path, WRITE_BYTES)
+    sign_and_grant(server, approval, challenge)
+
+    os.symlink(token, path)
+    assert write_frame(server, path, WRITE_BYTES) == [
+        "protected", "exit 87"], "an approved write through a link to the token must answer protected"
+    assert read_bytes(token) == before, "a protected token must not change"
+
+
+def scenario_write_changed_destination_answers_78(server):
+    """A destination that appeared after the grant answers approval_stale and is left alone."""
+    path = write_path(server, "wstale.bin")
+    approval, challenge = write_request(server, path, WRITE_BYTES)
+    sign_and_grant(server, approval, challenge)
+
+    with open(path, "wb") as handle:
+        handle.write(b"appeared after approval\n")
+
+    assert write_frame(server, path, WRITE_BYTES) == [
+        "approval_stale", "exit 78"], "a destination changed after the grant must answer approval_stale"
+    assert read_bytes(path) == b"appeared after approval\n", (
+        "a stale write must not replace the destination")
+    assert "write.stale" in write_events(server, path), (
+        "audit tail must show the stale write")
+
+
+def scenario_write_denied_answers_77(server):
+    """A write the owner denies answers approval_denied, writes nothing, and is audited."""
+    path = write_path(server, "wdeny.bin")
+    approval, _ = write_request(server, path, WRITE_BYTES)
+    server.controller("deny %s" % approval, "denied %s" % approval)
+
+    assert write_frame(server, path, WRITE_BYTES) == [
+        "approval_denied", "exit 77"], "a denied write must answer approval_denied"
+    assert not os.path.lexists(path), "a denied write must not land"
+    assert "write.denied" in write_events(server, path), (
+        "audit tail must show the denied write")
+
+
+WRITE_SCENARIOS = [
+    ("write asks the owner with path, size and hash, lands once after a grant",
+     scenario_write_is_gated_and_lands, HOST_ROOT_REASON),
+    ("write answers upload_mismatch for a body that does not match its frame",
+     scenario_write_mismatch_answers_like_push, HOST_ROOT_REASON),
+    ("write over 64 MiB answers too_large before the owner is asked",
+     scenario_write_over_cap_is_refused_before_asking, HOST_ROOT_REASON),
+    ("write onto an existing destination answers exists and replaces nothing",
+     scenario_write_existing_destination_answers_exists, HOST_ROOT_REASON),
+    ("write to the token, its links, the state directory or /system answers "
+     "protected and exit 87 without asking",
+     scenario_write_protected_destinations_answer_87, HOST_ROOT_REASON),
+    ("write whose destination became a link to the token after the grant "
+     "answers protected and exit 87",
+     scenario_write_protected_after_grant_answers_87, HOST_ROOT_REASON),
+    ("write whose destination appeared after the grant answers approval_stale",
+     scenario_write_changed_destination_answers_78, HOST_ROOT_REASON),
+    ("write the owner denies answers approval_denied and is audited",
+     scenario_write_denied_answers_77, HOST_ROOT_REASON),
+]
+
+
 HELLO_OUTPUT = "Hello, world from Ariel!"
 
 CHANGED_SOURCE = """
@@ -10388,6 +10582,8 @@ HOST_RESTART_SCENARIOS.update({REVOKE_LINEAGE_TITLE, REVOKE_EARLIER_TITLE,
 RELEASE_SCENARIOS.add(REVOKE_PIN_TITLE)
 
 SCENARIOS.extend(REVOKE_SCENARIOS)
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in WRITE_SCENARIOS)
+SCENARIOS.extend(WRITE_SCENARIOS)
 
 
 def main():

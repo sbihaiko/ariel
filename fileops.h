@@ -49,6 +49,9 @@ along with this program; see the file COPYING. If not, see
 /** The largest executable a run reads into memory. **/
 #define FILEOPS_RUN_MAX (64UL * 1024 * 1024)
 
+/** The largest file a write creates. **/
+#define FILEOPS_WRITE_MAX (64UL * 1024 * 1024)
+
 /**
  * Check one file command without acting. path must be absolute and inside a
  * writable root below root (root is "" on a console). operand is the mode,
@@ -110,6 +113,24 @@ int fileops_read_open(const char *root, const char *path, int *fd);
  **/
 int fileops_write_open(const char *root, const char *path,
                        const approval_facts_t *expected, int *fd);
+
+/**
+ * Check one write of a new file at path without acting. path must be a
+ * writable entry, not protected, not a link to a protected object, and its
+ * parent directory must not be protected. The entry's kind, device and inode
+ * go into facts; an entry that exists is for the caller to refuse. Returns
+ * FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_write_check(const char *root, const char *path,
+                        approval_facts_t *facts);
+
+/**
+ * Create the file at path with data, exclusively, and sync it. Returns
+ * FILEOPS_CHANGED when an entry exists at path, and removes a file it could
+ * not finish writing. Returns FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_write_act(const char *root, const char *path,
+                      const unsigned char *data, size_t size);
 
 /** Open the directory at path for reading, under the same checks. **/
 int fileops_dir_open(const char *root, const char *path, int *fd);

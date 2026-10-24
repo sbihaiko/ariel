@@ -1030,6 +1030,11 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     } else if(!strcmp(facts->command, "env") ||
               !strcmp(facts->command, "export")) {
       action->noptions = 0;
+    } else if(!strcmp(facts->command, "write")) {
+      decimal(facts->size, text[0], sizeof(text[0]));
+      options[0].key = "size";
+      options[0].value = text[0];
+      action->noptions = 1;
     } else if(!strcmp(facts->command, "reptyr")) {
       action->sha256 = facts->sha256;
       options[0].key = "start";
@@ -1283,6 +1288,9 @@ store_approval_request(const approval_facts_t *facts,
     } else {
       snprintf(prompt, promptlen, "fetch %s will run", facts->url);
     }
+  } else if(slot->gated && !strcmp(facts->command, "write")) {
+    snprintf(prompt, promptlen, "write %s (%llu bytes, sha256 %s) will run",
+             facts->target, (unsigned long long)facts->size, facts->sha256);
   } else if(slot->gated && !strcmp(facts->command, "reboot")) {
     snprintf(prompt, promptlen,
              "reboot the console with boot list sha256 %s will run",

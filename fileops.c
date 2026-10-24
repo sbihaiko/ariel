@@ -970,6 +970,60 @@ fileops_transfer_act(const char *root, const char *command,
 }
 
 
+int
+fileops_write_check(const char *root, const char *path,
+                    approval_facts_t *facts) {
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  rc = transfer_inspect(root, path, facts, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  close(dirfd);
+  return FILEOPS_OK;
+}
+
+
+int
+fileops_write_act(const char *root, const char *path, const unsigned char *data,
+                  size_t size) {
+  approval_facts_t now;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int fd;
+  int rc;
+
+  memset(&now, 0, sizeof(now));
+  rc = transfer_inspect(root, path, &now, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(now.kind, "absent")) {
+    close(dirfd);
+    return FILEOPS_CHANGED;
+  }
+
+  fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                           O_CLOEXEC, S_IRUSR | S_IWUSR);
+  if(fd < 0) {
+    close(dirfd);
+    return errno == EEXIST || errno == ELOOP ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+
+  rc = write_full(fd, (const char *)data, size) || fsync(fd) ? -1 : 0;
+  if(close(fd) || rc) {
+    unlinkat(dirfd, leaf, 0);
+    close(dirfd);
+    return FILEOPS_FAILED;
+  }
+
+  close(dirfd);
+  return FILEOPS_OK;
+}
+
+
 /** Whether text fits in size bytes, its NUL included. **/
 static int
 fits(const char *text, size_t size) {

@@ -693,8 +693,8 @@ parse_hash(const char *text, char out[SHA256_HEX_LEN + 1]) {
  **/
 static int
 upload_read_into(platform_t *platform, int wake, int fd, int outfd,
-                 uint64_t size, sha256_t *hash, uint64_t *received,
-                 unsigned char *buf) {
+                 unsigned char *mem, uint64_t size, sha256_t *hash,
+                 uint64_t *received, unsigned char *buf) {
   int64_t deadline = now_ms(platform) + UPLOAD_STALL_MS;
   uint64_t total = 0;
 
@@ -727,7 +727,9 @@ upload_read_into(platform_t *platform, int wake, int fd, int outfd,
       size_t hashed = (uint64_t)n < room ? (size_t)n : (size_t)room;
 
       sha256_update(hash, buf, hashed);
-      if(hashed > 0 && write_all(outfd, (const char*)buf, hashed)) {
+      if(mem) {
+        memcpy(mem + total, buf, hashed);
+      } else if(hashed > 0 && write_all(outfd, (const char*)buf, hashed)) {
         *received = total;
         return -2;
       }
@@ -746,8 +748,9 @@ upload_read_into(platform_t *platform, int wake, int fd, int outfd,
  * is CONNECTION_STACK, and a READ_CHUNK frame alone would overflow it.
  **/
 static int
-upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
-            sha256_t *hash, uint64_t *received) {
+upload_read(platform_t *platform, int wake, int fd, int outfd,
+            unsigned char *mem, uint64_t size, sha256_t *hash,
+            uint64_t *received) {
   unsigned char *buf;
   int rc;
 
@@ -755,7 +758,8 @@ upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
     *received = 0;
     return -1;
   }
-  rc = upload_read_into(platform, wake, fd, outfd, size, hash, received, buf);
+  rc = upload_read_into(platform, wake, fd, outfd, mem, size, hash, received,
+                        buf);
   free(buf);
 
   return rc;
@@ -1896,7 +1900,7 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
   }
 
   sha256_init(&hash);
-  rc = upload_read(platform, wake, fd, outfd, size, &hash, &received);
+  rc = upload_read(platform, wake, fd, outfd, NULL, size, &hash, &received);
 
   if(rc || received != size) {
     close(outfd);
@@ -1962,6 +1966,107 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
     reply(fd, answer);
     challenge_reply(fd, &challenge);
   }
+}
+
+
+static int
+write_vet(void *ctx) {
+  const approval_facts_t *facts = ctx;
+
+  return strcmp(facts->kind, "absent") ? FILEOPS_EXISTS : FILEOPS_OK;
+}
+
+
+static void
+write_outcome(int fd, const char *target, const char *id, int rc) {
+  char text[64];
+  const char *event = rc == FILEOPS_OK ? "done" :
+                      rc == FILEOPS_CHANGED ? "stale" : "refused";
+
+  outcome_text(rc, text, sizeof(text));
+  audit_reply(fd, "write", event, target, id, text);
+}
+
+
+/**
+ * write PATH SIZE SHA256: the body follows in the push frame. The path must be
+ * writable, unprotected and absent. The body is read and checked before the
+ * owner is asked, and each attempt sends it again.
+ **/
+static void
+write_command(agent_t *agent, int fd, int wake, const char *path,
+              const char *size_text, const char *hash_text) {
+  const char *root = agent->platform->fs_root;
+  platform_t *platform = agent->platform;
+  char declared[SHA256_HEX_LEN + 1];
+  char computed[SHA256_HEX_LEN + 1];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  unsigned char *body;
+  uint64_t size;
+  uint64_t received;
+  sha256_t hash;
+  int rc;
+
+  if(parse_size(size_text, &size) || parse_hash(hash_text, declared)) {
+    reply(fd, unknown);
+    return;
+  }
+  if(size > FILEOPS_WRITE_MAX) {
+    write_outcome(fd, path, "-", FILEOPS_TOO_LARGE);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_write_check(root, path, &facts);
+  if(rc != FILEOPS_OK) {
+    write_outcome(fd, path, "-", rc);
+    return;
+  }
+
+  body = malloc(size ? size : 1);
+  if(!body) {
+    write_outcome(fd, path, "-", FILEOPS_FAILED);
+    return;
+  }
+
+  sha256_init(&hash);
+  rc = upload_read(platform, wake, fd, -1, body, size, &hash, &received);
+  if(rc || received != size) {
+    free(body);
+    reply(fd, mismatch);
+    return;
+  }
+
+  sha256_final(&hash, digest);
+  sha256_hex(digest, computed);
+  if(strcmp(computed, declared)) {
+    free(body);
+    reply(fd, mismatch);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_write_check(root, path, &facts);
+  if(rc != FILEOPS_OK) {
+    free(body);
+    write_outcome(fd, path, "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "write");
+  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", computed);
+  facts.size = size;
+  if(!gate_pass_with(agent, fd, &facts, &challenge, write_vet, &facts)) {
+    free(body);
+    return;
+  }
+
+  rc = fileops_write_act(root, path, body, size);
+  free(body);
+  write_outcome(fd, path, challenge.id, rc);
 }
 
 
@@ -3794,6 +3899,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   // Exactly one command per connection.
   if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "push")) {
     payload_push(agent, fd, wake, argv[2], argv[3], argv[4]);
+    return;
+  }
+
+  if(argc == 4 && !strcmp(argv[0], "write")) {
+    write_command(agent, fd, wake, argv[1], argv[2], argv[3]);
     return;
   }
 
