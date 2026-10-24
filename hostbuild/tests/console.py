@@ -589,6 +589,47 @@ def check_background_refusals(session, context):
 
 
 # Every check console mode runs. Each is a scenario that needs no test clock.
+def autoload_listing(session):
+    return session.link.exchange("autoload show")
+
+
+def autoload_ask(session, op, name):
+    """Ask for an autoload edit and return its approval ID and challenge."""
+    session.operator.pause(NOTIFICATION_SPACING)
+    lines = session.link.exchange("autoload edit %s %s" % (op, name))
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "an autoload edit without a grant must answer 75, got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0])
+    assert approval, "expected 'approval_required <id>', got %r" % lines[0]
+    assert lines[1].startswith("challenge %s " % approval.group(1)), (
+        "expected the challenge for the approval, got %r" % lines[1])
+    return approval.group(1), lines[1]
+
+
+def autoload_approve(session, op, name):
+    """The owner's step for an autoload edit: ask, sign, grant; return the ID."""
+    approval, challenge = autoload_ask(session, op, name)
+    notification = ("prompt %s autoload %s %s will change the list"
+                    % (approval, op, name))
+    signature = session.operator.sign(name, notification, challenge)
+    lines = session.grant(approval, signature)
+    assert lines == ["approval_granted %s" % approval, "exit 0"], (
+        "the owner's signature must decide the autoload edit, got %r" % lines)
+    return approval
+
+
+def autoload_apply(session, op, name, approval):
+    return session.link.exchange("autoload edit %s %s %s" % (op, name, approval))
+
+
+def autoload_remove(session, name):
+    """Take an entry this check added back out of the console's list."""
+    approval = autoload_approve(session, "remove", name)
+    assert autoload_apply(session, "remove", name, approval) == [
+        "autoload remove %s" % name, "exit 0"], (
+        "the cleanup of %s must remove it" % name)
+
+
 def install_build(session, name, data):
     """Push, approve and commit one build, and return its digest."""
     digest = hashlib.sha256(data).hexdigest()
@@ -652,6 +693,103 @@ def check_rollback_refusals(session, context):
         % lines)
 
 
+def install_autoload_payload(session, name, data):
+    install_build(session, name, data)
+
+
+def check_autoload_show(session, context):
+    """autoload show lists the console's entries, Ariel first, and writes nothing."""
+    del context
+    before = session.link.exchange("audit tail")
+    lines = autoload_listing(session)
+    assert lines and lines[0] == "autoload ariel" and lines[-1] == "exit 0", (
+        "autoload show must list ariel first and end with exit 0, got %r"
+        % lines)
+    assert session.link.exchange("audit tail") == before, (
+        "autoload show is read-only and must not audit anything")
+
+
+def check_autoload_edit_asks_before_it_applies(session, context):
+    """An autoload edit without a grant answers 75 and the list does not change."""
+    del context
+    name = "consoleasks"
+    before = autoload_listing(session)
+    autoload_ask(session, "add", name)
+    assert autoload_listing(session) == before, (
+        "an edit that was asked for must not be applied before its grant")
+
+
+def check_autoload_edit_applies_after_grant(session, context):
+    """A granted autoload add is applied, shown by autoload show and audited."""
+    del context
+    name = "consoleboot"
+    install_autoload_payload(session, name, b"console boot\n")
+    approval = autoload_approve(session, "add", name)
+    try:
+        assert autoload_apply(session, "add", name, approval) == [
+            "autoload add %s" % name, "exit 0"], "a granted autoload add must apply"
+        assert "autoload %s" % name in autoload_listing(session), (
+            "autoload show must list the added entry")
+
+        kinds = [line.split()[1] for line in session.link.exchange("audit tail")
+                 if line.split()[3:4] == [approval]]
+        assert kinds == ["grant", "autoload_add"], (
+            "the grant and the applied edit must both be audited, got %r"
+            % kinds)
+
+        assert session.link.exchange("autoload edit add %s" % name) == [
+            "already_in_autoload", "exit 1"], (
+            "adding a name that is already listed must be refused")
+    finally:
+        autoload_remove(session, name)
+
+
+def check_autoload_pins_ariel(session, context):
+    """Ariel cannot be removed from the list: the edit is refused and audited."""
+    del context
+    assert session.link.exchange("autoload edit remove ariel") == [
+        "ariel_pinned", "exit 1"], "removing ariel must be refused"
+    assert "autoload ariel" in autoload_listing(session), (
+        "a refused removal must leave ariel in the list")
+    refused = [line.split() for line in session.link.exchange("audit tail")
+               if line.split()[1:4] == ["refuse", "ariel", "ariel_pinned"]]
+    assert refused, "the refused removal must be audited"
+
+
+def check_autoload_refusals_answer_their_words(session, context):
+    """Unknown and absent names are refused with their own words, unsigned."""
+    del context
+    assert session.link.exchange("autoload edit add consoleghost") == [
+        "unknown_payload", "exit 1"], "adding a payload that is not installed"
+    assert session.link.exchange("autoload edit remove consolemissing") == [
+        "not_in_autoload", "exit 1"], "removing a name that is not listed"
+
+
+def check_autoload_stale_grant_answers_78(session, context):
+    """A grant for a list that has since changed answers approval_stale, 78."""
+    del context
+    first, second = "consolestale", "consoleother"
+    install_autoload_payload(session, second, b"console other\n")
+    stale, challenge = autoload_ask(session, "add", first)
+    try:
+        other = autoload_approve(session, "add", second)
+        assert autoload_apply(session, "add", second, other) == [
+            "autoload add %s" % second, "exit 0"], "the other edit must apply"
+
+        notification = ("prompt %s autoload add %s will change the list"
+                        % (stale, first))
+        signature = session.operator.sign(first, notification, challenge)
+        lines = session.grant(stale, signature)
+        assert lines == ["approval_granted %s" % stale, "exit 0"], (
+            "the owner's signature must decide the stale edit, got %r" % lines)
+        assert autoload_apply(session, "add", first, stale) == [
+            "approval_stale", "exit 78"], "a grant for an older list is stale"
+        assert "autoload %s" % first not in autoload_listing(session), (
+            "a stale grant must not change the list")
+    finally:
+        autoload_remove(session, second)
+
+
 CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
     ("a line over 1 KiB closes the connection", check_line_limit),
@@ -683,6 +821,18 @@ CHECKS = [
     ("approval status answers pending, granted and consumed without an "
      "approval of its own, and an unknown id is an error",
      check_approval_status),
+    ("autoload show lists the entries, Ariel first, and writes nothing",
+     check_autoload_show),
+    ("an autoload edit without a grant answers 75 and leaves the list as it "
+     "was", check_autoload_edit_asks_before_it_applies),
+    ("a granted autoload add is applied, shown by autoload show and audited",
+     check_autoload_edit_applies_after_grant),
+    ("autoload edit remove ariel is refused with ariel_pinned and audited",
+     check_autoload_pins_ariel),
+    ("autoload refuses an unknown payload and an absent entry with their words",
+     check_autoload_refusals_answer_their_words),
+    ("a stale autoload grant answers approval_stale, 78, and leaves the list "
+     "as it was", check_autoload_stale_grant_answers_78),
     ("a read-only command with a relative path answers relative_path and "
      "exit 1", check_read_only_relative),
     ("kill with a bad signal, a bad pid or no such process answers an "

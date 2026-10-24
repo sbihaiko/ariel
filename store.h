@@ -186,6 +186,30 @@ int store_approval_deny(const char *id);
  **/
 int store_approval_facts(const char *id, approval_facts_t *facts);
 
+/** What one autoload edit ended in. **/
+#define STORE_AUTOLOAD_APPLIED 0
+#define STORE_AUTOLOAD_PENDING 1
+#define STORE_AUTOLOAD_DENIED  2
+#define STORE_AUTOLOAD_EXPIRED 3
+#define STORE_AUTOLOAD_STALE   4
+#define STORE_AUTOLOAD_UNKNOWN 5
+#define STORE_AUTOLOAD_FAILED  6
+
+/**
+ * Copy the autoload list into buf, NUL-terminated: one payload name per line,
+ * Ariel first. Returns its length, or -1 when it cannot be read.
+ **/
+int store_autoload_show(char *buf, size_t size);
+
+/**
+ * Apply the granted approval id to the autoload edit command names, for name.
+ * The list must still be the one the approval was asked about, or the answer
+ * is STORE_AUTOLOAD_STALE. A pending approval fills challenge with what the
+ * owner signs. Returns one of STORE_AUTOLOAD_*.
+ **/
+int store_autoload_apply(const char *id, const char *command, const char *name,
+                         approval_challenge_t *challenge);
+
 /** Bind a staged object to the approval that names it. **/
 void store_stage(const char *staging_id, const approval_facts_t *facts,
                  const char *approval_id);

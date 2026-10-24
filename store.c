@@ -33,6 +33,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "approval.h"
+#include "autoload.h"
 #include "protected.h"
 #include "sha256.h"
 #include "store.h"
@@ -100,7 +101,9 @@ struct staged {
  **/
 #define JOURNAL_FILE "journal"
 #define JOURNAL_TMP "journal.tmp"
-#define JOURNAL_MARKER "ariel-journal-v1"
+#define JOURNAL_MARKER "ariel-journal-v2"
+#define AUTOLOAD_FILE "autoload"
+#define AUTOLOAD_TMP "autoload.tmp"
 
 /** One member of the approval table. **/
 struct approval {
@@ -148,8 +151,9 @@ static int nonces_load(void);
 static int write_all(int fd, const char *buf, size_t len);
 static int audit_append_locked(const char *kind, const char *name,
                                const char *id, const char *sha256);
-static int transaction_recover_locked(int store_fd);
+static int transaction_recover_locked(int state_fd, int store_fd);
 static int recover_at_start(int state_fd);
+static int autoload_make(int state_fd);
 
 
 /** Give a staging entry back: its slot and the bytes it reserved. The
@@ -390,6 +394,10 @@ store_init(const char *dir, platform_t *p) {
   // The state file is built from Stage 1's current records, which live under
   // the store just made; a start that finds the file leaves those alone.
   if(!rc && state_open(state_dir)) {
+    rc = -1;
+  }
+
+  if(!rc && autoload_make(state_fd)) {
     rc = -1;
   }
 
@@ -941,6 +949,9 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     action->destination = NULL;
     action->sha256 = facts->sha256;
     action->noptions = facts->run ? 2 : 1;
+    if(!strncmp(facts->command, "autoload.", 9)) {
+      action->noptions = 0;
+    }
   }
 
   action->options = options;
@@ -1030,9 +1041,11 @@ store_approval_request(const approval_facts_t *facts,
   slot->challenge.action_len = (size_t)len;
   slot->challenge.issued_ms = now;
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
-  slot->facts = *facts;
 
-  if(rollback) {
+  if(!strncmp(facts->command, "autoload.", 9)) {
+    snprintf(prompt, promptlen, "%s %s (list sha256 %s) will change autoload",
+             facts->command, facts->name, facts->sha256);
+  } else if(rollback) {
     snprintf(prompt, promptlen,
              "payload %s rolls back to %s, replacing %s",
              facts->name, facts->sha256, facts->replaces);
@@ -1424,6 +1437,7 @@ object_present(int objects_fd, const char *hash) {
 
 /** One transaction's record, as the journal holds it between phases. **/
 struct journal {
+  char kind[16];
   char phase[16];
   char name[PAYLOAD_NAME_MAX + 1];
   char hash[SHA256_HEX_LEN + 1];
@@ -1528,8 +1542,8 @@ journal_write(int store_fd, const struct journal *j) {
   char text[256];
   int len;
 
-  len = snprintf(text, sizeof(text), JOURNAL_MARKER "\n%s %s %s %s %s\n",
-                 j->phase, j->name, j->hash, j->previous, j->drop);
+  len = snprintf(text, sizeof(text), JOURNAL_MARKER "\n%s %s %s %s %s %s\n",
+                 j->kind, j->phase, j->name, j->hash, j->previous, j->drop);
   if(len < 0 || len >= (int)sizeof(text)) {
     return -1;
   }
@@ -1580,12 +1594,13 @@ journal_read(int store_fd, struct journal *j) {
   close(fd);
   text[total] = '\0';
 
-  if(sscanf(text, JOURNAL_MARKER "\n%15s %32s %64s %64s %64s", j->phase,
-            j->name, j->hash, j->previous, j->drop) != 5) {
+  if(sscanf(text, JOURNAL_MARKER "\n%15s %15s %32s %64s %64s %64s", j->kind,
+            j->phase, j->name, j->hash, j->previous, j->drop) != 6) {
     return -1;
   }
 
-  if((strcmp(j->phase, "prepared") && strcmp(j->phase, "committed")) ||
+  if((strcmp(j->kind, "payload") && strcmp(j->kind, "autoload")) ||
+     (strcmp(j->phase, "prepared") && strcmp(j->phase, "committed")) ||
      !store_name_valid(j->name) || !hash_text(j->hash) ||
      (strcmp(j->previous, "-") && !hash_text(j->previous)) ||
      (strcmp(j->drop, "-") && !hash_text(j->drop))) {
@@ -1689,6 +1704,162 @@ out:
 }
 
 
+/** The SHA-256 of len bytes of text, as lowercase hex. **/
+static void
+text_hash(const char *text, size_t len, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+
+  sha256_init(&hash);
+  sha256_update(&hash, text, len);
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+}
+
+
+/**
+ * Read a small file below dirfd into buf, NUL-terminated. Returns its length,
+ * or -1 when it is missing, unreadable or longer than size - 1.
+ **/
+static int
+text_read(int dirfd, const char *name, char *buf, size_t size) {
+  size_t total = 0;
+  char probe;
+  int fd;
+
+  if((fd=open_entry(dirfd, name, O_RDONLY)) < 0) {
+    return -1;
+  }
+
+  while(total < size - 1) {
+    ssize_t n = read(fd, buf + total, size - 1 - total);
+
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      close(fd);
+      return -1;
+    }
+    if(n == 0) {
+      break;
+    }
+    total += (size_t)n;
+  }
+
+  if(total == size - 1 && read(fd, &probe, 1) != 0) {
+    close(fd);
+    return -1;
+  }
+
+  close(fd);
+  buf[total] = '\0';
+  return (int)total;
+}
+
+
+/**
+ * Write the list's first text, with a journal record, at the moment of the
+ * change: prepared, then committed, then the rename that makes the new list
+ * the list. A failure before the commit leaves the old list; a failure after
+ * it is finished by recovery at the next start. The caller holds the lock.
+ **/
+static int
+autoload_transaction_locked(int state_fd, int store_fd, const char *text,
+                            const char *old_hash, const char *new_hash,
+                            const char *kind, const char *name, const char *id) {
+  struct journal j;
+
+  memset(&j, 0, sizeof(j));
+  snprintf(j.kind, sizeof(j.kind), "autoload");
+  snprintf(j.phase, sizeof(j.phase), "prepared");
+  snprintf(j.name, sizeof(j.name), "%s", AUTOLOAD_FILE);
+  snprintf(j.hash, sizeof(j.hash), "%s", new_hash);
+  snprintf(j.previous, sizeof(j.previous), "%s", old_hash);
+  snprintf(j.drop, sizeof(j.drop), "-");
+
+  if(tmp_write(state_fd, AUTOLOAD_TMP, text, strlen(text))) {
+    return -1;
+  }
+
+  if(journal_write(store_fd, &j)) {
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    return -1;
+  }
+
+  fault_at("prepared");
+
+  snprintf(j.phase, sizeof(j.phase), "committed");
+  if(journal_write(store_fd, &j)) {
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    journal_clear(store_fd);
+    return -1;
+  }
+
+  fault_at("committed");
+
+  if(renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE) ||
+     fsync(state_fd)) {
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    journal_clear(store_fd);
+    return -1;
+  }
+
+  if(audit_append_locked(kind, name, id, new_hash)) {
+    return -1;
+  }
+
+  return journal_clear(store_fd);
+}
+
+
+/**
+ * Finish an autoload change the journal names: a prepared one is dropped, a
+ * committed one is put in place, and each is audited. The caller holds the
+ * lock.
+ **/
+static int
+autoload_recover_locked(int state_fd, int store_fd, const struct journal *j) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  int len;
+
+  if(!strcmp(j->phase, "prepared")) {
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    if(fsync(state_fd) ||
+       audit_append_locked("rollback", AUTOLOAD_FILE, "-", j->hash)) {
+      return -1;
+    }
+    return journal_clear(store_fd);
+  }
+
+  len = text_read(state_fd, AUTOLOAD_TMP, text, sizeof(text));
+  if(len >= 0) {
+    text_hash(text, (size_t)len, hex);
+    if(strcmp(hex, j->hash) || renameat(state_fd, AUTOLOAD_TMP, state_fd,
+                                        AUTOLOAD_FILE) ||
+       fsync(state_fd)) {
+      return -1;
+    }
+  } else {
+    len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
+    if(len < 0) {
+      return -1;
+    }
+    text_hash(text, (size_t)len, hex);
+    if(strcmp(hex, j->hash)) {
+      audit_append_locked("rollforward_refused", AUTOLOAD_FILE, "-", j->hash);
+      return -1;
+    }
+  }
+
+  if(audit_append_locked("rollforward", AUTOLOAD_FILE, "-", j->hash)) {
+    return -1;
+  }
+  return journal_clear(store_fd);
+}
+
+
 /**
  * Finish the change the journal names, if one is in progress: roll back a
  * prepared change, roll forward a committed one, and audit which. Running it
@@ -1696,7 +1867,7 @@ out:
  * the lock.
  **/
 static int
-transaction_recover_locked(int store_fd) {
+transaction_recover_locked(int state_fd, int store_fd) {
   struct journal j;
   int rc;
 
@@ -1706,6 +1877,10 @@ transaction_recover_locked(int store_fd) {
   }
   if(rc) {
     return -1;
+  }
+
+  if(!strcmp(j.kind, "autoload")) {
+    return autoload_recover_locked(state_fd, store_fd, &j);
   }
 
   if(!strcmp(j.phase, "prepared")) {
@@ -1732,7 +1907,7 @@ recover_at_start(int state_fd) {
 
   pthread_mutex_lock(&lock);
   if((store_fd=dir_open(state_fd, "store")) >= 0) {
-    rc = transaction_recover_locked(store_fd);
+    rc = transaction_recover_locked(state_fd, store_fd);
     close(store_fd);
   }
   pthread_mutex_unlock(&lock);
@@ -1866,7 +2041,7 @@ staged_install(struct staged *entry, struct approval *request,
   }
 
   // A change an earlier step left in the journal finishes before this one.
-  if(transaction_recover_locked(store_fd)) {
+  if(transaction_recover_locked(state_fd, store_fd)) {
     goto out;
   }
 
@@ -1914,6 +2089,7 @@ staged_install(struct staged *entry, struct approval *request,
   }
 
   memset(&j, 0, sizeof(j));
+  snprintf(j.kind, sizeof(j.kind), "payload");
   snprintf(j.name, sizeof(j.name), "%s", entry->facts.name);
   snprintf(j.hash, sizeof(j.hash), "%s", entry->facts.sha256);
 
@@ -2107,6 +2283,48 @@ rollback_open_find(const char *name) {
 }
 
 
+/** Make the list with Ariel alone when no list exists yet. **/
+static int
+autoload_make(int state_fd) {
+  int fd;
+
+  if((fd=open_entry(state_fd, AUTOLOAD_FILE, O_RDONLY)) >= 0) {
+    close(fd);
+    return 0;
+  }
+  if(errno != ENOENT) {
+    return -1;
+  }
+
+  if(tmp_write(state_fd, AUTOLOAD_TMP, AUTOLOAD_DEFAULT,
+               strlen(AUTOLOAD_DEFAULT)) ||
+     renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE) ||
+     fsync(state_fd)) {
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    return -1;
+  }
+
+  return 0;
+}
+
+
+int
+store_autoload_show(char *buf, size_t size) {
+  int state_fd;
+  int len;
+
+  pthread_mutex_lock(&lock);
+  state_fd = root_open();
+  len = state_fd < 0 ? -1 : text_read(state_fd, AUTOLOAD_FILE, buf, size);
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  pthread_mutex_unlock(&lock);
+
+  return len;
+}
+
+
 /**
  * The owner approved a rollback: check that the store still holds the facts
  * approved, then change it through the journal, as an install does. The build
@@ -2136,7 +2354,7 @@ rollback_apply_locked(struct approval *request, store_install_t *install) {
   }
 
   // A change an earlier step left in the journal finishes before this one.
-  if(transaction_recover_locked(store_fd)) {
+  if(transaction_recover_locked(state_fd, store_fd)) {
     goto out;
   }
 
@@ -2163,6 +2381,7 @@ rollback_apply_locked(struct approval *request, store_install_t *install) {
   }
 
   memset(&j, 0, sizeof(j));
+  snprintf(j.kind, sizeof(j.kind), "payload");
   snprintf(j.name, sizeof(j.name), "%s", name);
   snprintf(j.hash, sizeof(j.hash), "%s", live.sha256);
   snprintf(j.previous, sizeof(j.previous), "%s", live.replaces);
@@ -2212,6 +2431,57 @@ out:
 }
 
 
+/**
+ * Apply an approved autoload edit, under the lock, against the list as it is
+ * now: an approval whose list has changed since it was asked is stale. The
+ * caller holds the lock.
+ **/
+static int
+autoload_apply_locked(struct approval *request) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char next[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  char next_hex[SHA256_HEX_LEN + 1];
+  int state_fd;
+  int store_fd;
+  int len;
+  int add = !strcmp(request->facts.command, "autoload.add");
+  int outcome = STORE_AUTOLOAD_FAILED;
+
+  if((state_fd=root_open()) < 0) {
+    return STORE_AUTOLOAD_FAILED;
+  }
+  if((store_fd=dir_open(state_fd, "store")) < 0) {
+    close(state_fd);
+    return STORE_AUTOLOAD_FAILED;
+  }
+
+  len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
+  if(len >= 0) {
+    text_hash(text, (size_t)len, hex);
+
+    if(strcmp(hex, request->facts.sha256) ||
+       autoload_edit(text, add, request->facts.name, next, sizeof(next)) !=
+         AUTOLOAD_OK) {
+      outcome = STORE_AUTOLOAD_STALE;
+    } else {
+      text_hash(next, strlen(next), next_hex);
+      if(!autoload_transaction_locked(state_fd, store_fd, next, hex, next_hex,
+                                      add ? "autoload_add" : "autoload_remove",
+                                      request->facts.name, request->id)) {
+        request->consumed = 1;
+        request->released = 1;
+        outcome = STORE_AUTOLOAD_APPLIED;
+      }
+    }
+  }
+
+  close(store_fd);
+  close(state_fd);
+  return outcome;
+}
+
+
 int
 store_rollback(const char *name, char *approval_id, size_t idlen,
                store_install_t *install) {
@@ -2235,6 +2505,39 @@ store_rollback(const char *name, char *approval_id, size_t idlen,
     } else {
       outcome = rollback_apply_locked(request, install);
     }
+  }
+
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
+int
+store_autoload_apply(const char *id, const char *command, const char *name,
+                     approval_challenge_t *challenge) {
+  struct approval *request;
+  int outcome;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+  request = approval_find(id);
+
+  if(!request) {
+    outcome = STORE_AUTOLOAD_UNKNOWN;
+  } else if(request->consumed) {
+    outcome = STORE_AUTOLOAD_STALE;
+  } else if(request->expired) {
+    outcome = STORE_AUTOLOAD_EXPIRED;
+  } else if(!request->decided) {
+    *challenge = request->challenge;
+    outcome = STORE_AUTOLOAD_PENDING;
+  } else if(!request->approved) {
+    outcome = STORE_AUTOLOAD_DENIED;
+  } else if(strcmp(request->facts.command, command) ||
+            strcmp(request->facts.name, name)) {
+    outcome = STORE_AUTOLOAD_STALE;
+  } else {
+    outcome = autoload_apply_locked(request);
   }
 
   pthread_mutex_unlock(&lock);

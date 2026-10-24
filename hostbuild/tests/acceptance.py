@@ -1056,6 +1056,8 @@ FAULT_SCENARIOS = {
     "after restart",
     "a crash in committed during a rollback leaves the previous build current "
     "after restart",
+    "a crash in prepared of an autoload edit leaves the old list after restart",
+    "a crash in committed of an autoload edit leaves the new list after restart",
 }
 
 # The scenarios that rewrite or remove the state file on the host's disk,
@@ -4158,6 +4160,183 @@ def audit_tail(server, n=None):
     return send_command(server, command)
 
 
+def scenario_autoload_show_lists_entries(server):
+    """autoload show lists the boot entries, Ariel first, and writes nothing."""
+    before = read_audit_log(server)
+    lines = send_command(server, "autoload show")
+    assert lines == ["autoload ariel", "exit 0"], (
+        "a fresh store must autoload only Ariel, got %r" % lines)
+    assert read_audit_log(server) == before, (
+        "autoload show is read-only and must not audit anything")
+
+
+AUTOLOAD_SELF = "ariel"
+
+
+def autoload_listing(server):
+    return send_command(server, "autoload show")
+
+
+def autoload_ask(server, op, name):
+    """Ask for an autoload edit and return its approval ID and challenge."""
+    server.advance(10_000)
+    lines = send_command(server, "autoload edit %s %s" % (op, name))
+    assert lines and lines[-1] == "exit 75", (
+        "an autoload edit without a grant must answer 75, got %r" % lines)
+    approvals = [APPROVAL_LINE.match(line) for line in lines]
+    approvals = [match.group(1) for match in approvals if match]
+    assert len(approvals) == 1, "expected one approval, got %r" % lines
+    prompt = server.next_line()
+    assert prompt and prompt.startswith("prompt %s " % approvals[0]), (
+        "the owner must be prompted for the edit, got %r" % prompt)
+    return approvals[0], challenge_of(lines)
+
+
+def autoload_apply(server, op, name, approval):
+    return send_command(server, "autoload edit %s %s %s" % (op, name, approval))
+
+
+def autoload_approve(server, op, name):
+    """The owner's step for an autoload edit: ask, sign, grant; return the ID."""
+    approval, challenge = autoload_ask(server, op, name)
+    sign_and_grant(server, approval, challenge)
+    return approval
+
+
+def scenario_autoload_edit_asks_before_it_applies(server):
+    """An autoload edit without a grant answers 75 and leaves the list as it was."""
+    install_payload(server, "asks", b"asks build\n")
+    autoload_ask(server, "add", "asks")
+    assert "autoload asks" not in autoload_listing(server), (
+        "an edit that was asked for must not be applied before its grant")
+
+
+def scenario_autoload_edit_applies_after_grant(server):
+    """A granted autoload add is applied, shown by autoload show and audited."""
+    install_payload(server, "boot", b"boot build\n")
+    approval = autoload_approve(server, "add", "boot")
+    assert autoload_apply(server, "add", "boot", approval) == [
+        "autoload add boot", "exit 0"], "a granted autoload add must apply"
+
+    listing = autoload_listing(server)
+    assert listing[0] == "autoload ariel" and "autoload boot" in listing, (
+        "autoload show must list the added entry, got %r" % listing)
+
+    ours = [line.split() for line in audit_tail(server)
+            if line.split()[3:4] == [approval]]
+    assert [event[1] for event in ours] == ["grant", "autoload_add"], (
+        "the grant and the applied edit must both be audited, got %r" % ours)
+
+
+def scenario_autoload_pins_ariel(server):
+    """Ariel cannot be removed from the list: the edit is refused and audited."""
+    assert send_command(server, "autoload edit remove ariel") == [
+        "ariel_pinned", "exit 1"], "removing ariel must be refused"
+    assert "autoload ariel" in autoload_listing(server), (
+        "a refused removal must leave ariel in the list")
+    refused = [line.split() for line in audit_tail(server)
+               if line.split()[1:4] == ["refuse", "ariel", "ariel_pinned"]]
+    assert refused, "the refused removal must be audited"
+
+
+def scenario_autoload_refusals_answer_their_words(server):
+    """Unknown, present and absent names are refused with their own words."""
+    install_payload(server, "refused", b"refused build\n")
+    assert send_command(server, "autoload edit add ghost") == [
+        "unknown_payload", "exit 1"], "adding a payload that is not installed"
+    approval = autoload_approve(server, "add", "refused")
+    assert autoload_apply(server, "add", "refused", approval) == [
+        "autoload add refused", "exit 0"], "the granted add must apply"
+    assert send_command(server, "autoload edit add refused") == [
+        "already_in_autoload", "exit 1"], "adding a name twice"
+    assert send_command(server, "autoload edit remove missing") == [
+        "not_in_autoload", "exit 1"], "removing a name that is not listed"
+
+
+def scenario_autoload_stale_grant_answers_78(server):
+    """A grant for a list that has since changed answers approval_stale."""
+    install_payload(server, "stale_one", b"stale one build\n")
+    install_payload(server, "stale_two", b"stale two build\n")
+    stale, challenge = autoload_ask(server, "add", "stale_one")
+
+    other = autoload_approve(server, "add", "stale_two")
+    assert autoload_apply(server, "add", "stale_two", other) == [
+        "autoload add stale_two", "exit 0"], "the other edit must apply"
+
+    sign_and_grant(server, stale, challenge)
+    assert autoload_apply(server, "add", "stale_one", stale) == [
+        "approval_stale", "exit 78"], "a grant for an older list is stale"
+    assert "autoload stale_one" not in autoload_listing(server), (
+        "a stale grant must not change the list")
+
+
+def autoload_apply_until_crash(server, op, name, approval):
+    """Send an autoload apply that the injected fault ends, and wait for Ariel to die."""
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\nautoload edit %s %s %s\n"
+                      % (server.token, op, name, approval)).encode("ascii"))
+        reply = reply_lines(read_reply(sock))
+    except OSError:
+        reply = []
+    finally:
+        sock.close()
+    assert server.proc.wait(timeout=5.0) != 0, "the fault must end Ariel"
+    return reply
+
+
+def crash_autoload(server, step):
+    """Grant an autoload add of crash_tool, then crash its apply at step."""
+    install_payload(server, "crash_tool", b"crash tool build\n")
+    server.env = {FAULT_ENV: step}
+    server.restart()
+    approval, challenge = autoload_ask(server, "add", "crash_tool")
+    sign_and_grant(server, approval, challenge)
+    assert autoload_apply_until_crash(server, "add", "crash_tool",
+                                      approval) == [], (
+        "an apply that crashes must answer nothing")
+
+
+def scenario_crash_in_autoload_prepared_keeps_old_list(server):
+    """A crash after the prepared mark leaves the old list after restart."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        crash_autoload(crashed, "prepared")
+        crashed.env = None
+        crashed.restart()
+
+        assert "autoload crash_tool" not in autoload_listing(crashed), (
+            "a crash in prepared must leave the old list")
+        new_hash = hashlib.sha256(
+            (AUTOLOAD_SELF + "\ncrash_tool\n").encode("ascii")).hexdigest()
+        assert ("rollback", "autoload", new_hash) in journal_events(crashed), (
+            "the rollback must be audited, the log holds %r"
+            % journal_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_crash_in_autoload_committed_keeps_new_list(server):
+    """A crash after the commit mark leaves the new list after restart."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        crash_autoload(crashed, "committed")
+        crashed.env = None
+        crashed.restart()
+
+        assert "autoload crash_tool" in autoload_listing(crashed), (
+            "a crash in committed must leave the new list")
+        new_hash = hashlib.sha256(
+            (AUTOLOAD_SELF + "\ncrash_tool\n").encode("ascii")).hexdigest()
+        assert ("rollforward", "autoload", new_hash) in journal_events(crashed), (
+            "the roll forward must be audited, the log holds %r"
+            % journal_events(crashed))
+    finally:
+        crashed.stop()
+
+
 def scenario_audit_tail_order(server):
     """After a push, a grant and a commit, audit tail shows each one in order."""
     data = b"audited bytes\n"
@@ -5047,6 +5226,22 @@ SCENARIOS = [
      scenario_crash_in_committed_rolls_forward_the_rollback, FAULT_REASON),
     ("a payload the record marks running is not started again on restart",
      scenario_running_mark_does_not_restart_payload, None),
+    ("autoload show lists the boot entries, Ariel first, and writes nothing",
+     scenario_autoload_show_lists_entries, None),
+    ("autoload edit without a grant answers 75 and leaves the list as it was",
+     scenario_autoload_edit_asks_before_it_applies, None),
+    ("a granted autoload add is applied, shown by autoload show and audited",
+     scenario_autoload_edit_applies_after_grant, None),
+    ("autoload edit remove ariel is refused with ariel_pinned and audited",
+     scenario_autoload_pins_ariel, None),
+    ("autoload refuses an unknown payload, a present entry and an absent one",
+     scenario_autoload_refusals_answer_their_words, None),
+    ("a stale autoload grant answers approval_stale, 78, and leaves the list "
+     "as it was", scenario_autoload_stale_grant_answers_78, None),
+    ("a crash in prepared of an autoload edit leaves the old list after restart",
+     scenario_crash_in_autoload_prepared_keeps_old_list, FAULT_REASON),
+    ("a crash in committed of an autoload edit leaves the new list after restart",
+     scenario_crash_in_autoload_committed_keeps_new_list, FAULT_REASON),
 ]
 
 

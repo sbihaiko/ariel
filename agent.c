@@ -28,6 +28,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "agent.h"
 #include "approval.h"
+#include "autoload.h"
 #include "fileops.h"
 #include "runs.h"
 #include "sha256.h"
@@ -106,6 +107,26 @@ static const char approval_stale[] =
   "exit 78\n";
 static const char unknown_payload[] =
   "unknown_payload\n"
+  "exit 1\n";
+
+static const char ariel_pinned[] =
+  "ariel_pinned\n"
+  "exit 1\n";
+
+static const char already_in_autoload[] =
+  "already_in_autoload\n"
+  "exit 1\n";
+
+static const char not_in_autoload[] =
+  "not_in_autoload\n"
+  "exit 1\n";
+
+static const char autoload_full[] =
+  "autoload_full\n"
+  "exit 1\n";
+
+static const char autoload_failed[] =
+  "autoload_failed\n"
   "exit 1\n";
 static const char unknown_approval[] =
   "unknown_approval\n"
@@ -1773,6 +1794,138 @@ audit_tail_reply(int fd, const char *count_text) {
 }
 
 
+/** autoload show: the boot list, one line per entry, read-only. **/
+static void
+autoload_show(int fd) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char line[PAYLOAD_NAME_MAX + 16];
+  char *p;
+  char *nl;
+
+  if(store_autoload_show(text, sizeof(text)) < 0) {
+    reply(fd, list_failed);
+    return;
+  }
+
+  for(p=text; (nl=strchr(p, '\n')); p=nl + 1) {
+    *nl = '\0';
+    snprintf(line, sizeof(line), "autoload %s\n", p);
+    reply(fd, line);
+    *nl = '\n';
+  }
+
+  reply(fd, "exit 0\n");
+}
+
+
+/**
+ * autoload edit <add|remove> <name> [<approval-id>]: without an approval the
+ * edit is asked (75); with one, it is applied if the owner granted it and the
+ * list is still the one it was asked about.
+ **/
+static void
+autoload_change(agent_t *agent, int fd, int add, const char *name,
+                const char *id) {
+  const char *command = add ? "autoload.add" : "autoload.remove";
+  char text[AUTOLOAD_TEXT_MAX];
+  char next[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char answer[128];
+  approval_facts_t facts;
+  approval_challenge_t challenge;
+  sha256_t hash;
+  int len;
+
+  if(!store_name_valid(name)) {
+    refuse(fd, name, "bad_name", bad_name);
+    return;
+  }
+
+  if(id) {
+    switch(store_autoload_apply(id, command, name, &challenge)) {
+    case STORE_AUTOLOAD_APPLIED:
+      snprintf(answer, sizeof(answer), "autoload %s %s\nexit 0\n",
+               add ? "add" : "remove", name);
+      reply(fd, answer);
+      return;
+    case STORE_AUTOLOAD_PENDING:
+      challenge_reply(fd, &challenge);
+      return;
+    case STORE_AUTOLOAD_DENIED:
+      refuse(fd, name, "approval_denied", approval_denied);
+      return;
+    case STORE_AUTOLOAD_EXPIRED:
+      refuse(fd, name, "approval_expired", approval_expired);
+      return;
+    case STORE_AUTOLOAD_UNKNOWN:
+      refuse(fd, name, "unknown_approval", unknown_approval);
+      return;
+    case STORE_AUTOLOAD_STALE:
+      refuse(fd, name, "approval_stale", approval_stale);
+      return;
+    default:
+      reply(fd, autoload_failed);
+      return;
+    }
+  }
+
+  if(store_autoload_show(text, sizeof(text)) < 0) {
+    reply(fd, list_failed);
+    return;
+  }
+
+  switch(autoload_edit(text, add, name, next, sizeof(next))) {
+  case AUTOLOAD_OK:
+    break;
+  case AUTOLOAD_PINNED:
+    refuse(fd, name, "ariel_pinned", ariel_pinned);
+    return;
+  case AUTOLOAD_PRESENT:
+    refuse(fd, name, "already_in_autoload", already_in_autoload);
+    return;
+  case AUTOLOAD_ABSENT:
+    refuse(fd, name, "not_in_autoload", not_in_autoload);
+    return;
+  case AUTOLOAD_FULL:
+    refuse(fd, name, "autoload_full", autoload_full);
+    return;
+  default:
+    reply(fd, autoload_failed);
+    return;
+  }
+
+  if(add) {
+    len = payload_installed(name);
+    if(len < 0) {
+      reply(fd, list_failed);
+      return;
+    }
+    if(!len) {
+      refuse(fd, name, "unknown_payload", unknown_payload);
+      return;
+    }
+  }
+
+  sha256_init(&hash);
+  sha256_update(&hash, text, strlen(text));
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", command);
+  snprintf(facts.name, sizeof(facts.name), "%s", name);
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
+
+  if(agent->platform->approval_request(agent->platform, &facts, &challenge)) {
+    reply(fd, approval_busy);
+    return;
+  }
+
+  challenge_reply(fd, &challenge);
+}
+
+
 static void
 handle_command(agent_t *agent, int fd, int wake, char *line) {
   char *argv[MAX_ARGS + 1];
@@ -1796,6 +1949,20 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "list")) {
     payload_list(fd);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "autoload") && !strcmp(argv[1], "show")) {
+    autoload_show(fd);
+    return;
+  }
+
+  // autoload edit <add|remove> <name> [<approval-id>]: the Stage 3 list edit.
+  if((argc == 4 || argc == 5) && !strcmp(argv[0], "autoload") &&
+     !strcmp(argv[1], "edit") &&
+     (!strcmp(argv[2], "add") || !strcmp(argv[2], "remove"))) {
+    autoload_change(agent, fd, !strcmp(argv[2], "add"), argv[3],
+                    argc == 5 ? argv[4] : NULL);
     return;
   }
 
