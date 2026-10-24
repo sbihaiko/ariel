@@ -252,15 +252,19 @@ Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014). The spike is
 | `sceKernelLoadStartModule` after `/system/common/lib/libSceIpmi.sprx` and `/system/common/lib/libSceSysUtil.sprx` | loaded (handle 35), all 13 exports resolved, calls survive |
 | `sceKernelDlsym(handle, nid, &fn)` for each export | `0x80020003` for every one, plain and `#E#A`-decorated; `kernel_dynlib_resolve(getpid(), handle, nid)` answers instead |
 | `SetParam("Ariel capture spike", …, "issue #55")` | `0`, twice |
-| `Capture(mode 0, buf, cancel at 15 s, …)` | `0x80020023` until the cancel fired, then `0x80BE000A`; buffer empty |
+| `Capture(mode 0, buf, cancel at 15 s, …)`, first run | `0x80020023` until the cancel fired, then `0x80BE000A`; buffer empty |
+| `Capture(mode 0, buf, cancel at 20 s, …)`, second run | `0x80020003` at once; buffer empty |
+| `Capture(mode 1, buf, cancel at 20 s, …)` | `0x80020003` at once; buffer empty |
+| `IsDisabled(&flag)` | `0x80BE0001`, flag untouched: the export does not take a `int *` |
+| `IsVshScreenCaptureDisabled(&flag)` | `0x80020003`, flag untouched |
 | `SetOverlayImage("/data/shot-spike2.jpg", 1280, 720, 0)` | `0x80BE0003` (the export takes a path and two coordinates; no image either way) |
 
 Four things this run settled:
 
 - **The library loads in a payload only after its imports are present.** Loaded alone, it resolves and then dies on the first call that crosses a PLT entry into `libSceIpmi`/`libSceSysUtil`; loaded after those two, it answers. A payload has no `dlopen` at all, so `sceKernelLoadStartModule` with the full path is the only door, and `kernel_dynlib_resolve` with the kernel's own symbol table is the only lookup.
-- **A payload is not refused by the capture service, and not served either.** `SetParam` answers success and `Capture` is accepted (`0x80020023` is "still working", not an error), but on this console it never left that state: no game running, the system UI on screen, 15 s and no image. Whether `mode 1`, a running title, or the VSH's own identity changes that is not measured.
+- **A payload is not refused by the capture service, and not served either.** `SetParam` answers success. `Capture` is accepted (`0x80020023` is "still working", not an error) and never leaves that state — 15 s, no game running, the system UI on screen — and on the next payload it answers `0x80020003` at once, for both modes. No image was produced in either run. Whether a running title or the VSH's own identity changes that is not measured.
 - **Where the image goes is the system's choice.** The caller's buffer says where it went; it is not an argument.
-- **The spike's last run took the console down.** The run that tried both modes in one payload stopped answering ping, the shell's 2323, the agent's 2324, the loader's 9021 and FTP's 2121, and no magic packet brought it back within two minutes. The cause is not known: the log on `/data` will name the last step taken when the console answers again. Treat a second `Capture` in one payload, or the flag queries that preceded it, as the suspects until then.
+- **The console going dark after the second run was not the capture.** The second run finished and logged `capture spike end` at 20:51:35; the console stopped answering ping and every port a couple of minutes later and came back on its own, which is the rest/power behaviour already recorded above, not a crash in the payload. The spike logs its last step before taking it, and the log names the run's end.
 
 **Not measured.** The time and memory a capture costs, the size and format of the file (the system's PNG/JPEG setting), what a protected scene answers (no game or video app was run), and whether a capture works while a title is in the foreground. Each needs a console that completes a capture first.
 
