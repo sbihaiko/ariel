@@ -1313,42 +1313,47 @@ env_name_valid(const char *name) {
 }
 
 
-/** key rotate <primary>: the current primary signs the key that replaces it. **/
+/**
+ * key rotate <primary> and key rotate-recovery <recovery>: the key of role is
+ * replaced, signed by the key that role names.
+ **/
 static void
-key_rotate_command(agent_t *agent, int fd, const char *hex) {
+key_rotate_command(agent_t *agent, int fd, int role, const char *hex) {
   approval_challenge_t challenge;
   approval_facts_t facts;
+  const char *command;
   char answer[32];
   uint32_t generation = 0;
 
+  command = role == STORE_KEY_ROLE_RECOVERY ? "key.rotate-recovery"
+                                            : "key.rotate";
   if(store_key_check(hex)) {
-    audit_reply(fd, "key.rotate", "refused", "keyring", "-", key_refused);
+    audit_reply(fd, command, "refused", "keyring", "-", key_refused);
     return;
   }
 
   memset(&facts, 0, sizeof(facts));
-  snprintf(facts.command, sizeof(facts.command), "%s", "key.rotate");
+  snprintf(facts.command, sizeof(facts.command), "%s", command);
   snprintf(facts.target, sizeof(facts.target), "%s", "keyring");
   snprintf(facts.arg[0], sizeof(facts.arg[0]), "%s", hex);
   if(!gate_pass(agent, fd, &facts, &challenge)) {
     return;
   }
 
-  switch(store_key_rotate(&challenge, hex, &generation)) {
+  switch(store_key_rotate(&challenge, hex, role, &generation)) {
   case STORE_KEY_ROTATED:
     snprintf(answer, sizeof(answer), "key_rotated %u\nexit 0\n",
              (unsigned)generation);
     reply(fd, answer);
     return;
   case STORE_KEY_STALE:
-    audit_reply(fd, "key.rotate", "stale", "keyring", challenge.id,
-                approval_stale);
+    audit_reply(fd, command, "stale", "keyring", challenge.id, approval_stale);
     return;
   case STORE_KEY_UNRECORDED:
     reply(fd, audit_failed);
     return;
   default:
-    audit_reply(fd, "key.rotate", "failed", "keyring", challenge.id, key_failed);
+    audit_reply(fd, command, "failed", "keyring", challenge.id, key_failed);
     return;
   }
 }
@@ -3453,7 +3458,13 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   }
 
   if(argc == 3 && !strcmp(argv[0], "key") && !strcmp(argv[1], "rotate")) {
-    key_rotate_command(agent, fd, argv[2]);
+    key_rotate_command(agent, fd, STORE_KEY_ROLE_PRIMARY, argv[2]);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "key") &&
+     !strcmp(argv[1], "rotate-recovery")) {
+    key_rotate_command(agent, fd, STORE_KEY_ROLE_RECOVERY, argv[2]);
     return;
   }
 

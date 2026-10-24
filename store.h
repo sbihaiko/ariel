@@ -205,19 +205,25 @@ int store_approval_facts(const char *id, approval_facts_t *facts);
 #define STORE_KEY_FAILED     2
 #define STORE_KEY_UNRECORDED 3
 
+/** The keyring role a rotation replaces. **/
+#define STORE_KEY_ROLE_PRIMARY  0
+#define STORE_KEY_ROLE_RECOVERY 1
+
 /**
- * Whether hex is a public key this build accepts as a primary: 64 hex digits,
- * a key the pinning checks allow, and not the recovery key. Returns 0 or -1.
+ * Whether hex is a public key this build accepts as a new primary or recovery
+ * key: 64 hex digits, a key the pinning checks allow, and neither the active
+ * primary, the active recovery key nor a retired key. Returns 0 or -1.
  **/
 int store_key_check(const char *hex);
 
 /**
- * Move the keyring to the next generation with hex as its primary, for the
+ * Move the keyring to the next generation with hex as the key of role, for the
  * granted approval challenge. The challenge must be for the current generation,
- * or the answer is STORE_KEY_STALE. On success generation is the new one.
+ * or the answer is STORE_KEY_STALE. The key it replaces is retired. On success
+ * generation is the new one.
  **/
 int store_key_rotate(const approval_challenge_t *challenge, const char *hex,
-                     uint32_t *generation);
+                     int role, uint32_t *generation);
 
 /**
  * Copy the autoload list into buf, NUL-terminated: one payload name per line,

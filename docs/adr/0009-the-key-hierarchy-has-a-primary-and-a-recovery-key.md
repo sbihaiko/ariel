@@ -16,7 +16,9 @@ A single key cannot serve both needs. The owner signs everyday approvals, so the
 6. **Rotation.** `key rotate <new primary>` is a gated action, signed by the current primary. It raises the generation, retires the old primary and activates the new one in one journal transaction, and writes an audit record.
 7. **Distinct roles.** The primary and the recovery key must differ. A key is refused in any role it cannot hold: the zero key, a key equal to the other role's key, and, on PS5, the host test key.
 8. **Retired keys.** A challenge or an unused approval made under a retired key stops verifying once the rotation completes. Consumed nonces stay consumed across restarts.
-9. The verifier stays where ADR-0006 puts it. This ADR does not change ADR-0006.
+9. **Recovery rotation.** `key rotate-recovery <new recovery key>` is a gated action signed by the current recovery key only; the primary is never accepted as its signer. A target is refused when it equals the active primary, the current recovery key or a retired key. The rotation raises the generation, retires the old recovery key and activates the new one in one journal transaction, and writes an audit record.
+10. **Crash steps.** A rotation of either role writes the keyring through a journal with four steps: `prepared`, `committed`, `renamed` and `audited`. A crash at `prepared` leaves the old keyring; the next start removes the new text and audits a rollback. A crash at `committed`, `renamed` or `audited` leaves the new keyring; the next start completes the rename if it is still pending and audits a rollforward. Exactly one keyring is active afterwards.
+11. The verifier stays where ADR-0006 puts it. This ADR does not change ADR-0006.
 
 ## Trust boundary
 

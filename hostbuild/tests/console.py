@@ -34,7 +34,7 @@ PORT = 2324
 BANNER = "console mode: %s:%d"
 CLOCK_REASON = "needs the test clock"
 CONSOLE_STATE_DIR = "/data/ariel"
-SECRET_FILES = ("token", "approvals", "nonces")
+SECRET_FILES = ("token", "approvals", "nonces", "keyring")
 SECRET_READS = (
     "cat {p}",
     "stat {p}",
@@ -479,6 +479,18 @@ def check_secrets_read_directly(session, context):
             assert lines == ["protected", "exit 87"], (
                 "%s must answer protected and exit 87, got %r"
                 % (template.format(p=path), lines))
+
+
+def check_key_rotate_refusals(session, context):
+    del context
+    for command in ("key rotate", "key rotate-recovery"):
+        for what, target in [("the zero key", "00" * 32),
+                             ("a key that is not hex", "zz" * 32),
+                             ("a short key", "00" * 31)]:
+            lines = session.link.exchange("%s %s" % (command, target))
+            assert lines == ["key_refused", "exit 1"], (
+                "%s to %s must answer key_refused and exit 1 without asking, "
+                "got %r" % (command, what, lines))
 
 
 def check_quick_start(session, context):
@@ -929,8 +941,10 @@ CHECKS = [
      check_reboot_asks_the_owner),
     ("the read-only commands on the console's root and data directory exit 0",
      check_read_only_on_console),
-    ("the token, approval state and nonces answer protected and exit 87 when "
-     "read directly on the console", check_secrets_read_directly),
+    ("the token, approval state, nonces and keyring answer protected and exit "
+     "87 when read directly on the console", check_secrets_read_directly),
+    ("key rotate and key rotate-recovery refuse the zero key and malformed keys "
+     "without asking the owner, on the console", check_key_rotate_refusals),
     ("a run of a missing path answers no_such_file and exit 1, and a run of "
      "Ariel's token answers protected and exit 87, both without asking",
      check_run_refusals),

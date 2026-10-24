@@ -1071,6 +1071,29 @@ def scenario_notification_rate(server):
 
 # Console mode, proven without a console. The sentinel is TEST-NET-1, which
 # no console answers on: the plan path must reach it nowhere.
+RECOVERY_ROTATE_PROMPT = "key rotate-recovery will run"
+RECOVERY_SIGNED_TITLE = ("key rotate-recovery needs the current recovery key, "
+                         "and the primary's signature answers signature_invalid")
+RECOVERY_TARGETS_TITLE = ("key rotate-recovery refuses the active primary and "
+                          "the current recovery key before asking the owner")
+RECOVERY_RETIRED_TITLE = ("key rotate-recovery refuses a retired recovery key "
+                          "as target and as signer")
+ROTATE_CRASH_TITLE = ("a crash at each durable step of key rotate leaves "
+                      "exactly one keyring active after restart")
+RECOVERY_CRASH_TITLE = ("a crash at each durable step of key rotate-recovery "
+                        "leaves exactly one keyring active after restart")
+ADR_RECOVERY_TITLE = ("ADR-0009 names the recovery rotation and the crash steps "
+                      "of a rotation")
+
+# The durable steps of a rotation, each with the generation that is active
+# once Ariel restarts: a prepared rotation rolls back, the rest roll forward.
+ROTATION_CRASH_STEPS = (
+    ("prepared", 0),
+    ("committed", 1),
+    ("renamed", 1),
+    ("audited", 1),
+)
+
 CONSOLE_SENTINEL = "192.0.2.1"
 CONSOLE_BANNER = "console mode: %s:2324"
 PLAN_RUN = "run  "
@@ -1087,6 +1110,8 @@ HOST_FILE_REASON = "needs the state file on the host"
 # The scenarios that crash Ariel at a named commit step, which only a host
 # build with the fault injector can do.
 FAULT_SCENARIOS = {
+    ROTATE_CRASH_TITLE,
+    RECOVERY_CRASH_TITLE,
     "a crash in prepared leaves the old version in payload list after restart",
     "a crash in committed leaves the new version in payload list after restart",
     "a committed change whose new object is gone is refused at start and "
@@ -1138,6 +1163,8 @@ HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console 
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
+    RECOVERY_SIGNED_TITLE,
+    RECOVERY_RETIRED_TITLE,
     "key rotate accepts only the current primary and refuses the recovery "
     "key's signature",
     "key rotate refuses a retired primary's signature",
@@ -1383,6 +1410,11 @@ def scenario_console_mode_plan(server):
         % sorted(set(run) & set(skipped)))
     assert any("quick start" in title for title in run), (
         "console mode must run the quick start, runs %r" % run)
+    assert any("key rotate-recovery" in title for title in run), (
+        "console mode must refuse the key rotations without asking, runs %r"
+        % run)
+    assert any("keyring" in title for title in run), (
+        "console mode must read the keyring as protected, runs %r" % run)
 
     # With PS5_HOST unset nothing selects console mode.
     env.pop("PS5_HOST")
@@ -4957,6 +4989,193 @@ def scenario_unused_approval_stops_after_rotation(server):
         keys.stop()
 
 
+def recovery_rotation_action(new_pub):
+    return ["command=key.rotate-recovery", "target=keyring", "sha256=none",
+            "option.recovery=" + new_pub]
+
+
+def rotate_recovery(server, new_pub, generation, signer, wait_ms=120000):
+    """Request, sign with signer, grant and perform one recovery rotation."""
+    approval, challenge = gated_request(
+        server, "key rotate-recovery " + new_pub,
+        recovery_rotation_action(new_pub), RECOVERY_ROTATE_PROMPT,
+        wait_ms=wait_ms)
+    assert generation_of(challenge) == str(generation - 1), (
+        "the recovery rotation must be signed under generation %d"
+        % (generation - 1))
+    signature = sign_challenge(server, challenge, key=signer)
+    assert grant(server, approval, signature) == [
+        "approval_granted %s" % approval, "exit 0"]
+    assert run_command(server, "key rotate-recovery " + new_pub) == [
+        "key_rotated %d" % generation, "exit 0"]
+    return approval
+
+
+def scenario_key_rotate_recovery_needs_current_recovery(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "recovery"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+            approval, challenge = gated_request(
+                keys, "key rotate-recovery " + third,
+                recovery_rotation_action(third), RECOVERY_ROTATE_PROMPT)
+            assert generation_of(challenge) == "0", (
+                "the first recovery approval must be made under generation 0")
+            primary = sign_challenge(keys, challenge, key=test_key())
+            assert grant(keys, approval, primary) == [
+                "signature_invalid", "exit 79"], (
+                "the primary must not sign a recovery rotation")
+            signature = sign_challenge(keys, challenge, key=RECOVERY_KEY)
+            assert grant(keys, approval, signature) == [
+                "approval_granted %s" % approval, "exit 0"], (
+                "the current recovery key's signature must grant the rotation")
+            assert run_command(keys, "key rotate-recovery " + third) == [
+                "key_rotated 1", "exit 0"], (
+                "the granted recovery rotation must be performed")
+            assert "key_rotate_recovery" in [
+                kind for kind, _name, spent, _sha in audit_events(keys)
+                if spent == approval], (
+                "the recovery rotation must be recorded in the audit log")
+    finally:
+        keys.stop()
+
+
+def scenario_key_rotate_recovery_refuses_bad_targets(server):
+    """The active primary and the current recovery key are refused as targets
+    before the owner is asked."""
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "recovery-targets"})
+    try:
+        primary = public_key(keys, test_key())
+        recovery = public_key(keys, RECOVERY_KEY)
+        for what, target in [("the active primary", primary),
+                             ("the current recovery key", recovery)]:
+            assert run_command(keys, "key rotate-recovery " + target) == [
+                "key_refused", "exit 1"], (
+                "a recovery rotation to %s must be refused before the owner "
+                "is asked" % what)
+    finally:
+        keys.stop()
+
+
+def scenario_key_rotate_recovery_refuses_retired_recovery(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "recovery-retired"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            third_key = make_key(scratch, "third.key")
+            third = public_key(keys, third_key)
+            retired = public_key(keys, RECOVERY_KEY)
+            fourth = public_key(keys, make_key(scratch, "fourth.key"))
+            rotate_recovery(keys, third, 1, RECOVERY_KEY)
+            assert run_command(keys, "key rotate-recovery " + retired) == [
+                "key_refused", "exit 1"], (
+                "the retired recovery key must be refused as a target")
+            approval, challenge = gated_request(
+                keys, "key rotate-recovery " + fourth,
+                recovery_rotation_action(fourth), RECOVERY_ROTATE_PROMPT)
+            assert generation_of(challenge) == "1", (
+                "the next recovery approval must be made under generation 1")
+            signature = sign_challenge(keys, challenge, key=RECOVERY_KEY)
+            assert grant(keys, approval, signature) == [
+                "signature_invalid", "exit 79"], (
+                "the retired recovery key must not sign a recovery rotation")
+            signature = sign_challenge(keys, challenge, key=third_key)
+            assert grant(keys, approval, signature) == [
+                "approval_granted %s" % approval, "exit 0"], (
+                "the current recovery key must still sign")
+    finally:
+        keys.stop()
+
+
+def assert_one_keyring_active(server, scratch, name, expected, verb, action,
+                              prompt, old_key, new_key):
+    """Only the keyring Ariel restarted with verifies a fresh challenge."""
+    probe = public_key(server, make_key(scratch, name))
+    approval, challenge = gated_request(
+        server, "%s %s" % (verb, probe), action(probe), prompt)
+    generation = generation_of(challenge)
+    assert generation == str(expected), (
+        "after the restart the keyring must be generation %d, got %s"
+        % (expected, generation))
+    active, other = (old_key, new_key) if expected == 0 else (new_key, old_key)
+    assert grant(server, approval, sign_challenge(server, challenge,
+                                                  key=other)) == [
+        "signature_invalid", "exit 79"], (
+        "only one keyring may be active: the other key must not verify")
+    assert grant(server, approval, sign_challenge(server, challenge,
+                                                  key=active)) == [
+        "approval_granted %s" % approval, "exit 0"], (
+        "the active keyring's key must verify")
+
+
+def scenario_key_rotate_crash_leaves_one_keyring(server):
+    del server
+    with tempfile.TemporaryDirectory() as scratch:
+        for step, expected in ROTATION_CRASH_STEPS:
+            keys = Server(SERVER_BINARY, env={
+                "ARIEL_HOST_NONCE_SEED": "crash-" + step,
+                FAULT_ENV: step})
+            try:
+                second = public_key(keys, SECOND_PRIMARY_KEY)
+                approval, challenge = gated_request(
+                    keys, "key rotate " + second, rotation_action(second),
+                    ROTATE_PROMPT)
+                sign_and_grant(keys, approval, challenge)
+                assert command_until_crash(keys, "key rotate " + second) == [], (
+                    "a key rotate that crashes at %s must answer nothing" % step)
+                keys.env = None
+                keys.restart()
+                assert_one_keyring_active(
+                    keys, scratch, "probe-%s.key" % step, expected, "key rotate",
+                    rotation_action, ROTATE_PROMPT, test_key(),
+                    SECOND_PRIMARY_KEY)
+            finally:
+                keys.stop()
+
+
+def scenario_key_rotate_recovery_crash_leaves_one_keyring(server):
+    del server
+    with tempfile.TemporaryDirectory() as scratch:
+        for step, expected in ROTATION_CRASH_STEPS:
+            target_key = make_key(scratch, "target-%s.key" % step)
+            keys = Server(SERVER_BINARY, env={
+                "ARIEL_HOST_NONCE_SEED": "crash-recovery-" + step,
+                FAULT_ENV: step})
+            try:
+                target = public_key(keys, target_key)
+                approval, challenge = gated_request(
+                    keys, "key rotate-recovery " + target,
+                    recovery_rotation_action(target), RECOVERY_ROTATE_PROMPT)
+                signature = sign_challenge(keys, challenge, key=RECOVERY_KEY)
+                assert grant(keys, approval, signature) == [
+                    "approval_granted %s" % approval, "exit 0"]
+                assert command_until_crash(
+                    keys, "key rotate-recovery " + target) == [], (
+                    "a key rotate-recovery that crashes at %s must answer "
+                    "nothing" % step)
+                keys.env = None
+                keys.restart()
+                assert_one_keyring_active(
+                    keys, scratch, "probe-recovery-%s.key" % step, expected,
+                    "key rotate-recovery", recovery_rotation_action,
+                    RECOVERY_ROTATE_PROMPT, RECOVERY_KEY, target_key)
+            finally:
+                keys.stop()
+
+
+def scenario_adr_names_recovery_rotation_and_crash_steps(server):
+    del server
+    adr = os.path.join(repo_dir(), "docs", "adr",
+                       "0009-the-key-hierarchy-has-a-primary-and-a-recovery-key.md")
+    with open(adr, encoding="utf-8") as handle:
+        text = handle.read()
+    for term in ["key rotate-recovery", "prepared", "committed", "renamed",
+                 "audited"]:
+        assert term in text, "ADR-0009 must name %r" % term
+
+
 def scenario_ps5_pubkey_needs_recovery(server):
     """A PS5 build that pins the owner's key without its recovery key is
     refused by make, not left to refuse every grant at run time."""
@@ -7209,6 +7428,18 @@ SCENARIOS = [
      "key's signature", scenario_key_rotate_needs_current_primary, CLOCK_REASON),
     ("key rotate refuses a recovery-key target and malformed keys before "
      "asking the owner", scenario_key_rotate_refuses_bad_targets, False),
+    (RECOVERY_SIGNED_TITLE, scenario_key_rotate_recovery_needs_current_recovery,
+     CLOCK_REASON),
+    (RECOVERY_TARGETS_TITLE, scenario_key_rotate_recovery_refuses_bad_targets,
+     False),
+    (RECOVERY_RETIRED_TITLE, scenario_key_rotate_recovery_refuses_retired_recovery,
+     CLOCK_REASON),
+    (ROTATE_CRASH_TITLE, scenario_key_rotate_crash_leaves_one_keyring,
+     FAULT_REASON),
+    (RECOVERY_CRASH_TITLE, scenario_key_rotate_recovery_crash_leaves_one_keyring,
+     FAULT_REASON),
+    (ADR_RECOVERY_TITLE, scenario_adr_names_recovery_rotation_and_crash_steps,
+     False),
     ("key rotate refuses a retired primary's signature",
      scenario_key_rotate_refuses_retired_primary, CLOCK_REASON),
     ("a signature over another generation's message is refused",
