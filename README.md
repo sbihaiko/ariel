@@ -29,7 +29,7 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 |---|---|---|
 | 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.20: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
 | 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done. 37 sub-issues closed; console suite 36/36 on firmware 11.20, with the key hierarchy exercised on the console ([#46](https://github.com/sbihaiko/ariel/issues/46), [#48](https://github.com/sbihaiko/ariel/issues/48)). |
-| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | In progress. The line grammar of [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md) is in: one parser, quotes, escaped canonical actions and the 60 s connection deadline ([#59](https://github.com/sbihaiko/ariel/issues/59), `02e9f0e`), and `--json` on `ps`, `ls`, `stat`, `df` and `find` ([#63](https://github.com/sbihaiko/ariel/issues/63), `cd62866`). The bounded readers, binary read, `write`, flags and diagnostics follow. |
+| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | In progress. The line grammar of [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md) is in: one parser, quotes, escaped canonical actions and the 60 s connection deadline ([#59](https://github.com/sbihaiko/ariel/issues/59), `02e9f0e`); `--json` on `ps`, `ls`, `stat`, `df` and `find` ([#63](https://github.com/sbihaiko/ariel/issues/63), `cd62866`); the bounded readers, the 64 KiB cut and the `truncated` marker ([#60](https://github.com/sbihaiko/ariel/issues/60), `c0080ba`); and the diagnostics `date`, `du`, `dmesg` and `sysinfo`, with `--json` on `sysinfo` ([#65](https://github.com/sbihaiko/ariel/issues/65), `457da97`). The optional `diff` and the network diagnostics were not built. The remaining flags and `timeout` follow. |
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | Not started. |
 | 5. Sessions (optional) | | Not started. |
 | 6. MCP (optional) | | Not started. |
@@ -163,9 +163,9 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c` |
 | `find` | | ⚠️ only `-name`, `-type` | S3: more predicates |
 | `cmp`, `hexdump` | | ✅ | |
-| `diff` | | ❌ | S3, optional |
+| `diff` | | ❌ | S3, optional; not built |
 | `df` | | ✅ | |
-| `du` | | ❌ | S3 |
+| `du` | | ✅ | |
 | `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S2: gated |
 | `cp`, `mv` | | ⚠️ no `-r` | S2: gated. S3: `-r` |
 | `rm` | | ⚠️ one file, no `-r` | S2: gated. S3: `-r` |
@@ -180,14 +180,14 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `timeout` | | ❌ | S3 |
 | `sleep`, `id`, `sync` | | ✅ | |
 | `env`, `export`, `exec` | | ✅ | S2: gated |
-| `sysinfo` | `uname`, `uptime`, `free` | ⚠️ raw values via `sysctl` | S3 |
-| `date` | | ❌ | S3 |
-| `dmesg` | | ❌ only through klogsrv | S3 |
+| `sysinfo` | `uname`, `uptime`, `free` | ✅ | |
+| `date` | | ✅ | |
+| `dmesg` | | ✅ | |
 | `mount`, `umount`, `chroot`, `mknod` | | ✅ | S2: gated |
 | `reboot` | | ❌ | S2: gated; the host build simulates it |
 | `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
-| `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional |
+| `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional; not built |
 
 PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated, and `sfocreate` joined them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) `session` (Stage 5) and `screenshot` (Stage 4).
 
