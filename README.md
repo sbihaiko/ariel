@@ -5,6 +5,8 @@
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
 > **Status:** Stages 1 and 2 are done and validated on a real PS5. Stage 2 closed on 2026-10-24 with the console suite at 36/36 and the whole key hierarchy exercised on the console. Stages 3 to 6 have not started. See [Progress](#progress).
+>
+> **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have.
 
 ---
 
@@ -25,7 +27,7 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 
 | Stage | Spec | Status |
 |---|---|---|
-| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.200.005: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
+| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.20: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
 | 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done. 37 sub-issues closed; console suite 36/36 on firmware 11.20, with the key hierarchy exercised on the console ([#46](https://github.com/sbihaiko/ariel/issues/46), [#48](https://github.com/sbihaiko/ariel/issues/48)). |
 | 3. An interface agents can rely on | | Not started. |
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | Not started. |
