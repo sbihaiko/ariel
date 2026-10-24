@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** early development. Today the code is still shsrv. The features described under [Goals](#goals) are the roadmap, not something that already works.
+> **Status:** Stage 1 is done and validated on a real PS5. Stage 2 is nearly done: its commands are on the `dev` branch, and the key hierarchy and the console validation are being finished. Stages 3 to 5 have not started. See [Progress](#progress).
 
 ---
 
@@ -18,6 +18,31 @@ Coding agents like Claude Code are good at diagnosing systems: they run a comman
 - Everything lives in RAM. A reboot wipes the jailbreak and every running payload.
 
 Ariel closes that gap. The idea is that an agent connects to one endpoint on the console and gets a predictable, safe, recoverable interface to it.
+
+## Progress
+
+Work happens on the `dev` branch; `master` follows it at milestones. Each stage is a spec issue whose sub-issues are the work.
+
+| Stage | Spec | Status |
+|---|---|---|
+| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.200.005: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
+| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | 🚧 Nearly done. See below. |
+| 3. An interface agents can rely on | | Not started. |
+| 4. Sessions (optional) | | Not started. |
+| 5. MCP (optional) | | Not started. |
+
+**Stage 2 on `dev`:**
+
+- ✅ The state file, the audit log and `audit tail`, transactions and the journal, `approval status`.
+- ✅ The read-only and inspection commands on the agent port, with Ariel's secrets protected.
+- ✅ Every command that changes the system is gated, and so is any command not in the read-only set: file commands, `kill` (critical processes refused), `mount` and friends, `env`/`export`/`exec`, running an ELF by path, the PS5 built-ins, `reboot` and `http2_get`.
+- ✅ `payload run` in the background and `payload logs`, `payload rollback`, one-shot and service health checks with automatic rollback.
+- ✅ `autoload show`, `edit` and `safe-boot`.
+- ✅ `unzip` and `tar`, refusing members that escape.
+- ✅ `payload install` from an allowlisted GitHub release, by latest release or pinned tag, with a pinned hash or one the owner approves.
+- ✅ The owner's key hierarchy: a primary and an offline recovery key pinned as the anchor, a keyring with a generation, `key rotate` and `key rotate-recovery`, crash-safe ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)).
+- 🚧 Freezing the console when a key leaks ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a compromised lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)).
+- 🚧 Validation on a real PS5 ([#46](https://github.com/sbihaiko/ariel/issues/46)): the telnet boundary check passed; the console suite is being rerun after a fix to its test builds.
 
 ## Goals
 
@@ -47,7 +72,8 @@ Make the console safe to leave in an agent's hands:
 3. **Run it in the background** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
 4. **Persist it**: record what is installed (source, identifiers, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot. Approving an installation explicitly includes approving that the payload runs on every boot. `autoload safe-boot` skips autoload on the next boot, so a payload that crashes the console at startup can always be removed.
 5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
-6. **Gate everything that changes the system on the agent port**: every existing command that changes the system, starts code or reveals the environment, including running an ELF by path (the full list is in [Command coverage](#command-coverage)). The telnet shell is not gated: its copies of these commands stay ungated and need no token, as in upstream shsrv. It is the owner's escape hatch, and gating it needs a designed recovery path for a lost key first ([ADR-0008](docs/adr/0008-the-telnet-shell-stays-outside-the-gate.md), [#15](https://github.com/sbihaiko/ariel/issues/15), [the telnet boundary](docs/telnet-boundary.md)).
+6. **Gate everything that changes the system on the agent port**: every existing command that changes the system, starts code or reveals the environment, including running an ELF by path (the full list is in [Command coverage](#command-coverage)). The telnet shell is not gated: its copies of these commands stay ungated and need no token, as in upstream shsrv. It is the owner's escape hatch, and gating it needs a designed recovery path for a lost key first ([ADR-0008](docs/adr/0008-the-telnet-shell-stays-outside-the-gate.md), [the telnet boundary](docs/telnet-boundary.md)). That path is the key hierarchy in item 7.
+7. **Survive a leaked or lost key.** The build pins two keys: a primary that signs everyday approvals and an offline recovery key that is never on the agent's machine. A keyring on the console tracks the active keys and a generation, so the owner can rotate either key without a rebuild, and a signature made under one generation never verifies under another. A leaked key can be stopped: the owner freezes the console over the telnet shell, and only the recovery key can lift the freeze or revoke the compromised keys, suspending every grant they made. Damaged key state fails closed.
 
 Ariel itself is never overwritten while it is running, so the agent can never lock itself out.
 
@@ -62,6 +88,7 @@ New commands in this stage (see [Command coverage](#command-coverage)):
 - `reboot`, gated, to test that installed payloads survive a restart.
 - `approval status <id>`, to poll a pending approval.
 - `audit tail [n]`, to read the audit log: the newest `n` lines, at most 64.
+- `key rotate | rotate-recovery | unfreeze | revoke`, to manage the owner's keys.
 
 ### Stage 3: an interface agents can rely on
 
@@ -104,9 +131,9 @@ Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server
 
 Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-**Today:** ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S4 are Stages 1 to 4. "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
+**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S4 are Stages 1 to 4; S1 and S2 items are on `dev` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
 
-| Ariel | bash equivalent | Today (shsrv) | Plan |
+| Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
 | `pwd`, `cd` | | ✅ | S4: working directory kept across connections with sessions |
 | `ls` | | ⚠️ no flags | S3: `-l`, `-a`, `--json`, pagination |
@@ -137,7 +164,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `date` | | ❌ | S3 |
 | `dmesg` | | ❌ only through klogsrv | S3 |
 | `mount`, `umount`, `chroot`, `mknod` | | ✅ | S2: gated |
-| `reboot` | | ⚠️ host build simulates it; PS5 path not yet run on a console | S2: gated |
+| `reboot` | | ❌ | S2: gated; the host build simulates it |
 | `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
 | `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional |
@@ -168,7 +195,7 @@ To build Ariel, start it on a console and run your first `helloworld.elf` from i
 
 ## Using it today
 
-Until the Ariel features land, the shell behaves like upstream shsrv. Make sure [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) is running, send the payload to port 9021 and connect with a telnet client on port 2323. Type `help` once connected to see the available commands (`cd`, `ls`, `mkdir`, `stat`, `ps` and others).
+Make sure [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) is running and send `shsrv-ps5.elf` to port 9021. Ariel stops any running shsrv and takes its place. An agent connects to the agent port, 2324, with the token Ariel shows on the console at first start (the [quick start](docs/quick-start.md) walks through it). The telnet shell still answers on port 2323 exactly like upstream shsrv: type `help` once connected to see its commands (`cd`, `ls`, `mkdir`, `stat`, `ps` and others).
 
 Payloads placed in a folder on the `PATH` (initialized to `/user/homebrew/bin` and `/mnt/usb0/homebrew/bin`) can be run directly. Homebrew that needs audio or video is launched through `hbldr`, and `hbdbg` starts it under gdb.
 
@@ -177,6 +204,8 @@ Payloads placed in a folder on the `PATH` (initialized to `/user/homebrew/bin` a
 Ariel builds exactly like shsrv, with the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) installed on a Debian-based system: install `xxd`, point `PS5_PAYLOAD_SDK` at the SDK and run `make`.
 
 To pin the owner's keys into the build, set both `ARIEL_PUBKEY` (the primary key that signs everyday approvals) and `ARIEL_RECOVERY_PUBKEY` (the offline recovery key), as 64 hex digits each: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`. The two must differ, and setting `ARIEL_PUBKEY` without `ARIEL_RECOVERY_PUBKEY` stops the build, because the console would otherwise refuse every grant. The host build's test key is refused on the PS5 build.
+
+`make test` sends `shsrv-ps5.elf` to the console at `PS5_HOST` and refuses unless you ask for it by name: `make test ARIEL_DEPLOY=yes PS5_HOST=<console>`. The headless acceptance suite is `make -C hostbuild test`; it needs no console.
 
 ### Known limitations (inherited from shsrv)
 
