@@ -10,3 +10,4 @@ __pycache__/
 *.pyc
 hostbuild/ariel-sign
 hostbuild/canonical_test
+.red-output.txt
