@@ -14,6 +14,9 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+// sync() is not POSIX; glibc declares it only with _DEFAULT_SOURCE.
+#define _DEFAULT_SOURCE
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
