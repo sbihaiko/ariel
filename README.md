@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** Stage 1 is done and validated on a real PS5. Stage 2 is nearly done: its commands are on the `dev` branch, and the key hierarchy and the console validation are being finished. Stages 3 to 6 have not started. See [Progress](#progress).
+> **Status:** Stages 1 and 2 are done and validated on a real PS5. Stage 2 closed on 2026-10-24 with the console suite at 36/36 and the whole key hierarchy exercised on the console. Stages 3 to 6 have not started. See [Progress](#progress).
 
 ---
 
@@ -26,12 +26,13 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 | Stage | Spec | Status |
 |---|---|---|
 | 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.200.005: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
-| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | 🚧 Nearly done. See below. |
+| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done. 37 sub-issues closed; console suite 36/36 on firmware 11.20, with the key hierarchy exercised on the console ([#46](https://github.com/sbihaiko/ariel/issues/46), [#48](https://github.com/sbihaiko/ariel/issues/48)). |
 | 3. An interface agents can rely on | | Not started. |
-| 4. Sessions (optional) | | Not started. |
-| 5. MCP (optional) | | Not started. |
+| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | Not started. |
+| 5. Sessions (optional) | | Not started. |
+| 6. MCP (optional) | | Not started. |
 
-**Stage 2 on `dev`:**
+**Stage 2, complete on `dev` and `master`:**
 
 - ✅ The state file, the audit log and `audit tail`, transactions and the journal, `approval status`.
 - ✅ The read-only and inspection commands on the agent port, with Ariel's secrets protected.
@@ -41,8 +42,8 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 - ✅ `unzip` and `tar`, refusing members that escape.
 - ✅ `payload install` from an allowlisted GitHub release, by latest release or pinned tag, with a pinned hash or one the owner approves.
 - ✅ The owner's key hierarchy: a primary and an offline recovery key pinned as the anchor, a keyring with a generation, `key rotate` and `key rotate-recovery`, crash-safe ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)).
-- 🚧 Freezing the console when a key leaks ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a compromised lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)).
-- 🚧 Validation on a real PS5 ([#46](https://github.com/sbihaiko/ariel/issues/46)): the telnet boundary check passed; the console suite is being rerun after a fix to its test builds.
+- ✅ Freezing the console when a key leaks ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a compromised lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)).
+- ✅ Validation on a real PS5 ([#46](https://github.com/sbihaiko/ariel/issues/46)): the telnet boundary check passed, and the console suite passes 36/36. The key run on 2026-10-24 rotated, revoked, froze, unfroze, started without the keyring and restored it; it is recorded in [docs/console-findings.md](docs/console-findings.md).
 
 ## Goals
 
