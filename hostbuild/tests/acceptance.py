@@ -1534,6 +1534,134 @@ def scenario_console_quick_start_waits_for_the_gap(server):
         % (console.NOTIFICATION_SPACING, seen))
 
 
+class StopCheck(Exception):
+    """A fake console stops a check at the first command it has no answer for."""
+
+
+class ActivatingLink:
+    """A fake agent port that stages, grants and installs every push.
+
+    It answers just enough for a check to reach every push it makes before an
+    activation, and records each pushed body, so a test can see what a console
+    check would have run on the console.
+    """
+
+    def __init__(self):
+        self.pushes = []
+        self.staged = {}
+
+    def exchange(self, command, body=None, token=None):
+        words = command.split()
+        if words[:2] == ["payload", "push"]:
+            index = len(self.pushes) + 1
+            self.pushes.append((words[2], body))
+            self.staged["s-%d" % index] = (words[2], words[4])
+            return ["staged s-%d" % index, "approval_required a-%d" % index,
+                    "challenge a-%d 00" % index, "exit 75"]
+        if words[:2] == ["approval", "grant"]:
+            return ["approval_granted %s" % words[2], "exit 0"]
+        if words[:2] == ["payload", "commit"] and words[2] in self.staged:
+            name, digest = self.staged[words[2]]
+            return ["installed %s %s" % (name, digest), "exit 0"]
+        raise StopCheck(command)
+
+    def raw(self, payload):
+        raise StopCheck(payload)
+
+
+def scenario_console_checks_push_runnable_builds(server):
+    """Every console check that activates a build pushes one the console can run."""
+    del server  # the fake link stands in for the agent port
+
+    import console
+
+    # A check that only proves a refusal may push bytes that never run.
+    refusals = {console.check_truncated_upload, console.check_hash_mismatch,
+                console.check_bad_name, console.check_install_bad_name_is_audited,
+                console.check_unsigned_commit}
+    activating = {console.check_approval_then_install, console.check_audit_tail,
+                  console.check_approval_status,
+                  console.check_rollback_restores_previous,
+                  console.check_rollback_refusals,
+                  console.check_autoload_edit_asks_before_it_applies,
+                  console.check_autoload_edit_applies_after_grant,
+                  console.check_autoload_stale_grant_answers_78}
+
+    built = {}
+
+    def build(label):
+        # Stands in for prospero-clang: an ELF the console would run.
+        built[label] = b"\x7fELF runnable " + label.encode("ascii")
+        return built[label]
+
+    pushed = {}
+    for _title, check in console.CHECKS:
+        if check is console.check_quick_start:
+            continue  # it builds and pushes helloworld.elf itself
+        link = ActivatingLink()
+        operator = console.Operator(read=lambda prompt="": "",
+                                    write=lambda line="": None,
+                                    sleep=lambda s: None)
+        session = console.Session(link, operator, sleep=lambda s: None)
+        context = console.Context(host="192.0.2.1", port=console.PORT,
+                                  token="0" * 32, workdir="/nonexistent",
+                                  cc=["prospero-clang"],
+                                  document="quick-start.md")
+        context.build = build
+        try:
+            check(session, context)
+        except Exception:  # noqa: BLE001 - the fake stops every check early
+            pass
+        pushed[check] = link.pushes
+
+    runnable = set(built.values())
+    for check in activating:
+        assert pushed[check], (
+            "%s must push a build before it activates one" % check.__name__)
+    for check, pushes in pushed.items():
+        if check in refusals:
+            continue
+        stray = [name for name, data in pushes if data not in runnable]
+        assert not stray, (
+            "%s pushes bytes the console cannot run for %r; every activation "
+            "runs a health check" % (check.__name__, stray))
+    rollback = pushed[console.check_rollback_restores_previous]
+    assert len(rollback) == 2 and rollback[0][1] != rollback[1][1], (
+        "a rollback needs two distinct runnable builds, got %r"
+        % [name for name, _data in rollback])
+
+
+def scenario_console_gated_asks_wait_out_busy(server):
+    """reboot and a sysctl write wait out approval_busy before they assert 75."""
+    del server  # the scripted link stands in for the agent port
+
+    busy = ["approval_busy", "exit 76"]
+    for command in ("reboot", "sysctl kern.ostype=Other"):
+        console, link, _operator, session, events, _shown = scripted_session(
+            [busy, ["approval_required a-1", "challenge a-1 00", "exit 75"]])
+        console.ask_without_grant(session, command)
+        sent = [event for event in events if event[0] == "send"]
+        assert sent == [("send", command), ("send", command)], (
+            "%s must be sent again after approval_busy, sent %r"
+            % (command, sent))
+
+    console, link, _operator, session, _events, _shown = scripted_session(
+        [busy, ["approval_required a-1", "challenge a-1 00", "exit 75"]])
+    console.check_reboot_asks_the_owner(session, None)
+
+    # The suite leaves approvals pending by design (no console refusal), and
+    # Ariel keeps at most PENDING_MAX open until each expires; the busy
+    # retries must outlast one expiry.
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    with open(os.path.join(root, "store.h")) as handle:
+        expiry = int(re.search(r"#define APPROVAL_EXPIRY_MS (\d+)ULL",
+                               handle.read()).group(1)) / 1000.0
+    waited = console.BUSY_RETRIES * console.NOTIFICATION_SPACING
+    assert waited > expiry, (
+        "the busy retries wait %.0f s, less than one approval expiry (%.0f s)"
+        % (waited, expiry))
+
+
 def scenario_console_approval_prompts(server):
     """An approval step shows the notification and the challenge, and submits the signature."""
     del server  # the fake link stands in for the agent port
@@ -7546,7 +7674,12 @@ SCENARIOS = [
     ("console mode runs its checks over an injected transport",
      scenario_console_run_reaches_checks, None),
     ("console mode's quick start waits out the notification gap before its "
-     "push", scenario_console_quick_start_waits_for_the_gap, None),    ("a crash in prepared leaves the old version in payload list after restart",
+     "push", scenario_console_quick_start_waits_for_the_gap, None),
+    ("console mode activates only builds the console can run",
+     scenario_console_checks_push_runnable_builds, None),
+    ("console mode's reboot and sysctl write wait out approval_busy",
+     scenario_console_gated_asks_wait_out_busy, None),
+    ("a crash in prepared leaves the old version in payload list after restart",
      scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
     ("a crash in committed leaves the new version in payload list after restart",
      scenario_crash_in_committed_leaves_new_version, FAULT_REASON),
