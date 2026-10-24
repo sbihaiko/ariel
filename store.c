@@ -102,6 +102,7 @@ struct staged {
 #define JOURNAL_FILE "journal"
 #define JOURNAL_TMP "journal.tmp"
 #define JOURNAL_MARKER "ariel-journal-v2"
+#define JOURNAL_MARKER_V1 "ariel-journal-v1"
 #define AUTOLOAD_FILE "autoload"
 #define AUTOLOAD_TMP "autoload.tmp"
 
@@ -397,13 +398,15 @@ store_init(const char *dir, platform_t *p) {
     rc = -1;
   }
 
-  if(!rc && autoload_make(state_fd)) {
+  // A change the last run left in the journal finishes before anything else
+  // is served: it rolls back when it had not committed and forward when it had.
+  // It runs before the default list is made, which must not replace a list a
+  // committed change still names.
+  if(!rc && recover_at_start(state_fd)) {
     rc = -1;
   }
 
-  // A change the last run left in the journal finishes before anything else
-  // is served: it rolls back when it had not committed and forward when it had.
-  if(!rc && recover_at_start(state_fd)) {
+  if(!rc && autoload_make(state_fd)) {
     rc = -1;
   }
 
@@ -1594,8 +1597,16 @@ journal_read(int store_fd, struct journal *j) {
   close(fd);
   text[total] = '\0';
 
-  if(sscanf(text, JOURNAL_MARKER "\n%15s %15s %32s %64s %64s %64s", j->kind,
-            j->phase, j->name, j->hash, j->previous, j->drop) != 6) {
+  // A v1 record predates autoload, so it is always a payload change.
+  if(!strncmp(text, JOURNAL_MARKER_V1 "\n", strlen(JOURNAL_MARKER_V1) + 1)) {
+    if(sscanf(text, JOURNAL_MARKER_V1 "\n%15s %32s %64s %64s %64s", j->phase,
+              j->name, j->hash, j->previous, j->drop) != 5) {
+      return -1;
+    }
+    snprintf(j->kind, sizeof(j->kind), "payload");
+  } else if(sscanf(text, JOURNAL_MARKER "\n%15s %15s %32s %64s %64s %64s",
+                   j->kind, j->phase, j->name, j->hash, j->previous,
+                   j->drop) != 6) {
     return -1;
   }
 
@@ -1761,14 +1772,17 @@ text_read(int dirfd, const char *name, char *buf, size_t size) {
 /**
  * Write the list's first text, with a journal record, at the moment of the
  * change: prepared, then committed, then the rename that makes the new list
- * the list. A failure before the commit leaves the old list; a failure after
- * it is finished by recovery at the next start. The caller holds the lock.
+ * the list. A failure before the rename leaves the old list. Returns -1 when
+ * the list did not change, 0 when it changed and is audited, and 1 when it
+ * changed but its audit line or journal close failed. The caller holds the
+ * lock.
  **/
 static int
 autoload_transaction_locked(int state_fd, int store_fd, const char *text,
                             const char *old_hash, const char *new_hash,
                             const char *kind, const char *name, const char *id) {
   struct journal j;
+  int unrecorded;
 
   memset(&j, 0, sizeof(j));
   snprintf(j.kind, sizeof(j.kind), "autoload");
@@ -1798,18 +1812,23 @@ autoload_transaction_locked(int state_fd, int store_fd, const char *text,
 
   fault_at("committed");
 
-  if(renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE) ||
-     fsync(state_fd)) {
+  if(renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE)) {
     unlinkat(state_fd, AUTOLOAD_TMP, 0);
     journal_clear(store_fd);
     return -1;
   }
 
-  if(audit_append_locked(kind, name, id, new_hash)) {
-    return -1;
+  // The list is in place from here on, so the edit stands. An unflushed rename
+  // keeps its journal for recovery; a failed audit line or clear is reported.
+  if(fsync(state_fd)) {
+    return 1;
   }
 
-  return journal_clear(store_fd);
+  unrecorded = audit_append_locked(kind, name, id, new_hash) != 0;
+  if(journal_clear(store_fd)) {
+    unrecorded = 1;
+  }
+  return unrecorded;
 }
 
 
@@ -2445,6 +2464,8 @@ autoload_apply_locked(struct approval *request) {
   int state_fd;
   int store_fd;
   int len;
+  int applied;
+  const char *kind;
   int add = !strcmp(request->facts.command, "autoload.add");
   int outcome = STORE_AUTOLOAD_FAILED;
 
@@ -2466,12 +2487,14 @@ autoload_apply_locked(struct approval *request) {
       outcome = STORE_AUTOLOAD_STALE;
     } else {
       text_hash(next, strlen(next), next_hex);
-      if(!autoload_transaction_locked(state_fd, store_fd, next, hex, next_hex,
-                                      add ? "autoload_add" : "autoload_remove",
-                                      request->facts.name, request->id)) {
+      kind = add ? "autoload_add" : "autoload_remove";
+      applied = autoload_transaction_locked(state_fd, store_fd, next, hex,
+                                            next_hex, kind,
+                                            request->facts.name, request->id);
+      if(applied >= 0) {
         request->consumed = 1;
         request->released = 1;
-        outcome = STORE_AUTOLOAD_APPLIED;
+        outcome = applied ? STORE_AUTOLOAD_UNRECORDED : STORE_AUTOLOAD_APPLIED;
       }
     }
   }

@@ -194,6 +194,7 @@ int store_approval_facts(const char *id, approval_facts_t *facts);
 #define STORE_AUTOLOAD_STALE   4
 #define STORE_AUTOLOAD_UNKNOWN 5
 #define STORE_AUTOLOAD_FAILED  6
+#define STORE_AUTOLOAD_UNRECORDED 7
 
 /**
  * Copy the autoload list into buf, NUL-terminated: one payload name per line,

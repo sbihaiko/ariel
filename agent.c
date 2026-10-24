@@ -1803,7 +1803,7 @@ autoload_show(int fd) {
   char *nl;
 
   if(store_autoload_show(text, sizeof(text)) < 0) {
-    reply(fd, list_failed);
+    refuse(fd, "autoload", "list_failed", list_failed);
     return;
   }
 
@@ -1864,14 +1864,17 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
     case STORE_AUTOLOAD_STALE:
       refuse(fd, name, "approval_stale", approval_stale);
       return;
+    case STORE_AUTOLOAD_UNRECORDED:
+      reply(fd, audit_failed);
+      return;
     default:
-      reply(fd, autoload_failed);
+      refuse(fd, name, "autoload_failed", autoload_failed);
       return;
     }
   }
 
   if(store_autoload_show(text, sizeof(text)) < 0) {
-    reply(fd, list_failed);
+    refuse(fd, name, "list_failed", list_failed);
     return;
   }
 
@@ -1891,14 +1894,14 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
     refuse(fd, name, "autoload_full", autoload_full);
     return;
   default:
-    reply(fd, autoload_failed);
+    refuse(fd, name, "autoload_failed", autoload_failed);
     return;
   }
 
   if(add) {
     len = payload_installed(name);
     if(len < 0) {
-      reply(fd, list_failed);
+      refuse(fd, name, "list_failed", list_failed);
       return;
     }
     if(!len) {
@@ -1918,7 +1921,7 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
 
   if(agent->platform->approval_request(agent->platform, &facts, &challenge)) {
-    reply(fd, approval_busy);
+    refuse(fd, name, "approval_busy", approval_busy);
     return;
   }
 

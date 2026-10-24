@@ -606,11 +606,21 @@ def autoload_ask(session, op, name):
     return approval.group(1), lines[1]
 
 
+def autoload_notification(approval, op, name, listing):
+    """The notification the console shows for an edit asked of this listing."""
+    names = [line[len("autoload "):] for line in listing
+             if line.startswith("autoload ")]
+    text = "".join(entry + "\n" for entry in names)
+    digest = hashlib.sha256(text.encode("ascii")).hexdigest()
+    return ("prompt %s autoload.%s %s (list sha256 %s) will change autoload"
+            % (approval, op, name, digest))
+
+
 def autoload_approve(session, op, name):
     """The owner's step for an autoload edit: ask, sign, grant; return the ID."""
+    listing = autoload_listing(session)
     approval, challenge = autoload_ask(session, op, name)
-    notification = ("prompt %s autoload %s %s will change the list"
-                    % (approval, op, name))
+    notification = autoload_notification(approval, op, name, listing)
     signature = session.operator.sign(name, notification, challenge)
     lines = session.grant(approval, signature)
     assert lines == ["approval_granted %s" % approval, "exit 0"], (
@@ -770,14 +780,14 @@ def check_autoload_stale_grant_answers_78(session, context):
     del context
     first, second = "consolestale", "consoleother"
     install_autoload_payload(session, second, b"console other\n")
+    listing = autoload_listing(session)
     stale, challenge = autoload_ask(session, "add", first)
     try:
         other = autoload_approve(session, "add", second)
         assert autoload_apply(session, "add", second, other) == [
             "autoload add %s" % second, "exit 0"], "the other edit must apply"
 
-        notification = ("prompt %s autoload add %s will change the list"
-                        % (stale, first))
+        notification = autoload_notification(stale, "add", first, listing)
         signature = session.operator.sign(first, notification, challenge)
         lines = session.grant(stale, signature)
         assert lines == ["approval_granted %s" % stale, "exit 0"], (

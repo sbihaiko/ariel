@@ -1058,6 +1058,12 @@ FAULT_SCENARIOS = {
     "after restart",
     "a crash in prepared of an autoload edit leaves the old list after restart",
     "a crash in committed of an autoload edit leaves the new list after restart",
+    "a journal written as v1 before autoload existed rolls a committed change "
+    "forward after restart",
+    "a journal written as v1 before autoload existed rolls a prepared change "
+    "back after restart",
+    "a committed autoload edit whose list file is gone rolls forward at the "
+    "next start",
 }
 
 # The scenarios that rewrite or remove the state file on the host's disk,
@@ -1137,6 +1143,9 @@ CLOCK_SCENARIOS = {
     "exit 78",
     "exec of a program replaced after approval answers approval_stale and "
     "exit 78",
+    "an autoload edit refused as busy answers approval_busy and is audited",
+    "an autoload edit whose audit line fails after the rename answers "
+    "audit_failed and stays applied",
 }
 
 # The scenarios that act on a process only the host build starts, or on
@@ -4177,9 +4186,18 @@ def autoload_listing(server):
     return send_command(server, "autoload show")
 
 
+def autoload_list_sha(listing):
+    """The SHA-256 of the list text a listing shows: one name per line."""
+    names = [line[len("autoload "):] for line in listing
+             if line.startswith("autoload ")]
+    return hashlib.sha256("".join(name + "\n" for name in names)
+                          .encode("ascii")).hexdigest()
+
+
 def autoload_ask(server, op, name):
     """Ask for an autoload edit and return its approval ID and challenge."""
     server.advance(10_000)
+    listing = autoload_listing(server)
     lines = send_command(server, "autoload edit %s %s" % (op, name))
     assert lines and lines[-1] == "exit 75", (
         "an autoload edit without a grant must answer 75, got %r" % lines)
@@ -4187,8 +4205,11 @@ def autoload_ask(server, op, name):
     approvals = [match.group(1) for match in approvals if match]
     assert len(approvals) == 1, "expected one approval, got %r" % lines
     prompt = server.next_line()
-    assert prompt and prompt.startswith("prompt %s " % approvals[0]), (
-        "the owner must be prompted for the edit, got %r" % prompt)
+    expected = ("prompt %s autoload.%s %s (list sha256 %s) will change autoload"
+                % (approvals[0], op, name, autoload_list_sha(listing)))
+    assert prompt == expected, (
+        "the owner must be prompted with the edit and its list, expected %r, "
+        "got %r" % (expected, prompt))
     return approvals[0], challenge_of(lines)
 
 
@@ -4335,6 +4356,123 @@ def scenario_crash_in_autoload_committed_keeps_new_list(server):
             % journal_events(crashed))
     finally:
         crashed.stop()
+
+
+def autoload_path(server):
+    return os.path.join(server.root, "data", "ariel", "autoload")
+
+
+def journal_as_v1(text):
+    """The journal a build before autoload wrote: marker v1, no kind field."""
+    marker, record = text.split("\n", 1)
+    assert marker == "ariel-journal-v2", "expected a v2 journal, got %r" % marker
+    fields = record.split()
+    assert fields[0] == "payload", "the replacement must be a payload change"
+    return "ariel-journal-v1\n%s\n" % " ".join(fields[1:])
+
+
+def crash_replacement_as_v1(server, step):
+    """crash_commit at step, the journal rewritten as v1, then the restart."""
+    crash_commit(server, step)
+    path = os.path.join(store_dir(server), JOURNAL_FILE)
+    with open(path, "r", encoding="ascii") as handle:
+        text = handle.read()
+    with open(path, "w", encoding="ascii") as handle:
+        handle.write(journal_as_v1(text))
+    server.env = None
+    server.restart()
+
+
+def scenario_v1_journal_rolls_forward(server):
+    """A journal written before autoload existed still rolls a commit forward."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+        crash_replacement_as_v1(crashed, "committed")
+
+        assert listed(payload_list(crashed), JOURNAL_NAME) == (
+            expected_listing(JOURNAL_NAME, second_hash, first_hash)), (
+            "a v1 journal committed must roll the new version forward")
+        assert ("rollforward", JOURNAL_NAME, second_hash) in journal_events(
+            crashed), (
+            "the roll forward must be audited, the log holds %r"
+            % journal_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_v1_journal_rolls_back(server):
+    """A v1 journal left in prepared rolls the replacement back."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        crash_replacement_as_v1(crashed, "prepared")
+
+        assert listed(payload_list(crashed), JOURNAL_NAME) == (
+            expected_listing(JOURNAL_NAME, first_hash)), (
+            "a v1 journal prepared must roll the replacement back")
+    finally:
+        crashed.stop()
+
+
+def scenario_committed_autoload_without_its_file_rolls_forward(server):
+    """A committed autoload edit rolls forward even when its list file is gone."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        crash_autoload(crashed, "committed")
+        os.remove(autoload_path(crashed))
+        crashed.env = None
+        crashed.restart()
+
+        assert "autoload crash_tool" in autoload_listing(crashed), (
+            "a committed edit must be listed after its file was lost")
+        new_hash = hashlib.sha256(
+            (AUTOLOAD_SELF + "\ncrash_tool\n").encode("ascii")).hexdigest()
+        assert ("rollforward", "autoload", new_hash) in journal_events(crashed), (
+            "the roll forward must be audited, the log holds %r"
+            % journal_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_autoload_busy_is_audited(server):
+    """An autoload edit refused as busy answers approval_busy and is audited."""
+    install_payload(server, "busy_one", b"busy one build\n")
+    install_payload(server, "busy_two", b"busy two build\n")
+    autoload_ask(server, "add", "busy_one")
+    lines = send_command(server, "autoload edit add busy_two")
+    assert lines == ["approval_busy", "exit 76"], (
+        "a second notification within 10 s must answer approval_busy, got %r"
+        % lines)
+    refused = [line.split() for line in audit_tail(server)
+               if line.split()[1:4] == ["refuse", "busy_two", "approval_busy"]]
+    assert refused, "the busy refusal must be audited"
+
+
+def scenario_autoload_audit_failure_after_rename_stays_applied(server):
+    """An applied autoload edit whose audit line fails answers audit_failed."""
+    fresh = Server(server.binary)
+    try:
+        install_payload(fresh, "unlogged", b"unlogged build\n")
+        approval, challenge = autoload_ask(fresh, "add", "unlogged")
+        sign_and_grant(fresh, approval, challenge)
+
+        log = audit_log_path(fresh)
+        os.rename(log, log + ".saved")
+        os.mkdir(log)
+
+        assert autoload_apply(fresh, "add", "unlogged", approval) == [
+            "audit_failed", "exit 1"], "an edit the log cannot record"
+        assert "autoload unlogged" in autoload_listing(fresh), (
+            "an edit applied before its audit failed must stay in the list")
+        assert not os.path.exists(os.path.join(store_dir(fresh), JOURNAL_FILE)), (
+            "the journal must be closed once the list is in place")
+    finally:
+        fresh.stop()
 
 
 def scenario_audit_tail_order(server):
@@ -5242,6 +5380,18 @@ SCENARIOS = [
      scenario_crash_in_autoload_prepared_keeps_old_list, FAULT_REASON),
     ("a crash in committed of an autoload edit leaves the new list after restart",
      scenario_crash_in_autoload_committed_keeps_new_list, FAULT_REASON),
+    ("a journal written as v1 before autoload existed rolls a committed change "
+     "forward after restart", scenario_v1_journal_rolls_forward, FAULT_REASON),
+    ("a journal written as v1 before autoload existed rolls a prepared change "
+     "back after restart", scenario_v1_journal_rolls_back, FAULT_REASON),
+    ("a committed autoload edit whose list file is gone rolls forward at the "
+     "next start", scenario_committed_autoload_without_its_file_rolls_forward,
+     FAULT_REASON),
+    ("an autoload edit refused as busy answers approval_busy and is audited",
+     scenario_autoload_busy_is_audited, CLOCK_REASON),
+    ("an autoload edit whose audit line fails after the rename answers "
+     "audit_failed and stays applied",
+     scenario_autoload_audit_failure_after_rename_stays_applied, CLOCK_REASON),
 ]
 
 
