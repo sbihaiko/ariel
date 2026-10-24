@@ -26,6 +26,7 @@ import socket
 import sys
 import tempfile
 import time
+import uuid
 
 import quickstart
 
@@ -202,6 +203,10 @@ class Session:
             self._sleep(NOTIFICATION_SPACING)
         return lines
 
+    def rollback(self, name):
+        return self.until_not_busy(
+            lambda: self.link.exchange("payload rollback %s" % name))
+
     def commit(self, staging_id):
         return self.link.exchange("payload commit %s" % staging_id)
 
@@ -212,14 +217,17 @@ class Session:
     def status(self, approval_id):
         return self.link.exchange("approval status %s" % approval_id)
 
-    def request(self, approval_id, challenge, name, size, digest):
+    def decide(self, approval_id, challenge, name, notification):
         """Show what the console displays, read the owner's signature, grant it."""
-        notification = ("prompt %s payload %s (%d bytes, sha256 %s) will run"
-                        % (approval_id, name, size, digest))
         signature = self.operator.sign(name, notification, challenge)
         lines = self.grant(approval_id, signature)
         assert lines == ["approval_granted %s" % approval_id, "exit 0"], (
             "the owner's signature must decide the approval, got %r" % lines)
+
+    def request(self, approval_id, challenge, name, size, digest):
+        notification = ("prompt %s payload %s (%d bytes, sha256 %s) will run"
+                        % (approval_id, name, size, digest))
+        self.decide(approval_id, challenge, name, notification)
         return notification
 
 
@@ -563,6 +571,69 @@ def check_background_refusals(session, context):
 
 
 # Every check console mode runs. Each is a scenario that needs no test clock.
+def install_build(session, name, data):
+    """Push, approve and commit one build, and return its digest."""
+    digest = hashlib.sha256(data).hexdigest()
+    lines = session.push(name, data)
+    staging, approval, challenge = assert_staged(lines, name, data)
+    session.request(approval, challenge, name, len(data), digest)
+    lines = session.commit(staging)
+    assert lines == ["installed %s %s" % (name, digest), "exit 0"], (
+        "an approved commit must install the build, got %r" % lines)
+    return digest
+
+
+def check_rollback_restores_previous(session, context):
+    """A rollback waits for the owner, then restores the previous build and is audited."""
+    del context
+    name = "rollb" + uuid.uuid4().hex[:8]
+    previous = install_build(session, name, b"console rollback first\n")
+    current = install_build(session, name, b"console rollback second\n")
+
+    lines = session.rollback(name)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "a rollback without a grant must answer approval_required and exit 75, "
+        "got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0])
+    assert approval, "expected 'approval_required <id>', got %r" % lines[0]
+    notification = ("prompt %s payload %s rolls back to %s, replacing %s"
+                    % (approval.group(1), name, previous, current))
+    session.decide(approval.group(1), lines[1], name, notification)
+
+    lines = session.rollback(name)
+    assert lines == ["rolled_back %s %s" % (name, previous), "exit 0"], (
+        "a granted rollback must restore the previous build, got %r" % lines)
+
+    listing = [line for line in session.link.exchange("payload list")
+               if line.startswith("payload %s " % name)]
+    assert len(listing) == 1 and ("sha256=%s" % previous) in listing[0] and (
+        "previous=%s" % current) in listing[0], (
+        "the previous build must be listed as current, got %r" % listing)
+
+    events = [line.split() for line in session.link.exchange("audit tail")
+              if line != "exit 0"]
+    assert ["rollback_done", name, approval.group(1)] in [
+        event[1:4] for event in events], (
+        "the completed rollback must be audited as rollback_done, got %r"
+        % events)
+
+
+def check_rollback_refusals(session, context):
+    """A payload with no previous build and an unknown name answer their words."""
+    del context
+    name = "rollfirst" + uuid.uuid4().hex[:8]
+    install_build(session, name, b"console rollback only build\n")
+
+    lines = session.rollback(name)
+    assert lines == ["no_previous_version", "exit 1"], (
+        "a payload with no previous version must answer no_previous_version, "
+        "got %r" % lines)
+    lines = session.rollback("rollnone" + uuid.uuid4().hex[:8])
+    assert lines == ["unknown_payload", "exit 1"], (
+        "a rollback of an unknown payload must answer unknown_payload, got %r"
+        % lines)
+
+
 CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
     ("a line over 1 KiB closes the connection", check_line_limit),
@@ -585,6 +656,12 @@ CHECKS = [
      "and the commit stays refused", check_unsigned_commit),
     ("after a push, a grant and a commit, audit tail shows each one in order "
      "and no agent-port command can clear the log", check_audit_tail),
+    ("a payload rollback answers 75, the owner signs it, and the previous build "
+     "is listed as current and audited as rollback_done",
+     check_rollback_restores_previous),
+    ("a payload rollback with no previous version answers no_previous_version "
+     "and an unknown name unknown_payload, both with exit 1",
+     check_rollback_refusals),
     ("approval status answers pending, granted and consumed without an "
      "approval of its own, and an unknown id is an error",
      check_approval_status),

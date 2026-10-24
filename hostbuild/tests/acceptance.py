@@ -1065,6 +1065,8 @@ HOST_FILE_SCENARIOS = {
     "second start changes nothing",
     "a state file whose payload lines have eight fields starts and lists "
     "previous=-",
+    "a rollback whose record the store cannot read answers rollback_failed "
+    "and keeps the grant",
 }
 
 # Scenarios that act on a process only the host build starts (a victim the
@@ -1075,6 +1077,8 @@ HOST_FIXTURE_REASON = ("needs a process only the host build starts, which "
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
+    "rollbacks that end, and requests left to expire, free their approval "
+    "rows, so a push still asks for approval",
     "missing auth after 5 s of test clock closes with exit 70",
     "a stalled upload does not block another connection",
     "a hung background payload is listed as running, then cut at its "
@@ -1961,8 +1965,9 @@ def scenario_rollback_restores_the_previous_version(server):
     events = audit_events(server)
     assert ("request", "rollb", approval, previous) in events, (
         "the request must be audited, the log holds %r" % events)
-    assert ("rollback", "rollb", approval, previous) in events, (
-        "the rollback must be audited, the log holds %r" % events)
+    assert ("rollback_done", "rollb", approval, previous) in events, (
+        "the completed rollback must be audited as rollback_done, the log "
+        "holds %r" % events)
 
 
 def scenario_rollback_without_previous_version_answers_error(server):
@@ -2024,6 +2029,83 @@ def scenario_rollback_denied_answers_77(server):
         "a denied rollback must leave the store as it was")
     assert ("refuse", "rolldeny", "approval_denied", "-") in audit_events(
         server), "the denial must be audited"
+
+
+# More than the approval table holds, so a table that never gives rows back
+# runs out during the first loop.
+ROLLBACK_ROUNDS = 20
+
+
+def scenario_rollbacks_give_their_approval_rows_back(server):
+    """Rollbacks that end, and requests left to expire, free their rows for a push."""
+    del server  # a table filled by an earlier scenario must not decide this one
+    rolls = Server(SERVER_BINARY)
+    try:
+        rollbacks_give_rows_back(rolls)
+    finally:
+        rolls.stop()
+
+
+def rollbacks_give_rows_back(server):
+    previous = install_payload(server, "rollmany", b"many build a\n")
+    current = install_payload(server, "rollmany", b"many build b\n")
+
+    for i in range(ROLLBACK_ROUNDS):
+        lines = rollback_request(server, "rollmany")
+        assert APPROVAL_LINE.match(lines[0]), (
+            "granted rollback request %d must ask for approval, got %r"
+            % (i, lines))
+        approval = APPROVAL_LINE.match(lines[0]).group(1)
+        server.next_line()
+        sign_and_grant(server, approval, challenge_of(lines))
+        restored = previous if i % 2 == 0 else current
+        assert send_command(server, "payload rollback rollmany") == [
+            "rolled_back rollmany %s" % restored, "exit 0"], (
+            "granted rollback %d must restore %s" % (i, restored))
+
+    for i in range(ROLLBACK_ROUNDS):
+        lines = rollback_request(server, "rollmany")
+        assert APPROVAL_LINE.match(lines[0]), (
+            "rollback request %d must ask for approval, got %r" % (i, lines))
+        server.next_line()
+        server.advance(120_000)
+
+    data = b"pushed after the rollbacks"
+    lines = push(server, "rollpush", data)
+    assert_staged(server, lines, "rollpush", data)
+
+
+def scenario_unreadable_record_answers_rollback_failed(server):
+    """A record the store cannot read answers rollback_failed and keeps the grant."""
+    del server  # a table filled by an earlier scenario must not decide this one
+    broken = Server(SERVER_BINARY)
+    try:
+        previous = install_payload(broken, "rollbroken", b"broken build a\n")
+        current = install_payload(broken, "rollbroken", b"broken build b\n")
+
+        lines = rollback_request(broken, "rollbroken")
+        approval = APPROVAL_LINE.match(lines[0]).group(1)
+        broken.next_line()
+        sign_and_grant(broken, approval, challenge_of(lines))
+
+        record = os.path.join(store_dir(broken), "current", "rollbroken")
+        os.remove(record)
+        os.mkdir(record)
+        assert send_command(broken, "payload rollback rollbroken") == [
+            "rollback_failed", "exit 1"], (
+            "a record that cannot be read must answer rollback_failed, not "
+            "unknown_payload")
+
+        os.rmdir(record)
+        with open(record, "w") as fh:
+            fh.write(current + "\n")
+        assert send_command(broken, "payload rollback rollbroken") == [
+            "rolled_back rollbroken %s" % previous, "exit 0"], (
+            "the grant must survive the failed attempt and restore the build")
+        assert ("refuse", "rollbroken", "rollback_failed", "-") in audit_events(
+            broken), "the failed attempt must be audited"
+    finally:
+        broken.stop()
 
 
 ROLLBACK_CRASH_NAME = "rollcrash"
@@ -4730,6 +4812,12 @@ SCENARIOS = [
      scenario_rollback_refused_when_the_store_moved_on, None),
     ("a denied rollback answers approval_denied and exit 77 and changes nothing",
      scenario_rollback_denied_answers_77, None),
+    ("rollbacks that end, and requests left to expire, free their approval "
+     "rows, so a push still asks for approval",
+     scenario_rollbacks_give_their_approval_rows_back, CLOCK_REASON),
+    ("a rollback whose record the store cannot read answers rollback_failed "
+     "and keeps the grant",
+     scenario_unreadable_record_answers_rollback_failed, HOST_FILE_REASON),
     ("a crash in prepared during a rollback leaves the newer build current "
      "after restart",
      scenario_crash_in_prepared_rolls_back_the_rollback, FAULT_REASON),

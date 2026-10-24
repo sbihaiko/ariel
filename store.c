@@ -142,6 +142,7 @@ static int dir_open(int dirfd, const char *name);
 static int dir_make(int dirfd, const char *name);
 static void staging_clear(void);
 static void expire_locked(uint64_t now);
+static struct approval *rollback_open_find(const char *name);
 static void *expiry_run(void *arg);
 static int nonces_load(void);
 static int write_all(int fd, const char *buf, size_t len);
@@ -548,16 +549,23 @@ staged_leave(struct staged *entry) {
  * after its expiry, but its row stays, so a later question can still say
  * expired and a late commit can say approval_expired. A staging object
  * nobody committed leaves after its TTL; its approval stays too, answered
- * as expired rather than forgotten. The caller holds the lock.
+ * as expired rather than forgotten. A rollback stages nothing, so an
+ * expired one is released here and its row can be given up. The caller
+ * holds the lock.
  **/
 static void
 expire_locked(uint64_t now) {
   int i;
 
   for(i=0; i<APPROVALS_MAX; i++) {
-    if(approvals[i].used && !approvals[i].expired &&
-       elapsed_ms(now, approvals[i].created_ms) >= APPROVAL_EXPIRY_MS) {
-      approvals[i].expired = 1;
+    struct approval *request = &approvals[i];
+
+    if(request->used && !request->expired &&
+       elapsed_ms(now, request->created_ms) >= APPROVAL_EXPIRY_MS) {
+      request->expired = 1;
+      if(!strcmp(request->facts.command, "payload.rollback")) {
+        request->released = 1;
+      }
     }
   }
 
@@ -954,7 +962,11 @@ store_approval_request(const approval_facts_t *facts,
   now = now_ms();
   expire_locked(now);
 
-  if(pending_count() >= PENDING_MAX || !(slot=approval_slot())) {
+  // Two requests for one rollback can both have found none open before
+  // either inserted; the second must not open a second approval for it.
+  if(pending_count() >= PENDING_MAX ||
+     (rollback && rollback_open_find(facts->name)) ||
+     !(slot=approval_slot())) {
     pthread_mutex_unlock(&lock);
     return -1;
   }
@@ -2017,13 +2029,21 @@ store_rollback_target(const char *name, approval_facts_t *facts) {
   int state_fd = -1;
   int store_fd = -1;
   int current_fd = -1;
-  int rc = STORE_ROLLBACK_UNKNOWN;
+  int rc = STORE_ROLLBACK_ERROR;
 
   if((state_fd=root_open()) < 0 ||
      (store_fd=dir_open(state_fd, "store")) < 0 ||
-     (current_fd=dir_open(store_fd, "current")) < 0 ||
-     current_read(current_fd, name, current) ||
-     state_previous(name, previous, sizeof(previous))) {
+     (current_fd=dir_open(store_fd, "current")) < 0) {
+    goto out;
+  }
+
+  errno = 0;
+  if(current_read(current_fd, name, current)) {
+    rc = errno == ENOENT ? STORE_ROLLBACK_UNKNOWN : STORE_ROLLBACK_ERROR;
+    goto out;
+  }
+
+  if(state_previous(name, previous, sizeof(previous))) {
     goto out;
   }
 
@@ -2056,6 +2076,7 @@ out:
 /** The newest rollback approval of name that is neither spent nor released. **/
 static struct approval *
 rollback_open_find(const char *name) {
+  struct approval *newest = NULL;
   int i;
 
   for(i=0; i<APPROVALS_MAX; i++) {
@@ -2063,11 +2084,12 @@ rollback_open_find(const char *name) {
 
     if(request->used && !request->consumed && !request->released &&
        !strcmp(request->facts.command, "payload.rollback") &&
-       !strcmp(request->facts.name, name)) {
-      return request;
+       !strcmp(request->facts.name, name) &&
+       (!newest || request->created_ms > newest->created_ms)) {
+      newest = request;
     }
   }
-  return NULL;
+  return newest;
 }
 
 
@@ -2089,6 +2111,7 @@ rollback_apply_locked(struct approval *request, store_install_t *install) {
   int store_fd = -1;
   int objects_fd = -1;
   int current_fd = -1;
+  int target;
   int rc = STORE_ROLLBACK_FAILED;
 
   if((state_fd=root_open()) < 0 ||
@@ -2103,11 +2126,18 @@ rollback_apply_locked(struct approval *request, store_install_t *install) {
     goto out;
   }
 
-  if(store_rollback_target(name, &live) != STORE_ROLLBACK_OK ||
+  // An unreadable store is not a changed one: the grant stays for a retry.
+  target = store_rollback_target(name, &live);
+  if(target == STORE_ROLLBACK_ERROR) {
+    goto out;
+  }
+
+  if(target != STORE_ROLLBACK_OK ||
      strcmp(live.sha256, request->facts.sha256) ||
      strcmp(live.replaces, request->facts.replaces) ||
      !object_present(objects_fd, live.sha256)) {
     request->consumed = 1;
+    request->released = 1;
     rc = STORE_APPROVAL_STALE;
     goto out;
   }
@@ -2147,6 +2177,7 @@ rollback_apply_locked(struct approval *request, store_install_t *install) {
   snprintf(install->sha256, sizeof(install->sha256), "%s", live.sha256);
   object_path(live.sha256, install->path, sizeof(install->path));
   request->consumed = 1;
+  request->released = 1;
 
   rc = STORE_INSTALLED;
 
@@ -2182,10 +2213,7 @@ store_rollback(const char *name, char *approval_id, size_t idlen,
   } else {
     snprintf(approval_id, idlen, "%s", request->id);
 
-    if(request->expired) {
-      request->released = 1;
-      outcome = STORE_APPROVAL_EXPIRED;
-    } else if(!request->decided) {
+    if(!request->decided) {
       outcome = STORE_APPROVAL_REQUIRED;
     } else if(!request->approved) {
       request->released = 1;

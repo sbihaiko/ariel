@@ -50,6 +50,7 @@ along with this program; see the file COPYING. If not, see
 #define STORE_ROLLBACK_OK          0
 #define STORE_ROLLBACK_UNKNOWN     1
 #define STORE_ROLLBACK_NO_PREVIOUS 2
+#define STORE_ROLLBACK_ERROR       3
 
 /** What a successful commit installed. **/
 typedef struct {
@@ -210,10 +211,10 @@ int store_rollback_target(const char *name, approval_facts_t *facts);
  * Roll back a payload name under its open approval, the newest one that is
  * neither spent nor released. Returns STORE_APPROVAL_NEW when there is none
  * (the caller asks for one), STORE_APPROVAL_REQUIRED with approval_id set
- * while it waits, STORE_APPROVAL_DENIED or STORE_APPROVAL_EXPIRED once it
- * has ended, STORE_APPROVAL_STALE when the store no longer holds the facts
- * the owner approved, STORE_INSTALLED when the rollback is done, or
- * STORE_ROLLBACK_FAILED. approval_id is set whenever an approval is found.
+ * while it waits, STORE_APPROVAL_DENIED once it was refused, STORE_APPROVAL_STALE
+ * when the store no longer holds the facts the owner approved, STORE_INSTALLED
+ * when the rollback is done, or STORE_ROLLBACK_FAILED with the grant kept
+ * open. approval_id is set whenever an approval is found.
  **/
 int store_rollback(const char *name, char *approval_id, size_t idlen,
                    store_install_t *install);

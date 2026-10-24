@@ -1222,6 +1222,9 @@ payload_rollback(agent_t *agent, int fd, const char *name) {
   case STORE_ROLLBACK_NO_PREVIOUS:
     refuse(fd, name, "no_previous_version", no_previous_version);
     return;
+  case STORE_ROLLBACK_ERROR:
+    refuse(fd, name, "rollback_failed", rollback_failed);
+    return;
   }
 
   approval_id[0] = '\0';
@@ -1249,14 +1252,11 @@ payload_rollback(agent_t *agent, int fd, const char *name) {
   case STORE_APPROVAL_DENIED:
     refuse(fd, name, "approval_denied", approval_denied);
     return;
-  case STORE_APPROVAL_EXPIRED:
-    refuse(fd, name, "approval_expired", approval_expired);
-    return;
   case STORE_APPROVAL_STALE:
     refuse(fd, name, "approval_stale", approval_stale);
     return;
   case STORE_INSTALLED:
-    if(store_audit_append("rollback", install.name, approval_id,
+    if(store_audit_append("rollback_done", install.name, approval_id,
                           install.sha256)) {
       reply(fd, audit_failed);
       return;
