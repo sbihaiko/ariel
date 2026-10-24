@@ -316,7 +316,10 @@ parse_limit(int argc, char *const argv[], int errfd, size_t *limit, int *skip) {
   *limit = SIZE_MAX;
   *skip = 0;
 
-  if(argc < 2 || strncmp(argv[1], "--", 2)) {
+  // Any dash-led word in the place an option goes is an option, and `--limit`
+  // is the only one these commands take: anything else answers bad_option
+  // rather than being read as a path.
+  if(argc < 2 || argv[1][0] != '-') {
     return 0;
   }
   if(!strcmp(argv[1], "--limit") && argc >= 3 && !parse_count(argv[2], limit)) {
