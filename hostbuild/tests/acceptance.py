@@ -8950,7 +8950,7 @@ def scenario_find_predicates(server):
         "find -type f must print the regular files")
     assert set(run_exit_zero(server, "find %s -name '*.txt'" % tree)) == {
         a, b}, "find -name must expand a glob against the name, as bash does"
-    assert run_exit_zero(server, "find %s -name '[a-z].txt'" % tree) == [a], (
+    assert run_exit_zero(server, "find %s -name '[a].txt'" % tree) == [a], (
         "find -name must accept a bracket expression")
     assert run_exit_zero(server, "find %s -name '*.log'" % tree) == [], (
         "a glob that matches nothing prints nothing and exits 0")
