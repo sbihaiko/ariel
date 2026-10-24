@@ -9033,6 +9033,365 @@ HTTP2_SCENARIOS = [
 SCENARIOS.extend(HTTP2_SCENARIOS)
 
 
+# ---------------------------------------------------------------------------
+# Freeze (SPEC 2, #47): the owner creates /data/ariel/freeze and Ariel records
+# it in the keyring. From then on every ordinary approval, gated commit and run
+# answers frozen and exit 89, including one granted or installed before the
+# freeze. Only recovery-signed key commands pass; a recovery-signed key unfreeze
+# lifts it, and deleting the file does not.
+# ---------------------------------------------------------------------------
+
+FROZEN_REPLY = ["frozen", "exit 89"]
+ROTATE_RECOVERY_ACTION = "command=key.rotate-recovery"
+FREEZE_STEPS = ("prepared", "committed", "renamed", "audited")
+RUN_OK = ["status 0", "exit 0"]
+APPROVALS_TABLE_SIZE = 16  # APPROVALS_MAX in store.c
+
+FREEZE_NEW_TITLE = ("a freeze refuses new approvals and gated commands with "
+                    "frozen and exit 89")
+FREEZE_COMMIT_TITLE = ("a freeze refuses a commit granted before it and "
+                       "installs nothing")
+FREEZE_RUN_TITLE = "a freeze refuses to run a payload installed before it"
+FREEZE_DELETE_TITLE = ("deleting the freeze file does not lift a freeze, and "
+                       "a recovery-signed key unfreeze does")
+FREEZE_RESTART_TITLE = ("a freeze holds after a restart with its file "
+                        "deleted")
+FREEZE_SLOTS_TITLE = ("while frozen, a recovery-signed key unfreeze passes "
+                      "with the approval table full")
+FREEZE_ROTATE_TITLE = ("a freeze refuses key rotate and still asks for key "
+                       "rotate-recovery")
+FREEZE_PRIMARY_TITLE = ("a freeze is lifted only by the recovery key: a "
+                        "primary signature over key unfreeze answers 79")
+FREEZE_RACE_TITLE = ("a freeze racing a grant, a commit and a run admits "
+                     "nothing after the cutoff")
+FREEZE_RECORD_CRASH_TITLE = ("a crash at each durable step of the freeze "
+                             "record leaves the console frozen or unfrozen, "
+                             "never between")
+FREEZE_UNFREEZE_CRASH_TITLE = ("a crash at each durable step of a key "
+                               "unfreeze leaves the console frozen or "
+                               "unfrozen, never between")
+
+
+def freeze_file(server):
+    return os.path.join(server.root, "data", "ariel", "freeze")
+
+
+def set_freeze(server):
+    with open(freeze_file(server), "w"):
+        pass
+
+
+def pending_challenge(server, command):
+    """Request a gated command that is not signed yet: (approval, challenge)."""
+    lines = run_command(server, command)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "%s must answer approval_required and exit 75, got %r" % (command, lines))
+    approval = APPROVAL_LINE.match(lines[0])
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert approval and challenge and challenge.group(1) == approval.group(1), (
+        "expected approval_required and a matching challenge, got %r" % lines)
+    return approval.group(1), lines[1]
+
+
+def request_unfreeze(server):
+    # A notification is shown at most once in ten seconds of test clock.
+    server.advance(10_000)
+    return pending_challenge(server, "key unfreeze")
+
+
+def sign_and_grant_with(server, approval, challenge, key):
+    """The owner's step with the named key: sign, submit, expect the grant."""
+    assert grant(server, approval, sign_challenge(server, challenge, key=key)) == [
+        "approval_granted %s" % approval, "exit 0"], (
+        "the signature of the named key must grant the approval")
+
+
+def scenario_freeze_refuses_new_approvals(server):
+    del server  # each freeze needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-new"})
+    try:
+        set_freeze(keys)
+        assert run_command(keys, "env PATH") == FROZEN_REPLY, (
+            "a gated command must answer frozen and exit 89 while frozen")
+        assert push(keys, "frozennew", healthy_build("frozennew")) == FROZEN_REPLY, (
+            "a push must not ask for approval while frozen")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_refuses_commit_granted_before_it(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-commit"})
+    try:
+        staging, approval, challenge = push_for_challenge(
+            keys, "frozencommit", healthy_build("frozencommit"))
+        sign_and_grant(keys, approval, challenge)
+        set_freeze(keys)
+        assert commit(keys, staging) == FROZEN_REPLY, (
+            "a commit granted before the freeze must answer frozen and exit 89")
+        assert listed(payload_list(keys), "frozencommit") is None, (
+            "a refused commit must install nothing")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_refuses_run_of_installed_payload(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-run"})
+    try:
+        install_payload(keys, "frozenrun", healthy_build("frozenrun"))
+        set_freeze(keys)
+        assert run_payload(keys, "frozenrun") == FROZEN_REPLY, (
+            "a payload installed before the freeze must not run while frozen")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_survives_deleting_its_file(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-delete"})
+    try:
+        install_payload(keys, "frozendel", healthy_build("frozendel"))
+        set_freeze(keys)
+        assert run_payload(keys, "frozendel") == FROZEN_REPLY
+        os.unlink(freeze_file(keys))
+        assert run_payload(keys, "frozendel") == FROZEN_REPLY, (
+            "deleting the freeze file must not lift the freeze")
+        assert run_command(keys, "env PATH") == FROZEN_REPLY
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, "key unfreeze") == ["key_unfrozen 0", "exit 0"], (
+            "a recovery-signed unfreeze must lift the freeze")
+        assert run_payload(keys, "frozendel")[-2:] == RUN_OK, (
+            "after the unfreeze the installed payload must run again")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_holds_after_restart(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-restart"})
+    try:
+        install_payload(keys, "frozenrestart", healthy_build("frozenrestart"))
+        set_freeze(keys)
+        assert run_payload(keys, "frozenrestart") == FROZEN_REPLY
+        os.unlink(freeze_file(keys))
+        keys.restart()
+        assert run_payload(keys, "frozenrestart") == FROZEN_REPLY, (
+            "the recorded freeze must hold after a restart, file deleted")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_unfreeze_with_slots_full(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-slots"})
+    try:
+        # Each unanswered payload approval expires and keeps its row, so
+        # sixteen of them fill the table.
+        for index in range(APPROVALS_TABLE_SIZE):
+            push_for_challenge(keys, "fill%d" % index, b"fill %d" % index)
+        set_freeze(keys)
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, "key unfreeze") == ["key_unfrozen 0", "exit 0"], (
+            "a recovery-signed unfreeze must pass with the approval table full")
+        keys.advance(10_000)
+        assert run_command(keys, "env PATH")[-1] == "exit 75", (
+            "an unfrozen Ariel must ask for an ordinary approval again")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_refuses_key_rotate(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-rotate"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        set_freeze(keys)
+        assert run_command(keys, "key rotate " + second) == FROZEN_REPLY, (
+            "a primary key rotate must not be asked while frozen")
+        lines = run_command(keys, "key rotate-recovery " + second)
+        assert lines[-1] == "exit 75" and ROTATE_RECOVERY_ACTION in (
+            challenge_action(lines[1]).split("\n")), (
+            "a recovery-signed key rotate-recovery must still be asked while "
+            "frozen, got %r" % lines)
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_unfreeze_refuses_primary_signature(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-primary"})
+    try:
+        set_freeze(keys)
+        approval, challenge = request_unfreeze(keys)
+        assert grant(keys, approval, sign_challenge(keys, challenge)) == [
+            "signature_invalid", "exit 79"], (
+            "a primary signature over key unfreeze must be refused")
+        assert run_command(keys, "env PATH") == FROZEN_REPLY, (
+            "a refused primary signature must not lift the freeze")
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, "key unfreeze") == ["key_unfrozen 0", "exit 0"], (
+            "the recovery signature must still lift the freeze")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_racing_admissions(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "freeze-race"})
+    try:
+        install_payload(keys, "racerun", healthy_build("racerun"))
+        keys.advance(10_000)
+        staging, _ = approve_push(keys, "racecommit", healthy_build("racecommit"))
+        keys.advance(10_000)
+        approval, challenge = pending_challenge(keys, "env PATH")
+        signature = signature_of(sign_challenge(keys, challenge))
+        keys.advance(10_000)
+        late_staging, _ = approve_push(keys, "racelate", healthy_build("racelate"))
+        keys.advance(10_000)
+        late_approval, late_challenge = pending_challenge(keys, "env HOME")
+
+        results = []
+        results_lock = threading.Lock()
+        stop = threading.Event()
+
+        def admit(kind, attempt):
+            start = time.monotonic_ns()
+            lines = attempt()
+            with results_lock:
+                results.append((start, kind, lines))
+
+        def run_until_stopped():
+            while not stop.is_set():
+                admit("run", lambda: run_payload(keys, "racerun"))
+                time.sleep(0.005)
+
+        workers = [threading.Thread(target=run_until_stopped) for _ in range(2)]
+        workers.append(threading.Thread(
+            target=admit, args=("commit", lambda: commit(keys, staging))))
+        workers.append(threading.Thread(
+            target=admit, args=("grant", lambda: grant(keys, approval, signature))))
+        for worker in workers:
+            worker.start()
+        time.sleep(0.05)
+        set_freeze(keys)
+        cutoff = time.monotonic_ns()
+        time.sleep(0.05)
+        stop.set()
+        for worker in workers:
+            worker.join(timeout=30)
+
+        late = [(kind, lines) for start, kind, lines in results if start > cutoff]
+        assert any(kind == "run" for kind, _ in late), (
+            "the runs must overlap the cutoff, got %r" % results)
+        for kind, lines in late:
+            assert lines == FROZEN_REPLY, (
+                "a %s started after the freeze must be refused, got %r"
+                % (kind, lines))
+
+        assert run_payload(keys, "racerun") == FROZEN_REPLY
+        assert commit(keys, late_staging) == FROZEN_REPLY, (
+            "a commit granted before the freeze must be refused after it")
+        assert grant(keys, late_approval, sign_challenge(
+            keys, late_challenge)) == FROZEN_REPLY, (
+            "a grant after the freeze must be refused")
+        assert listed(payload_list(keys), "racelate") is None, (
+            "a refused commit must install nothing")
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_record_crash(server):
+    del server
+    for step in FREEZE_STEPS:
+        keys = Server(SERVER_BINARY, env={
+            "ARIEL_HOST_NONCE_SEED": "freeze-record-" + step})
+        try:
+            install_payload(keys, "crashrecord", healthy_build("crashrecord"))
+            set_freeze(keys)
+            keys.env = {FAULT_ENV: step}
+            keys.restart()
+            command_until_crash(keys, "payload run --wait crashrecord")
+            keys.env = None
+            keys.restart()
+            # Only the record itself can keep the freeze now.
+            os.unlink(freeze_file(keys))
+            if step == "prepared":
+                assert run_payload(keys, "crashrecord")[-2:] == RUN_OK, (
+                    "a freeze record crashed at prepared is not recorded: the "
+                    "run must go through once the file is gone")
+            else:
+                assert run_payload(keys, "crashrecord") == FROZEN_REPLY, (
+                    "a freeze record crashed at %s is recorded: it must hold "
+                    "with the file gone" % step)
+        finally:
+            keys.stop()
+
+
+def scenario_freeze_unfreeze_crash(server):
+    del server
+    for step in FREEZE_STEPS:
+        keys = Server(SERVER_BINARY, env={
+            "ARIEL_HOST_NONCE_SEED": "freeze-unfreeze-" + step})
+        try:
+            install_payload(keys, "crashunfreeze", healthy_build("crashunfreeze"))
+            set_freeze(keys)
+            assert run_payload(keys, "crashunfreeze") == FROZEN_REPLY
+            keys.env = {FAULT_ENV: step}
+            keys.restart()
+            approval, challenge = request_unfreeze(keys)
+            sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+            command_until_crash(keys, "key unfreeze")
+            keys.env = None
+            keys.restart()
+            if step == "prepared":
+                assert run_payload(keys, "crashunfreeze") == FROZEN_REPLY, (
+                    "an unfreeze crashed at prepared leaves the keyring frozen")
+            else:
+                assert run_payload(keys, "crashunfreeze")[-2:] == RUN_OK, (
+                    "an unfreeze crashed at %s is recorded: the console must "
+                    "be unfrozen" % step)
+        finally:
+            keys.stop()
+
+
+FREEZE_SCENARIOS = [
+    (FREEZE_NEW_TITLE, scenario_freeze_refuses_new_approvals, HOST_ROOT_REASON),
+    (FREEZE_COMMIT_TITLE, scenario_freeze_refuses_commit_granted_before_it,
+     CLOCK_REASON),
+    (FREEZE_RUN_TITLE, scenario_freeze_refuses_run_of_installed_payload,
+     HOST_ROOT_REASON),
+    (FREEZE_DELETE_TITLE, scenario_freeze_survives_deleting_its_file,
+     CLOCK_REASON),
+    (FREEZE_RESTART_TITLE, scenario_freeze_holds_after_restart,
+     HOST_RESTART_REASON),
+    (FREEZE_SLOTS_TITLE, scenario_freeze_unfreeze_with_slots_full,
+     CLOCK_REASON),
+    (FREEZE_ROTATE_TITLE, scenario_freeze_refuses_key_rotate, HOST_ROOT_REASON),
+    (FREEZE_PRIMARY_TITLE, scenario_freeze_unfreeze_refuses_primary_signature,
+     CLOCK_REASON),
+    (FREEZE_RACE_TITLE, scenario_freeze_racing_admissions, CLOCK_REASON),
+    (FREEZE_RECORD_CRASH_TITLE, scenario_freeze_record_crash, FAULT_REASON),
+    (FREEZE_UNFREEZE_CRASH_TITLE, scenario_freeze_unfreeze_crash, FAULT_REASON),
+]
+
+CLOCK_SCENARIOS.update({FREEZE_COMMIT_TITLE, FREEZE_DELETE_TITLE,
+                        FREEZE_SLOTS_TITLE, FREEZE_PRIMARY_TITLE,
+                        FREEZE_RACE_TITLE, FREEZE_UNFREEZE_CRASH_TITLE})
+HOST_ROOT_SCENARIOS.update({FREEZE_NEW_TITLE, FREEZE_COMMIT_TITLE,
+                            FREEZE_RUN_TITLE, FREEZE_DELETE_TITLE,
+                            FREEZE_RESTART_TITLE, FREEZE_SLOTS_TITLE,
+                            FREEZE_ROTATE_TITLE, FREEZE_PRIMARY_TITLE,
+                            FREEZE_RACE_TITLE, FREEZE_RECORD_CRASH_TITLE,
+                            FREEZE_UNFREEZE_CRASH_TITLE})
+FAULT_SCENARIOS.update({FREEZE_RECORD_CRASH_TITLE, FREEZE_UNFREEZE_CRASH_TITLE})
+HOST_RESTART_SCENARIOS.add(FREEZE_RESTART_TITLE)
+
+SCENARIOS.extend(FREEZE_SCENARIOS)
+
+
 def main():
     argv = sys.argv[1:]
 
