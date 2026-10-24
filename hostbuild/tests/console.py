@@ -526,6 +526,24 @@ def check_kill_refusals(session, context):
         "SceShellCore must be refused with exit 87")
 
 
+def check_env_export_exec_refusals(session, context):
+    del context
+    link = session.link
+    assert link.exchange("env A=B") == ["bad_name", "exit 1"]
+    assert link.exchange("export 9X=1") == ["bad_name", "exit 1"]
+    assert link.exchange("exec relative/prog") == ["relative_path", "exit 1"]
+    assert link.exchange("exec /data/gate-missing") == [
+        "no_such_file", "exit 1"]
+    assert link.exchange("exec %s/token" % CONSOLE_STATE_DIR) == [
+        "protected", "exit 87"], "the console's token must be refused with exit 87"
+    kinds = {line.split()[1] for line in link.exchange("audit tail")
+             if len(line.split()) == 5}
+    for kind in ("env.refused", "export.refused", "exec.refused",
+                 "exec.protected"):
+        assert kind in kinds, "audit tail must show %s, got %r" % (
+            kind, sorted(kinds))
+
+
 def check_inspection_commands(session, context):
     del context
     link = session.link
@@ -670,6 +688,9 @@ CHECKS = [
     ("kill with a bad signal, a bad pid or no such process answers an "
      "error and exit 1, and SceShellCore is refused with exit 87",
      check_kill_refusals),
+    ("env, export and exec refuse a bad name, a relative or missing path and "
+     "the token without asking, and audit each refusal",
+     check_env_export_exec_refusals),
     ("the read-only commands on the console's root and data directory exit 0",
      check_read_only_on_console),
     ("the token, approval state and nonces answer protected and exit 87 when "

@@ -37,6 +37,7 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_BAD_OWNER 13
 #define FILEOPS_BAD_GROUP 14
 #define FILEOPS_BAD_ARG   15
+#define FILEOPS_TOO_LARGE 16
 
 /**
  * Check one file command without acting. path must be absolute and inside a
@@ -96,6 +97,15 @@ int fileops_system_check(const char *root, approval_facts_t *facts);
  * the facts name. Returns FILEOPS_OK, FILEOPS_CHANGED, or the refusal.
  **/
 int fileops_system_recheck(const char *root, const approval_facts_t *expected);
+
+/**
+ * Read the program at path for exec, whole, and return its bytes in *bytes,
+ * owned by the caller, with their length in *size. The same checks as
+ * fileops_check apply, and a program over the size a store object may have is
+ * FILEOPS_TOO_LARGE.
+ **/
+int fileops_program(const char *root, const char *path, unsigned char **bytes,
+                    size_t *size);
 
 /** The protocol word of a refusal, and its exit status. **/
 const char *fileops_word(int rc);

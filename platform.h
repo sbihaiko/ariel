@@ -36,6 +36,8 @@ along with this program; see the file COPYING. If not, see
 /** The longest signal name and process start identity a kill carries. **/
 #define SIGNAL_NAME_MAX  8
 #define PROCESS_START_MAX 31
+/** The hash of an exec's arguments, in hex. **/
+#define ARGS_HASH_MAX 64
 
 /**
  * The immutable fact record an approval is bound to: what exactly the
@@ -49,6 +51,8 @@ along with this program; see the file COPYING. If not, see
  * start identity; for anything else they are empty.
  * chmod, chown and chgrp also fill value with the requested mode or owner.
  * A transfer, cp, mv or ln, also fills dest with its destination path.
+ * For exec, the target is the program, sha256 its bytes, argc the arguments
+ * after it and args their hash. For export, sha256 is the hash of the value.
  **/
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
@@ -72,6 +76,7 @@ typedef struct {
   uint64_t major;
   uint64_t minor;
   char replaces[65];  /** The build a rollback replaces; empty otherwise. **/
+  char args[ARGS_HASH_MAX + 1];
 } approval_facts_t;
 
 /**

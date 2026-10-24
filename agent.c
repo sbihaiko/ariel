@@ -16,6 +16,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,6 +53,8 @@ along with this program; see the file COPYING. If not, see
 
 /** One line is at most 1 KiB, so this many words covers every command. **/
 #define MAX_ARGS            512
+#define ENV_NAME_MAX        32
+#define ENV_LINE_MAX        1024
 
 static const char bad_name[] =
   "bad_name\n"
@@ -125,6 +128,15 @@ static const char kill_failed[] =
 static const char protected_process[] =
   "protected\n"
   "exit 87\n";
+static const char export_failed[] =
+  "export_failed\n"
+  "exit 1\n";
+static const char value_too_long[] =
+  "value_too_long\n"
+  "exit 1\n";
+
+/** Serializes the environment: setenv and getenv must not run at once. **/
+static pthread_mutex_t environ_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /** The signals kill accepts, by the name the owner reads. **/
 static const struct {
@@ -848,6 +860,196 @@ system_command(agent_t *agent, int fd, int argc, char *argv[]) {
     rc = act ? FILEOPS_FAILED : FILEOPS_OK;
   }
   file_outcome(fd, facts.command, facts.target, challenge.id, rc);
+}
+
+
+static void
+hash_hex(const void *data, size_t len, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+
+  sha256_init(&hash);
+  sha256_update(&hash, data, len);
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+}
+
+
+/** The hash of each argument followed by a NUL, so no two lists share one. **/
+static void
+args_hash(int argc, char *argv[], char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+  int i;
+
+  sha256_init(&hash);
+  for(i=0; i<argc; i++) {
+    sha256_update(&hash, argv[i], strlen(argv[i]) + 1);
+  }
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+}
+
+
+/** A variable name: a letter or '_', then letters, digits or '_'. **/
+static int
+env_name_valid(const char *name) {
+  size_t i;
+
+  if(!name[0] || strlen(name) > ENV_NAME_MAX) {
+    return 0;
+  }
+
+  for(i=0; name[i]; i++) {
+    int c = (unsigned char)name[i];
+    int letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+
+    if(!letter && !(i > 0 && c >= '0' && c <= '9')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+/** env NAME: reveals the one variable the owner signed for. **/
+static void
+env_command(agent_t *agent, int fd, const char *name) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  char line[ENV_LINE_MAX];
+  const char *value;
+  int len = 0;
+
+  if(!env_name_valid(name)) {
+    audit_reply(fd, "env", "refused", name, "-", bad_name);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "env");
+  snprintf(facts.target, sizeof(facts.target), "%s", name);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  pthread_mutex_lock(&environ_lock);
+  value = getenv(name);
+  if(value) {
+    len = snprintf(line, sizeof(line), "%s=%s\n", name, value);
+  }
+  pthread_mutex_unlock(&environ_lock);
+
+  if(len < 0 || len >= (int)sizeof(line)) {
+    audit_reply(fd, "env", "failed", name, challenge.id, value_too_long);
+    return;
+  }
+
+  if(audit_line("env", "done", name, challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  write_all(fd, line, (size_t)len);
+  reply(fd, "exit 0\n");
+}
+
+
+/** export NAME=VALUE: sets the one variable the owner signed the value of. **/
+static void
+export_command(agent_t *agent, int fd, const char *assign) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  char name[ENV_NAME_MAX + 1];
+  char answer[64];
+  const char *value;
+  size_t len;
+  int rc;
+
+  value = strchr(assign, '=');
+  len = (size_t)(value - assign);
+  if(len > ENV_NAME_MAX) {
+    audit_reply(fd, "export", "refused", "-", "-", bad_name);
+    return;
+  }
+  memcpy(name, assign, len);
+  name[len] = '\0';
+  value++;
+
+  if(!env_name_valid(name)) {
+    audit_reply(fd, "export", "refused", name, "-", bad_name);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "export");
+  snprintf(facts.target, sizeof(facts.target), "%s", name);
+  hash_hex(value, strlen(value), facts.sha256);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  if(audit_line("export", "done", name, challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  pthread_mutex_lock(&environ_lock);
+  rc = setenv(name, value, 1);
+  pthread_mutex_unlock(&environ_lock);
+  if(rc) {
+    audit_reply(fd, "export", "failed", name, challenge.id, export_failed);
+    return;
+  }
+
+  snprintf(answer, sizeof(answer), "exported %s\nexit 0\n", name);
+  reply(fd, answer);
+}
+
+
+/** exec <path> [args]: runs the bytes the owner signed for, with its arguments. **/
+static void
+exec_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  platform_t *platform = agent->platform;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  unsigned char *bytes = NULL;
+  size_t size = 0;
+  char answer[64];
+  int status = 0;
+  int len;
+  int rc;
+
+  rc = fileops_program(platform->fs_root, argv[1], &bytes, &size);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, "exec", argv[1], "-", rc);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "exec");
+  snprintf(facts.target, sizeof(facts.target), "%s", argv[1]);
+  hash_hex(bytes, size, facts.sha256);
+  facts.argc = (uint64_t)(argc - 2);
+  args_hash(argc - 2, &argv[2], facts.args);
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    free(bytes);
+    return;
+  }
+
+  if(audit_line("exec", "done", argv[1], challenge.id)) {
+    free(bytes);
+    reply(fd, audit_failed);
+    return;
+  }
+  if(platform->spawn(platform, bytes, size, &argv[1], fd, &status)) {
+    free(bytes);
+    audit_reply(fd, "exec", "failed", argv[1], challenge.id, spawn_failed);
+    return;
+  }
+  free(bytes);
+
+  len = snprintf(answer, sizeof(answer), "status %d\nexit 0\n", status);
+  write_all(fd, answer, (size_t)len);
 }
 
 
@@ -1670,6 +1872,23 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc >= 1 && system_name(argv[0])) {
     system_command(agent, fd, argc, argv);
+    return;
+  }
+
+  // env, export and exec are gated on the one name or program they carry.
+  if(argc == 2 && !strcmp(argv[0], "env")) {
+    env_command(agent, fd, argv[1]);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "export") && strchr(argv[1], '=')) {
+    export_command(agent, fd, argv[1]);
+    return;
+  }
+
+  if(argc >= 2 && !strcmp(argv[0], "exec")) {
+    argv[argc] = NULL;
+    exec_command(agent, fd, argc, argv);
     return;
   }
 

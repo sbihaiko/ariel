@@ -1125,6 +1125,16 @@ CLOCK_SCENARIOS = {
     "approval_stale and exit 78",
     "the challenge of mount and mknod names its command, target and options",
     "a system command's audit lines reach audit tail",
+    "env asks for approval, and a grant reveals the one variable it names",
+    "export asks for approval, and a grant sets the variable it names",
+    "an export whose value changed after approval answers approval_stale and "
+    "exit 78",
+    "exec asks for approval of the program's bytes and arguments, and a grant "
+    "runs it once",
+    "exec with other arguments after approval answers approval_stale and "
+    "exit 78",
+    "exec of a program replaced after approval answers approval_stale and "
+    "exit 78",
 }
 
 # The scenarios that act on a process only the host build starts, or on
@@ -2809,11 +2819,11 @@ def scenario_no_system_change_on_agent_port(server):
             lines = reply_lines(read_reply(sock))
         finally:
             sock.close()
-        # mv and mount are gated commands of their own now. Their paths are
-        # outside the host test root, so they answer protected before they ask
-        # the owner.
+        # mv, mount and exec are gated commands of their own now. Their paths
+        # are outside the host test root, so they answer protected before they
+        # ask the owner.
         if command.startswith(("rm ", "mkdir ", "touch ", "chmod ", "mv ",
-                               "mount ")):
+                               "mount ", "exec ")):
             assert lines == ["protected", "exit 87"], (
                 "%s must answer protected, got %r" % (command, lines))
         else:
@@ -4523,6 +4533,202 @@ def scenario_kill_retarget_refused(server):
 SERVER_BINARY = "./ariel-host"
 
 
+# ---------------------------------------------------------------------------
+# env, export and exec (issue #31): gated by the owner's signature. env reveals
+# one named variable, export sets one, and exec runs one program by path with
+# its arguments. Each signed action names the variable or the program.
+# ---------------------------------------------------------------------------
+
+def args_hash(*args):
+    """The hash an exec challenge binds its arguments to: each one, then a NUL."""
+    return hashlib.sha256(
+        b"".join(arg.encode("ascii") + b"\0" for arg in args)).hexdigest()
+
+
+def gated_request(server, command, expected_action, prompt):
+    """Request a gated command and check its 75, challenge, action and prompt.
+
+    Returns the approval ID and the challenge line.
+    """
+    server.advance(120000)
+    lines = run_command(server, command)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "%s must answer approval_required and exit 75, got %r" % (command, lines))
+    approval = APPROVAL_LINE.match(lines[0])
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert approval and challenge and challenge.group(1) == approval.group(1), (
+        "expected approval_required and a matching challenge, got %r" % lines)
+    action = challenge_action(lines[1]).split("\n")
+    for line in expected_action:
+        assert line in action, (
+            "%s: the challenge must carry %r, got %r" % (command, line, action))
+    shown = server.next_line() or ""
+    assert shown == "prompt %s %s" % (approval.group(1), prompt), (
+        "%s: expected the prompt %r, got %r" % (command, prompt, shown))
+    return approval.group(1), lines[1]
+
+
+def assert_asks_again(server, command):
+    """A command whose grant was spent asks the owner again."""
+    server.advance(120000)
+    lines = run_command(server, command)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "%s must ask again after its grant was used, got %r" % (command, lines))
+    assert APPROVAL_LINE.match(lines[0]), (
+        "%s must answer approval_required, got %r" % (command, lines))
+    assert (server.next_line() or "").startswith("prompt "), (
+        "%s must prompt the owner again" % command)
+
+
+def scenario_env_needs_grant_and_reveals(server):
+    """env waits for the owner's signature, reveals the one variable it names,
+    and a second reveal asks again."""
+    name = "PATH"
+    approval, challenge = gated_request(
+        server, "env " + name,
+        ["command=env", "target=%s" % name, "sha256=none"],
+        "env %s will run" % name)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "env " + name) == [
+        "%s=%s" % (name, os.environ[name]), "exit 0"], (
+        "the granted env must reveal the variable")
+    assert approval_status(server, approval) == [
+        "approval_status %s consumed" % approval, "exit 0"], (
+        "a performed env spends its approval")
+    assert_asks_again(server, "env " + name)
+    ours = [event.split()[1] for event in audit_tail(server)
+            if AUDIT_LINE.match(event) and event.split()[3] == approval]
+    assert ours == ["env.request", "grant", "env.done"], (
+        "the audit log must show the request, the grant and the reveal: %r"
+        % ours)
+
+
+def scenario_export_needs_grant_and_sets(server):
+    """export waits for the owner's signature and sets the variable it names;
+    env then reveals the value through its own grant."""
+    name = "ARIEL_GATE_EXPORT"
+    value = "first"
+    approval, challenge = gated_request(
+        server, "export %s=%s" % (name, value),
+        ["command=export", "target=%s" % name,
+         "sha256=%s" % hashlib.sha256(value.encode("ascii")).hexdigest()],
+        "export %s will run" % name)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "export %s=%s" % (name, value)) == [
+        "exported %s" % name, "exit 0"], "the granted export must run"
+    reveal, reveal_challenge = gated_request(
+        server, "env " + name, ["command=env", "target=%s" % name],
+        "env %s will run" % name)
+    sign_and_grant(server, reveal, reveal_challenge)
+    assert run_command(server, "env " + name) == [
+        "%s=%s" % (name, value), "exit 0"], "env must show the exported value"
+
+
+def scenario_export_changed_value_is_stale(server):
+    """An export whose value changed after the owner signed answers
+    approval_stale, sets nothing and spends the approval."""
+    name = "ARIEL_GATE_STALE"
+    approval, challenge = gated_request(
+        server, "export %s=one" % name,
+        ["command=export", "target=%s" % name,
+         "sha256=%s" % hashlib.sha256(b"one").hexdigest()],
+        "export %s will run" % name)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "export %s=two" % name) == [
+        "approval_stale", "exit 78"], "a changed value must answer approval_stale"
+    assert approval_status(server, approval) == [
+        "approval_status %s consumed" % approval, "exit 0"], (
+        "a stale export spends its approval")
+    assert not kill_audit(server, "export.done", name), (
+        "a stale export must not be performed")
+    assert kill_audit(server, "export.stale", name), (
+        "a stale export must be audited")
+
+
+def exec_request(server, path, data, args):
+    """Ask for exec of path with args and check the challenge names the program."""
+    command = " ".join(["exec", path] + list(args))
+    return gated_request(
+        server, command,
+        ["command=exec", "target=%s" % path,
+         "sha256=%s" % hashlib.sha256(data).hexdigest(),
+         "option.argc=%d" % len(args),
+         "option.args=%s" % args_hash(*args)],
+        "exec %s will run" % path)
+
+
+def scenario_exec_needs_grant_and_runs_once(server):
+    """exec waits for the owner's signature for the program's bytes and its
+    arguments, runs it once with them, and asks again after."""
+    data = compile_payload(HELLO_SOURCE, "exec-hello")
+    path = write_scratch(server, "exec-hello", data)
+    approval, challenge = exec_request(server, path, data, ["one", "two"])
+    sign_and_grant(server, approval, challenge)
+    command = "exec %s one two" % path
+    assert run_command(server, command) == [
+        "Hello, world from Ariel!", "argv[1] = one", "argv[2] = two",
+        "status 0", "exit 0"], "the granted exec must run the program once"
+    assert approval_status(server, approval) == [
+        "approval_status %s consumed" % approval, "exit 0"], (
+        "a performed exec spends its approval")
+    assert_asks_again(server, command)
+    ours = [event.split()[1] for event in audit_tail(server)
+            if AUDIT_LINE.match(event) and event.split()[3] == approval]
+    assert ours == ["exec.request", "grant", "exec.done"], (
+        "the audit log must show the request, the grant and the run: %r" % ours)
+
+
+def scenario_exec_args_are_bound(server):
+    """An exec with other arguments after the grant answers approval_stale,
+    runs nothing and spends the approval."""
+    data = compile_payload(HELLO_SOURCE, "exec-args")
+    path = write_scratch(server, "exec-args", data)
+    approval, challenge = exec_request(server, path, data, ["one"])
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "exec %s two" % path) == [
+        "approval_stale", "exit 78"], "other arguments must answer approval_stale"
+    assert approval_status(server, approval) == [
+        "approval_status %s consumed" % approval, "exit 0"], (
+        "a stale exec spends its approval")
+    assert kill_audit(server, "exec.stale", path), "a stale exec must be audited"
+    assert not kill_audit(server, "exec.done", path), (
+        "a stale exec must not run the program")
+
+
+def scenario_exec_replaced_is_stale(server):
+    """A program replaced after the owner signed answers approval_stale and
+    does not run."""
+    data = compile_payload(HELLO_SOURCE, "exec-swap")
+    path = write_scratch(server, "exec-swap", data)
+    approval, challenge = exec_request(server, path, data, ["one"])
+    sign_and_grant(server, approval, challenge)
+    with open(path, "wb") as handle:
+        handle.write(data + b"\0")
+    assert run_command(server, "exec %s one" % path) == [
+        "approval_stale", "exit 78"], "a replaced program must answer approval_stale"
+    assert kill_audit(server, "exec.stale", path), "a stale exec must be audited"
+
+
+def scenario_env_export_exec_refusals(server):
+    """A bad variable name, a relative or missing program and a protected file
+    are refused without a question, and each refusal is audited."""
+    assert run_command(server, "env A=B") == ["bad_name", "exit 1"]
+    assert run_command(server, "env 1X") == ["bad_name", "exit 1"]
+    assert run_command(server, "export 9X=1") == ["bad_name", "exit 1"]
+    assert run_command(server, "exec relative/prog") == [
+        "relative_path", "exit 1"]
+    missing = os.path.join(server.root, "data", "gate-missing")
+    assert run_command(server, "exec " + missing) == [
+        "no_such_file", "exit 1"]
+    assert_protected(server, "exec " + secret_path(server, "token"))
+    server.assert_no_line()
+    kinds = {event.split()[1] for event in audit_tail(server)
+             if AUDIT_LINE.match(event)}
+    assert {"env.refused", "export.refused", "exec.refused",
+            "exec.protected"} <= kinds, (
+        "each refusal must reach audit tail, got %r" % sorted(kinds))
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -4752,6 +4958,21 @@ SCENARIOS = [
     ("a kill signal or start changed in the challenge answers "
      "signature_action_mismatch, and the real grant still runs it",
      scenario_kill_retarget_refused, True),
+    ("env asks for approval, and a grant reveals the one variable it names",
+     scenario_env_needs_grant_and_reveals, True),
+    ("export asks for approval, and a grant sets the variable it names",
+     scenario_export_needs_grant_and_sets, True),
+    ("an export whose value changed after approval answers approval_stale and "
+     "exit 78", scenario_export_changed_value_is_stale, True),
+    ("exec asks for approval of the program's bytes and arguments, and a grant "
+     "runs it once", scenario_exec_needs_grant_and_runs_once, True),
+    ("exec with other arguments after approval answers approval_stale and "
+     "exit 78", scenario_exec_args_are_bound, True),
+    ("exec of a program replaced after approval answers approval_stale and "
+     "exit 78", scenario_exec_replaced_is_stale, True),
+    ("env, export and exec refuse a bad name, a relative or missing path and "
+     "the token without asking, and audit each refusal",
+     scenario_env_export_exec_refusals, False),
     ("the PS5 build rejects the host test key",
      scenario_ps5_rejects_test_key, None),
     ("the PS5 platform no longer reads the controller",

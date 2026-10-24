@@ -853,8 +853,10 @@ value_key(const char *command) {
  * entry's kind and identity, or with the argument count of a command nothing
  * implements, and with the requested value of chmod, chown or chgrp. A kill
  * is an action on its pid, with the hash of its pid and start, its signal and
- * start. A rollback is an action on its name, with the build it replaces.
- * text holds the numbers the options point at.
+ * start. A rollback is an action on its name, with the build it replaces. An
+ * exec is an action on its program, with the hash of its bytes, its argument
+ * count and the hash of its arguments. env and export name one variable, so
+ * they have no options. text holds the numbers the options point at.
  **/
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
@@ -864,14 +866,23 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     action->command = facts->command;
     action->target = facts->target;
     action->destination = facts->dest[0] ? facts->dest : NULL;
-    action->sha256 = APPROVAL_NO_HASH;
+    action->sha256 = facts->sha256[0] ? facts->sha256 : APPROVAL_NO_HASH;
     if(!strcmp(facts->command, "kill")) {
-      action->sha256 = facts->sha256;
       options[0].key = "signal";
       options[0].value = facts->signal;
       options[1].key = "start";
       options[1].value = facts->start;
       action->noptions = 2;
+    } else if(!strcmp(facts->command, "exec")) {
+      decimal(facts->argc, text[0], sizeof(text[0]));
+      options[0].key = "argc";
+      options[0].value = text[0];
+      options[1].key = "args";
+      options[1].value = facts->args;
+      action->noptions = 2;
+    } else if(!strcmp(facts->command, "env") ||
+              !strcmp(facts->command, "export")) {
+      action->noptions = 0;
     } else if(facts->kind[0]) {
       size_t n = 0;
 
@@ -1047,9 +1058,10 @@ store_approval_request(const approval_facts_t *facts,
 
 
 /**
- * Whether two targets are the same object, asked the same thing: the same
+ * Whether two targets are the same action on the same object: the same
  * kind, device and inode, the same requested value and destination, the same
- * mount or mknod options, and for a kill the same signal and process start.
+ * mount or mknod options, the same signal and process start for a kill, and
+ * the same content hash, argument count and argument hash.
  **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
@@ -1058,7 +1070,9 @@ same_identity(const approval_facts_t *a, const approval_facts_t *b) {
          !strcmp(a->value, b->value) && !strcmp(a->dest, b->dest) &&
          !strcmp(a->fstype, b->fstype) && !strcmp(a->from, b->from) &&
          !strcmp(a->type, b->type) && a->major == b->major &&
-         a->minor == b->minor;
+         a->minor == b->minor &&
+         !strcmp(a->sha256, b->sha256) && a->argc == b->argc &&
+         !strcmp(a->args, b->args);
 }
 
 

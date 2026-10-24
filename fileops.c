@@ -318,6 +318,97 @@ system_entry(const char *root, const char *path, approval_facts_t *facts,
 }
 
 
+/** The largest program exec reads: the size of a store object at most. **/
+#define PROGRAM_MAX (64UL * 1024 * 1024)
+
+
+/** Read the whole regular file open at fd, which has the size st_size. **/
+static int
+read_all(int fd, off_t size, unsigned char *out) {
+  off_t done = 0;
+  ssize_t n;
+
+  while(done < size) {
+    n = read(fd, out + done, (size_t)(size - done));
+    if(n < 0 && errno == EINTR) {
+      continue;
+    }
+    if(n <= 0) {
+      return FILEOPS_FAILED;
+    }
+    done += n;
+  }
+  return FILEOPS_OK;
+}
+
+
+int
+fileops_program(const char *root, const char *path, unsigned char **bytes,
+                size_t *size) {
+  char leaf[PATH_MAX];
+  struct stat st;
+  const char *rel;
+  int dirfd;
+  int fd;
+  int rc;
+
+  if(path[0] != '/') {
+    return FILEOPS_RELATIVE;
+  }
+  if(!approval_target_valid(path)) {
+    return FILEOPS_BAD_PATH;
+  }
+
+  rel = below(root, path);
+  if(!rel) {
+    return FILEOPS_PROTECTED;
+  }
+
+  rc = parent_open(root, rel, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+
+  fd = openat(dirfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  close(dirfd);
+  if(fd < 0) {
+    return walk_refusal(errno);
+  }
+
+  if(fstat(fd, &st)) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    close(fd);
+    return FILEOPS_PROTECTED;
+  }
+  if(!S_ISREG(st.st_mode)) {
+    close(fd);
+    return FILEOPS_NOT_FILE;
+  }
+  if((uint64_t)st.st_size > PROGRAM_MAX) {
+    close(fd);
+    return FILEOPS_TOO_LARGE;
+  }
+
+  *size = (size_t)st.st_size;
+  *bytes = malloc(*size ? *size : 1);
+  if(!*bytes) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+
+  rc = read_all(fd, st.st_size, *bytes);
+  close(fd);
+  if(rc) {
+    free(*bytes);
+    *bytes = NULL;
+  }
+  return rc;
+}
+
+
 /** Whether the entry's kind lets the command run. **/
 static int
 precondition(const char *command, const char *kind) {
@@ -915,6 +1006,8 @@ fileops_word(int rc) {
     return "approval_stale";
   case FILEOPS_FAILED:
     return "operation_failed";
+  case FILEOPS_TOO_LARGE:
+    return "too_large";
   case FILEOPS_BAD_MODE:
     return "bad_mode";
   case FILEOPS_BAD_OWNER:
