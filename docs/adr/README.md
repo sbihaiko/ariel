@@ -18,3 +18,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0009](0009-the-key-hierarchy-has-a-primary-and-a-recovery-key.md) | The key hierarchy has a primary and a recovery key |
 | [0010](0010-an-addon-is-a-process-of-its-own.md) | A capability beyond the gate is an addon in a process of its own |
 | [0011](0011-the-target-firmware-is-11-20.md) | The target firmware is 11.20, and only 11.20 for now |
+| [0012](0012-the-agent-port-line-grammar.md) | The agent port's line grammar: quoting, escaped actions, one frame and one cap |
