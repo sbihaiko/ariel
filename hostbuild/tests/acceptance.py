@@ -3336,6 +3336,10 @@ def scenario_a_large_file_is_cut(server):
         "3 3 14 " + small, "exit 0"], "wc must count the small file"
     assert run_command(server, "head x " + small) == [
         "bad_argument", "exit 1"], "head takes a whole count"
+    assert run_command(server, "head %s 2" % small) == [
+        "bad_argument", "exit 1"], "head takes the count before the path"
+    assert run_command(server, "tail %s 2" % small) == [
+        "bad_argument", "exit 1"], "tail takes the count before the path"
 
 
 def scenario_a_grep_with_many_matches_is_cut(server):
@@ -3955,6 +3959,52 @@ def scenario_find_json_is_one_object_per_path(server):
          '{"path":"%s"}' % table_path(root, "gamma"),
          '{"path":"%s/gamma/delta"}' % root]), (
         "find --json must list every path once, got %r" % objects)
+
+
+def scenario_json_row_longer_than_a_line_is_shown_whole(server):
+    """A JSON row whose escaped text is longer than a line still shows, while the answer fits."""
+    root = os.path.join(scratch_dir(server), "wide")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    open(os.path.join(root, "\x01" * 255), "wb").close()
+    assert run_command(server, "find --json " + root) == [
+        '{"path":"%s"}' % root, '{"path":"%s/%s"}' % (root, "\\u0001" * 255), "exit 0"], (
+        "find --json must show a row over 1536 bytes when the answer fits 64 KiB")
+    assert run_command(server, "ls --json " + root) == [
+        '{"name":"%s"}' % ("\\u0001" * 255), "exit 0"], (
+        "ls --json must show a name over 1536 bytes when the answer fits 64 KiB")
+
+
+def scenario_json_listing_over_the_cap_is_cut(server):
+    """ls --json cuts its objects at the cap, keeps them whole and says how many it showed."""
+    folder, names = make_listing(server, "json-listing", BIG_LISTING)
+    body, shown, total = cut_answer(run_command_raw(server, "ls --json " + folder))
+    assert total == BIG_LISTING and 0 < shown < BIG_LISTING, (
+        "ls --json must cut a listing over 64 KiB, got shown %d of %d" % (shown, total))
+    assert body == ['{"name":"%s"}' % name for name in names[:shown]], (
+        "a cut ls --json shows the first objects in order, each whole")
+
+
+def scenario_json_limit_is_taken_by_ls_and_find_only(server):
+    """--json takes --limit N for ls and find, in either order, and refuses it for the rest."""
+    root = table_fixture(server)
+    ls_cut = ['{"name":"alpha"}', '{"name":"beta"}', "truncated 2 of 5", "exit 0"]
+    find_none = ["truncated 0 of 9", "exit 0"]
+    assert run_command(server, "ls --json --limit 2 " + root) == ls_cut, (
+        "ls --json --limit 2 must show two objects and say how many there are")
+    assert run_command(server, "ls --limit 2 --json " + root) == ls_cut, (
+        "ls --limit 2 --json must answer the same as the other order")
+    assert run_command(server, "find --limit 0 --json " + root) == find_none, (
+        "find --limit 0 --json must show no object and say how many there are")
+    assert run_command(server, "find --json --limit 0 " + root) == find_none, (
+        "find --json --limit 0 must answer the same as the other order")
+    for command in ("stat --json --limit 1 " + os.path.join(root, "alpha"),
+                    "df --json --limit 1 " + root,
+                    "ps --json --limit 1",
+                    "ls --json --limit " + root,
+                    "ls --json --limit many " + root):
+        assert run_command(server, command) == ["bad_option", "exit 1"], (
+            "%r must answer bad_option and nothing else" % command)
 
 
 def scenario_ps_json_from_a_fixed_ps(server):
@@ -8671,6 +8721,12 @@ SCENARIOS = [
     ("stat --json answers one object and plain stat keeps its line", scenario_stat_json_is_one_object, False),
     ("df --json answers one object and plain df keeps its line", scenario_df_json_is_one_object, False),
     ("find --json answers one object per path", scenario_find_json_is_one_object_per_path, False),
+    ("a JSON row longer than a line is shown whole when the answer fits",
+     scenario_json_row_longer_than_a_line_is_shown_whole, False),
+    ("ls --json over the cap is cut at whole objects",
+     scenario_json_listing_over_the_cap_is_cut, False),
+    ("ls and find take --limit with --json, in either order, and no other command does",
+     scenario_json_limit_is_taken_by_ls_and_find_only, False),
     ("ps --json answers one object per row from a fixed ps", scenario_ps_json_from_a_fixed_ps, False),
     ("table commands without --json print what they printed", scenario_table_plain_output_is_unchanged, False),
     ("table commands answer bad_option with no partial output", scenario_table_bad_option_answers_nothing_else, False),
