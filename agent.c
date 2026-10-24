@@ -42,24 +42,28 @@ along with this program; see the file COPYING. If not, see
 #include "token.h"
 
 /**
- * The agent port bounds: a line is at most 1 KiB, and auth and the command
- * each have a deadline. A line over the limit and a missed deadline are the
- * same failure here: no line was read.
+ * The agent port bounds: a command line is at most 4 KiB and 64 tokens,
+ * the auth line has its own short limit, and a connection lasts at most
+ * 60 seconds.
  **/
-#define LINE_LIMIT          1024
-#define AUTH_DEADLINE_MS    5000L
-#define COMMAND_DEADLINE_MS 5000L
+#define LINE_LIMIT             4096
+#define AUTH_LINE_MAX          64
+#define MAX_TOKENS             64
+#define AUTH_DEADLINE_MS       5000L
+#define CONNECTION_DEADLINE_MS 60000L
 
-/** One upload waits at most this long for its next bytes. **/
-#define UPLOAD_STALL_MS     60000L
+/**
+ * One upload waits at most this long for its next bytes: a second below the
+ * connection deadline, so a stall names upload_mismatch before the deadline
+ * ends the connection with timed_out.
+ **/
+#define UPLOAD_STALL_MS     (CONNECTION_DEADLINE_MS - 1000L)
 
 /** A close drains unread input for at most this long. **/
 #define CLOSE_DRAIN_MS      200L
 
 #define READ_CHUNK          65536
 
-/** One line is at most 1 KiB, so this many words covers every command. **/
-#define MAX_ARGS            512
 #define ENV_NAME_MAX        32
 #define ENV_LINE_MAX        1024
 
@@ -68,6 +72,18 @@ static const char bad_name[] =
   "exit 1\n";
 static const char unknown[] =
   "unknown_command\n"
+  "exit 1\n";
+static const char bad_quoting_reply[] =
+  "bad_quoting\n"
+  "exit 1\n";
+static const char too_many_arguments_reply[] =
+  "too_many_arguments\n"
+  "exit 1\n";
+static const char timed_out_reply[] =
+  "timed_out\n"
+  "exit 1\n";
+static const char bad_path[] =
+  "bad_path\n"
   "exit 1\n";
 static const char missing_operand[] =
   "missing_operand\n"
@@ -347,6 +363,138 @@ wait_readable(platform_t *platform, int wake, int fd, int64_t deadline_ms) {
 }
 
 
+/** The state a connection's deadline watchdog shares with its thread. **/
+typedef struct {
+  platform_t *platform;
+  int wake;
+  int64_t deadline;
+  pthread_t target;
+  pthread_t watchdog;
+  int started;
+  int fd;
+  volatile int done;
+  volatile int fired;
+} deadline_watch_t;
+
+
+/** One command line, answered in full, or cancelled by its deadline. **/
+static void handle_command(agent_t *agent, int fd, int wake, char *line);
+
+
+/**
+ * Stop the connection at its deadline. The watchdog does not read the
+ * connection's wake pipe: an advance is one byte, and a second reader that
+ * drained it would leave the connection asleep. With a test clock it looks
+ * again a few real milliseconds later, since only a scenario can move that
+ * clock, and marks the connection idle while it waits so a settle expects
+ * it; on a console it waits out the remaining real time. When the deadline
+ * passes, it marks the shared state and cancels the connection thread,
+ * which answers timed_out from its cleanup handler.
+ **/
+static void *
+deadline_watch(void *arg) {
+  deadline_watch_t *watch = arg;
+
+  while(!__atomic_load_n(&watch->done, __ATOMIC_ACQUIRE)) {
+    int64_t left = watch->deadline - now_ms(watch->platform);
+
+    if(left <= 0) {
+      __atomic_store_n(&watch->fired, 1, __ATOMIC_RELEASE);
+      pthread_cancel(watch->target);
+      break;
+    }
+
+    if(watch->platform->wake_idle) {
+      struct timespec brief = {0, 10 * 1000 * 1000L};
+
+      // Check the socket as the connection's own wait does: a watched
+      // connection with bytes to read is not idle, whatever this thread is
+      // doing. The watchdog itself never reads the wake pipe.
+      watch->platform->wake_idle(watch->platform, watch->wake, watch->fd, 1);
+      nanosleep(&brief, NULL);
+      watch->platform->wake_idle(watch->platform, watch->wake, watch->fd, 0);
+    } else {
+      poll(NULL, 0, left > INT_MAX ? INT_MAX : (int)left);
+    }
+  }
+
+  return NULL;
+}
+
+
+/**
+ * The connection thread was cancelled, or a command just returned. Join the
+ * watchdog so the state can go, then answer timed_out when the deadline was
+ * what stopped a command that had not finished.
+ **/
+static void
+deadline_cleanup(void *arg) {
+  deadline_watch_t *watch = arg;
+  int was_done;
+  int fired;
+
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+  was_done = __atomic_load_n(&watch->done, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&watch->done, 1, __ATOMIC_RELEASE);
+  fired = __atomic_load_n(&watch->fired, __ATOMIC_ACQUIRE);
+
+  if(watch->started) {
+    pthread_cancel(watch->watchdog);
+    pthread_join(watch->watchdog, NULL);
+  }
+
+  if(fired && !was_done) {
+    write_all(watch->fd, timed_out_reply, sizeof(timed_out_reply) - 1);
+  }
+
+  free(watch);
+}
+
+
+/**
+ * Run one command under the connection deadline. Returns normally when the
+ * command finishes in time; on the deadline the thread is cancelled and
+ * deadline_cleanup writes the answer.
+ **/
+static void
+handle_bounded(agent_t *agent, int fd, int wake, char *line,
+               int64_t deadline) {
+  deadline_watch_t *watch;
+  int oldstate;
+
+  if(!(watch=calloc(1, sizeof(*watch)))) {
+    handle_command(agent, fd, wake, line);
+    return;
+  }
+
+  watch->platform = agent->platform;
+  watch->wake = wake;
+  watch->deadline = deadline;
+  watch->target = pthread_self();
+  watch->fd = fd;
+
+  pthread_cleanup_push(deadline_cleanup, watch);
+
+  if(!pthread_create(&watch->watchdog, NULL, deadline_watch, watch)) {
+    watch->started = 1;
+  }
+
+  handle_command(agent, fd, wake, line);
+
+  // Cancellation is off while the watchdog joins, so a deadline that
+  // arrives in this window cannot make the handler join it twice.
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
+  __atomic_store_n(&watch->done, 1, __ATOMIC_RELEASE);
+  if(watch->started) {
+    pthread_cancel(watch->watchdog);
+    pthread_join(watch->watchdog, NULL);
+  }
+  pthread_cleanup_pop(0);
+  free(watch);
+  pthread_setcancelstate(oldstate, NULL);
+}
+
+
 /**
  * Read one line of at most LINE_LIMIT bytes, without the line ending.
  * Returns the length, -1 when the connection ended or the deadline passed,
@@ -403,7 +551,7 @@ static int
 authenticate(platform_t *platform, int wake, int fd, const char *token,
              int64_t deadline_ms) {
   char candidate[TOKEN_LEN];
-  char line[LINE_LIMIT + 1];
+  char line[AUTH_LINE_MAX + 1];
   int len;
 
   len = read_line(platform, wake, fd, line, sizeof(line), deadline_ms);
@@ -422,31 +570,61 @@ authenticate(platform_t *platform, int wake, int fd, const char *token,
 
 
 /**
- * Split line on spaces into at most max arguments. Returns the number of
- * arguments, or max + 1 when there are more.
+ * Split line into tokens in place. Tokens are separated by spaces or tabs;
+ * double and single quotes group a token and are removed; inside double
+ * quotes \" and \\ escape, and inside single quotes nothing escapes. No
+ * byte is globbed or expanded. Returns the number of tokens, max + 1 when
+ * there is one token too many, or -1 when a quote is unbalanced.
  **/
 static int
-split_args(char *line, char *argv[], int max) {
+tokenize(char *line, char *argv[], int max) {
+  char *src = line;
+  char *dst = line;
   int argc = 0;
-  char *p = line;
+  int in_token = 0;
 
-  while(*p) {
-    while(*p == ' ' || *p == '\t') {
-      p++;
+  while(*src) {
+    char c = *src;
+
+    if(c == ' ' || c == '\t') {
+      if(in_token) {
+        *dst++ = '\0';
+        in_token = 0;
+      }
+      src++;
+      continue;
     }
-    if(!*p) {
-      break;
+
+    if(!in_token) {
+      if(argc == max) {
+        return max + 1;
+      }
+      argv[argc++] = dst;
+      in_token = 1;
     }
-    if(argc == max) {
-      return max + 1;
+
+    if(c == '"' || c == '\'') {
+      char quote = c;
+
+      src++;
+      while(*src && *src != quote) {
+        if(quote == '"' && *src == '\\' &&
+           (src[1] == '"' || src[1] == '\\')) {
+          src++;
+        }
+        *dst++ = *src++;
+      }
+      if(!*src) {
+        return -1;
+      }
+      src++;
+    } else {
+      *dst++ = *src++;
     }
-    argv[argc++] = p;
-    while(*p && *p != ' ' && *p != '\t') {
-      p++;
-    }
-    if(*p) {
-      *p++ = '\0';
-    }
+  }
+
+  if(in_token) {
+    *dst++ = '\0';
   }
 
   return argc;
@@ -1110,7 +1288,8 @@ elf_lookup(const char *root, const char *name, char *path, size_t size,
 
 /**
  * Copy a run's arguments, after its name, into facts. Returns -1 when there
- * are more than RUN_ARGS_MAX or one is longer than an option value.
+ * are more than RUN_ARGS_MAX or one is longer than an option value, and -2
+ * when one carries a byte outside printable ASCII.
  **/
 static int
 run_arguments(approval_facts_t *facts, int argc, char *argv[]) {
@@ -1123,6 +1302,9 @@ run_arguments(approval_facts_t *facts, int argc, char *argv[]) {
   for(i=1; i<argc; i++) {
     if(strlen(argv[i]) > APPROVAL_VALUE_MAX) {
       return -1;
+    }
+    if(!approval_value_valid(argv[i])) {
+      return -2;
     }
     snprintf(facts->arg[i - 1], sizeof(facts->arg[i - 1]), "%s", argv[i]);
   }
@@ -1189,10 +1371,15 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
     audit_reply(fd, "run", "refused", "-", "-", unknown);
     return 1;
   }
-  if(run_arguments(&facts, argc, argv)) {
-    free(bytes);
-    audit_reply(fd, "run", "refused", path, "-", unknown);
-    return 1;
+  {
+    int arg_error = run_arguments(&facts, argc, argv);
+
+    if(arg_error) {
+      free(bytes);
+      audit_reply(fd, "run", "refused", path, "-",
+                  arg_error == -2 ? bad_path : unknown);
+      return 1;
+    }
   }
   if(!gate_pass(agent, fd, &facts, &challenge)) {
     free(bytes);
@@ -2121,7 +2308,7 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
   }
 
   if(tag && !approval_value_valid(tag)) {
-    install_refuse(fd, name, "unknown_command");
+    install_refuse(fd, name, "bad_path");
     return;
   }
 
@@ -3314,7 +3501,8 @@ autoload_show(int fd) {
 /**
  * Copy a built-in's arguments from argv[first] on into facts, as the text the
  * owner reads. Returns -1 when there are more than the action can name, or
- * one is not a word the encoder accepts.
+ * one is longer than an option value, and -2 when one carries a byte outside
+ * printable ASCII.
  **/
 static int
 builtin_args(int argc, char *argv[], int first, approval_facts_t *facts) {
@@ -3324,8 +3512,11 @@ builtin_args(int argc, char *argv[], int first, approval_facts_t *facts) {
     return -1;
   }
   for(i=first; i<argc; i++) {
-    if(!approval_value_valid(argv[i])) {
+    if(strlen(argv[i]) > APPROVAL_VALUE_MAX) {
       return -1;
+    }
+    if(!approval_value_valid(argv[i])) {
+      return -2;
     }
     snprintf(facts->arg[i - first], sizeof(facts->arg[0]), "%s", argv[i]);
   }
@@ -3454,9 +3645,14 @@ builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
             approval_facts_t *facts) {
   approval_challenge_t challenge;
 
-  if(builtin_args(argc, argv, first, facts)) {
-    audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
-    return;
+  {
+    int arg_error = builtin_args(argc, argv, first, facts);
+
+    if(arg_error) {
+      audit_reply(fd, argv[0], "refused", "-", "-",
+                  arg_error == -2 ? bad_path : bad_argument);
+      return;
+    }
   }
   facts->argc = (uint64_t)argc;
   if(!gate_pass(agent, fd, facts, &challenge)) {
@@ -3510,7 +3706,7 @@ builtin_word_command(agent_t *agent, int fd, int argc, char *argv[]) {
     }
     target = argv[1];
     if(!approval_target_valid(target)) {
-      audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
+      audit_reply(fd, argv[0], "refused", "-", "-", bad_path);
       return;
     }
   }
@@ -3582,11 +3778,16 @@ builtin_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
 static void
 handle_command(agent_t *agent, int fd, int wake, char *line) {
-  char *argv[MAX_ARGS + 1];
-  int argc = split_args(line, argv, MAX_ARGS);
+  char *argv[MAX_TOKENS + 1];
+  int argc = tokenize(line, argv, MAX_TOKENS);
 
-  if(argc == MAX_ARGS + 1) {
-    reply(fd, unknown);
+  if(argc < 0) {
+    reply(fd, bad_quoting_reply);
+    return;
+  }
+
+  if(argc == MAX_TOKENS + 1) {
+    reply(fd, too_many_arguments_reply);
     return;
   }
 
@@ -3809,11 +4010,14 @@ agent_serve(agent_t *agent, int fd, int wake) {
   static const char auth_failed[] = "exit 70\n";
   char line[LINE_LIMIT + 1];
   int64_t start;
+  int64_t deadline;
   int len;
   int auth;
 
-  // The auth deadline runs from the moment the connection is served.
+  // The auth deadline runs from the moment the connection is served; the
+  // one connection deadline covers everything after it.
   start = now_ms(agent->platform);
+  deadline = start + CONNECTION_DEADLINE_MS;
   auth = authenticate(agent->platform, wake, fd, agent->token,
                       start + AUTH_DEADLINE_MS);
 
@@ -3826,18 +4030,18 @@ agent_serve(agent_t *agent, int fd, int wake) {
     return;
   }
 
-  len = read_line(agent->platform, wake, fd, line, sizeof(line),
-                  now_ms(agent->platform) + COMMAND_DEADLINE_MS);
+  len = read_line(agent->platform, wake, fd, line, sizeof(line), deadline);
   if(len == -2) {
-    // A command line over the limit closes the connection too.
+    // A command line over the 4 KiB limit is refused before it can run.
+    reply(fd, too_many_arguments_reply);
     return;
   }
   if(len < 0) {
-    reply(fd, unknown);
+    reply(fd, timed_out_reply);
     return;
   }
 
-  handle_command(agent, fd, wake, line);
+  handle_bounded(agent, fd, wake, line, deadline);
 }
 
 

@@ -23,11 +23,9 @@ along with this program; see the file COPYING. If not, see
 /** The tag that keeps an Ariel approval from verifying as anything else. **/
 #define MESSAGE_TAG "ARIEL-APPROVAL-V1"
 
-#define SEGMENT_MAX  32
 #define TARGET_MAX   128
 #define KEY_MAX      16
 #define HASH_LEN     64
-
 
 #ifndef ARIEL_SIGNER
 /**
@@ -100,40 +98,54 @@ command_ok(const char *command) {
 }
 
 
-/** Segments of letters, digits, '_' and '-' joined by single slashes. A
-    '.' is not among them, so neither '.' nor '..' can be one. A leading
-    slash is one spelling of a path, not a segment, so an absolute target
-    encodes as written; an empty segment, a trailing slash or a target of
-    only '/' still reads two ways and is refused. **/
+/** Whether every byte is printable ASCII, 0x20 to 0x7E. **/
+static int
+printable(const char *text) {
+  for(; *text; text++) {
+    int c = (unsigned char)*text;
+
+    if(c < 0x20 || c > 0x7e) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+
+/** A segment is the bytes between two slashes. A leading slash is one
+    spelling of an absolute path, not a segment, so it is not empty. A
+    segment of '.', '..' or no bytes at all is refused: escaping makes a
+    byte expressible, never traversal. **/
 static int
 target_ok(const char *target) {
-  size_t seg = 0;
   size_t len;
   size_t i;
-  size_t start = 0;
+  size_t start;
+  size_t seg;
 
-  if(!target || !(len=strlen(target)) || len > TARGET_MAX) {
+  if(!target || !(len=strlen(target)) || len > TARGET_MAX ||
+     !printable(target)) {
     return 0;
   }
 
-  if(target[0] == '/') {
-    start = 1;
+  start = target[0] == '/' ? 1 : 0;
+  if(start == len) {
+    return 0;
   }
 
+  seg = start;
   for(i=start; i<=len; i++) {
-    int c = (unsigned char)target[i];
+    int c = i == len ? 0 : (unsigned char)target[i];
 
     if(!c || c == '/') {
-      if(!seg) {
+      size_t n = i - seg;
+
+      if(!n || (n == 1 && target[seg] == '.') ||
+         (n == 2 && target[seg] == '.' && target[seg + 1] == '.')) {
         return 0;
       }
-      seg = 0;
-    } else if(is_alnum(c) || c == '_' || c == '-') {
-      if(++seg > SEGMENT_MAX) {
-        return 0;
-      }
-    } else {
-      return 0;
+      seg = i + 1;
     }
   }
 
@@ -147,9 +159,18 @@ approval_target_valid(const char *target) {
 }
 
 
+static int
+value_ok(const char *value) {
+  size_t len;
+
+  return value && (len=strlen(value)) >= 1 && len <= APPROVAL_VALUE_MAX &&
+         printable(value);
+}
+
+
 int
 approval_value_valid(const char *value) {
-  return in_set(value, 1, APPROVAL_VALUE_MAX, "._-", 0);
+  return value_ok(value);
 }
 
 
@@ -197,8 +218,9 @@ option_key_ok(const char *key) {
 
 
 /**
- * An option value is a word of the grammar, or the absolute path of a mount
- * source, which is a target.
+ * An option value is any printable ASCII word, or the absolute path of a
+ * mount source, which is a target. Values are escaped in the action, so a
+ * space or a bracket is expressible; a URL keeps its own validity rule.
  **/
 static int
 url_ok(const char *value) {
@@ -215,7 +237,7 @@ option_value_ok(const approval_option_t *option) {
   if(!strcmp(option->key, "url")) {
     return url_ok(option->value);
   }
-  return in_set(option->value, 1, APPROVAL_VALUE_MAX, "._-", 0);
+  return value_ok(option->value);
 }
 
 
@@ -230,6 +252,41 @@ put(char *out, size_t size, size_t *pos, const char *text) {
 
   memcpy(out + *pos, text, len + 1);
   *pos += len;
+  return 0;
+}
+
+
+/**
+ * Append one target, destination or option value, escaping every byte
+ * outside letters, digits, '.', '_' and '-' as %XX in uppercase hex. '%'
+ * itself is outside the set, so a literal percent is %25 and the encoding
+ * is injective. The caller has already established printable ASCII.
+ **/
+static int
+put_escaped(char *out, size_t size, size_t *pos, const char *text) {
+  static const char digits[] = "0123456789ABCDEF";
+  const unsigned char *p = (const unsigned char *)text;
+
+  for(; *p; p++) {
+    int c = *p;
+
+    if((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+       (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+      if(*pos + 1 >= size) {
+        return -1;
+      }
+      out[(*pos)++] = (char)c;
+    } else {
+      if(*pos + 3 >= size) {
+        return -1;
+      }
+      out[(*pos)++] = '%';
+      out[(*pos)++] = digits[c >> 4];
+      out[(*pos)++] = digits[c & 15];
+    }
+  }
+
+  out[*pos] = '\0';
   return 0;
 }
 
@@ -276,11 +333,11 @@ approval_canonical(const approval_action_t *action, char *out, size_t size) {
   if(put(out, size, &pos, "ariel-action-v1\ncommand=") ||
      put(out, size, &pos, action->command) ||
      put(out, size, &pos, "\ntarget=") ||
-     put(out, size, &pos, action->target) ||
+     put_escaped(out, size, &pos, action->target) ||
      put(out, size, &pos, "\n") ||
      (action->destination &&
       (put(out, size, &pos, "destination=") ||
-       put(out, size, &pos, action->destination) ||
+       put_escaped(out, size, &pos, action->destination) ||
        put(out, size, &pos, "\n"))) ||
      put(out, size, &pos, "sha256=") ||
      put(out, size, &pos, action->sha256) ||
@@ -294,7 +351,7 @@ approval_canonical(const approval_action_t *action, char *out, size_t size) {
     if(put(out, size, &pos, "option.") ||
        put(out, size, &pos, option->key) ||
        put(out, size, &pos, "=") ||
-       put(out, size, &pos, option->value) ||
+       put_escaped(out, size, &pos, option->value) ||
        put(out, size, &pos, "\n")) {
       return -1;
     }

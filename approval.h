@@ -84,11 +84,13 @@ typedef struct {
  * Turn an action into the bytes the owner reads and signs. This is the one
  * function that does so. Anything that could read two ways is refused, not
  * normalized: a target with a '..', an empty or '.' segment, a trailing
- * '/', a target of only '/', bytes outside ASCII, a repeated option, an
- * omitted field, a hash that is neither 64 lowercase hex digits nor none
- * (the hash of an action with no content), and any newline or space that
- * would smuggle in a line. A leading '/' is one spelling of a path, so an
- * absolute target encodes as written. Options are written in key order.
+ * '/', a target of only '/', a byte outside printable ASCII, a repeated
+ * option, an omitted field, or a hash that is neither 64 lowercase hex
+ * digits nor none (the hash of an action with no content). Every byte in a
+ * target, a destination and an option value outside letters, digits, '.',
+ * '_' and '-' is written %XX in uppercase hex, so a path with a space is
+ * expressible and the signer decodes it before showing it. Options are
+ * written in key order.
  * Returns the length of the NUL-terminated text in out, or -1 when the
  * action is refused or does not fit in size.
  **/

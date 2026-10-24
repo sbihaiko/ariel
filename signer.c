@@ -28,12 +28,12 @@ along with this program; see the file COPYING. If not, see
  *
  *   challenge <id> <console> <nonce> <issued-ms> <expires-ms> <action-hex>
  *
- * The signer prints the canonical action text on standard error exactly as
- * the bytes it is about to sign, not a summary of them, and asks the owner
- * to confirm on the terminal unless --yes is given. The signature, 128 hex
- * digits, goes to standard output followed by the console and the action's
- * SHA-256, so Ariel can tell a wrong console or action from a forged
- * signature; paste the whole line after `approval grant <id>`.
+ * The signer prints the canonical action text on standard error with the
+ * encoder's %XX escapes decoded, so a path reads as the path it names, and
+ * asks the owner to confirm on the terminal unless --yes is given. The
+ * signature, 128 hex digits, goes to standard output followed by the console
+ * and the action's SHA-256, so Ariel can tell a wrong console or action from
+ * a forged signature; paste the whole line after `approval grant <id>`.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -211,12 +211,70 @@ action_shown_whole(const unsigned char *bytes, size_t len) {
 }
 
 
+/** The value of one uppercase hex digit, or -1. The encoder writes no other. **/
+static int
+escape_hex(int c) {
+  if(c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if(c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+
+/**
+ * Decode the %XX escapes the encoder writes, so the owner reads the path
+ * rather than its escapes. Returns -1 for a broken escape or one that
+ * decodes to a byte that cannot be shown.
+ **/
+static int
+action_decoded(const unsigned char *bytes, size_t len, char *out,
+               size_t size) {
+  size_t i;
+  size_t pos = 0;
+
+  for(i=0; i<len; i++) {
+    unsigned char c = bytes[i];
+
+    if(c == '%') {
+      int hi;
+      int lo;
+
+      if(i + 2 >= len) {
+        return -1;
+      }
+      hi = escape_hex(bytes[i + 1]);
+      lo = escape_hex(bytes[i + 2]);
+      if(hi < 0 || lo < 0) {
+        return -1;
+      }
+      c = (unsigned char)(hi << 4 | lo);
+      if(c < 0x20 || c > 0x7e) {
+        return -1;
+      }
+      i += 2;
+    }
+
+    if(pos + 1 >= size) {
+      return -1;
+    }
+    out[pos++] = (char)c;
+  }
+
+  out[pos] = '\0';
+  return 0;
+}
+
+
 static int
 cmd_sign(const char *path, int assume_yes) {
   unsigned char pk[APPROVAL_PUBKEY_LEN];
   unsigned char sk[crypto_sign_SECRETKEYBYTES];
   unsigned char nonce[APPROVAL_NONCE_LEN];
   unsigned char action_bytes[APPROVAL_ACTION_MAX + 1];
+  char action_shown[APPROVAL_ACTION_MAX + 1];
   unsigned char message[APPROVAL_MESSAGE_MAX];
   unsigned char signed_msg[APPROVAL_SIG_LEN + APPROVAL_MESSAGE_MAX];
   unsigned long long signed_len = 0;
@@ -278,7 +336,9 @@ cmd_sign(const char *path, int assume_yes) {
 
   // Show only what can be shown: a NUL or a control byte would hide part of
   // the signed bytes from the owner.
-  if(!action_len || action_shown_whole(action_bytes, action_len)) {
+  if(!action_len || action_shown_whole(action_bytes, action_len) ||
+     action_decoded(action_bytes, action_len, action_shown,
+                    sizeof(action_shown))) {
     fprintf(stderr, "the action has bytes that cannot be shown; not signed\n");
     return 1;
   }
@@ -298,10 +358,11 @@ cmd_sign(const char *path, int assume_yes) {
     return 1;
   }
 
-  // What the owner reads is the byte string that gets signed.
+  // What the owner reads is the byte string that gets signed, with the
+  // encoder's escapes decoded so a path reads as a path.
   fprintf(stderr, "console %s, approval %s, valid %llu to %llu ms\n",
           fields[2], fields[1], issued, expires);
-  fwrite(action_bytes, 1, action_len, stderr);
+  fputs(action_shown, stderr);
   fflush(stderr);
 
   if(!assume_yes && !confirm()) {

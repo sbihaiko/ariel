@@ -104,13 +104,32 @@ say(int fd, const char *text) {
 }
 
 
+/**
+ * The word a failed file operation answers. A legacy command names what
+ * went wrong instead of leaving the agent to read a strerror string.
+ **/
+static const char *
+errno_word(int err) {
+  switch(err) {
+  case ENOENT:
+    return "no_such_file";
+  case ENOTDIR:
+    return "not_a_directory";
+  case EISDIR:
+    return "is_a_directory";
+  case ELOOP:
+    return "symbolic_link";
+  default:
+    return "operation_failed";
+  }
+}
+
+
 static void
 report(const char *cmd, const char *path, int errfd, int err) {
-  say(errfd, cmd);
-  say(errfd, ": ");
-  say(errfd, path);
-  say(errfd, ": ");
-  say(errfd, strerror(err));
+  (void)cmd;
+  (void)path;
+  say(errfd, errno_word(err));
   say(errfd, "\n");
 }
 
@@ -129,8 +148,8 @@ say_failure(int errfd, const char *command, const char *path, int err) {
 
 static int
 bad_arguments(const char *cmd, int errfd) {
-  say(errfd, cmd);
-  say(errfd, ": bad arguments\n");
+  (void)cmd;
+  say(errfd, "bad_argument\n");
   return 1;
 }
 
@@ -190,11 +209,9 @@ run_ls(int argc, char *const argv[], int outfd, int errfd) {
   }
 
   if(!(dir = opendir(argv[1]))) {
-    say(errfd, "ls: ");
-    say(errfd, argv[1]);
-    say(errfd, ": ");
-    say(errfd, strerror(errno));
-    say(errfd, "\n");
+    int err = errno;
+
+    report("ls", argv[1], errfd, err);
     return 1;
   }
 
@@ -221,7 +238,7 @@ run_ls(int argc, char *const argv[], int outfd, int errfd) {
   closedir(dir);
 
   if(rc) {
-    say(errfd, "ls: out of memory\n");
+    say(errfd, "operation_failed\n");
   } else {
     qsort(names, count, sizeof(*names), name_cmp);
     for(i=0; i<count; i++) {
@@ -439,7 +456,7 @@ run_grep(int argc, char *const argv[], int outfd, int errfd) {
     return bad_arguments("grep", errfd);
   }
   if(regcomp(&re, argv[1], REG_NOSUB)) {
-    say(errfd, "grep: bad pattern\n");
+    say(errfd, "bad_argument\n");
     return 1;
   }
   if((rc=open_target("grep", argv[2], errfd, &fd))) {
@@ -449,7 +466,7 @@ run_grep(int argc, char *const argv[], int outfd, int errfd) {
   if(!(file=fdopen(fd, "r"))) {
     close(fd);
     regfree(&re);
-    say(errfd, "grep: out of memory\n");
+    say(errfd, "operation_failed\n");
     return 1;
   }
 
@@ -472,7 +489,7 @@ run_grep(int argc, char *const argv[], int outfd, int errfd) {
   regfree(&re);
 
   if(failed) {
-    say(errfd, "grep: read error\n");
+    say(errfd, "operation_failed\n");
     return 1;
   }
   return matched ? 0 : 1;
@@ -699,7 +716,7 @@ run_find(int argc, char *const argv[], int outfd, int errfd) {
   if(!root || push_path(&todo, &count, &cap, root)) {
     free(root);
     free(todo);
-    say(errfd, "find: out of memory\n");
+    say(errfd, "operation_failed\n");
     return 1;
   }
 
@@ -753,7 +770,7 @@ run_find(int argc, char *const argv[], int outfd, int errfd) {
   free(todo);
 
   if(oom) {
-    say(errfd, "find: out of memory\n");
+    say(errfd, "operation_failed\n");
     return 1;
   }
   return failed;
@@ -1001,7 +1018,7 @@ run_sfoinfo(int argc, char *const argv[], int outfd, int errfd) {
   size = (uint64_t)st.st_size;
   if(!(buf = malloc(size))) {
     close(fd);
-    say(errfd, "sfoinfo: out of memory\n");
+    say(errfd, "operation_failed\n");
     return 1;
   }
   while(got < size) {

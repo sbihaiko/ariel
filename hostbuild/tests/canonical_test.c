@@ -193,7 +193,8 @@ main(void) {
   refused(&other, "a newline in a target is refused");
 
   // A mount source is an absolute path, held to the rules of a target. Any
-  // other option value is still a word.
+  // other option value is a printable word, so a slash in one is escaped
+  // like every other byte outside the safe set.
   {
     approval_option_t source[1];
 
@@ -215,7 +216,9 @@ main(void) {
            "a space in a mount source is escaped");
     source[0].key = "fspath";
     source[0].value = "/data/src";
-    refused(&other, "a path in an option other than from is refused");
+    expect(encode(&other, out, sizeof(out)) > 0 &&
+           strstr(out, "option.fspath=%2Fdata%2Fsrc\n"),
+           "a path in an option other than from is a word, escaped");
   }
 
   // An omitted field must not encode as an empty one.

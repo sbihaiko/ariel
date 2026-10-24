@@ -287,22 +287,34 @@ refuse(agent_t *agent, int fd) {
 }
 
 
-static void *
-serve_connection(void *arg) {
+/**
+ * Give back everything one connection holds. It runs on the normal path and
+ * as a cancellation cleanup handler when the connection deadline stops the
+ * thread, so a stopped connection frees its slot and its wake pipe too.
+ **/
+static void
+connection_release(void *arg) {
   struct connection *conn = arg;
-  int fd = conn->fd;
-  int wake = conn->wake;
 
-  agent_serve(conn->agent, fd, wake);
-  agent_close(conn->agent->platform, fd, wake);
+  agent_close(conn->agent->platform, conn->fd, conn->wake);
+  connection_drop();
 
   // The slot goes before the wake pipe, so a test clock that sees no pipe
   // left also sees every slot free.
-  connection_drop();
-  if(wake >= 0 && conn->agent->platform->wake_close) {
-    conn->agent->platform->wake_close(conn->agent->platform, wake);
+  if(conn->wake >= 0 && conn->agent->platform->wake_close) {
+    conn->agent->platform->wake_close(conn->agent->platform, conn->wake);
   }
   free(conn);
+}
+
+
+static void *
+serve_connection(void *arg) {
+  struct connection *conn = arg;
+
+  pthread_cleanup_push(connection_release, conn);
+  agent_serve(conn->agent, conn->fd, conn->wake);
+  pthread_cleanup_pop(1);
 
   return NULL;
 }

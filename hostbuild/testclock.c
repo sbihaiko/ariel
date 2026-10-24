@@ -176,6 +176,7 @@ void
 testclock_wake_idle(int wake, int fd, int idle) {
   struct pollfd pfd[2];
   nfds_t nfds = 1;
+  int cancel;
   int i;
 
   pfd[0].fd = wake;
@@ -189,6 +190,10 @@ testclock_wake_idle(int wake, int fd, int idle) {
     nfds = 2;
   }
 
+  // The agent's deadline watchdog cancels a slow connection thread, and poll
+  // is a cancellation point: a cancel here would leave the lock held.
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel);
+
   pthread_mutex_lock(&lock);
   for(i=0; i<WAKE_MAX; i++) {
     if(wake_reads[i] == wake) {
@@ -200,6 +205,8 @@ testclock_wake_idle(int wake, int fd, int idle) {
   }
   pthread_cond_broadcast(&idle_changed);
   pthread_mutex_unlock(&lock);
+
+  pthread_setcancelstate(cancel, NULL);
 }
 
 

@@ -4785,20 +4785,58 @@ store_list(state_payload_t *entries, size_t max, size_t *count) {
 
 
 /**
+ * Write one audit field, escaping a byte that would split the line or hide
+ * part of it. A quoted path may hold a space now, and a 60 s deadline can
+ * hand over any name; no name may add a column or a line.
+ **/
+static int
+audit_field(char *out, size_t size, const char *text) {
+  static const char digits[] = "0123456789ABCDEF";
+  size_t pos = 0;
+
+  for(; *text; text++) {
+    unsigned char c = (unsigned char)*text;
+
+    if(c > 0x20 && c < 0x7f) {
+      if(pos + 1 >= size) {
+        return -1;
+      }
+      out[pos++] = (char)c;
+    } else {
+      if(pos + 3 >= size) {
+        return -1;
+      }
+      out[pos++] = '%';
+      out[pos++] = digits[c >> 4];
+      out[pos++] = digits[c & 15];
+    }
+  }
+
+  out[pos] = '\0';
+  return 0;
+}
+
+
+/**
  * Append one action to the audit log. The line is flushed before it returns,
  * so a crash cannot lose an action that already happened.
  **/
 static int
 audit_append_locked(const char *kind, const char *name, const char *id,
                     const char *sha256) {
+  char field[AUDIT_LINE_MAX];
   char line[AUDIT_LINE_MAX];
   int len;
   int fd;
   int state_fd;
   int rc;
 
+  if(audit_field(field, sizeof(field), name)) {
+    return -1;
+  }
+
   len = snprintf(line, sizeof(line), "%llu %s %s %s %s\n",
-                 (unsigned long long)now_ms(), kind, name, id, sha256);
+                 (unsigned long long)now_ms(), kind, field, id, sha256);
   if(len < 0 || len >= (int)sizeof(line)) {
     return -1;
   }

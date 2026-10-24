@@ -1233,6 +1233,9 @@ CLOCK_SCENARIOS = {
     "touches nothing",
     "a file replaced after a built-in grant answers approval_stale and exit 78",
     "missing auth after 5 s of test clock closes with exit 70",
+    "a command still running at the 60 s deadline answers timed_out",
+    "a quoted path is escaped in the signed action and decoded by the "
+    "signer",
     "a stalled upload does not block another connection",
     "a hung background payload is listed as running, then cut at its "
     "timeout and listed as not running",
@@ -1391,8 +1394,10 @@ HOST_ROOT_SCENARIOS = {
     "a run of a missing path, a directory or a file without execute bits "
     "answers its word and exit 1 without asking",
     "a run of Ariel's token answers protected and exit 87 without asking",
-    "a run with an argument outside printable ASCII answers bad_path and "
-    "with too many arguments answers unknown_command, without asking",
+    "a run with an argument outside printable ASCII answers bad_path, and a "
+    "run with too many arguments answers unknown_command, without asking",
+    "a quoted path with a space runs, and a quote or backslash is escaped",
+    "a target outside printable ASCII answers bad_path and asks nothing",
     "a run of a file over 64 MiB answers too_large and exit 1 without asking",
     "a run never follows a symbolic link, by path or on the PATH, and answers "
     "symbolic_link",
@@ -3175,11 +3180,16 @@ def scenario_a_slow_command_times_out(server):
     server.advance(120000)
     sock = server.connect(timeout=10.0)
     try:
-        sock.sendall(("auth %s\nsleep 60\n" % server.token).encode("ascii"))
-        # The watchdog is the one waiter on this connection; wait for it,
-        # then pass the deadline without sleeping.
+        sock.sendall(("auth %s\n" % server.token).encode("ascii"))
         server.settle(1)
-        server.advance(60000)
+        # Half of the connection's deadline goes by before the command is
+        # sent, so the sleep's own 60 s ceiling ends 30 s after the
+        # connection deadline: only the watchdog can fire on the next step,
+        # whatever order two waiters due at once would wake in.
+        server.advance(30000)
+        sock.sendall(b"sleep 60\n")
+        server.settle(1)
+        server.advance(30000)
         assert reply_lines(read_reply(sock)) == ["timed_out", "exit 1"], (
             "a command past the connection deadline must answer timed_out")
     finally:
@@ -3207,6 +3217,8 @@ def scenario_legacy_commands_name_their_error(server):
         ("sleep soon", "bad_duration"),
         ("procstat not-a-pid", "not_a_pid"),
         ("sysctl", "missing_operand"),
+        ("payload run nosuchbuild", "unknown_payload"),
+        ("autoload remove nosuchbuild", "not_in_autoload"),
     )
     for command, word in cases:
         lines = run_command(server, command)
@@ -4768,9 +4780,11 @@ def scenario_stalled_upload_does_not_block(server):
         assert elapsed < 1.0, (
             "a stalled upload blocked another connection for %.2f s" % elapsed)
 
-        # The stalled upload ends only when the clock passes its 60 s stall.
+        # The stalled upload ends at its own 59 s stall, which stays below
+        # the 60 s connection deadline: a stall is upload_mismatch, not
+        # timed_out.
         server.settle(1)
-        server.advance(59_999)
+        server.advance(58_999)
         server.settle(1)
         assert_open(stalled, "1 ms before the upload stall deadline")
 
@@ -8807,12 +8821,14 @@ def scenario_install_tag_naming_another_release_is_refused(_server):
 
 
 def scenario_install_invalid_tag_is_refused_and_audited(_server):
-    """A tag with a slash is refused before anything is fetched, and audited."""
+    """A tag the encoder cannot carry is refused before anything is fetched, and audited."""
     def run(fx):
-        lines = install_request(fx.server, INSTALL_NAME, tag="../v1")
-        assert lines == ["unknown_command", "exit 1"], lines
+        # A slash is an ordinary byte the encoder escapes, so the tag that is
+        # invalid is one over the 64 bytes an option value carries.
+        lines = install_request(fx.server, INSTALL_NAME, tag="v" * 65)
+        assert lines == ["bad_path", "exit 1"], lines
         assert fx.fake.requests == [], "an invalid tag must fetch nothing"
-        assert ("payload.install.refused", INSTALL_NAME, "unknown_command") in (
+        assert ("payload.install.refused", INSTALL_NAME, "bad_path") in (
             install_audit(fx.server)), install_audit(fx.server)
     with_install(healthy_build(INSTALL_NAME), run)
 
