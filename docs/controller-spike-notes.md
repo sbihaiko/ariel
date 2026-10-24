@@ -42,7 +42,7 @@ nc 192.168.68.77 9021 < controller-spike.elf &
 nc -G 5 192.168.68.77 9150    # read the transcript
 ```
 
-The console was at `192.168.68.77` (elfldr on 9021, spike on 9150). The spike runs 120 seconds and leaves the port free afterwards. `nc -z ... 9150` tells you whether a run is still in progress.
+The console was at `192.168.68.77` (elfldr on 9021, spike on 9150). The spike runs 30 seconds and leaves the port free afterwards. `nc -z ... 9150` tells you whether a run is still in progress. The 30 second clock is checked between probes. It does not interrupt a `pt_call` that is already single-stepping inside the title.
 
 ## What the console confirmed
 
@@ -95,7 +95,7 @@ Note: `pt_resolve` cannot find these functions. It only looks at library handles
 
 ## Next steps, in order
 
-1. **Run with a title in the foreground.** This is the actual question. The payload now waits for `sceSystemServiceGetAppIdOfRunningBigApp` to return an id, finds that title's `eboot.bin` through `sceKernelGetAppInfo`, and calls `scePadGetHandle` / `scePadReadState` there. It has not been run on the console yet.
+1. **Run with a title in the foreground.** This is the actual question. The payload waits for `sceSystemServiceGetAppIdOfRunningBigApp` to return an id, finds that title's `eboot.bin` through `sceKernelGetAppInfo`, and calls `scePadGetHandle` / `scePadReadState` there. The first send produced no transcript; see the run note below. The next send uses a 30 second window.
 2. **If that fails, reproduce the PoorDS4 path**: the context setters (`scePadSetLoginUserNumber`, `scePadSetUserNumber`, `scePadSetProcessFocus`) before the handle probe, and port type 3 with indexes 0–7. The spike still only tries port types 0 and 2, index 0.
 3. **Only then consider a virtual device.** That creates a controller rather than reading the real one, so it does not answer #3 — it is a different design.
 
@@ -103,7 +103,7 @@ Note: `pt_resolve` cannot find these functions. It only looks at library handles
 
 Not a console result. The home-screen attempts (local `scePadOpen`, the registry sign-in flag, `np-fake-signin`, and `SceShellCore`) are no longer in the loop.
 
-- A big app id at or below 0 means nothing is in front. The spike says so once and retries for the rest of the 120 seconds, so the title can come to the foreground during the run.
+- A big app id at or below 0 means nothing is in front. The spike says so once and retries until the 30 seconds are up, so the title can come to the foreground during the run.
 - It lists every `eboot.bin` with the app id `sceKernelGetAppInfo` writes and any title id string in that buffer. The title id offset is logged because the two SDK samples disagree on the struct layout.
 - It attaches to the eboot whose app id equals the big app. If none equals it, it attaches to eboots whose title id is not `NPXS`.
 - Inside that process it calls `scePadGetHandle` for user ids `1`, the foreground user and `0x10000000`, port types 0 and 2, index 0, then `scePadReadState`.
@@ -111,6 +111,14 @@ Not a console result. The home-screen attempts (local `scePadOpen`, the registry
 
 ## Caveat for whoever continues
 
-Attaching stops the title for the duration of the call. `pt_call` single-steps the target function, so a long `scePadReadState` can consume a lot of the 120 seconds. Hold a button while the spike is running. `nc -z ... 9150` tells you whether a run is still in progress.
+Attaching stops the title for the duration of the call. `pt_call` single-steps the target function, and that call is not bounded by the 30 second window. Hold a button while the spike is running. `nc -z ... 9150` tells you whether a run is still in progress.
+
+## Run with a title claimed in front
+
+Sent `controller-spike.elf` (commit `f173589`, 120 second build) to `192.168.68.77:9021` after the operator said a game was in the foreground.
+
+- The elfldr connection printed `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while the payload was starting. `0x80940004` is the same code the notes already have for "no app info".
+- Port 9150 accepted a TCP connection. The payload wrote no line. The first probe inside the title had not returned.
+- The operator rebooted the console from that state. A reboot ends the payload. Nothing was read from the pad.
 
 The worktree is `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`.

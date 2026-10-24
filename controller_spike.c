@@ -50,7 +50,7 @@ along with this program; see the file COPYING. If not, see
 
 
 #define SPIKE_PORT        9150
-#define SPIKE_SECONDS     120
+#define SPIKE_SECONDS     30
 
 /**
  * Marks the process as a fully privileged system app for every credential
