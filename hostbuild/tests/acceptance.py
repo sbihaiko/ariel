@@ -9065,7 +9065,11 @@ def scenario_unsupported_options_answer_bad_option(server):
             "touch -x " + os.path.join(data, "none"),
             "rmdir -x " + os.path.join(data, "none"),
             "cp -x %s %s" % (scratch, data), "mv -x %s %s" % (scratch, data),
-            "ln -x %s %s" % (scratch, data)):
+            "ln -x %s %s" % (scratch, data),
+            "chmod -R 755 " + scratch, "chown -h 0 " + scratch,
+            "chgrp -R 0 " + scratch,
+            "rm -r -x " + os.path.join(data, "none"),
+            "cp -r -x %s %s" % (scratch, data)):
         assert run_command(server, command) == ["bad_option", "exit 1"], (
             "%r must answer bad_option and exit 1" % command)
     server.assert_no_line()

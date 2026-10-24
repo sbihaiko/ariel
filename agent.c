@@ -271,6 +271,20 @@ static const char config_failed[] =
   "config_failed\n"
   "exit 1\n";
 
+/** Whether text is a minus sign and at least one digit, as `-1` is. **/
+static int
+negative_number(const char *text) {
+  if(text[0] != '-' || !text[1]) {
+    return 0;
+  }
+  for(text++; *text; text++) {
+    if(*text < '0' || *text > '9') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int
 write_all(int fd, const char *buf, size_t len) {
   while(len > 0) {
@@ -1096,6 +1110,15 @@ file_options(agent_t *agent, int fd, int argc, char *argv[]) {
   if(recursive) {
     int operands = argc - 2;
 
+    // Every operand of a recursive command is an absolute path, so a dash-led
+    // word after -r is an option the command does not take: it is answered
+    // before the operands are counted, not as a bad argument.
+    for(i=2; i<argc; i++) {
+      if(argv[i][0] == '-') {
+        audit_reply(fd, argv[0], "refused", "-", "-", bad_option);
+        return 1;
+      }
+    }
     if(operands < (cp ? 2 : 1)) {
       audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
     } else if(operands > (cp ? 2 : 1)) {
@@ -1488,6 +1511,23 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
  **/
 static void
 attribute_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  int i;
+
+  // chmod, chown and chgrp take a mode and a path, and no option at all: a
+  // dash-led word is answered before anything else, so the owner is never
+  // asked for something that cannot run. A negative id in the first slot is
+  // an operand and not an option (`chown -1 PATH` answers bad_owner), and the
+  // path is absolute in every other slot, so a dash there is an option.
+  for(i=2; i<argc; i++) {
+    if(argv[i][0] == '-') {
+      audit_reply(fd, argv[0], "refused", "-", "-", bad_option);
+      return;
+    }
+  }
+  if(argc >= 2 && argv[1][0] == '-' && !negative_number(argv[1])) {
+    audit_reply(fd, argv[0], "refused", "-", "-", bad_option);
+    return;
+  }
   if(argc < 3) {
     audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
     return;
