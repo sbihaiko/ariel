@@ -1007,8 +1007,18 @@ PLAN_RUN = "run  "
 # cannot create them, so it runs its own checks of the same commands instead.
 HOST_ROOT_REASON = ("needs files or links in the host test root, which console "
                     "mode cannot create")
-PLAN_SKIP = re.compile(r"^skip (\S.*) \((needs the test clock|%s)\)$"
-                       % re.escape(HOST_ROOT_REASON))
+PLAN_SKIP = re.compile(r"^skip (\S.*) \((needs [^()]+)\)$")
+CLOCK_REASON = "needs the test clock"
+FAULT_REASON = "needs the fault injector"
+FAULT_ENV = "ARIEL_HOST_FAULT"
+
+# The scenarios that crash Ariel at a named commit step, which only a host
+# build with the fault injector can do.
+FAULT_SCENARIOS = {
+    "a crash in prepared leaves the old version in payload list after restart",
+    "a crash in committed leaves the new version in payload list after restart",
+    "running recovery twice after a crash in renamed gives the same state",
+}
 
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
@@ -1086,10 +1096,10 @@ def scenario_console_mode_plan(server):
         assert match, "a skipped scenario must name its reason: %r" % line
         skipped.append(match.group(1))
 
-    expected_skips = CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS
+    expected_skips = CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
-        "clock or the host test root:\nmissing %r\nunexpected %r"
+        "clock, the host test root or the fault injector:\nmissing %r\nunexpected %r"
         % (sorted(expected_skips - set(skipped)),
            sorted(set(skipped) - expected_skips)))
     assert run, "console mode must run its scenarios against the console"
@@ -1381,16 +1391,17 @@ def listed(lines, name):
     return matches[0] if matches else None
 
 
-def expected_listing(name, hash_hex):
+def expected_listing(name, hash_hex, previous_hex=None):
     """The payload list line a push of name committed as hash_hex shows.
 
     Stage 1 records only a name and a hash. A push has no release, so its
     version identifiers and source say so, and nothing is running: the commit
-    approved running the build, it did not start it.
+    approved running the build, it did not start it. previous names the build
+    the commit replaced, or "-" for a first build.
     """
     return ("payload %s source=push version=- release=- asset=- "
-            "sha256=%s path=/data/ariel/store/objects/%s running=no" % (
-                name, hash_hex, hash_hex))
+            "sha256=%s path=/data/ariel/store/objects/%s running=no "
+            "previous=%s" % (name, hash_hex, hash_hex, previous_hex or "-"))
 
 
 def state_path(server):
@@ -1509,7 +1520,8 @@ def scenario_commit_replaces(server):
     )
 
     # The store is what the commit promised: the name points at the new
-    # object, and the object it replaces is gone.
+    # object, and the object it replaces is kept as the previous version.
+    # Stage 1 deleted the replaced object here; SPEC #2 keeps it.
     with open(os.path.join(store_dir(server), "current", "replace")) as fh:
         current = fh.read().strip()
     assert current == second_hash, (
@@ -1519,9 +1531,220 @@ def scenario_commit_replaces(server):
     assert second_hash in objects, (
         "the new build must be in the store, it holds %r" % objects
     )
-    assert first_hash not in objects, (
-        "the replaced object must be deleted, store holds %r" % objects
+    assert first_hash in objects, (
+        "the replaced build must be kept as the previous version, store "
+        "holds %r" % objects
     )
+
+
+FIRST_BUILD = b"journal first build\n"
+SECOND_BUILD = b"journal second build\n"
+JOURNAL_NAME = "journal"
+
+COUNT_SOURCE = """
+#include <stdio.h>
+
+int
+main(int argc, char* argv[]) {
+  FILE* log;
+
+  if(argc < 2) {
+    return 2;
+  }
+
+  // Each start appends one line, so the harness can count how often it ran.
+  log = fopen(argv[1], "a");
+  if(!log) {
+    return 2;
+  }
+  if(fputs("start\\n", log) == EOF || fclose(log) != 0) {
+    return 2;
+  }
+  return 0;
+}
+"""
+
+
+def audit_events(server):
+    """The (kind, name, sha256) of every audit line, in order."""
+    events = []
+    for line in read_audit_log(server).decode("ascii").splitlines():
+        match = AUDIT_LINE.match(line)
+        if match:
+            events.append((match.group(2), match.group(3), match.group(5)))
+    return events
+
+
+def commit_until_crash(server, staging):
+    """Send a commit that the injected fault ends, and wait for Ariel to die."""
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\npayload commit %s\n" % (server.token, staging))
+            .encode("ascii")
+        )
+        reply = reply_lines(read_reply(sock))
+    except OSError:
+        reply = []
+    finally:
+        sock.close()
+    assert server.proc.wait(timeout=5.0) != 0, "the fault must end Ariel"
+    return reply
+
+
+def crash_replacement(server, step):
+    """Install FIRST_BUILD, then crash the commit of SECOND_BUILD at step.
+
+    The restart after the crash is the recovery under test.
+    """
+    install_payload(server, JOURNAL_NAME, FIRST_BUILD)
+    server.env = {FAULT_ENV: step}
+    server.restart()
+    staging, _ = approve_push(server, JOURNAL_NAME, SECOND_BUILD)
+    assert commit_until_crash(server, staging) == [], (
+        "a commit that crashes must answer nothing"
+    )
+    server.env = None
+    server.restart()
+
+
+def scenario_crash_in_prepared_leaves_old_version(server):
+    """A crash after the prepared mark rolls the replacement back on restart."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+        crash_replacement(crashed, "prepared")
+
+        assert listed(payload_list(crashed), JOURNAL_NAME) == (
+            expected_listing(JOURNAL_NAME, first_hash)), (
+            "a crash in prepared must leave the old version listed")
+        objects = os.listdir(os.path.join(store_dir(crashed), "objects"))
+        assert second_hash not in objects, (
+            "a rolled back build must leave the store, it holds %r" % objects)
+        assert ("rollback", JOURNAL_NAME, second_hash) in audit_events(crashed), (
+            "the rollback must be audited, the log holds %r"
+            % audit_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_crash_in_committed_leaves_new_version(server):
+    """A crash after the committed mark rolls the replacement forward on restart."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+        crash_replacement(crashed, "committed")
+
+        assert listed(payload_list(crashed), JOURNAL_NAME) == (
+            expected_listing(JOURNAL_NAME, second_hash, first_hash)), (
+            "a crash in committed must leave the new version listed")
+        objects = os.listdir(os.path.join(store_dir(crashed), "objects"))
+        assert second_hash in objects and first_hash in objects, (
+            "the new build and its previous version must be stored, it holds %r"
+            % objects)
+        assert ("rollforward", JOURNAL_NAME, second_hash) in audit_events(
+            crashed), (
+            "the roll forward must be audited, the log holds %r"
+            % audit_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_recovery_twice_gives_the_same_state(server):
+    """Recovery that runs again after it finished changes nothing."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        crash_replacement(crashed, "renamed")
+        listing = payload_list(crashed)
+        state = read_state(crashed)
+        events = audit_events(crashed)
+
+        crashed.restart()
+
+        assert payload_list(crashed) == listing, (
+            "a second recovery must list the same payloads")
+        assert read_state(crashed) == state, (
+            "a second recovery must write the same state file")
+        assert audit_events(crashed) == events, (
+            "a second recovery must not act again, the log holds %r"
+            % audit_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_previous_version_is_kept_then_dropped(server):
+    """The replaced build is listed as previous; the build before it is dropped."""
+    del server  # the object store is read from the root, so this Ariel is its own
+    history = Server(SERVER_BINARY)
+    try:
+        first = install_payload(history, "history", b"history build a\n")
+        second = install_payload(history, "history", b"history build b\n")
+        assert listed(payload_list(history), "history") == expected_listing(
+            "history", second, first), (
+            "the replaced build must be listed as previous")
+
+        third = install_payload(history, "history", b"history build c\n")
+        assert listed(payload_list(history), "history") == expected_listing(
+            "history", third, second), (
+            "the newest replacement must name the build it replaced")
+        objects = os.listdir(os.path.join(store_dir(history), "objects"))
+        assert second in objects, (
+            "the previous version must stay in the store, it holds %r" % objects)
+        assert first not in objects, (
+            "a build two replacements old must be dropped, it holds %r" % objects)
+    finally:
+        history.stop()
+
+
+def starts(log):
+    try:
+        with open(log) as fh:
+            return len(fh.readlines())
+    except FileNotFoundError:
+        return 0
+
+
+def mark_running(server, name):
+    """Edit the state file so name reads as running, as a crash could leave it."""
+    marked = []
+    for line in read_state(server).decode("ascii").splitlines():
+        parts = line.split(" ")
+        if len(parts) > 8 and parts[0] == "payload" and parts[1] == name:
+            parts[8] = "1"
+            line = " ".join(parts)
+        marked.append(line)
+    with open(state_path(server), "w") as fh:
+        fh.write("\n".join(marked) + "\n")
+
+
+def scenario_running_mark_does_not_restart_payload(server):
+    """A payload the record marks running is not started again on restart."""
+    del server  # the record is edited on disk, so this Ariel is its own
+    host = Server(SERVER_BINARY)
+    try:
+        log = os.path.join(host.root, "starts.log")
+        data = compile_payload(COUNT_SOURCE, "count")
+        hash_hex = install_payload(host, "count", data)
+        reply = run_payload(host, "count", [log])
+        assert "exit 0" in reply, "the counting payload must run, got %r" % reply
+        assert starts(log) == 1, "the run must start the payload once"
+
+        host.stop()
+        mark_running(host, "count")
+        host.restart()
+
+        assert starts(log) == 1, (
+            "a restart must not start a payload the record marks running")
+        assert listed(payload_list(host), "count") == expected_listing(
+            "count", hash_hex), (
+            "the restart must clear the running mark")
+    finally:
+        host.stop()
 
 
 def scenario_commit_after_restart(server):
@@ -3002,18 +3225,18 @@ SERVER_BINARY = "./ariel-host"
 
 
 SCENARIOS = [
-    ("missing auth closes with exit 70", scenario_missing_auth, False),
+    ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
-     scenario_auth_deadline, True),
-    ("a line over 1 KiB closes the connection", scenario_line_limit, False),
-    ("wrong token closes with exit 70", scenario_wrong_token, False),
+     scenario_auth_deadline, CLOCK_REASON),
+    ("a line over 1 KiB closes the connection", scenario_line_limit, None),
+    ("wrong token closes with exit 70", scenario_wrong_token, None),
     ("right token and a Stage 1 command outside the set answers "
-     "unknown_command", scenario_unknown_command, False),
+     "unknown_command", scenario_unknown_command, None),
     ("the agent port opens no system change outside the gate and the "
      "telnet shell stays out of scope",
-     scenario_no_system_change_on_agent_port, False),
+     scenario_no_system_change_on_agent_port, None),
     ("pwd and ls <absolute path> run through the agent port",
-     scenario_pwd_and_ls, False),
+     scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",
      scenario_cd_is_an_error, False),
     ("each read-only command runs with no approval and exits 0 with its output",
@@ -3041,134 +3264,134 @@ SCENARIOS = [
     ("authid answers 'not available on this platform' on the host and "
      "exit 1", scenario_authid_is_not_available_on_the_host, False),
     ("two connections are served at the same time",
-     scenario_two_connections, False),
+     scenario_two_connections, None),
     ("a fifth concurrent connection answers busy and exit 82",
-     scenario_connection_limit, False),
+     scenario_connection_limit, None),
     ("a ninth connection answers busy and exit 82 with every refusal slot "
-     "taken", scenario_refusal_slots_exhausted, False),
+     "taken", scenario_refusal_slots_exhausted, None),
     ("a stalled upload does not block another connection",
-     scenario_stalled_upload_does_not_block, True),
+     scenario_stalled_upload_does_not_block, CLOCK_REASON),
     ("a truncated upload answers upload_mismatch and exit 81",
-     scenario_truncated_upload, False),
+     scenario_truncated_upload, None),
     ("bytes past the declared size answer upload_mismatch and exit 81",
-     scenario_extra_bytes, False),
+     scenario_extra_bytes, None),
     ("a hash mismatch answers upload_mismatch and exit 81",
-     scenario_hash_mismatch, False),
-    ("a name outside the grammar answers bad_name", scenario_bad_name, False),
+     scenario_hash_mismatch, None),
+    ("a name outside the grammar answers bad_name", scenario_bad_name, None),
     ("a matching push is staged, asks for approval and exits 75",
-     scenario_matching_push, False),
+     scenario_matching_push, None),
     ("an upload in many small fragments arrives intact",
-     scenario_fragmented_upload, False),
+     scenario_fragmented_upload, None),
     ("an ELF containing 0xff bytes arrives intact",
-     scenario_elf_with_ff, False),
+     scenario_elf_with_ff, None),
     ("a denied push is answered on the virtual controller",
-     scenario_denied_push, False),
+     scenario_denied_push, None),
     ("a commit before the decision answers approval_required and exit 75",
-     scenario_commit_before_decision, False),
+     scenario_commit_before_decision, None),
     ("an approved commit answers installed <name> <hash> and exit 0",
-     scenario_commit_installed, False),
+     scenario_commit_installed, None),
     ("after a commit, payload list shows the payload with every field",
-     scenario_list_after_commit, False),
+     scenario_list_after_commit, None),
     ("the state file records a commit, survives a restart and is not "
-     "rewritten by listing", scenario_state_survives_restart, False),
+     "rewritten by listing", scenario_state_survives_restart, None),
     ("a store written by Stage 1 is migrated on the first start, and a "
      "second start changes nothing", scenario_stage1_store_migrates_once,
      False),
     ("a second commit of the same name replaces the first build",
-     scenario_commit_replaces, False),
+     scenario_commit_replaces, None),
     ("an approval does not survive a restart of Ariel",
-     scenario_commit_after_restart, False),
+     scenario_commit_after_restart, None),
     ("a staging object changed after approval answers approval_stale and "
-     "exit 78", scenario_commit_stale, False),
+     "exit 78", scenario_commit_stale, None),
     ("an approval is single-use when two commits race",
-     scenario_commit_single_use, False),
+     scenario_commit_single_use, None),
     ("a denied commit answers approval_denied and exit 77 and deletes the "
-     "staging object", scenario_commit_denied, False),
+     "staging object", scenario_commit_denied, None),
     ("a run streams the payload's output, then status 0 and exit 0",
-     scenario_run_streams_output, False),
+     scenario_run_streams_output, None),
     ("a payload exiting 3 answers status 3, and one exiting 75 answers "
      "status 75, never an approval request",
-     scenario_run_reports_payload_status, False),
-    ("an unknown payload name is an error", scenario_run_unknown_name, False),
+     scenario_run_reports_payload_status, None),
+    ("an unknown payload name is an error", scenario_run_unknown_name, None),
     ("an object changed behind Ariel's back answers approval_stale and "
-     "exit 78 and does not run", scenario_run_stale_object, False),
+     "exit 78 and does not run", scenario_run_stale_object, None),
     ("a FIFO in place of a committed object answers approval_stale and "
      "exit 78 without blocking other clients",
-     scenario_run_fifo_object, False),
+     scenario_run_fifo_object, None),
     ("a run of a committed build needs no new approval, and a push of a "
-     "different build asks again", scenario_run_needs_no_new_approval, False),
+     "different build asks again", scenario_run_needs_no_new_approval, None),
     ("a stored object that cannot be executed answers spawn_failed and "
-     "exit 1", scenario_run_exec_failure, False),
+     "exit 1", scenario_run_exec_failure, None),
     ("a finished connection reaches end of stream while a payload runs",
-     scenario_run_does_not_leak_connections, False),
+     scenario_run_does_not_leak_connections, None),
     ("the quick start's 'After Stage 1' section passes headless",
-     scenario_quick_start, False),
+     scenario_quick_start, None),
     ("a change to the 'After Stage 1' section without a change to Ariel "
-     "makes the fixture fail", scenario_quick_start_doc_drift, False),
+     "makes the fixture fail", scenario_quick_start_doc_drift, None),
     ("a broken setup command or a wrong exported token makes the fixture "
-     "fail", scenario_quick_start_broken_setup, False),
+     "fail", scenario_quick_start_broken_setup, None),
     ("a failing '$' command in a block of any label makes the fixture fail",
-     scenario_quick_start_unlabeled_block, False),
+     scenario_quick_start_unlabeled_block, None),
     ("an approval expires after 120 s of test clock and answers exit 88",
-     scenario_approval_expired, True),
+     scenario_approval_expired, CLOCK_REASON),
     ("approval status answers pending, granted, denied, expired and consumed, "
-     "and an unknown id is an error", scenario_approval_status, True),
+     "and an unknown id is an error", scenario_approval_status, CLOCK_REASON),
     ("a full approval table gives up an approval with no staged object first, "
      "and an expired staged object still answers approval_expired",
-     scenario_approval_slot_reclaim, True),
+     scenario_approval_slot_reclaim, CLOCK_REASON),
     ("the challenge names the command, target, hash, size and run of the "
-     "approval", scenario_challenge_fields, True),
+     "approval", scenario_challenge_fields, CLOCK_REASON),
     ("an expired approval does not count among the pending ones",
-     scenario_expired_not_pending, True),
+     scenario_expired_not_pending, CLOCK_REASON),
     ("an upload over 64 MiB answers staging_full and exit 80",
-     scenario_upload_too_large, False),
+     scenario_upload_too_large, None),
     ("staging past 64 MiB in total answers staging_full",
-     scenario_staging_total, False),
+     scenario_staging_total, None),
     ("an unanswered staging object disappears after 15 min",
-     scenario_staging_ttl, True),
+     scenario_staging_ttl, CLOCK_REASON),
     ("a fourth pending approval answers approval_busy and exit 76 with no "
-     "prompt", scenario_pending_limit, False),
+     "prompt", scenario_pending_limit, None),
     ("a second notification within 10 s answers approval_busy with no "
-     "prompt", scenario_notification_rate, True),
+     "prompt", scenario_notification_rate, CLOCK_REASON),
     ("the test clock is host-only and cannot enter the PS5 build",
-     scenario_test_clock_host_only, True),
+     scenario_test_clock_host_only, CLOCK_REASON),
     ("the virtual controller is host-only and cannot enter the PS5 build",
-     scenario_vcontroller_host_only, False),
+     scenario_vcontroller_host_only, None),
     ("a valid signature decides the approval and the gated command runs "
-     "once", scenario_signature_loop, True),
+     "once", scenario_signature_loop, CLOCK_REASON),
     ("a forged signature answers signature_invalid and runs nothing",
-     scenario_signature_forged, True),
+     scenario_signature_forged, CLOCK_REASON),
     ("a signature for a different command, target or hash answers "
-     "signature_action_mismatch", scenario_signature_wrong_action, True),
+     "signature_action_mismatch", scenario_signature_wrong_action, CLOCK_REASON),
     ("a signature for another console answers signature_console_mismatch",
-     scenario_signature_wrong_console, True),
+     scenario_signature_wrong_console, CLOCK_REASON),
     ("the signer refuses an action with bytes it cannot show",
-     scenario_signer_refuses_hidden_bytes, True),
+     scenario_signer_refuses_hidden_bytes, CLOCK_REASON),
     ("a signature after the challenge expired answers approval_expired and "
-     "exit 88", scenario_signature_expired, True),
+     "exit 88", scenario_signature_expired, CLOCK_REASON),
     ("a malformed signature answers signature_malformed and exit 83",
-     scenario_signature_malformed, True),
+     scenario_signature_malformed, CLOCK_REASON),
     ("the same signature twice is refused the second time",
-     scenario_signature_twice, True),
+     scenario_signature_twice, CLOCK_REASON),
     ("a consumed nonce is refused after Ariel restarts",
-     scenario_signature_replay_after_restart, True),
+     scenario_signature_replay_after_restart, CLOCK_REASON),
     ("the PS5 build rejects the host test key",
-     scenario_ps5_rejects_test_key, False),
+     scenario_ps5_rejects_test_key, None),
     ("the PS5 platform no longer reads the controller",
-     scenario_ps5_has_no_pad, False),
+     scenario_ps5_has_no_pad, None),
     ("one function builds the canonical action text",
-     scenario_one_canonical_function, False),
+     scenario_one_canonical_function, None),
     ("the canonical encoder refuses ambiguous inputs",
-     scenario_canonical_encoder, False),
+     scenario_canonical_encoder, None),
     ("after a push, a grant and a commit, audit tail shows each one in order",
-     scenario_audit_tail_order, False),
-    ("audit tail is read-only", scenario_audit_tail_readonly, False),
+     scenario_audit_tail_order, None),
+    ("audit tail is read-only", scenario_audit_tail_readonly, None),
     ("no agent-port command can clear or rewrite the audit log",
-     scenario_audit_log_not_rewritable, False),
+     scenario_audit_log_not_rewritable, None),
     ("a long audit line is dropped whole, never shown in pieces",
-     scenario_audit_tail_drops_long_lines, False),
+     scenario_audit_tail_drops_long_lines, None),
     ("a push the audit log cannot record is refused and stages nothing",
-     scenario_failed_audit_append_is_refused, False),
+     scenario_failed_audit_append_is_refused, None),
     ("a grant or commit the audit log cannot record answers audit_failed",
      scenario_failed_audit_append_after_the_action, False),
     ("a background run answers a pid at once, and logs of a one-shot show "
@@ -3182,14 +3405,23 @@ SCENARIOS = [
      "a bad name, and audits each refusal", scenario_background_run_refusals,
      False),
     ("console mode with PS5_HOST set names the console scenarios and every "
-     "scenario that needs the test clock", scenario_console_mode_plan, False),
+     "scenario that needs the test clock", scenario_console_mode_plan, None),
     ("console mode prints what the owner should see on the console and "
      "waits for the owner's signature",
-     scenario_console_approval_prompts, False),
+     scenario_console_approval_prompts, None),
     ("console mode runs its checks over an injected transport",
-     scenario_console_run_reaches_checks, False),
+     scenario_console_run_reaches_checks, None),
     ("console mode's quick start waits out the notification gap before its "
-     "push", scenario_console_quick_start_waits_for_the_gap, False),
+     "push", scenario_console_quick_start_waits_for_the_gap, None),    ("a crash in prepared leaves the old version in payload list after restart",
+     scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
+    ("a crash in committed leaves the new version in payload list after restart",
+     scenario_crash_in_committed_leaves_new_version, FAULT_REASON),
+    ("running recovery twice after a crash in renamed gives the same state",
+     scenario_recovery_twice_gives_the_same_state, FAULT_REASON),
+    ("the previous version is kept and listed, and the one before it is dropped",
+     scenario_previous_version_is_kept_then_dropped, None),
+    ("a payload the record marks running is not started again on restart",
+     scenario_running_mark_does_not_restart_payload, None),
 ]
 
 

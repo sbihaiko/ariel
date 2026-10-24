@@ -94,6 +94,14 @@ struct staged {
 /** The audit log: one appended line per action Ariel takes. **/
 #define AUDIT_FILE "audit.log"
 
+/**
+ * The journal: the one store change in progress, under store/. It is replaced
+ * as a whole, so a start reads either the record before a phase or after it.
+ **/
+#define JOURNAL_FILE "journal"
+#define JOURNAL_TMP "journal.tmp"
+#define JOURNAL_MARKER "ariel-journal-v1"
+
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -135,6 +143,10 @@ static void expire_locked(uint64_t now);
 static void *expiry_run(void *arg);
 static int nonces_load(void);
 static int write_all(int fd, const char *buf, size_t len);
+static int audit_append_locked(const char *kind, const char *name,
+                               const char *id, const char *sha256);
+static int transaction_recover_locked(int store_fd);
+static int recover_at_start(int state_fd);
 
 
 /** Give a staging entry back: its slot and the bytes it reserved. The
@@ -375,6 +387,12 @@ store_init(const char *dir, platform_t *p) {
   // The state file is built from Stage 1's current records, which live under
   // the store just made; a start that finds the file leaves those alone.
   if(!rc && state_open(state_dir)) {
+    rc = -1;
+  }
+
+  // A change the last run left in the journal finishes before anything else
+  // is served: it rolls back when it had not committed and forward when it had.
+  if(!rc && recover_at_start(state_fd)) {
     rc = -1;
   }
 
@@ -1176,36 +1194,316 @@ object_path(const char *hash, char *out, size_t size) {
 }
 
 
+/** One transaction's record, as the journal holds it between phases. **/
+struct journal {
+  char phase[16];
+  char name[PAYLOAD_NAME_MAX + 1];
+  char hash[SHA256_HEX_LEN + 1];
+  char previous[SHA256_HEX_LEN + 1];
+  char drop[SHA256_HEX_LEN + 1];
+};
+
+
+/** Fire the platform's fault hook at a named step, when a build has one. **/
+static void
+fault_at(const char *step) {
+  if(platform->fault) {
+    platform->fault(platform, step);
+  }
+}
+
+
+/** Whether text is one lowercase hex SHA-256 and nothing else. **/
+static int
+hash_text(const char *text) {
+  size_t i;
+
+  if(strlen(text) != SHA256_HEX_LEN) {
+    return 0;
+  }
+
+  for(i=0; i<SHA256_HEX_LEN; i++) {
+    if(!((text[i] >= '0' && text[i] <= '9') ||
+         (text[i] >= 'a' && text[i] <= 'f'))) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+
 /**
- * Replace one payload name's current record through a temporary file and
- * an atomic rename, so a reader never sees a partial record.
+ * Create name below dirfd with text, flushed to disk. A leftover of the same
+ * name is removed first. Returns 0, or -1 with nothing left behind.
  **/
 static int
-current_write(int dirfd, const char *name, const char *hash) {
-  char tmp[PAYLOAD_NAME_MAX + 32];
+tmp_write(int dirfd, const char *name, const char *text, size_t len) {
   int fd;
 
-  if(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", name, (long)getpid()) >=
-     (int)sizeof(tmp)) {
+  unlinkat(dirfd, name, 0);
+
+  if((fd=open_entry(dirfd, name, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
     return -1;
   }
 
-  if((fd=open_entry(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
+  if(write_all(fd, text, len) || fsync(fd)) {
+    close(fd);
+    unlinkat(dirfd, name, 0);
     return -1;
   }
 
-  if(write_all(fd, hash, strlen(hash)) || write_all(fd, "\n", 1) ||
-     fsync(fd) || close(fd)) {
-    unlinkat(dirfd, tmp, 0);
-    return -1;
-  }
-
-  if(renameat(dirfd, tmp, dirfd, name)) {
-    unlinkat(dirfd, tmp, 0);
+  if(close(fd)) {
+    unlinkat(dirfd, name, 0);
     return -1;
   }
 
   return 0;
+}
+
+
+/**
+ * Remove the new object and the new current record of a transaction that did
+ * not commit, and flush what that changed. Missing files are not an error.
+ * The caller holds the lock.
+ **/
+static void
+tmp_discard(int store_fd, const char *name, const char *hash) {
+  char tmp_object[SHA256_HEX_LEN + 8];
+  char tmp_current[PAYLOAD_NAME_MAX + 8];
+  int objects_fd;
+  int current_fd;
+
+  snprintf(tmp_object, sizeof(tmp_object), "%s.tmp", hash);
+  snprintf(tmp_current, sizeof(tmp_current), "%s.tmp", name);
+
+  if((objects_fd=dir_open(store_fd, "objects")) >= 0) {
+    unlinkat(objects_fd, tmp_object, 0);
+    fsync(objects_fd);
+    close(objects_fd);
+  }
+
+  if((current_fd=dir_open(store_fd, "current")) >= 0) {
+    unlinkat(current_fd, tmp_current, 0);
+    fsync(current_fd);
+    close(current_fd);
+  }
+}
+
+
+/**
+ * Replace the journal with one record: the temporary file is flushed, renamed
+ * over the journal and the store directory flushed. The caller holds the lock.
+ **/
+static int
+journal_write(int store_fd, const struct journal *j) {
+  char text[256];
+  int len;
+
+  len = snprintf(text, sizeof(text), JOURNAL_MARKER "\n%s %s %s %s %s\n",
+                 j->phase, j->name, j->hash, j->previous, j->drop);
+  if(len < 0 || len >= (int)sizeof(text)) {
+    return -1;
+  }
+
+  if(tmp_write(store_fd, JOURNAL_TMP, text, (size_t)len)) {
+    return -1;
+  }
+
+  if(renameat(store_fd, JOURNAL_TMP, store_fd, JOURNAL_FILE)) {
+    unlinkat(store_fd, JOURNAL_TMP, 0);
+    return -1;
+  }
+
+  return fsync(store_fd);
+}
+
+
+/**
+ * Read the journal. Returns 0 with the record, 1 when no change is in
+ * progress, or -1 when the journal is not a record Ariel wrote.
+ **/
+static int
+journal_read(int store_fd, struct journal *j) {
+  char text[256];
+  size_t total = 0;
+  int fd;
+
+  if((fd=open_entry(store_fd, JOURNAL_FILE, O_RDONLY)) < 0) {
+    return errno == ENOENT ? 1 : -1;
+  }
+
+  while(total < sizeof(text) - 1) {
+    ssize_t n = read(fd, text + total, sizeof(text) - 1 - total);
+
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      close(fd);
+      return -1;
+    }
+    if(n == 0) {
+      break;
+    }
+    total += (size_t)n;
+  }
+
+  close(fd);
+  text[total] = '\0';
+
+  if(sscanf(text, JOURNAL_MARKER "\n%15s %32s %64s %64s %64s", j->phase,
+            j->name, j->hash, j->previous, j->drop) != 5) {
+    return -1;
+  }
+
+  if((strcmp(j->phase, "prepared") && strcmp(j->phase, "committed")) ||
+     !store_name_valid(j->name) || !hash_text(j->hash) ||
+     (strcmp(j->previous, "-") && !hash_text(j->previous)) ||
+     (strcmp(j->drop, "-") && !hash_text(j->drop))) {
+    return -1;
+  }
+
+  return 0;
+}
+
+
+/** Remove the journal once its change is finished. The caller holds the lock. **/
+static int
+journal_clear(int store_fd) {
+  if(unlinkat(store_fd, JOURNAL_FILE, 0) && errno != ENOENT) {
+    return -1;
+  }
+
+  return fsync(store_fd);
+}
+
+
+/**
+ * Undo a change that had not committed: remove its new files, record the
+ * rollback and clear the journal. The caller holds the lock.
+ **/
+static int
+transaction_rollback_locked(int store_fd, const char *name, const char *hash) {
+  tmp_discard(store_fd, name, hash);
+
+  if(audit_append_locked("rollback", name, "-", hash)) {
+    return -1;
+  }
+
+  return journal_clear(store_fd);
+}
+
+
+/**
+ * Finish a committed change: move its new files into place, point the name's
+ * record at the new object and drop the build it displaces from the previous
+ * slot. Each step is safe to repeat, so a crash in any of them is recovered by
+ * running this again. The caller holds the lock.
+ **/
+static int
+transaction_roll_forward_locked(int store_fd, const struct journal *j) {
+  char tmp_object[SHA256_HEX_LEN + 8];
+  char tmp_current[PAYLOAD_NAME_MAX + 8];
+  int objects_fd = -1;
+  int current_fd = -1;
+  int rc = -1;
+
+  snprintf(tmp_object, sizeof(tmp_object), "%s.tmp", j->hash);
+  snprintf(tmp_current, sizeof(tmp_current), "%s.tmp", j->name);
+
+  if((objects_fd=dir_open(store_fd, "objects")) < 0 ||
+     (current_fd=dir_open(store_fd, "current")) < 0) {
+    goto out;
+  }
+
+  // A rename that already happened leaves no temporary file behind.
+  if((renameat(objects_fd, tmp_object, objects_fd, j->hash) &&
+      errno != ENOENT) ||
+     (renameat(current_fd, tmp_current, current_fd, j->name) &&
+      errno != ENOENT) ||
+     fsync(objects_fd) || fsync(current_fd)) {
+    goto out;
+  }
+
+  fault_at("renamed");
+
+  if(state_record(j->name, j->hash, j->previous)) {
+    goto out;
+  }
+
+  if(strcmp(j->drop, "-") && unlinkat(objects_fd, j->drop, 0) &&
+     errno != ENOENT) {
+    goto out;
+  }
+
+  if(fsync(objects_fd)) {
+    goto out;
+  }
+
+  rc = 0;
+
+out:
+  if(objects_fd >= 0) {
+    close(objects_fd);
+  }
+  if(current_fd >= 0) {
+    close(current_fd);
+  }
+
+  return rc;
+}
+
+
+/**
+ * Finish the change the journal names, if one is in progress: roll back a
+ * prepared change, roll forward a committed one, and audit which. Running it
+ * again after it finished finds no journal and does nothing. The caller holds
+ * the lock.
+ **/
+static int
+transaction_recover_locked(int store_fd) {
+  struct journal j;
+  int rc;
+
+  rc = journal_read(store_fd, &j);
+  if(rc == 1) {
+    return 0;
+  }
+  if(rc) {
+    return -1;
+  }
+
+  if(!strcmp(j.phase, "prepared")) {
+    return transaction_rollback_locked(store_fd, j.name, j.hash);
+  }
+
+  if(transaction_roll_forward_locked(store_fd, &j) ||
+     audit_append_locked("rollforward", j.name, "-", j.hash)) {
+    return -1;
+  }
+
+  return journal_clear(store_fd);
+}
+
+
+/**
+ * Recover at start, under the lock: the state record is loaded first, so a
+ * roll forward can record the commit in it.
+ **/
+static int
+recover_at_start(int state_fd) {
+  int store_fd;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+  if((store_fd=dir_open(state_fd, "store")) >= 0) {
+    rc = transaction_recover_locked(store_fd);
+    close(store_fd);
+  }
+  pthread_mutex_unlock(&lock);
+
+  return rc;
 }
 
 
@@ -1285,20 +1583,24 @@ staged_consume(struct staged *entry, struct approval *request) {
 
 
 /**
- * The approval is granted: hash the staging object again, put it in the
- * store under its hash, point the payload name's current record at it and
- * delete the object it replaces. The caller holds the lock.
+ * The approval is granted: hash the staging object again, then change the
+ * store through the journal. The new files are written beside the old ones and
+ * flushed, and the journal marks the change prepared. It is marked committed
+ * before anything is renamed, so a crash from then on rolls forward. The state
+ * record takes the new hash, with the build it replaces as previous. The caller
+ * holds the lock.
  **/
 static int
 staged_install(struct staged *entry, struct approval *request,
                store_install_t *install) {
-  char tmp[SHA256_HEX_LEN + 32];
+  struct journal j;
+  char tmp_object[SHA256_HEX_LEN + 8];
+  char tmp_current[PAYLOAD_NAME_MAX + 8];
+  char current_text[SHA256_HEX_LEN + 2];
   char hash[SHA256_HEX_LEN + 1];
   char old[SHA256_HEX_LEN + 1];
-  struct stat st;
+  char previous[SHA256_HEX_LEN + 1];
   uint64_t total = 0;
-  int have_old = 0;
-  int existed = 0;
   int state_fd = -1;
   int staging_fd = -1;
   int store_fd = -1;
@@ -1329,12 +1631,17 @@ staged_install(struct staged *entry, struct approval *request,
     goto out;
   }
 
-  if(snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", entry->facts.sha256,
-              (long)getpid()) >= (int)sizeof(tmp)) {
+  // A change an earlier step left in the journal finishes before this one.
+  if(transaction_recover_locked(store_fd)) {
     goto out;
   }
 
-  if((dst=open_entry(objects_fd, tmp, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
+  tmp_discard(store_fd, entry->facts.name, entry->facts.sha256);
+
+  snprintf(tmp_object, sizeof(tmp_object), "%s.tmp", entry->facts.sha256);
+  snprintf(tmp_current, sizeof(tmp_current), "%s.tmp", entry->facts.name);
+
+  if((dst=open_entry(objects_fd, tmp_object, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
     goto out;
   }
 
@@ -1360,45 +1667,74 @@ staged_install(struct staged *entry, struct approval *request,
   }
   dst = -1;
 
-  existed = fstatat(objects_fd, hash, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISREG(st.st_mode);
-
-  if(renameat(objects_fd, tmp, objects_fd, hash)) {
+  snprintf(current_text, sizeof(current_text), "%s\n", entry->facts.sha256);
+  if(tmp_write(current_fd, tmp_current, current_text, SHA256_HEX_LEN + 1)) {
     goto out_temp;
   }
 
-  if(current_read(current_fd, entry->facts.name, old) == 0) {
-    have_old = 1;
+  if(current_read(current_fd, entry->facts.name, old)) {
+    snprintf(old, sizeof(old), "-");
+  }
+  if(state_previous(entry->facts.name, previous, sizeof(previous))) {
+    goto out_temp;
   }
 
-  if(current_write(current_fd, entry->facts.name, hash)) {
-    if(!existed) {
-      unlinkat(objects_fd, hash, 0);
-    }
+  memset(&j, 0, sizeof(j));
+  snprintf(j.name, sizeof(j.name), "%s", entry->facts.name);
+  snprintf(j.hash, sizeof(j.hash), "%s", entry->facts.sha256);
+
+  // The build the record names now becomes previous, unless this commit
+  // repeats it; the build previous named before is dropped once replaced.
+  if(strcmp(old, "-") && strcmp(old, j.hash)) {
+    snprintf(j.previous, sizeof(j.previous), "%s", old);
+  } else {
+    snprintf(j.previous, sizeof(j.previous), "%s", previous);
+  }
+  if(strcmp(previous, "-") && strcmp(previous, j.previous) &&
+     strcmp(previous, j.hash)) {
+    snprintf(j.drop, sizeof(j.drop), "%s", previous);
+  } else {
+    snprintf(j.drop, sizeof(j.drop), "-");
+  }
+
+  snprintf(j.phase, sizeof(j.phase), "prepared");
+  if(journal_write(store_fd, &j)) {
+    goto out_rollback;
+  }
+  fault_at("prepared");
+
+  snprintf(j.phase, sizeof(j.phase), "committed");
+  if(journal_write(store_fd, &j)) {
+    goto out_rollback;
+  }
+  fault_at("committed");
+
+  // On failure the journal stays committed, and the next start or commit
+  // finishes the change.
+  if(transaction_roll_forward_locked(store_fd, &j)) {
     goto out;
   }
 
-  if(state_record(entry->facts.name, hash)) {
-    goto out;
-  }
-
-  // Stage 1 keeps one build per name: the object the new one replaces goes.
-  if(have_old && strcmp(old, hash) && !existed) {
-    unlinkat(objects_fd, old, 0);
-  }
+  // A journal that survives this is finished later, and finishing it again is safe.
+  journal_clear(store_fd);
 
   snprintf(install->name, sizeof(install->name), "%s", entry->facts.name);
-  snprintf(install->sha256, sizeof(install->sha256), "%s", hash);
-  object_path(hash, install->path, sizeof(install->path));
+  snprintf(install->sha256, sizeof(install->sha256), "%s", entry->facts.sha256);
+  object_path(entry->facts.sha256, install->path, sizeof(install->path));
   staged_consume(entry, request);
 
   rc = STORE_INSTALLED;
+  goto out;
+
+out_rollback:
+  transaction_rollback_locked(store_fd, entry->facts.name, entry->facts.sha256);
+  goto out;
 
 out_temp:
   if(dst >= 0) {
     close(dst);
-    unlinkat(objects_fd, tmp, 0);
   }
+  tmp_discard(store_fd, entry->facts.name, entry->facts.sha256);
 out:
   if(src >= 0) {
     close(src);
@@ -1420,7 +1756,6 @@ out:
   }
   return rc;
 }
-
 
 int
 store_commit(const char *staging_id, store_install_t *install,
@@ -1659,40 +1994,49 @@ store_list(state_payload_t *entries, size_t max, size_t *count) {
  * Append one action to the audit log. The line is flushed before it returns,
  * so a crash cannot lose an action that already happened.
  **/
-int
-store_audit_append(const char *kind, const char *name, const char *id,
-                   const char *sha256) {
+static int
+audit_append_locked(const char *kind, const char *name, const char *id,
+                    const char *sha256) {
   char line[AUDIT_LINE_MAX];
   int len;
   int fd;
   int state_fd;
+  int rc;
 
-  pthread_mutex_lock(&lock);
   len = snprintf(line, sizeof(line), "%llu %s %s %s %s\n",
                  (unsigned long long)now_ms(), kind, name, id, sha256);
   if(len < 0 || len >= (int)sizeof(line)) {
-    pthread_mutex_unlock(&lock);
     return -1;
   }
 
-  state_fd = root_open();
-  if(state_fd >= 0) {
-    fd = open_entry(state_fd, AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND);
-    close(state_fd);
-  } else {
-    fd = -1;
+  if((state_fd=root_open()) < 0) {
+    return -1;
+  }
+  fd = open_entry(state_fd, AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND);
+  close(state_fd);
+  if(fd < 0) {
+    return -1;
   }
 
-  if(fd >= 0 && !write_all(fd, line, (size_t)len) && !fsync(fd) && !close(fd)) {
-    pthread_mutex_unlock(&lock);
-    return 0;
+  rc = write_all(fd, line, (size_t)len) || fsync(fd) ? -1 : 0;
+  if(close(fd)) {
+    rc = -1;
   }
 
-  if(fd >= 0) {
-    close(fd);
-  }
+  return rc;
+}
+
+
+int
+store_audit_append(const char *kind, const char *name, const char *id,
+                   const char *sha256) {
+  int rc;
+
+  pthread_mutex_lock(&lock);
+  rc = audit_append_locked(kind, name, id, sha256);
   pthread_mutex_unlock(&lock);
-  return -1;
+
+  return rc;
 }
 
 

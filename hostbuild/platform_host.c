@@ -684,6 +684,23 @@ host_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
 }
 
 
+/**
+ * ARIEL_HOST_FAULT names the step at which this build ends itself. The
+ * process aborts there, with nothing flushed after the step, so a restart
+ * meets the store as the crash left it.
+ **/
+static void
+host_fault(platform_t *self, const char *step) {
+  const char *want = getenv("ARIEL_HOST_FAULT");
+
+  (void)self;
+
+  if(want && !strcmp(want, step)) {
+    abort();
+  }
+}
+
+
 static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
@@ -701,6 +718,7 @@ static platform_t host_platform = {
   .spawn_poll = host_spawn_poll,
   .spawn_kill = host_spawn_kill,
   .run = host_run,
+  .fault = host_fault,
 };
 
 

@@ -656,11 +656,11 @@ payload_list(int fd) {
     number_text(entries[i].asset, asset, sizeof(asset));
     snprintf(line, sizeof(line),
              "payload %s source=%s version=%s release=%s asset=%s sha256=%s "
-             "path=%s running=%s\n",
+             "path=%s running=%s previous=%s\n",
              entries[i].name, entries[i].source,
              entries[i].version[0] ? entries[i].version : "-",
              release, asset, entries[i].sha256, entries[i].path,
-             entries[i].running ? "yes" : "no");
+             entries[i].running ? "yes" : "no", entries[i].previous);
     reply(fd, line);
   }
 

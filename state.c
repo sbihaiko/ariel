@@ -31,6 +31,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ps5_at.h"
 #include "sha256.h"
 #include "state.h"
 #include "store.h"
@@ -59,6 +60,7 @@ struct state_payload {
   char sha256[SHA256_HEX_LEN + 1];
   char path[256];
   int running;
+  char previous[SHA256_HEX_LEN + 1];
 };
 
 /**
@@ -238,12 +240,12 @@ state_save_locked(void) {
     }
 
     wrote = snprintf(body + len, size - len,
-                     "payload %s %s %s %llu %llu %s %s %d\n",
+                     "payload %s %s %s %llu %llu %s %s %d %s\n",
                      entry->name, entry->source,
                      entry->version[0] ? entry->version : "-",
                      (unsigned long long)entry->release,
                      (unsigned long long)entry->asset, entry->sha256,
-                     entry->path, entry->running);
+                     entry->path, entry->running, entry->previous);
     if(wrote < 0 || len + (size_t)wrote >= size) {
       free(body);
       return -1;
@@ -302,12 +304,13 @@ parse_payload(char *line) {
   int got;
 
   memset(&parsed, 0, sizeof(parsed));
-  got = sscanf(line, "payload %32s %15s %63s %llu %llu %64s %255s %d",
+  got = sscanf(line, "payload %32s %15s %63s %llu %llu %64s %255s %d %64s",
                parsed.name, parsed.source, version, &release, &asset,
-               parsed.sha256, parsed.path, &running);
+               parsed.sha256, parsed.path, &running, parsed.previous);
 
-  if(got != 8 || !store_name_valid(parsed.name) || !hash_text(parsed.sha256) ||
-     (running != 0 && running != 1)) {
+  if(got != 9 || !store_name_valid(parsed.name) || !hash_text(parsed.sha256) ||
+     (running != 0 && running != 1) ||
+     (strcmp(parsed.previous, "-") && !hash_text(parsed.previous))) {
     return -1;
   }
 
@@ -502,6 +505,7 @@ state_migrate(void) {
     snprintf(slot->name, sizeof(slot->name), "%s", entry->d_name);
     snprintf(slot->source, sizeof(slot->source), "push");
     snprintf(slot->sha256, sizeof(slot->sha256), "%s", hash);
+    snprintf(slot->previous, sizeof(slot->previous), "-");
     object_path(hash, slot->path, sizeof(slot->path));
   }
 
@@ -554,7 +558,14 @@ state_open(const char *dir) {
     rc = state_migrate();
   }
 
+  // No run outlives the process that started it, so no payload is running
+  // when Ariel starts and none is started again here.
   if(!rc) {
+    size_t i;
+
+    for(i=0; i<STATE_PAYLOADS_MAX; i++) {
+      payloads[i].running = 0;
+    }
     loaded = 1;
   }
 
@@ -564,7 +575,7 @@ state_open(const char *dir) {
 
 
 int
-state_record(const char *name, const char *hash) {
+state_record(const char *name, const char *hash, const char *previous) {
   struct state_payload *entry;
   int rc;
 
@@ -590,6 +601,7 @@ state_record(const char *name, const char *hash) {
   }
 
   snprintf(entry->sha256, sizeof(entry->sha256), "%s", hash);
+  snprintf(entry->previous, sizeof(entry->previous), "%s", previous);
   object_path(hash, entry->path, sizeof(entry->path));
   entry->running = 0;
 
@@ -597,6 +609,25 @@ state_record(const char *name, const char *hash) {
   pthread_mutex_unlock(&lock);
 
   return rc;
+}
+
+
+int
+state_previous(const char *name, char *previous, size_t size) {
+  struct state_payload *entry;
+
+  pthread_mutex_lock(&lock);
+
+  if(!loaded) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
+  entry = payload_find(name);
+  snprintf(previous, size, "%s", entry ? entry->previous : "-");
+
+  pthread_mutex_unlock(&lock);
+  return 0;
 }
 
 
@@ -629,6 +660,8 @@ state_list(state_payload_t *entries, size_t max, size_t *count) {
     snprintf(entries[n].sha256, sizeof(entries[n].sha256), "%s", entry->sha256);
     snprintf(entries[n].path, sizeof(entries[n].path), "%s", entry->path);
     entries[n].running = entry->running;
+    snprintf(entries[n].previous, sizeof(entries[n].previous), "%s",
+             entry->previous);
     n++;
   }
 

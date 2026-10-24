@@ -172,6 +172,13 @@ struct platform {
    **/
   int (*run)(platform_t *self, int argc, char *const argv[], int outfd,
              int errfd, int *status);
+
+  /**
+   * Called at each named step of a store change, so a host build can end
+   * Ariel there and a test can see what a restart recovers. NULL on the
+   * console, where no fault is injected.
+   **/
+  void (*fault)(platform_t *self, const char *step);
 };
 
 /**

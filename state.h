@@ -28,7 +28,8 @@ along with this program; see the file COPYING. If not, see
 /**
  * One installed payload, as the state file records it. A push has no release,
  * so release and asset are 0 and version is empty; running is 1 only while a
- * background run of it is alive, which Stage 2's later slices add.
+ * background run of it is alive, which Stage 2's later slices add. previous is
+ * the hash of the build the last commit replaced, or "-" when there is none.
  **/
 typedef struct {
   char name[PAYLOAD_NAME_MAX + 1];
@@ -39,6 +40,7 @@ typedef struct {
   char sha256[65];
   char path[256];
   int running;
+  char previous[65];
 } state_payload_t;
 
 /**
@@ -48,8 +50,18 @@ typedef struct {
  **/
 int state_open(const char *dir);
 
-/** Record the hash a commit installed under name. Returns 0, or -1. **/
-int state_record(const char *name, const char *hash);
+/**
+ * Record that name now points at hash and that previous is the build it
+ * replaced, or "-". Recording the same values again changes nothing, so a
+ * recovery that repeats a commit is harmless. Returns 0, or -1.
+ **/
+int state_record(const char *name, const char *hash, const char *previous);
+
+/**
+ * Copy the previous hash of name into previous, or "-" when name has none.
+ * Returns 0, or -1 before state_open has loaded the record.
+ **/
+int state_previous(const char *name, char *previous, size_t size);
 
 /**
  * Copy the installed payloads into entries, at most max of them, and set
