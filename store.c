@@ -1575,6 +1575,7 @@ store_run_load(const char *name, store_object_t *object) {
     goto out;
   }
 
+  snprintf(object->sha256, sizeof(object->sha256), "%s", computed);
   rc = STORE_RUN_OK;
 
 out:
@@ -1604,6 +1605,47 @@ store_object_free(store_object_t *object) {
   free(object->bytes);
   object->bytes = NULL;
   object->size = 0;
+}
+
+
+/** The file in the logs directory that holds one payload's output. **/
+#define LOGS_DIR "logs"
+
+int
+store_log_open(const char *name, int create) {
+  char file[PAYLOAD_NAME_MAX + 8];
+  int state_fd;
+  int logs_fd = -1;
+  int fd = -1;
+
+  if(snprintf(file, sizeof(file), "%s.log", name) >= (int)sizeof(file)) {
+    return -1;
+  }
+
+  if((state_fd=root_open()) < 0) {
+    return -1;
+  }
+
+  if(create && dir_make(state_fd, LOGS_DIR)) {
+    goto out;
+  }
+
+  if((logs_fd=dir_open(state_fd, LOGS_DIR)) < 0) {
+    goto out;
+  }
+
+  if(create) {
+    fd = open_entry(logs_fd, file, O_WRONLY | O_CREAT | O_TRUNC);
+  } else {
+    fd = open_entry(logs_fd, file, O_RDONLY);
+  }
+
+out:
+  if(logs_fd >= 0) {
+    close(logs_fd);
+  }
+  close(state_fd);
+  return fd;
 }
 
 

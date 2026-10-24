@@ -58,6 +58,7 @@ typedef struct {
 typedef struct {
   unsigned char *bytes;
   size_t size;
+  char sha256[65];
 } store_object_t;
 
 /** Whether name follows the payload-name grammar. Returns 1 when it does. **/
@@ -179,6 +180,14 @@ int store_run_load(const char *name, store_object_t *object);
 
 /** Free the bytes of an object store_run_load returned. **/
 void store_object_free(store_object_t *object);
+
+/**
+ * Open the log of one payload name, relative to Ariel's directory without
+ * following symbolic links. With create set the log is made, or emptied
+ * when it exists; otherwise it is opened to read. Returns the descriptor, or
+ * -1 when it cannot be opened. The name must follow the payload-name grammar.
+ **/
+int store_log_open(const char *name, int create);
 
 /** One audit line is at most this long; a tail shows at most AUDIT_TAIL_MAX. **/
 #define AUDIT_LINE_MAX 256

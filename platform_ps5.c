@@ -30,6 +30,7 @@ along with this program; see the file COPYING. If not, see
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -225,23 +226,47 @@ platform_ps5_loader_unlock(void) {
 
 
 static int
-ps5_spawn(platform_t *self, const unsigned char *bytes, size_t size,
-          char *const argv[], int outfd, int *status) {
-  int wait_status;
-  int rc = -1;
-  pid_t pid;
-
+ps5_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
+                char *const argv[], int outfd, pid_t *pid) {
   (void)self;
   (void)size;
 
   // The loader only reads the bytes; the store holds the verified object
   // in memory, so nothing is loaded from a path.
   platform_ps5_loader_lock();
-  pid = elfldr_spawn(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv);
+  *pid = elfldr_spawn(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv);
   platform_ps5_loader_unlock();
 
-  if(pid < 0) {
+  if(*pid < 0) {
     klog_printf("elfldr_spawn failed\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+
+static int
+ps5_status(int wait_status, int *status) {
+  if(WIFEXITED(wait_status)) {
+    *status = WEXITSTATUS(wait_status);
+    return 0;
+  }
+  if(WIFSIGNALED(wait_status)) {
+    *status = 128 + WTERMSIG(wait_status);
+    return 0;
+  }
+  return -1;
+}
+
+
+static int
+ps5_spawn(platform_t *self, const unsigned char *bytes, size_t size,
+          char *const argv[], int outfd, int *status) {
+  int wait_status;
+  pid_t pid;
+
+  if(ps5_spawn_start(self, bytes, size, argv, outfd, &pid)) {
     return -1;
   }
 
@@ -254,15 +279,38 @@ ps5_spawn(platform_t *self, const unsigned char *bytes, size_t size,
     }
   }
 
-  if(WIFEXITED(wait_status)) {
-    *status = WEXITSTATUS(wait_status);
-    rc = 0;
-  } else if(WIFSIGNALED(wait_status)) {
-    *status = 128 + WTERMSIG(wait_status);
-    rc = 0;
+  return ps5_status(wait_status, status);
+}
+
+
+static int
+ps5_spawn_poll(platform_t *self, pid_t pid, int *status) {
+  int wait_status;
+  pid_t got;
+
+  (void)self;
+
+  do {
+    got = waitpid(pid, &wait_status, WNOHANG);
+  } while(got < 0 && errno == EINTR);
+
+  if(got < 0) {
+    klog_perror("waitpid");
+    return -1;
+  }
+  if(got == 0) {
+    return 0;
   }
 
-  return rc;
+  return ps5_status(wait_status, status) ? -1 : 1;
+}
+
+
+static int
+ps5_spawn_kill(platform_t *self, pid_t pid) {
+  (void)self;
+
+  return kill(pid, SIGKILL);
 }
 
 
@@ -290,6 +338,9 @@ static platform_t ps5_platform = {
   .approval_request = ps5_approval_request,
   .approval_grant = ps5_approval_grant,
   .spawn = ps5_spawn,
+  .spawn_start = ps5_spawn_start,
+  .spawn_poll = ps5_spawn_poll,
+  .spawn_kill = ps5_spawn_kill,
   .run = ps5_run,
 };
 

@@ -19,6 +19,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include "approval.h"
@@ -142,6 +143,24 @@ struct platform {
    **/
   int (*spawn)(platform_t *self, const unsigned char *bytes, size_t size,
                char *const argv[], int outfd, int *status);
+
+  /**
+   * Start a payload from its verified bytes as spawn does, but return at
+   * once: pid is the started payload, and its output goes to outfd. Returns
+   * 0 when it started, -1 on a platform error.
+   **/
+  int (*spawn_start)(platform_t *self, const unsigned char *bytes, size_t size,
+                     char *const argv[], int outfd, pid_t *pid);
+
+  /**
+   * Check on a payload that spawn_start started, without blocking. Returns 1
+   * with its exit status in status once it has exited, 0 while it runs, and
+   * -1 on a platform error. An exited payload is reaped by this call.
+   **/
+  int (*spawn_poll)(platform_t *self, pid_t pid, int *status);
+
+  /** Stop a payload that spawn_start started, at once. Returns 0, or -1. **/
+  int (*spawn_kill)(platform_t *self, pid_t pid);
 
   /**
    * Run one noninteractive shell command: argv[0] is the command and

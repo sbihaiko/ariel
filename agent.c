@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "agent.h"
 #include "approval.h"
+#include "runs.h"
 #include "sha256.h"
 #include "store.h"
 #include "token.h"
@@ -106,6 +107,22 @@ static const char spawn_failed[] =
   "exit 1\n";
 static const char audit_failed[] =
   "audit_failed\n"
+  "exit 1\n";
+
+static const char already_running[] =
+  "already_running\n"
+  "exit 1\n";
+
+static const char too_many_runs[] =
+  "too_many_runs\n"
+  "exit 1\n";
+
+static const char no_log[] =
+  "no_log\n"
+  "exit 1\n";
+
+static const char log_failed[] =
+  "log_failed\n"
   "exit 1\n";
 
 static int
@@ -634,6 +651,7 @@ payload_list(int fd) {
   }
 
   for(i=0; i<count; i++) {
+    entries[i].running = runs_running(entries[i].name);
     number_text(entries[i].release, release, sizeof(release));
     number_text(entries[i].asset, asset, sizeof(asset));
     snprintf(line, sizeof(line),
@@ -799,6 +817,153 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
 }
 
 
+/** A refused background command is audited, then answers its word. **/
+static void
+refuse(int fd, const char *name, const char *word, const char *answer) {
+  if(store_audit_append("refuse", name, word, "-")) {
+    reply(fd, audit_failed);
+    return;
+  }
+  reply(fd, answer);
+}
+
+
+/** 1 when name is an installed payload, 0 when not, -1 when unreadable. **/
+static int
+payload_installed(const char *name) {
+  state_payload_t *entries;
+  size_t count = 0;
+  size_t i;
+  int found = 0;
+
+  entries = calloc(STATE_PAYLOADS_MAX, sizeof(*entries));
+  if(!entries || store_list(entries, STATE_PAYLOADS_MAX, &count)) {
+    free(entries);
+    return -1;
+  }
+
+  for(i=0; i<count; i++) {
+    if(!strcmp(entries[i].name, name)) {
+      found = 1;
+    }
+  }
+
+  free(entries);
+  return found;
+}
+
+
+/**
+ * payload run <name>: start the committed build in the background. Its PID
+ * comes back at once; its output goes to the payload's log.
+ **/
+static void
+payload_start(agent_t *agent, int fd, const char *name) {
+  store_object_t object;
+  char answer[64];
+  pid_t pid = 0;
+  int outcome;
+  int started;
+  int len;
+
+  if(!store_name_valid(name)) {
+    reply(fd, bad_name);
+    return;
+  }
+
+  outcome = store_run_load(name, &object);
+
+  if(outcome == STORE_RUN_UNKNOWN) {
+    refuse(fd, name, "unknown_payload", unknown_payload);
+    return;
+  }
+
+  if(outcome != STORE_RUN_OK) {
+    refuse(fd, name, "approval_stale", approval_stale);
+    return;
+  }
+
+  started = runs_start(agent->platform, name, object.sha256, object.bytes,
+                       object.size, &pid);
+  store_object_free(&object);
+
+  switch(started) {
+  case RUNS_STARTED:
+    len = snprintf(answer, sizeof(answer), "pid %ld\nexit 0\n", (long)pid);
+    write_all(fd, answer, (size_t)len);
+    return;
+  case RUNS_ALREADY:
+    refuse(fd, name, "already_running", already_running);
+    return;
+  case RUNS_FULL:
+    refuse(fd, name, "too_many_runs", too_many_runs);
+    return;
+  case RUNS_AUDIT:
+    reply(fd, audit_failed);
+    return;
+  default:
+    refuse(fd, name, "spawn_failed", spawn_failed);
+    return;
+  }
+}
+
+
+/**
+ * payload logs <name>: the payload's output. A background run still going is
+ * waited for; its reaper cuts it at the timeout, so the wait is bounded.
+ **/
+static void
+payload_logs(int fd, const char *name) {
+  struct timespec pause = {0, 20 * 1000 * 1000};
+  char buf[4096];
+  ssize_t n;
+  int installed;
+  int logfd;
+
+  if(!store_name_valid(name)) {
+    reply(fd, bad_name);
+    return;
+  }
+
+  installed = payload_installed(name);
+  if(installed < 0) {
+    reply(fd, list_failed);
+    return;
+  }
+  if(!installed) {
+    refuse(fd, name, "unknown_payload", unknown_payload);
+    return;
+  }
+
+  while(runs_running(name)) {
+    (void)nanosleep(&pause, NULL);
+  }
+
+  if((logfd=store_log_open(name, 0)) < 0) {
+    refuse(fd, name, "no_log", no_log);
+    return;
+  }
+
+  for(;;) {
+    n = read(logfd, buf, sizeof(buf));
+    if(n < 0 && errno == EINTR) {
+      continue;
+    }
+    if(n < 0) {
+      close(logfd);
+      reply(fd, log_failed);
+      return;
+    }
+    if(n == 0 || write_all(fd, buf, (size_t)n)) {
+      break;
+    }
+  }
+
+  close(logfd);
+  reply(fd, "exit 0\n");
+}
+
+
 /** One command, one connection: output and diagnostics both go to fd. **/
 static int
 run_command(agent_t *agent, int fd, int argc, char *argv[]) {
@@ -901,6 +1066,18 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
      !strcmp(argv[2], "--wait")) {
     argv[argc] = NULL;
     payload_run(agent, fd, argv[3], &argv[3]);
+    return;
+  }
+
+  // payload run <name> and payload logs <name>: the Stage 2 background pair.
+  if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "run") &&
+     strcmp(argv[2], "--wait")) {
+    payload_start(agent, fd, argv[2]);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "logs")) {
+    payload_logs(fd, argv[2]);
     return;
   }
 

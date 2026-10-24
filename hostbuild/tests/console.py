@@ -492,6 +492,18 @@ def check_inspection_commands(session, context):
         "a sysctl write must be refused, got %r" % lines)
 
 
+def check_background_refusals(session, context):
+    del context
+    for command, expected in (
+        ("payload run bgnosuch", ["unknown_payload", "exit 1"]),
+        ("payload logs bgnosuch", ["unknown_payload", "exit 1"]),
+        ("payload run ../escape", ["bad_name", "exit 1"]),
+    ):
+        lines = session.link.exchange(command)
+        assert lines == expected, (
+            "%r must answer %r, got %r" % (command, expected, lines))
+
+
 # Every check console mode runs. Each is a scenario that needs no test clock.
 CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
@@ -520,6 +532,8 @@ CHECKS = [
      check_read_only_on_console),
     ("the token, approval state and nonces answer protected and exit 87 when "
      "read directly on the console", check_secrets_read_directly),
+    ("a background run or logs of an unknown payload, and a run of a bad "
+     "name, answer their word and exit 1", check_background_refusals),
     ("the quick start's 'After Stage 1' section passes against the console",
      check_quick_start),
     ("the inspection commands run with no approval and answer their output",

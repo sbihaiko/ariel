@@ -374,42 +374,73 @@ child_fail(int errfd, int err) {
 }
 
 
-/**
- * The host has no exec from memory, so the verified bytes go to a fresh
- * file inside a directory only Ariel can read, run from there and the
- * file and directory go away after the payload exits.
- **/
-static int
-host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
-           char *const argv[], int outfd, int *status) {
+/** The file a run executes from, and the directory it lives in. **/
+struct host_file {
   char dir[PATH_MAX];
   char path[PATH_MAX];
+};
+
+/**
+ * Background payloads keep their file until they exit, so at most this many
+ * can be running at once.
+ **/
+#define HOST_STARTED_MAX 16
+
+struct host_started {
+  int used;
+  pid_t pid;
+  struct host_file file;
+};
+
+static pthread_mutex_t started_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct host_started started[HOST_STARTED_MAX];
+
+
+static void
+host_file_remove(const struct host_file *file) {
+  if(file->path[0]) {
+    unlink(file->path);
+  }
+  if(file->dir[0]) {
+    rmdir(file->dir);
+  }
+}
+
+
+/**
+ * The host has no exec from memory, so the verified bytes go to a fresh
+ * file inside a directory only Ariel can read. The file stays until the
+ * caller removes it; the spawn lock covers only the fork and exec window.
+ **/
+static int
+host_start(const unsigned char *bytes, size_t size, char *const argv[],
+           int outfd, struct host_file *file, pid_t *child) {
   int errpipe[2] = {-1, -1};
-  int wait_status;
   int exec_failed = 0;
-  int have_dir = 0;
   int filefd = -1;
   int nullfd = -1;
   int rc = -1;
   pid_t pid;
 
-  (void)self;
-
   pthread_mutex_lock(&spawn_lock);
 
-  path[0] = '\0';
+  file->dir[0] = '\0';
+  file->path[0] = '\0';
 
-  if(snprintf(dir, sizeof(dir), "%s/payload-XXXXXX", run_dir) >=
-     (int)sizeof(dir) || !mkdtemp(dir)) {
-    goto out;
-  }
-  have_dir = 1;
-
-  if(snprintf(path, sizeof(path), "%s/payload", dir) >= (int)sizeof(path)) {
+  if(snprintf(file->dir, sizeof(file->dir), "%s/payload-XXXXXX", run_dir) >=
+     (int)sizeof(file->dir) || !mkdtemp(file->dir)) {
+    file->dir[0] = '\0';
     goto out;
   }
 
-  if((filefd=open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700)) < 0) {
+  if(snprintf(file->path, sizeof(file->path), "%s/payload", file->dir) >=
+     (int)sizeof(file->path)) {
+    file->path[0] = '\0';
+    goto out;
+  }
+
+  if((filefd=open(file->path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                  0700)) < 0) {
     goto out;
   }
 
@@ -467,7 +498,7 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
     // payload runs.
     close_extra_fds(errpipe[1]);
 
-    execv(path, argv);
+    execv(file->path, argv);
     child_fail(errpipe[1], errno);
   }
 
@@ -488,23 +519,13 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
     exec_failed = n > 0;
   }
 
-  while(waitpid(pid, &wait_status, 0) < 0) {
-    if(errno != EINTR) {
-      goto out;
-    }
-  }
-
   if(exec_failed) {
+    (void)waitpid(pid, NULL, 0);
     goto out;
   }
 
-  if(WIFEXITED(wait_status)) {
-    *status = WEXITSTATUS(wait_status);
-    rc = 0;
-  } else if(WIFSIGNALED(wait_status)) {
-    *status = 128 + WTERMSIG(wait_status);
-    rc = 0;
-  }
+  *child = pid;
+  rc = 0;
 
 out:
   if(errpipe[0] >= 0) {
@@ -516,11 +537,8 @@ out:
   if(filefd >= 0) {
     close(filefd);
   }
-  if(path[0]) {
-    unlink(path);
-  }
-  if(have_dir) {
-    rmdir(dir);
+  if(rc) {
+    host_file_remove(file);
   }
   if(nullfd >= 0) {
     close(nullfd);
@@ -528,6 +546,132 @@ out:
 
   pthread_mutex_unlock(&spawn_lock);
   return rc;
+}
+
+
+static int
+host_status(int wait_status, int *status) {
+  if(WIFEXITED(wait_status)) {
+    *status = WEXITSTATUS(wait_status);
+    return 0;
+  }
+  if(WIFSIGNALED(wait_status)) {
+    *status = 128 + WTERMSIG(wait_status);
+    return 0;
+  }
+  return -1;
+}
+
+
+static int
+host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
+           char *const argv[], int outfd, int *status) {
+  struct host_file file;
+  int wait_status;
+  pid_t pid;
+
+  (void)self;
+
+  if(host_start(bytes, size, argv, outfd, &file, &pid)) {
+    return -1;
+  }
+
+  while(waitpid(pid, &wait_status, 0) < 0) {
+    if(errno != EINTR) {
+      host_file_remove(&file);
+      return -1;
+    }
+  }
+  host_file_remove(&file);
+
+  return host_status(wait_status, status);
+}
+
+
+static int
+host_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
+                 char *const argv[], int outfd, pid_t *pid) {
+  struct host_started *slot = NULL;
+  size_t i;
+  int rc;
+
+  (void)self;
+
+  pthread_mutex_lock(&started_lock);
+  for(i=0; i<HOST_STARTED_MAX && !slot; i++) {
+    if(!started[i].used) {
+      slot = &started[i];
+    }
+  }
+  if(slot) {
+    slot->used = 1;
+    slot->pid = 0;
+  }
+  pthread_mutex_unlock(&started_lock);
+
+  if(!slot) {
+    return -1;
+  }
+
+  rc = host_start(bytes, size, argv, outfd, &slot->file, pid);
+
+  pthread_mutex_lock(&started_lock);
+  if(rc) {
+    slot->used = 0;
+  } else {
+    slot->pid = *pid;
+  }
+  pthread_mutex_unlock(&started_lock);
+
+  return rc;
+}
+
+
+static void
+host_forget(pid_t pid) {
+  size_t i;
+
+  pthread_mutex_lock(&started_lock);
+  for(i=0; i<HOST_STARTED_MAX; i++) {
+    if(started[i].used && started[i].pid == pid) {
+      host_file_remove(&started[i].file);
+      started[i].used = 0;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&started_lock);
+}
+
+
+static int
+host_spawn_poll(platform_t *self, pid_t pid, int *status) {
+  int wait_status;
+  pid_t got;
+
+  (void)self;
+
+  do {
+    got = waitpid(pid, &wait_status, WNOHANG);
+  } while(got < 0 && errno == EINTR);
+
+  if(got < 0) {
+    host_forget(pid);
+    return -1;
+  }
+  if(got == 0) {
+    return 0;
+  }
+
+  host_forget(pid);
+  return host_status(wait_status, status) ? -1 : 1;
+}
+
+
+static int
+host_spawn_kill(platform_t *self, pid_t pid) {
+  (void)self;
+
+  return kill(pid, SIGKILL);
 }
 
 
@@ -553,6 +697,9 @@ static platform_t host_platform = {
   .approval_request = host_approval_request,
   .approval_grant = host_approval_grant,
   .spawn = host_spawn,
+  .spawn_start = host_spawn_start,
+  .spawn_poll = host_spawn_poll,
+  .spawn_kill = host_spawn_kill,
   .run = host_run,
 };
 

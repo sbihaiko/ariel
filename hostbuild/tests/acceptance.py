@@ -636,6 +636,148 @@ def scenario_run_exec_failure(server):
     )
 
 
+HANG_SOURCE = """
+#include <unistd.h>
+
+int
+main(void) {
+  for(;;) {
+    (void)pause();
+  }
+}
+"""
+
+SLEEP_SOURCE = """
+#include <stdio.h>
+#include <time.h>
+
+int
+main(void) {
+  struct timespec pause = {1, 0};
+  (void)nanosleep(&pause, NULL);
+  printf("slept\\n");
+  return 0;
+}
+"""
+
+# The one-shot timeout a background run gets: payload config, which would set
+# it per payload, is Stage 2 (#2). Until then every background run has this.
+RUN_TIMEOUT_MS = 30_000
+
+
+def background_run(server, name):
+    """Send one payload run without --wait and return the lines answered."""
+    return send_command(server, "payload run %s" % name)
+
+
+def payload_logs(server, name):
+    """Send one payload logs and return the lines answered."""
+    return send_command(server, "payload logs %s" % name)
+
+
+def audit_events(server):
+    """The audit tail as (kind, name, id, sha256) tuples, oldest first."""
+    return [
+        tuple(line.split()[1:5])
+        for line in audit_tail(server)
+        if line != "exit 0"
+    ]
+
+
+def running_flag(server, name):
+    """The running= field of one payload's list line."""
+    line = listed(payload_list(server), name)
+    assert line is not None, "payload list must name %s" % name
+    return line.rsplit("running=", 1)[1]
+
+
+def scenario_background_run_returns_pid(server):
+    data = compile_payload(EXIT_SOURCE.replace("EXIT_CODE", "0"), "bgpid")
+    digest = install_payload(server, "bgpid", data)
+    lines = background_run(server, "bgpid")
+    assert len(lines) == 2 and lines[1] == "exit 0" and re.fullmatch(
+        r"pid [1-9][0-9]*", lines[0]), (
+        "a background run must answer 'pid <n>' and 'exit 0' at once, "
+        "got %r" % lines)
+    pid = lines[0].split()[1]
+    assert payload_logs(server, "bgpid") == ["exiting 0", "exit 0"], (
+        "logs must hold what the payload printed, then its exit line")
+    runs = [event for event in audit_events(server)
+            if event[1] == "bgpid" and event[0] in ("run", "exit")]
+    assert runs == [
+        ("run", "bgpid", pid, digest),
+        ("exit", "bgpid", "0", digest)], (
+        "the run and its exit must be audited in order, got %r" % runs)
+
+
+def scenario_background_logs_one_shot(server):
+    data = compile_payload(HELLO_SOURCE, "bghello")
+    install_payload(server, "bghello", data)
+    assert background_run(server, "bghello")[-1] == "exit 0"
+    lines = payload_logs(server, "bghello")
+    assert lines == ["Hello, world from Ariel!", "exit 0"], (
+        "logs of a one-shot must show its full output once it has exited, "
+        "got %r" % lines)
+
+
+def scenario_background_hung_payload_is_cut(server):
+    data = compile_payload(HANG_SOURCE, "bghang")
+    digest = install_payload(server, "bghang", data)
+    lines = background_run(server, "bghang")
+    assert lines[-1] == "exit 0" and lines[0].startswith("pid "), (
+        "a background run must answer a pid, got %r" % lines)
+    pid = lines[0].split()[1]
+    assert running_flag(server, "bghang") == "yes", (
+        "payload list must show a background payload as running")
+
+    server.advance(RUN_TIMEOUT_MS - 1000)
+    assert running_flag(server, "bghang") == "yes", (
+        "a payload must not be cut before its timeout")
+
+    server.advance(1000)
+    deadline = time.monotonic() + 5.0
+    while running_flag(server, "bghang") != "no":
+        assert time.monotonic() < deadline, (
+            "a hung payload must be cut once its timeout has passed")
+        time.sleep(0.02)
+
+    assert payload_logs(server, "bghang") == ["exit 0"], (
+        "logs of a cut payload answer once it is gone, with no output")
+    cuts = [event for event in audit_events(server) if event[1] == "bghang"]
+    assert ("cut", "bghang", pid, digest) in cuts, (
+        "the cut must be audited, got %r" % cuts)
+
+
+def scenario_background_run_refusals(server):
+    assert send_command(server, "payload run bgnosuch") == [
+        "unknown_payload", "exit 1"]
+    assert send_command(server, "payload logs bgnosuch") == [
+        "unknown_payload", "exit 1"]
+    assert send_command(server, "payload run ../escape") == [
+        "bad_name", "exit 1"]
+    assert send_command(server, "payload logs ../escape") == [
+        "bad_name", "exit 1"]
+
+    data = compile_payload(EXIT_SOURCE.replace("EXIT_CODE", "0"), "bgnever")
+    install_payload(server, "bgnever", data)
+    assert payload_logs(server, "bgnever") == ["no_log", "exit 1"], (
+        "logs of a payload that never ran must answer no_log")
+
+    data = compile_payload(SLEEP_SOURCE, "bgsleep")
+    install_payload(server, "bgsleep", data)
+    assert background_run(server, "bgsleep")[-1] == "exit 0"
+    assert background_run(server, "bgsleep") == [
+        "already_running", "exit 1"], (
+        "a second background run of a running payload must be refused")
+    events = audit_events(server)
+    assert ("refuse", "bgnosuch", "unknown_payload", "-") in events, (
+        "a refused run must be audited, got %r" % events)
+    assert ("refuse", "bgsleep", "already_running", "-") in events, (
+        "a refused run of a running payload must be audited, got %r" % events)
+    assert payload_logs(server, "bgsleep") == ["slept", "exit 0"], (
+        "logs must wait for the running payload to exit")
+
+
 def doc_path(name="quick-start.md"):
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, "..", "..", "docs", name)
@@ -873,6 +1015,8 @@ PLAN_SKIP = re.compile(r"^skip (\S.*) \((needs the test clock|%s)\)$"
 CLOCK_SCENARIOS = {
     "missing auth after 5 s of test clock closes with exit 70",
     "a stalled upload does not block another connection",
+    "a hung background payload is listed as running, then cut at its "
+    "timeout and listed as not running",
     "an approval expires after 120 s of test clock and answers exit 88",
     "an expired approval does not count among the pending ones",
     "an unanswered staging object disappears after 15 min",
@@ -1711,8 +1855,9 @@ def scenario_wrong_token(server):
 
 
 def scenario_unknown_command(server):
+    # payload run <name> is a Stage 2 command from #26 on, so it is not a probe.
     for command in (
-        "payload run helloworld",
+        "payload stop helloworld",
         "payload status",
         "nonsense",
     ):
@@ -3026,6 +3171,16 @@ SCENARIOS = [
      scenario_failed_audit_append_is_refused, False),
     ("a grant or commit the audit log cannot record answers audit_failed",
      scenario_failed_audit_append_after_the_action, False),
+    ("a background run answers a pid at once, and logs of a one-shot show "
+     "its output after it exits", scenario_background_run_returns_pid, False),
+    ("logs of a one-shot payload started in the background show its full "
+     "output", scenario_background_logs_one_shot, False),
+    ("a hung background payload is listed as running, then cut at its "
+     "timeout and listed as not running",
+     scenario_background_hung_payload_is_cut, True),
+    ("a background run refuses an unknown, never-run or running payload and "
+     "a bad name, and audits each refusal", scenario_background_run_refusals,
+     False),
     ("console mode with PS5_HOST set names the console scenarios and every "
      "scenario that needs the test clock", scenario_console_mode_plan, False),
     ("console mode prints what the owner should see on the console and "

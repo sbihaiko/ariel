@@ -12,7 +12,8 @@ CANONICAL_TEST := canonical_test
 # The platform port, the agent protocol, the store and the token are shared
 # with the PS5 build, so they live at the repository root.
 SHARED_SRCS := ../agent.c ../agent_server.c ../store.c ../state.c \
-               ../token.c ../approval.c ../runner.c ../protected.c
+               ../token.c ../approval.c ../runner.c ../protected.c \
+               ../runs.c
 SHARED_OBJS := $(notdir $(SHARED_SRCS:.c=.o))
 
 SRCS := main.c platform_host.c readers_host.c vcontroller.c testclock.c

@@ -4,6 +4,8 @@ The registry of every `exit <n>` value the agent port answers. A number is assig
 
 `payload run --wait` reports the payload's own status on a `status <n>` line, then `exit 0`. A payload's status never appears on the `exit` line.
 
+`payload run <name>` without `--wait` answers `pid <n>` then `exit 0` at once and runs the payload in the background, cut at its timeout. `payload logs <name>` shows what the payload printed, then `exit 0`; for a payload still running it waits until the payload exits. `payload list` marks a background payload that is still going as running.
+
 A shell command (`pwd`, `cd`, a read-only command that takes a path: `ls`, `stat`, `file`, `cat`, `grep`, `find`, `cmp`, `hexdump`, `df`, `sha256sum`, or an inspection command: `echo`, `help`, `id`, `sync`, `sleep`, `sum`, `sfoinfo`, `ps`, `procstat`, `sysctl`, `authid`) writes its output and its error word to the connection and ends with `exit <n>`, where `n` is the command's own status: 0 for success, 1 for an error such as `relative_path` or `no_working_directory`. `grep` and `cmp` also exit 1 when nothing matches or the files differ. A connection has no working directory, so every path is absolute and `cd` always fails.
 
 The inspection commands add these error words, all with exit 1: `missing_operand` (an operand is required), `bad_duration` (`sleep` takes whole seconds from 0 to 60), `not_a_pid` (`procstat` takes a decimal pid), `no_such_process` (no process has that pid), and `not_sfo` (the file is not a PARAM.SFO). On the host build, `authid` answers `not available on this platform`, because it reads the console's kernel credentials. A `sysctl` write (`sysctl name=value`) is not a command of the agent port and answers `unknown_command`.
@@ -13,7 +15,7 @@ The inspection commands add these error words, all with exit 1: `missing_operand
 | Exit | Word | Meaning | What the agent does |
 |---|---|---|---|
 | 0 | | Success | |
-| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, others | Any other error | Read the word; do not retry as is |
+| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, others | Any other error | Read the word; do not retry as is |
 | 70 | | Missing or wrong token; the connection is closed | Fix the token |
 | 75 | `approval_required` | The action waits for the owner's signature; the reply carries the challenge | Have the owner sign, send `approval grant`, then repeat the command |
 | 76 | `approval_busy` | Too many pending approvals, or a notification shown less than 10 s ago | Wait and push again |
