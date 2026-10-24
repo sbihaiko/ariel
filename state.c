@@ -78,6 +78,9 @@ static struct state_payload payloads[STATE_PAYLOADS_MAX];
 static int loaded;
 static char state_dir[PATH_MAX];
 
+/** The key generation on record; without a generation line it is 0. **/
+static uint32_t key_generation;
+
 /** Open an entry below dirfd, without following a symbolic link. **/
 static int
 open_entry(int dirfd, const char *name, int flags) {
@@ -235,6 +238,10 @@ state_save_locked(void) {
   }
 
   len += (size_t)snprintf(body + len, size - len, "%s\n", STATE_MARKER);
+  if(key_generation) {
+    len += (size_t)snprintf(body + len, size - len, "generation %lu\n",
+                            (unsigned long)key_generation);
+  }
 
   for(i=0; i<STATE_PAYLOADS_MAX; i++) {
     struct state_payload *entry = &payloads[i];
@@ -355,6 +362,28 @@ parse_payload(char *line, int v1) {
 
 
 /**
+ * Read the generation line's number. Each file holds one, and it is above 0,
+ * since zero is never written. Returns 0, or -1 when it is not such a number.
+ **/
+static int
+parse_generation(const char *text) {
+  unsigned long value;
+  char *end;
+
+  if(key_generation || *text < '1' || *text > '9') {
+    return -1;
+  }
+  errno = 0;
+  value = strtoul(text, &end, 10);
+  if(errno || *end || value > UINT32_MAX) {
+    return -1;
+  }
+  key_generation = (uint32_t)value;
+  return 0;
+}
+
+
+/**
  * Read one whole file, at most limit bytes, into a fresh buffer. A file that
  * is not a regular file, or that is larger, is refused. Returns the buffer
  * and its length, or NULL. The chunk is on the heap: this runs at start and
@@ -460,6 +489,11 @@ state_read(void) {
         return -1;
       }
       seen = 1;
+    } else if(!strncmp(line, "generation ", 11)) {
+      if(parse_generation(line + 11)) {
+        free(text);
+        return -1;
+      }
     } else if(*line && parse_payload(line, v1)) {
       free(text);
       return -1;
@@ -564,6 +598,7 @@ state_open(const char *dir) {
 
   snprintf(state_dir, sizeof(state_dir), "%s", dir);
   memset(payloads, 0, sizeof(payloads));
+  key_generation = 0;
   loaded = 0;
 
   if((dirfd=open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
@@ -593,6 +628,40 @@ state_open(const char *dir) {
     loaded = 1;
   }
 
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
+state_key_generation(uint32_t *generation) {
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+  if(loaded) {
+    *generation = key_generation;
+    rc = 0;
+  }
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
+state_key_generation_set(uint32_t generation) {
+  uint32_t previous;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+  if(loaded) {
+    previous = key_generation;
+    key_generation = generation;
+    if(state_save_locked()) {
+      key_generation = previous;
+    } else {
+      rc = 0;
+    }
+  }
   pthread_mutex_unlock(&lock);
   return rc;
 }

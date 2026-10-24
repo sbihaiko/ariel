@@ -748,6 +748,9 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
   case STORE_GATE_REFUSED:
     audit_reply(fd, facts->command, "refused", target, "-", unknown);
     return 0;
+  case STORE_GATE_KEYRING:
+    audit_reply(fd, facts->command, "refused", target, "-", key_refused);
+    return 0;
   default:
     break;
   }
@@ -1348,6 +1351,56 @@ key_rotate_command(agent_t *agent, int fd, int role, const char *hex) {
     return;
   case STORE_KEY_STALE:
     audit_reply(fd, command, "stale", "keyring", challenge.id, approval_stale);
+    return;
+  case STORE_KEY_UNRECORDED:
+    reply(fd, audit_failed);
+    return;
+  default:
+    audit_reply(fd, command, "failed", "keyring", challenge.id, key_failed);
+    return;
+  }
+}
+
+
+/**
+ * key adopt-anchor: the keyring takes the build's anchor as its keys, for the
+ * owner's signature by the anchor's recovery key.
+ **/
+static void
+key_adopt_command(agent_t *agent, int fd) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  unsigned char primary[APPROVAL_PUBKEY_LEN];
+  unsigned char recovery[APPROVAL_PUBKEY_LEN];
+  const char *command = "key.adopt-anchor";
+  char answer[32];
+  uint32_t generation = 0;
+
+  if(agent->platform->anchor(agent->platform, primary, recovery)) {
+    audit_reply(fd, command, "refused", "keyring", "-", key_refused);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", command);
+  snprintf(facts.target, sizeof(facts.target), "%s", "keyring");
+  approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, facts.arg[0]);
+  approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, facts.arg[1]);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  switch(store_key_adopt(&challenge, &generation)) {
+  case STORE_KEY_ADOPTED:
+    snprintf(answer, sizeof(answer), "key_adopted %u\nexit 0\n",
+             (unsigned)generation);
+    reply(fd, answer);
+    return;
+  case STORE_KEY_STALE:
+    audit_reply(fd, command, "stale", "keyring", challenge.id, approval_stale);
+    return;
+  case STORE_KEY_REFUSED:
+    audit_reply(fd, command, "refused", "keyring", challenge.id, key_refused);
     return;
   case STORE_KEY_UNRECORDED:
     reply(fd, audit_failed);
@@ -3465,6 +3518,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc == 3 && !strcmp(argv[0], "key") &&
      !strcmp(argv[1], "rotate-recovery")) {
     key_rotate_command(agent, fd, STORE_KEY_ROLE_RECOVERY, argv[2]);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "key") && !strcmp(argv[1], "adopt-anchor")) {
+    key_adopt_command(agent, fd);
     return;
   }
 

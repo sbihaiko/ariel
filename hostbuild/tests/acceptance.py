@@ -1084,6 +1084,22 @@ RECOVERY_CRASH_TITLE = ("a crash at each durable step of key rotate-recovery "
                         "leaves exactly one keyring active after restart")
 ADR_RECOVERY_TITLE = ("ADR-0009 names the recovery rotation and the crash steps "
                       "of a rotation")
+KEYRING_MISSING_TITLE = ("a keyring missing above generation 0 refuses every "
+                         "approval")
+KEYRING_CORRUPT_TITLE = ("a corrupt keyring above generation 0 refuses every "
+                         "approval")
+KEYRING_OLDER_TITLE = ("a keyring older than the state file refuses every "
+                       "approval")
+REVIVE_TITLE = ("a rotated recovery key then a corrupt keyring never revives "
+                "the original recovery key")
+ANCHOR_MISMATCH_TITLE = ("a build with another anchor refuses every approval "
+                         "until key adopt-anchor")
+ADOPT_SIGNER_TITLE = ("key adopt-anchor needs the new anchor's recovery key and "
+                      "refuses every other signature")
+ADOPT_AUDIT_TITLE = ("key adopt-anchor keeps the consumed nonces and the audit "
+                     "log")
+ADOPT_MATCH_TITLE = ("key adopt-anchor is refused, without a challenge, while "
+                     "the anchor matches")
 
 # The durable steps of a rotation, each with the generation that is active
 # once Ariel restarts: a prepared rotation rolls back, the rest roll forward.
@@ -1165,6 +1181,13 @@ HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console 
 CLOCK_SCENARIOS = {
     RECOVERY_SIGNED_TITLE,
     RECOVERY_RETIRED_TITLE,
+    KEYRING_MISSING_TITLE,
+    KEYRING_CORRUPT_TITLE,
+    KEYRING_OLDER_TITLE,
+    REVIVE_TITLE,
+    ANCHOR_MISMATCH_TITLE,
+    ADOPT_SIGNER_TITLE,
+    ADOPT_AUDIT_TITLE,
     "key rotate accepts only the current primary and refuses the recovery "
     "key's signature",
     "key rotate refuses a retired primary's signature",
@@ -5369,6 +5392,211 @@ def scenario_key_rotate_recovery_crash_leaves_one_keyring(server):
                 keys.stop()
 
 
+ANCHOR_PRIMARY_ENV = "ARIEL_HOST_ANCHOR_PRIMARY"
+ANCHOR_RECOVERY_ENV = "ARIEL_HOST_ANCHOR_RECOVERY"
+ADOPT_COMMAND = "key adopt-anchor"
+ADOPT_PROMPT = "key adopt-anchor will run"
+
+
+def adopt_action(primary_pub, recovery_pub):
+    return ["command=key.adopt-anchor", "target=keyring", "sha256=none",
+            "option.primary=" + primary_pub, "option.recovery=" + recovery_pub]
+
+
+def anchored(seed, primary_pub, recovery_pub):
+    """The environment of a build whose anchor is the given pair."""
+    return {"ARIEL_HOST_NONCE_SEED": seed,
+            ANCHOR_PRIMARY_ENV: primary_pub,
+            ANCHOR_RECOVERY_ENV: recovery_pub}
+
+
+def new_anchor(server, scratch):
+    """A new anchor's keys: primary and recovery as hex, then their key files."""
+    primary_key = make_key(scratch, "anchor-primary.key")
+    recovery_key = make_key(scratch, "anchor-recovery.key")
+    return (public_key(server, primary_key), public_key(server, recovery_key),
+            primary_key, recovery_key)
+
+
+def assert_refused_without_asking(server, command):
+    """The command is refused before the owner is asked: no challenge, exit 1."""
+    lines = run_command(server, command)
+    assert lines == ["key_refused", "exit 1"], (
+        "%s must be refused without a challenge, got %r" % (command, lines))
+
+
+def assert_refused_everything(server):
+    """With the key state untrusted, nothing asks the owner and nothing runs."""
+    second = public_key(server, SECOND_PRIMARY_KEY)
+    for command in ["env PATH", ADOPT_COMMAND, "key rotate " + second,
+                    "key rotate-recovery " + second]:
+        assert_refused_without_asking(server, command)
+
+
+def scenario_keyring_missing_refuses_approvals(server):
+    """A recorded generation 1 with the keyring gone refuses every approval,
+    and the build's own keys do not come back in the keyring's place."""
+    del server  # each rotation needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "missing"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        os.remove(secret_path(keys, "keyring"))
+        keys.restart()
+        assert_refused_everything(keys)
+    finally:
+        keys.stop()
+
+
+def scenario_keyring_corrupt_refuses_approvals(server):
+    """A recorded generation 1 with a corrupt keyring refuses every approval."""
+    del server  # each rotation needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "corrupt"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        with open(secret_path(keys, "keyring"), "w", encoding="ascii") as fh:
+            fh.write("generation 1\nprimary not-a-key\n")
+        keys.restart()
+        assert_refused_everything(keys)
+    finally:
+        keys.stop()
+
+
+def scenario_keyring_older_than_state_refuses_approvals(server):
+    """A keyring restored to generation 0 under a state file at generation 1
+    refuses every approval, so the retired keys do not verify again."""
+    del server  # each rotation needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "older"})
+    try:
+        with open(secret_path(keys, "keyring"), "rb") as fh:
+            generation_zero = fh.read()
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        with open(secret_path(keys, "keyring"), "wb") as fh:
+            fh.write(generation_zero)
+        keys.restart()
+        assert_refused_everything(keys)
+    finally:
+        keys.stop()
+
+
+def scenario_recovery_then_corrupt_keyring_never_revives_recovery(server):
+    """After a recovery rotation, a corrupt keyring does not fall back to the
+    build's original recovery key: approvals are refused and nothing asks."""
+    del server  # each rotation needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revive"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third-recovery.key"))
+            rotate_recovery(keys, third, 1, RECOVERY_KEY)
+        with open(secret_path(keys, "keyring"), "w", encoding="ascii") as fh:
+            fh.write("generation 1\nrecovery 00\n")
+        keys.restart()
+        assert_refused_everything(keys)
+    finally:
+        keys.stop()
+
+
+def scenario_anchor_mismatch_refuses_until_adopted(server):
+    """A build whose anchor differs from the keyring's refuses every approval
+    except key adopt-anchor, which it asks for and refuses without a rotation."""
+    del server  # the anchor change needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "mismatch"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            primary, recovery, _pkey, _rkey = new_anchor(keys, scratch)
+            keys.env = anchored("mismatch", primary, recovery)
+            keys.restart()
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        for command in ["env PATH", "key rotate " + second]:
+            assert_refused_without_asking(keys, command)
+        approval, challenge = gated_request(
+            keys, ADOPT_COMMAND, adopt_action(primary, recovery), ADOPT_PROMPT)
+        assert approval and challenge
+    finally:
+        keys.stop()
+
+
+def scenario_adopt_anchor_needs_the_new_recovery_key(server):
+    """key adopt-anchor is granted only by the new anchor's recovery key; the
+    new primary, the retired recovery key and the retired primary are refused."""
+    del server  # the anchor change needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "signer"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            primary, recovery, primary_key, recovery_key = new_anchor(keys, scratch)
+            keys.env = anchored("signer", primary, recovery)
+            keys.restart()
+            approval, challenge = gated_request(
+                keys, ADOPT_COMMAND, adopt_action(primary, recovery), ADOPT_PROMPT)
+            for what, key in [("the new primary", primary_key),
+                              ("the retired recovery key", RECOVERY_KEY),
+                              ("the retired primary", test_key())]:
+                assert grant(keys, approval,
+                             sign_challenge(keys, challenge, key=key)) == [
+                    "signature_invalid", "exit 79"], (
+                    "key adopt-anchor must refuse a signature by %s" % what)
+            signature = sign_challenge(keys, challenge, key=recovery_key)
+            assert grant(keys, approval, signature) == [
+                "approval_granted %s" % approval, "exit 0"], (
+                "the new recovery key's signature must grant key adopt-anchor")
+            assert run_command(keys, ADOPT_COMMAND) == [
+                "key_adopted 1", "exit 0"], (
+                "a granted key adopt-anchor must adopt the anchor")
+    finally:
+        keys.stop()
+
+
+def scenario_adopt_anchor_keeps_nonces_and_audit(server):
+    """key adopt-anchor keeps consumed nonces consumed and the audit log's
+    earlier lines, and appends its own."""
+    del server  # the anchor change needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "adopt-audit"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        approval, challenge = gated_request(
+            keys, "env PATH",
+            ["command=env", "target=PATH", "sha256=none"], "env PATH will run")
+        spent = CHALLENGE_LINE.match(challenge).group(3)
+        assert grant(keys, approval, sign_challenge(
+            keys, challenge, key=SECOND_PRIMARY_KEY)) == [
+            "approval_granted %s" % approval, "exit 0"]
+        assert run_command(keys, "env PATH")[-1] == "exit 0"
+        with tempfile.TemporaryDirectory() as scratch:
+            primary, recovery, _pkey, recovery_key = new_anchor(keys, scratch)
+            keys.env = anchored("adopt-audit", primary, recovery)
+            keys.restart()
+            approval, challenge = gated_request(
+                keys, ADOPT_COMMAND, adopt_action(primary, recovery), ADOPT_PROMPT)
+            assert grant(keys, approval, sign_challenge(
+                keys, challenge, key=recovery_key)) == [
+                "approval_granted %s" % approval, "exit 0"]
+            assert run_command(keys, ADOPT_COMMAND) == [
+                "key_adopted 2", "exit 0"]
+            keys.restart()
+            _approval, fresh = gated_request(
+                keys, "env PATH",
+                ["command=env", "target=PATH", "sha256=none"], "env PATH will run")
+        assert CHALLENGE_LINE.match(fresh).group(3) != spent, (
+            "a nonce consumed before key adopt-anchor must not be offered again")
+        kinds = [event[0] for event in audit_events(keys)]
+        assert kinds.count("key_rotate") == 1 and kinds.count(
+            "key_adopt_anchor") == 1 and kinds.index("key_rotate") < kinds.index(
+            "key_adopt_anchor"), (
+            "the audit log must keep the rotation and record the adoption, got %r"
+            % kinds)
+    finally:
+        keys.stop()
+
+
+def scenario_adopt_anchor_refused_when_anchor_matches(server):
+    """key adopt-anchor is refused, without a challenge, while the build's
+    anchor is the keyring's: adoption is only for a mismatch."""
+    assert_refused_without_asking(server, ADOPT_COMMAND)
+
+
 def scenario_adr_names_recovery_rotation_and_crash_steps(server):
     del server
     adr = os.path.join(repo_dir(), "docs", "adr",
@@ -7657,6 +7885,22 @@ SCENARIOS = [
     ("an unused approval granted under a retired primary answers "
      "approval_stale", scenario_unused_approval_stops_after_rotation,
      CLOCK_REASON),
+    (KEYRING_MISSING_TITLE, scenario_keyring_missing_refuses_approvals,
+     CLOCK_REASON),
+    (KEYRING_CORRUPT_TITLE, scenario_keyring_corrupt_refuses_approvals,
+     CLOCK_REASON),
+    (KEYRING_OLDER_TITLE, scenario_keyring_older_than_state_refuses_approvals,
+     CLOCK_REASON),
+    (REVIVE_TITLE, scenario_recovery_then_corrupt_keyring_never_revives_recovery,
+     CLOCK_REASON),
+    (ANCHOR_MISMATCH_TITLE, scenario_anchor_mismatch_refuses_until_adopted,
+     CLOCK_REASON),
+    (ADOPT_SIGNER_TITLE, scenario_adopt_anchor_needs_the_new_recovery_key,
+     CLOCK_REASON),
+    (ADOPT_AUDIT_TITLE, scenario_adopt_anchor_keeps_nonces_and_audit,
+     CLOCK_REASON),
+    (ADOPT_MATCH_TITLE, scenario_adopt_anchor_refused_when_anchor_matches,
+     False),
     ("the PS5 makefile refuses an owner key pinned without its recovery key",
      scenario_ps5_pubkey_needs_recovery, None),
     ("the README and the quick start document ARIEL_RECOVERY_PUBKEY",

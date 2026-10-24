@@ -119,6 +119,7 @@ int store_approval_request(const approval_facts_t *facts,
 #define STORE_GATE_STALE   3
 #define STORE_GATE_DENIED  4
 #define STORE_GATE_REFUSED 5
+#define STORE_GATE_KEYRING 6
 
 /**
  * Check a gated command against its approval, and spend the approval when it
@@ -126,7 +127,8 @@ int store_approval_request(const approval_facts_t *facts,
  * PENDING: the owner has not answered; challenge is the one to show. NEW: no
  * approval stands for these facts, so one must be requested, and the caller
  * does so with the platform. STALE: the entry changed after the owner signed.
- * DENIED: the owner refused. REFUSED: the facts cannot be signed. challenge
+ * DENIED: the owner refused. REFUSED: the facts cannot be signed. KEYRING: the
+ * keyring state does not allow this command, so nothing is requested. challenge
  * holds the approval's challenge for every answer that has one.
  **/
 int store_gate_check(const approval_facts_t *facts,
@@ -204,6 +206,8 @@ int store_approval_facts(const char *id, approval_facts_t *facts);
 #define STORE_KEY_STALE      1
 #define STORE_KEY_FAILED     2
 #define STORE_KEY_UNRECORDED 3
+#define STORE_KEY_ADOPTED    4
+#define STORE_KEY_REFUSED    5
 
 /** The keyring role a rotation replaces. **/
 #define STORE_KEY_ROLE_PRIMARY  0
@@ -224,6 +228,17 @@ int store_key_check(const char *hex);
  **/
 int store_key_rotate(const approval_challenge_t *challenge, const char *hex,
                      int role, uint32_t *generation);
+
+/**
+ * Adopt the build's anchor as the keyring, for the granted approval challenge
+ * of key adopt-anchor, while the keyring is under another anchor. The keyring
+ * moves to the next generation with the anchor's keys as its active keys; the
+ * keys it held are retired. The answer is STORE_KEY_REFUSED when an anchor key
+ * is one that is retired or active, and STORE_KEY_STALE when the challenge is
+ * not for the current generation or the keyring is not waiting for an anchor.
+ **/
+int store_key_adopt(const approval_challenge_t *challenge,
+                    uint32_t *generation);
 
 /**
  * Copy the autoload list into buf, NUL-terminated: one payload name per line,

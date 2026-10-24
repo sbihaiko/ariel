@@ -202,6 +202,14 @@ static unsigned char host_pubkey[APPROVAL_PUBKEY_LEN];
 static unsigned char host_recovery_pubkey[APPROVAL_PUBKEY_LEN];
 
 /**
+ * The anchor this host build pins. ARIEL_HOST_ANCHOR_PRIMARY and
+ * ARIEL_HOST_ANCHOR_RECOVERY, as hex, replace the test pair so a scenario can
+ * start a build whose anchor differs from the keyring's. The host build only.
+ **/
+static unsigned char host_anchor_primary[APPROVAL_PUBKEY_LEN];
+static unsigned char host_anchor_recovery[APPROVAL_PUBKEY_LEN];
+
+/**
  * A scenario can make the nonce stream repeat from a restart by giving
  * ARIEL_HOST_NONCE_SEED. Without it the nonces come from the system's
  * random source. The seed exists only in the host build.
@@ -286,13 +294,24 @@ host_verify(platform_t *self, const unsigned char key[APPROVAL_PUBKEY_LEN],
 }
 
 
+static void
+host_anchor_override(const char *name, unsigned char key[APPROVAL_PUBKEY_LEN]) {
+  const char *hex = getenv(name);
+
+  if(hex && *hex && (approval_pubkey_parse(hex, key) || approval_pin(key))) {
+    fprintf(stderr, "the host build cannot pin %s\n", name);
+    exit(EXIT_FAILURE);
+  }
+}
+
+
 static int
 host_anchor(platform_t *self, unsigned char primary[APPROVAL_PUBKEY_LEN],
             unsigned char recovery[APPROVAL_PUBKEY_LEN]) {
   (void)self;
 
-  memcpy(primary, host_pubkey, APPROVAL_PUBKEY_LEN);
-  memcpy(recovery, host_recovery_pubkey, APPROVAL_PUBKEY_LEN);
+  memcpy(primary, host_anchor_primary, APPROVAL_PUBKEY_LEN);
+  memcpy(recovery, host_anchor_recovery, APPROVAL_PUBKEY_LEN);
   return 0;
 }
 
@@ -898,6 +917,10 @@ platform_host(const char *dir, const char *fs_root, const char *exe) {
     fprintf(stderr, "the host build cannot pin its test keys\n");
     exit(EXIT_FAILURE);
   }
+  memcpy(host_anchor_primary, host_pubkey, APPROVAL_PUBKEY_LEN);
+  memcpy(host_anchor_recovery, host_recovery_pubkey, APPROVAL_PUBKEY_LEN);
+  host_anchor_override("ARIEL_HOST_ANCHOR_PRIMARY", host_anchor_primary);
+  host_anchor_override("ARIEL_HOST_ANCHOR_RECOVERY", host_anchor_recovery);
 
   // Read the seed here too, before any connection thread exists.
   {

@@ -53,6 +53,18 @@ typedef struct {
 int state_open(const char *dir);
 
 /**
+ * Copy the key generation on record into generation: 0 when none is recorded.
+ * Returns 0, or -1 before state_open has loaded the record.
+ **/
+int state_key_generation(uint32_t *generation);
+
+/**
+ * Record the key generation and save the file. On failure the recorded
+ * generation is unchanged. Returns 0, or -1.
+ **/
+int state_key_generation_set(uint32_t generation);
+
+/**
  * Record that name now points at hash and that previous is the build it
  * replaced, or "-". Recording the same values again changes nothing, so a
  * recovery that repeats a commit is harmless. Returns 0, or -1.

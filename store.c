@@ -97,13 +97,24 @@ struct staged {
 #define KEYRING_MAX 1536
 #define KEYRING_REVOKED_MAX 16
 
+/** Whether the keyring answers approvals, refuses them all, or awaits an anchor. **/
+#define KEYRING_REFUSED  0
+#define KEYRING_READY    1
+#define KEYRING_MISMATCH 2
+
 /** The keyring generation a new approval is bound to, its active keys, and the keys it retired. **/
 static uint32_t keyring_generation;
 static unsigned char keyring_primary[APPROVAL_PUBKEY_LEN];
 static unsigned char keyring_recovery[APPROVAL_PUBKEY_LEN];
 static unsigned char keyring_revoked[KEYRING_REVOKED_MAX][APPROVAL_PUBKEY_LEN];
 static size_t keyring_revoked_count;
-static int keyring_ready;
+static char keyring_anchor[SHA256_HEX_LEN + 1];
+static int keyring_state;
+
+/** The build's pinned anchor: the keyring is READY only when built from it. **/
+static unsigned char anchor_primary[APPROVAL_PUBKEY_LEN];
+static unsigned char anchor_recovery[APPROVAL_PUBKEY_LEN];
+static char anchor_hash[SHA256_HEX_LEN + 1];
 
 /** The audit log: one appended line per action Ariel takes. **/
 #define AUDIT_FILE "audit.log"
@@ -939,6 +950,16 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
                                                            : "recovery";
     options[0].value = facts->arg[0];
     action->noptions = 1;
+  } else if(!strcmp(facts->command, "key.adopt-anchor")) {
+    action->command = facts->command;
+    action->target = facts->target;
+    action->destination = NULL;
+    action->sha256 = APPROVAL_NO_HASH;
+    options[0].key = "primary";
+    options[0].value = facts->arg[0];
+    options[1].key = "recovery";
+    options[1].value = facts->arg[1];
+    action->noptions = 2;
   } else if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
@@ -1189,6 +1210,8 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen, "key rotate will run");
   } else if(!strcmp(facts->command, "key.rotate-recovery")) {
     snprintf(prompt, promptlen, "key rotate-recovery will run");
+  } else if(!strcmp(facts->command, "key.adopt-anchor")) {
+    snprintf(prompt, promptlen, "key adopt-anchor will run");
   } else if(rollback) {
     snprintf(prompt, promptlen,
              "payload %s rolls back to %s, replacing %s",
@@ -1290,6 +1313,29 @@ gate_row(const approval_facts_t *facts) {
 }
 
 
+static int
+keyring_allows(const char *command) {
+  int adopt = !strcmp(command, "key.adopt-anchor");
+
+  if(keyring_state == KEYRING_READY) {
+    return !adopt;
+  }
+  return keyring_state == KEYRING_MISMATCH && adopt;
+}
+
+
+static const unsigned char *
+grant_key(const char *command) {
+  if(!strcmp(command, "key.adopt-anchor")) {
+    return anchor_recovery;
+  }
+  if(!strcmp(command, "key.rotate-recovery")) {
+    return keyring_recovery;
+  }
+  return keyring_primary;
+}
+
+
 int
 store_gate_check(const approval_facts_t *facts,
                  approval_challenge_t *challenge) {
@@ -1307,6 +1353,10 @@ store_gate_check(const approval_facts_t *facts,
 
   pthread_mutex_lock(&lock);
   expire_locked(now_ms());
+  if(!keyring_allows(facts->command)) {
+    pthread_mutex_unlock(&lock);
+    return STORE_GATE_KEYRING;
+  }
   row = gate_row(facts);
 
   if(!row) {
@@ -1377,8 +1427,9 @@ store_approval_grant(const char *id, const unsigned char *signature,
              sha256_final(&hash, digest), sha256_hex(digest, digest_hex),
              strcmp(action_sha256, digest_hex))) {
     rc = STORE_GRANT_WRONG_ACTION;
-  } else if(request->challenge.generation != keyring_generation) {
-    // Issued under a primary that a rotation has since retired.
+  } else if(!keyring_allows(request->facts.command) ||
+            request->challenge.generation != keyring_generation) {
+    // Issued under a primary a rotation retired, or the keyring state refuses it.
     rc = STORE_GRANT_INVALID;
   } else {
     len = approval_message(request->challenge.console,
@@ -1392,10 +1443,8 @@ store_approval_grant(const char *id, const unsigned char *signature,
 
     // The platform checks the signature against the key that the action's
     // role names, over the exact bytes of this approval's challenge.
-    if(!keyring_ready || len < 0 ||
-       platform->verify(platform,
-                        !strcmp(request->facts.command, "key.rotate-recovery")
-                          ? keyring_recovery : keyring_primary,
+    if(len < 0 ||
+       platform->verify(platform, grant_key(request->facts.command),
                         message, (size_t)len, signature)) {
       rc = STORE_GRANT_INVALID;
     } else if(nonce_consume(request->challenge.nonce)) {
@@ -1960,34 +2009,36 @@ text_read(int dirfd, const char *name, char *buf, size_t size) {
  * the fingerprint of the build's pinned pair, so a keyring file must render
  * back to exactly the text Ariel wrote.
  **/
+static void
+keyring_anchor_hash(const unsigned char primary[APPROVAL_PUBKEY_LEN],
+                    const unsigned char recovery[APPROVAL_PUBKEY_LEN],
+                    char anchor[SHA256_HEX_LEN + 1]) {
+  char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char pinned[4 * APPROVAL_PUBKEY_LEN + 1];
+
+  approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, primary_hex);
+  approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, recovery_hex);
+  snprintf(pinned, sizeof(pinned), "%s%s", primary_hex, recovery_hex);
+  text_hash(pinned, 4 * APPROVAL_PUBKEY_LEN, anchor);
+}
+
+
 static int
 keyring_render(char *text, size_t size, uint32_t generation,
                const unsigned char primary[APPROVAL_PUBKEY_LEN],
                const unsigned char recovery[APPROVAL_PUBKEY_LEN],
-               unsigned char (*revoked)[APPROVAL_PUBKEY_LEN], size_t count) {
-  unsigned char anchor_primary[APPROVAL_PUBKEY_LEN];
-  unsigned char anchor_recovery[APPROVAL_PUBKEY_LEN];
-  char anchor_hex[2 * APPROVAL_PUBKEY_LEN + 1];
-  char anchor_recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+               unsigned char (*revoked)[APPROVAL_PUBKEY_LEN], size_t count,
+               const char *anchor) {
   char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char revoked_hex[2 * APPROVAL_PUBKEY_LEN + 1];
-  char pinned[4 * APPROVAL_PUBKEY_LEN + 1];
-  char anchor[SHA256_HEX_LEN + 1];
   size_t used;
   size_t i;
   int n;
 
-  if(platform->anchor(platform, anchor_primary, anchor_recovery)) {
-    return -1;
-  }
-
-  approval_hex_encode(anchor_primary, APPROVAL_PUBKEY_LEN, anchor_hex);
-  approval_hex_encode(anchor_recovery, APPROVAL_PUBKEY_LEN, anchor_recovery_hex);
   approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, primary_hex);
   approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, recovery_hex);
-  snprintf(pinned, sizeof(pinned), "%s%s", anchor_hex, anchor_recovery_hex);
-  text_hash(pinned, 4 * APPROVAL_PUBKEY_LEN, anchor);
 
   n = snprintf(text, size, "generation %lu\nprimary %s\nrecovery %s\nanchor %s\n",
                (unsigned long)generation, primary_hex, recovery_hex, anchor);
@@ -2017,7 +2068,8 @@ static int
 keyring_parse(const char *text, uint32_t *generation,
               unsigned char primary[APPROVAL_PUBKEY_LEN],
               unsigned char recovery[APPROVAL_PUBKEY_LEN],
-              unsigned char (*revoked)[APPROVAL_PUBKEY_LEN], size_t *count) {
+              unsigned char (*revoked)[APPROVAL_PUBKEY_LEN], size_t *count,
+              char anchor[SHA256_HEX_LEN + 1]) {
   char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
   char revoked_hex[2 * APPROVAL_PUBKEY_LEN + 1];
@@ -2025,8 +2077,9 @@ keyring_parse(const char *text, uint32_t *generation,
   const char *cursor;
   int used = 0;
 
-  if(sscanf(text, "generation %lu\nprimary %64s\nrecovery %64s\nanchor %*s\n%n",
-            &value, primary_hex, recovery_hex, &used) != 3 ||
+  if(sscanf(text,
+            "generation %lu\nprimary %64s\nrecovery %64s\nanchor %64s\n%n",
+            &value, primary_hex, recovery_hex, anchor, &used) != 4 ||
      value > UINT32_MAX || approval_pubkey_parse(primary_hex, primary) ||
      approval_pubkey_parse(recovery_hex, recovery)) {
     return -1;
@@ -2049,10 +2102,12 @@ keyring_parse(const char *text, uint32_t *generation,
 
 
 /**
- * Load the keyring at start, or make it at generation 0 from the build's
- * anchor when none exists. A file that does not render back from its own
- * generation and primary is refused. A build that pins no anchor keeps no
- * keyring, so every grant is refused.
+ * Load the keyring at start. Before any rotation is recorded, a missing one is
+ * made at generation 0 from the build's anchor, and a corrupt one stops the
+ * start. After one is recorded, a missing, corrupt or older keyring refuses
+ * every approval and never falls back to the build's keys. A keyring made
+ * under another anchor waits for key adopt-anchor. A keyring ahead of the
+ * state file's generation is recorded in it.
  **/
 static int
 keyring_open(int state_fd) {
@@ -2061,20 +2116,35 @@ keyring_open(int state_fd) {
   unsigned char revoked[KEYRING_REVOKED_MAX][APPROVAL_PUBKEY_LEN] = {{0}};
   char text[KEYRING_MAX];
   char expect[KEYRING_MAX];
+  char anchor[SHA256_HEX_LEN + 1];
+  uint32_t recorded = 0;
   uint32_t generation = 0;
   size_t count = 0;
   struct stat st;
 
-  keyring_ready = 0;
-  if(platform->anchor(platform, primary, recovery)) {
-    keyring_generation = 0;
+  keyring_state = KEYRING_REFUSED;
+  keyring_generation = 0;
+  keyring_revoked_count = 0;
+  if(platform->anchor(platform, anchor_primary, anchor_recovery)) {
     return 0;
+  }
+  keyring_anchor_hash(anchor_primary, anchor_recovery, anchor_hash);
+  if(state_key_generation(&recorded)) {
+    return -1;
   }
 
   if(fstatat(state_fd, KEYRING_FILE, &st, AT_SYMLINK_NOFOLLOW)) {
-    if(errno != ENOENT ||
-       keyring_render(expect, sizeof(expect), 0, primary, recovery, revoked,
-                      0) ||
+    if(errno != ENOENT) {
+      return -1;
+    }
+    if(recorded) {
+      return 0;
+    }
+    memcpy(primary, anchor_primary, sizeof(primary));
+    memcpy(recovery, anchor_recovery, sizeof(recovery));
+    memcpy(anchor, anchor_hash, sizeof(anchor));
+    if(keyring_render(expect, sizeof(expect), 0, primary, recovery, revoked,
+                      0, anchor) ||
        tmp_write(state_fd, KEYRING_TMP, expect, strlen(expect)) ||
        renameat(state_fd, KEYRING_TMP, state_fd, KEYRING_FILE) ||
        fsync(state_fd)) {
@@ -2083,10 +2153,17 @@ keyring_open(int state_fd) {
     }
   } else if(text_read(state_fd, KEYRING_FILE, text, sizeof(text)) < 0 ||
             keyring_parse(text, &generation, primary, recovery, revoked,
-                          &count) ||
+                          &count, anchor) ||
             keyring_render(expect, sizeof(expect), generation, primary,
-                           recovery, revoked, count) ||
+                           recovery, revoked, count, anchor) ||
             strcmp(text, expect)) {
+    return recorded ? 0 : -1;
+  }
+
+  if(generation < recorded) {
+    return 0;
+  }
+  if(generation > recorded && state_key_generation_set(generation)) {
     return -1;
   }
 
@@ -2095,7 +2172,9 @@ keyring_open(int state_fd) {
   memcpy(keyring_recovery, recovery, sizeof(keyring_recovery));
   memcpy(keyring_revoked, revoked, sizeof(keyring_revoked));
   keyring_revoked_count = count;
-  keyring_ready = 1;
+  memcpy(keyring_anchor, anchor, sizeof(keyring_anchor));
+  keyring_state = strcmp(anchor, anchor_hash) ? KEYRING_MISMATCH
+                                              : KEYRING_READY;
   return 0;
 }
 
@@ -3072,7 +3151,8 @@ store_key_check(const char *hex) {
   }
 
   pthread_mutex_lock(&lock);
-  if(keyring_ready && keyring_revoked_count < KEYRING_REVOKED_MAX) {
+  if(keyring_state == KEYRING_READY &&
+     keyring_revoked_count < KEYRING_REVOKED_MAX) {
     rc = approval_key_admissible(key, keyring_primary, keyring_recovery,
                                  keyring_revoked, keyring_revoked_count);
   }
@@ -3104,7 +3184,8 @@ store_key_rotate(const approval_challenge_t *challenge, const char *hex,
   }
 
   pthread_mutex_lock(&lock);
-  if(!keyring_ready || challenge->generation != keyring_generation) {
+  if(keyring_state != KEYRING_READY ||
+     challenge->generation != keyring_generation) {
     outcome = STORE_KEY_STALE;
   } else if(keyring_revoked_count == KEYRING_REVOKED_MAX) {
     outcome = STORE_KEY_FAILED;
@@ -3125,9 +3206,9 @@ store_key_rotate(const approval_challenge_t *challenge, const char *hex,
     count++;
     if(!keyring_render(current, sizeof(current), keyring_generation,
                        keyring_primary, keyring_recovery, keyring_revoked,
-                       keyring_revoked_count) &&
+                       keyring_revoked_count, keyring_anchor) &&
        !keyring_render(text, sizeof(text), keyring_generation + 1, primary,
-                       recovery, revoked, count) &&
+                       recovery, revoked, count, keyring_anchor) &&
        (state_fd=root_open()) >= 0) {
       if((store_fd=dir_open(state_fd, "store")) >= 0) {
         text_hash(current, strlen(current), old_hash);
@@ -3142,7 +3223,76 @@ store_key_rotate(const approval_challenge_t *challenge, const char *hex,
           memcpy(keyring_revoked, revoked, sizeof(revoked));
           keyring_revoked_count = count;
           *generation = keyring_generation;
-          outcome = applied ? STORE_KEY_UNRECORDED : STORE_KEY_ROTATED;
+          outcome = applied || state_key_generation_set(keyring_generation)
+                      ? STORE_KEY_UNRECORDED : STORE_KEY_ROTATED;
+        }
+        close(store_fd);
+      }
+      close(state_fd);
+    }
+  }
+
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
+int
+store_key_adopt(const approval_challenge_t *challenge, uint32_t *generation) {
+  unsigned char revoked[KEYRING_REVOKED_MAX][APPROVAL_PUBKEY_LEN];
+  size_t count;
+  char current[KEYRING_MAX];
+  char text[KEYRING_MAX];
+  char old_hash[SHA256_HEX_LEN + 1];
+  char new_hash[SHA256_HEX_LEN + 1];
+  int state_fd;
+  int store_fd;
+  int applied;
+  int outcome = STORE_KEY_FAILED;
+
+  pthread_mutex_lock(&lock);
+  if(keyring_state != KEYRING_MISMATCH ||
+     challenge->generation != keyring_generation) {
+    outcome = STORE_KEY_STALE;
+  } else if(keyring_revoked_count + 2 > KEYRING_REVOKED_MAX ||
+            approval_key_admissible(anchor_primary, keyring_primary,
+                                    keyring_recovery, keyring_revoked,
+                                    keyring_revoked_count) ||
+            approval_key_admissible(anchor_recovery, keyring_primary,
+                                    keyring_recovery, keyring_revoked,
+                                    keyring_revoked_count) ||
+            !memcmp(anchor_primary, anchor_recovery, APPROVAL_PUBKEY_LEN)) {
+    outcome = STORE_KEY_REFUSED;
+  } else {
+    memcpy(revoked, keyring_revoked, sizeof(revoked));
+    count = keyring_revoked_count;
+    memcpy(revoked[count++], keyring_primary, APPROVAL_PUBKEY_LEN);
+    memcpy(revoked[count++], keyring_recovery, APPROVAL_PUBKEY_LEN);
+    if(!keyring_render(current, sizeof(current), keyring_generation,
+                       keyring_primary, keyring_recovery, keyring_revoked,
+                       keyring_revoked_count, keyring_anchor) &&
+       !keyring_render(text, sizeof(text), keyring_generation + 1,
+                       anchor_primary, anchor_recovery, revoked, count,
+                       anchor_hash) &&
+       (state_fd=root_open()) >= 0) {
+      if((store_fd=dir_open(state_fd, "store")) >= 0) {
+        text_hash(current, strlen(current), old_hash);
+        text_hash(text, strlen(text), new_hash);
+        applied = file_transaction_locked(state_fd, store_fd, text, old_hash,
+                                          new_hash, KEYRING_FILE, KEYRING_TMP,
+                                          "key_adopt_anchor", KEYRING_FILE,
+                                          challenge->id);
+        if(applied >= 0) {
+          keyring_generation++;
+          memcpy(keyring_primary, anchor_primary, sizeof(keyring_primary));
+          memcpy(keyring_recovery, anchor_recovery, sizeof(keyring_recovery));
+          memcpy(keyring_revoked, revoked, sizeof(revoked));
+          keyring_revoked_count = count;
+          memcpy(keyring_anchor, anchor_hash, sizeof(keyring_anchor));
+          keyring_state = KEYRING_READY;
+          *generation = keyring_generation;
+          outcome = applied || state_key_generation_set(keyring_generation)
+                      ? STORE_KEY_UNRECORDED : STORE_KEY_ADOPTED;
         }
         close(store_fd);
       }
