@@ -294,6 +294,14 @@ def check_protected_without_asking(session, context):
             "%s must answer protected and exit 87 without asking" % command)
 
 
+def check_run_refusals(session, context):
+    del context
+    assert session.link.exchange("/data/ariel-no-such-elf") == [
+        "no_such_file", "exit 1"], "a run of a missing path must answer no_such_file"
+    assert session.link.exchange("%s/token" % CONSOLE_STATE_DIR) == [
+        "protected", "exit 87"], "a run of Ariel's token must answer protected"
+
+
 def run_gated_file_command(session, command):
     """Ask for command, show the owner the challenge, grant it; return the approval ID."""
     lines = session.until_not_busy(lambda: session.link.exchange(command))
@@ -855,6 +863,9 @@ CHECKS = [
      check_read_only_on_console),
     ("the token, approval state and nonces answer protected and exit 87 when "
      "read directly on the console", check_secrets_read_directly),
+    ("a run of a missing path answers no_such_file and exit 1, and a run of "
+     "Ariel's token answers protected and exit 87, both without asking",
+     check_run_refusals),
     ("a background run or logs of an unknown payload, and a run of a bad "
      "name, answer their word and exit 1", check_background_refusals),
     ("the quick start's 'After Stage 1' section passes against the console",

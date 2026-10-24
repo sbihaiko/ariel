@@ -15,6 +15,7 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -883,6 +884,108 @@ unlisted_command(agent_t *agent, int fd, int argc, char *argv[]) {
   if(gate_pass(agent, fd, &facts, &challenge)) {
     audit_reply(fd, "unlisted", "refused", argv[0], challenge.id, unknown);
   }
+}
+
+
+/**
+ * The first PATH entry that holds a file the run may take for name, in path.
+ * An entry without the name, a file without an execute bit or a directory is
+ * skipped, as a shell skips it. Returns FILEOPS_NOT_RUNNABLE when none does.
+ **/
+static int
+elf_lookup(const char *root, const char *name, char *path, size_t size,
+           approval_facts_t *facts, unsigned char **bytes, size_t *len) {
+  const char *dirs = getenv("PATH");
+
+  while(dirs && *dirs) {
+    const char *colon = strchr(dirs, ':');
+    size_t n = colon ? (size_t)(colon - dirs) : strlen(dirs);
+    int rc;
+
+    while(n > 0 && dirs[n - 1] == '/') {
+      n--;
+    }
+    if(n > 0 && dirs[0] == '/' && n + strlen(name) + 2 <= size) {
+      snprintf(path, size, "%.*s/%s", (int)n, dirs, name);
+      rc = fileops_run_load(root, path, facts, bytes, len);
+      if(rc != FILEOPS_NO_FILE && rc != FILEOPS_NOT_FILE &&
+         rc != FILEOPS_NOT_EXEC && rc != FILEOPS_NOT_RUNNABLE &&
+         rc != FILEOPS_BAD_PATH) {
+        return rc;
+      }
+    }
+    dirs = colon ? colon + 1 : NULL;
+  }
+  return FILEOPS_NOT_RUNNABLE;
+}
+
+
+/**
+ * One run of an executable, by absolute path or by a bare name on the PATH.
+ * The owner signs the resolved path and the file's hash, and the bytes that
+ * were hashed are the bytes that run. Returns 0 when the name is not an
+ * executable this platform runs, so the caller treats it as unlisted.
+ **/
+static int
+elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  const char *root = agent->platform->fs_root;
+  char path[PATH_MAX];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  unsigned char *bytes = NULL;
+  size_t size = 0;
+  char answer[64];
+  int status = 0;
+  int rc;
+  int len;
+
+  if(strlen(argv[0]) > APPROVAL_TARGET_MAX) {
+    return 0;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  if(argv[0][0] == '/') {
+    snprintf(path, sizeof(path), "%s", argv[0]);
+    rc = fileops_run_load(root, path, &facts, &bytes, &size);
+  } else if(strchr(argv[0], '/')) {
+    return 0;
+  } else {
+    rc = elf_lookup(root, argv[0], path, sizeof(path), &facts, &bytes, &size);
+  }
+
+  if(rc == FILEOPS_NOT_RUNNABLE) {
+    return 0;
+  }
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, "run", path, "-", rc);
+    return 1;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "run");
+  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    free(bytes);
+    return 1;
+  }
+
+  if(audit_line("run", "done", path, challenge.id)) {
+    free(bytes);
+    reply(fd, audit_failed);
+    return 1;
+  }
+
+  argv[argc] = NULL;
+  if(agent->platform->spawn(agent->platform, bytes, size, argv, fd, &status)) {
+    free(bytes);
+    audit_line("run", "failed", path, challenge.id);
+    reply(fd, spawn_failed);
+    return 1;
+  }
+  free(bytes);
+
+  len = snprintf(answer, sizeof(answer), "status %d\nexit 0\n", status);
+  write_all(fd, answer, (size_t)len);
+  return 1;
 }
 
 
@@ -2308,6 +2411,10 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc < 1) {
     reply(fd, unknown);
+    return;
+  }
+
+  if(elf_command(agent, fd, argc, argv)) {
     return;
   }
 

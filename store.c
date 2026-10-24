@@ -910,6 +910,9 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     } else if(facts->kind[0]) {
       size_t n = 0;
 
+      if(!strcmp(facts->command, "run")) {
+        action->sha256 = facts->sha256;
+      }
       decimal(facts->dev, text[0], sizeof(text[0]));
       decimal(facts->ino, text[1], sizeof(text[1]));
       options[n].key = "kind";
@@ -1073,6 +1076,9 @@ store_approval_request(const approval_facts_t *facts,
   } else if(slot->gated && !strcmp(facts->command, "kill")) {
     snprintf(prompt, promptlen, "kill %s with %s (start %s) will run",
              facts->target, facts->signal, facts->start);
+  } else if(slot->gated && !strcmp(facts->command, "run")) {
+    snprintf(prompt, promptlen, "run %s (sha256 %s) will run", facts->target,
+             facts->sha256);
   } else if(slot->gated) {
     snprintf(prompt, promptlen, "%s %s%s%s will run", facts->command,
              facts->target, facts->dest[0] ? " " : "", facts->dest);

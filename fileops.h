@@ -40,6 +40,11 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_TOO_LARGE 16
 #define FILEOPS_UNSAFE_MEMBER 17
 #define FILEOPS_BAD_ARCHIVE   18
+#define FILEOPS_NOT_EXEC  19
+#define FILEOPS_NOT_RUNNABLE 20
+
+/** The largest executable a run reads into memory. **/
+#define FILEOPS_RUN_MAX (64UL * 1024 * 1024)
 
 /**
  * Check one file command without acting. path must be absolute and inside a
@@ -144,6 +149,18 @@ int fileops_unzip_check(const char *root, const char *archive,
 int fileops_unzip_act(const char *root, const char *archive,
                       const char *destination,
                       const approval_facts_t *expected);
+
+/**
+ * Load the executable at path for a run. path must be absolute and name a
+ * regular file with an execute bit, reached without following a symbolic link
+ * and not protected. Its bytes are read once into bytes, at most
+ * FILEOPS_RUN_MAX of them, and their SHA-256 goes into facts with the entry's
+ * kind, device and inode. Returns FILEOPS_OK, FILEOPS_NOT_RUNNABLE when path is
+ * not under root, or the refusal that stops it. The caller frees bytes.
+ **/
+int fileops_run_load(const char *root, const char *path,
+                     approval_facts_t *facts, unsigned char **bytes,
+                     size_t *size);
 
 /** The protocol word of a refusal, and its exit status. **/
 const char *fileops_word(int rc);

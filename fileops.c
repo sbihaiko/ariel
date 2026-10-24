@@ -191,7 +191,9 @@ identity(int dirfd, const char *leaf, approval_facts_t *facts) {
 
 /**
  * Resolve path to its parent directory and entry, and say what the entry is.
- * On success the parent stays open in dirfd for the caller to close.
+ * On success the parent stays open in dirfd for the caller to close. A read
+ * (a run, a built-in check) may reach any entry under root; a write reaches
+ * only below a writable root.
  **/
 static int
 inspect(const char *root, const char *path, approval_facts_t *facts,
@@ -1410,6 +1412,102 @@ fileops_unzip_act(const char *root, const char *archive,
 }
 
 
+
+
+/**
+ * Read the entry leaf in dirfd, which must still be the one inspected, into
+ * bytes, and hash those bytes into facts.
+ **/
+static int
+read_run(int dirfd, const char *leaf, approval_facts_t *facts,
+         unsigned char **bytes, size_t *size) {
+  struct stat st;
+  unsigned char *buf;
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+  size_t len = 0;
+  ssize_t n;
+  int fd;
+
+  fd = openat(dirfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if(fd < 0) {
+    return errno == ELOOP ? FILEOPS_LINK : FILEOPS_FAILED;
+  }
+  if(fstat(fd, &st)) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  if((uint64_t)st.st_dev != facts->dev || (uint64_t)st.st_ino != facts->ino) {
+    close(fd);
+    return FILEOPS_CHANGED;
+  }
+  if(st.st_size < 0 || (uint64_t)st.st_size > FILEOPS_RUN_MAX) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+
+  buf = malloc((size_t)st.st_size + 1);
+  if(!buf) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  while(len < (size_t)st.st_size) {
+    n = read(fd, buf + len, (size_t)st.st_size - len);
+    if(n <= 0) {
+      free(buf);
+      close(fd);
+      return n < 0 ? FILEOPS_FAILED : FILEOPS_CHANGED;
+    }
+    len += (size_t)n;
+  }
+  close(fd);
+
+  sha256_init(&hash);
+  sha256_update(&hash, buf, len);
+  sha256_final(&hash, digest);
+  sha256_hex(digest, facts->sha256);
+
+  *bytes = buf;
+  *size = len;
+  return FILEOPS_OK;
+}
+
+
+int
+fileops_run_load(const char *root, const char *path, approval_facts_t *facts,
+                 unsigned char **bytes, size_t *size) {
+  struct stat st;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  if(path[0] == '/' && approval_target_valid(path) && !below(root, path)) {
+    return FILEOPS_NOT_RUNNABLE;
+  }
+  rc = inspect(root, path, facts, &dirfd, leaf, sizeof(leaf), 0);
+  if(rc) {
+    return rc;
+  }
+
+  if(!strcmp(facts->kind, "absent")) {
+    rc = FILEOPS_NO_FILE;
+  } else if(!strcmp(facts->kind, "link")) {
+    rc = FILEOPS_LINK;
+  } else if(strcmp(facts->kind, "file")) {
+    rc = FILEOPS_NOT_FILE;
+  } else if(fstatat(dirfd, leaf, &st, AT_SYMLINK_NOFOLLOW)) {
+    rc = FILEOPS_FAILED;
+  } else if(!(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+    rc = FILEOPS_NOT_EXEC;
+  } else {
+    rc = read_run(dirfd, leaf, facts, bytes, size);
+  }
+
+  close(dirfd);
+  return rc;
+}
+
+
 const char *
 fileops_word(int rc) {
   switch(rc) {
@@ -1449,6 +1547,8 @@ fileops_word(int rc) {
     return "unsafe_member";
   case FILEOPS_BAD_ARCHIVE:
     return "bad_archive";
+  case FILEOPS_NOT_EXEC:
+    return "not_executable";
   default:
     return "ok";
   }

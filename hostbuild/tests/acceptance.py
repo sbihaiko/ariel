@@ -1126,6 +1126,14 @@ CLOCK_SCENARIOS = {
     "a command nothing implements asks the owner and then does nothing",
     "a file command's audit lines reach audit tail",
     "the challenge of a file command names its path, sha256 none and identity",
+    "a file run by path prints nothing until the owner signs, then runs once",
+    "a run of a file rewritten after approval answers approval_stale and "
+    "exit 78",
+    "a run of a file replaced by another object with the same bytes answers "
+    "approval_stale and exit 78",
+    "a bare name found on the PATH is gated as the file it resolves to",
+    "a run's request, grant and completion reach audit tail in order",
+    "the challenge of a run names its path, its sha256 and its identity",
     "kill asks for approval, and a grant runs it once and audits the request, "
     "grant and kill",
     "a restarted process under the same pid answers approval_stale and exit "
@@ -1211,6 +1219,9 @@ HOST_ROOT_SCENARIOS = {
     "unzip refuses the token, approval state, nonces and the state directory "
     "through any alias with protected and exit 87, even when approved",
     "unzip lists, runs and refusals reach audit tail under their paths",
+    "a run of a missing path, a directory or a file without execute bits "
+    "answers its word and exit 1 without asking",
+    "a run of Ariel's token answers protected and exit 87 without asking",
 }
 
 
@@ -3472,6 +3483,146 @@ def scenario_transfer_action_names_its_facts(server):
     assert "\ntarget=%s\n" % source in action, action
     assert "\ndestination=%s\n" % destination in action, action
     assert "\nsha256=none\n" in action, action
+
+
+HELLO_OUTPUT = "Hello, world from Ariel!"
+
+CHANGED_SOURCE = """
+#include <stdio.h>
+
+int
+main(void) {
+  printf("changed after approval\\n");
+  return 0;
+}
+"""
+
+
+def install_elf(server, name, data, directory="data"):
+    """Write data as an executable file under the test root; return its path."""
+    folder = os.path.join(server.root, directory)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    os.chmod(path, 0o755)
+    return path
+
+
+def scenario_elf_run_needs_the_owner(server):
+    """A file run by path prints nothing until the owner signs, then runs once."""
+    server.advance(120000)
+    path = install_elf(server, "elf-hello", compile_payload(HELLO_SOURCE, "hello"))
+    approval, challenge = gate_request(server, path)
+    assert run_command(server, path)[-1] == "exit 75", (
+        "a run before the signature must still ask")
+    server.assert_no_line()
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, path) == [HELLO_OUTPUT, "status 0", "exit 0"], (
+        "a signed run must print the payload's output, its status and exit 0")
+    spent, _ = gate_request(server, path)
+    assert spent != approval, "a signature is spent by the run it allowed"
+
+
+def scenario_elf_changed_after_approval_answers_78(server):
+    """A file rewritten after the owner signs answers approval_stale and does not run."""
+    server.advance(120000)
+    path = install_elf(server, "elf-changed", compile_payload(HELLO_SOURCE, "hello"))
+    approval, challenge = gate_request(server, path)
+    sign_and_grant(server, approval, challenge)
+    with open(path, "wb") as handle:
+        handle.write(compile_payload(CHANGED_SOURCE, "changed"))
+    assert run_command(server, path) == ["approval_stale", "exit 78"], (
+        "a file rewritten after approval must answer approval_stale")
+
+
+def scenario_elf_replaced_answers_78(server):
+    """A new object with the same bytes is another file: approval_stale, not run."""
+    server.advance(120000)
+    data = compile_payload(HELLO_SOURCE, "hello")
+    path = install_elf(server, "elf-moved", data)
+    approval, challenge = gate_request(server, path)
+    sign_and_grant(server, approval, challenge)
+    replacement = install_elf(server, "elf-moved-new", data)
+    os.replace(replacement, path)
+    assert run_command(server, path) == ["approval_stale", "exit 78"], (
+        "a file replaced after approval must answer approval_stale")
+
+
+def scenario_elf_on_path_needs_the_owner(server):
+    """A bare name found on the PATH is gated as the file it resolves to."""
+    server.advance(120000)
+    binary = install_elf(server, "elf-path-hello",
+                         compile_payload(HELLO_SOURCE, "hello"), "bin")
+    saved = server.env
+    server.env = dict(saved or {}, PATH=os.path.dirname(binary))
+    server.restart()
+    try:
+        approval, challenge = gate_request(server, "elf-path-hello")
+        assert "\ntarget=%s\n" % binary in challenge_action(challenge), (
+            "the challenge must name the resolved path, not the bare name")
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "elf-path-hello") == [
+            HELLO_OUTPUT, "status 0", "exit 0"], (
+            "a signed PATH name must run the file it resolves to")
+    finally:
+        server.env = saved
+        server.restart()
+
+
+def scenario_elf_refusals_need_no_owner(server):
+    """A missing path, a directory and a file without execute bits answer their word."""
+    missing = os.path.join(server.root, "data", "elf-missing")
+    assert run_command(server, missing) == ["no_such_file", "exit 1"]
+
+    folder = os.path.join(server.root, "data", "elf-folder")
+    os.makedirs(folder, exist_ok=True)
+    assert run_command(server, folder) == ["not_a_file", "exit 1"]
+
+    plain = os.path.join(server.root, "data", "elf-plain")
+    with open(plain, "wb") as handle:
+        handle.write(b"not a program\n")
+    os.chmod(plain, 0o644)
+    assert run_command(server, plain) == ["not_executable", "exit 1"], (
+        "a file without execute bits must not be run")
+    server.assert_no_line()
+
+
+def scenario_elf_token_refused(server):
+    """Ariel's token answers protected and exit 87 as a run, without asking."""
+    token = secret_path(server, "token")
+    assert run_command(server, token) == ["protected", "exit 87"], (
+        "the token must never be run")
+    server.assert_no_line()
+    assert any(AUDIT_LINE.match(event) and event.split()[1] == "run.protected"
+               for event in audit_tail(server)), (
+        "the refusal must be in the audit log")
+
+
+def scenario_elf_run_is_audited(server):
+    """A run's request, grant and completion reach audit tail in that order."""
+    server.advance(120000)
+    path = install_elf(server, "elf-audited", compile_payload(HELLO_SOURCE, "hello"))
+    approval, challenge = gate_request(server, path)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, path) == [HELLO_OUTPUT, "status 0", "exit 0"]
+    ours = [event.split()[1] for event in audit_tail(server)
+            if AUDIT_LINE.match(event) and event.split()[2] == path
+            and event.split()[3] == approval]
+    assert ours == ["run.request", "grant", "run.done"], (
+        "the audit log must show the request, the grant and the run: %r" % ours)
+
+
+def scenario_elf_action_names_its_facts(server):
+    """The challenge of a run names the command, the path, the file's sha256 and identity."""
+    server.advance(120000)
+    data = compile_payload(HELLO_SOURCE, "hello")
+    path = install_elf(server, "elf-facts", data)
+    _, challenge = gate_request(server, path)
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\ncommand=run\n"), action
+    assert "\ntarget=%s\n" % path in action, action
+    assert "\nsha256=%s\n" % hashlib.sha256(data).hexdigest() in action, action
     assert "\noption.kind=file\n" in action, action
     assert "\noption.dev=" in action and "\noption.ino=" in action, action
 
@@ -5523,6 +5674,23 @@ SCENARIOS = [
      scenario_unzip_outside_writable_roots_answers_87, None),
     ("unzip lists, runs and refusals reach audit tail under their paths",
      scenario_unzip_actions_are_audited, HOST_ROOT_REASON),
+    ("a file run by path prints nothing until the owner signs, then runs once",
+     scenario_elf_run_needs_the_owner, True),
+    ("a run of a file rewritten after approval answers approval_stale and "
+     "exit 78", scenario_elf_changed_after_approval_answers_78, True),
+    ("a run of a file replaced by another object with the same bytes answers "
+     "approval_stale and exit 78", scenario_elf_replaced_answers_78, True),
+    ("a bare name found on the PATH is gated as the file it resolves to",
+     scenario_elf_on_path_needs_the_owner, True),
+    ("a run of a missing path, a directory or a file without execute bits "
+     "answers its word and exit 1 without asking",
+     scenario_elf_refusals_need_no_owner, HOST_ROOT_REASON),
+    ("a run of Ariel's token answers protected and exit 87 without asking",
+     scenario_elf_token_refused, HOST_ROOT_REASON),
+    ("a run's request, grant and completion reach audit tail in order",
+     scenario_elf_run_is_audited, True),
+    ("the challenge of a run names its path, its sha256 and its identity",
+     scenario_elf_action_names_its_facts, True),
     ("pwd and ls <absolute path> run through the agent port",
      scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",
