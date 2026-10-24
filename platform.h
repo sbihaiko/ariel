@@ -38,6 +38,9 @@ along with this program; see the file COPYING. If not, see
 #define PROCESS_START_MAX 31
 /** The hash of an exec's arguments, in hex. **/
 #define ARGS_HASH_MAX 64
+/** The arguments a gated built-in binds after its target, and their bytes. **/
+#define BUILTIN_ARGS_MAX 5
+#define BUILTIN_ARG_MAX  64
 
 /**
  * The immutable fact record an approval is bound to: what exactly the
@@ -53,6 +56,7 @@ along with this program; see the file COPYING. If not, see
  * A transfer, cp, mv or ln, also fills dest with its destination path.
  * For exec, the target is the program, sha256 its bytes, argc the arguments
  * after it and args their hash. For export, sha256 is the hash of the value.
+ * A PS5 built-in fills arg with its arguments after the target, as text.
  **/
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
@@ -77,6 +81,7 @@ typedef struct {
   uint64_t minor;
   char replaces[65];  /** The build a rollback replaces; empty otherwise. **/
   char args[ARGS_HASH_MAX + 1];
+  char arg[BUILTIN_ARGS_MAX][BUILTIN_ARG_MAX + 1];
 } approval_facts_t;
 
 /**

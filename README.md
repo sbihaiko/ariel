@@ -142,7 +142,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
 | `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional |
 
-PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) and `session` (Stage 4).
+PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid`, `sfoinfo` and `sfocreate` are gated, and `sfocreate` joins them in #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) and `session` (Stage 4).
 
 Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `ssh`, `top` and package managers. The agent composes logic on its own side, on the computer it runs on.
 

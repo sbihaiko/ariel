@@ -148,6 +148,12 @@ approval_target_valid(const char *target) {
 }
 
 
+int
+approval_value_valid(const char *value) {
+  return in_set(value, 1, VALUE_MAX, "._-", 0);
+}
+
+
 /** A content hash, or none for an action with no content behind it. **/
 static int
 hash_ok(const char *hash) {

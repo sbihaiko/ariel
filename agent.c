@@ -1886,22 +1886,25 @@ autoload_show(int fd) {
 }
 
 
-/** The digest of a built-in's arguments, joined by spaces. **/
-static void
-args_digest(int argc, char *argv[], char out[SHA256_HEX_LEN + 1]) {
-  unsigned char digest[SHA256_DIGEST_LEN];
-  sha256_t hash;
+/**
+ * Copy a built-in's arguments from argv[first] on into facts, as the text the
+ * owner reads. Returns -1 when there are more than the action can name, or
+ * one is not a word the encoder accepts.
+ **/
+static int
+builtin_args(int argc, char *argv[], int first, approval_facts_t *facts) {
   int i;
 
-  sha256_init(&hash);
-  for(i=1; i<argc; i++) {
-    if(i > 1) {
-      sha256_update(&hash, " ", 1);
-    }
-    sha256_update(&hash, argv[i], strlen(argv[i]));
+  if(argc - first > BUILTIN_ARGS_MAX) {
+    return -1;
   }
-  sha256_final(&hash, digest);
-  sha256_hex(digest, out);
+  for(i=first; i<argc; i++) {
+    if(!approval_value_valid(argv[i])) {
+      return -1;
+    }
+    snprintf(facts->arg[i - first], sizeof(facts->arg[0]), "%s", argv[i]);
+  }
+  return 0;
 }
 
 
@@ -2017,16 +2020,20 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
 
 
 /**
- * One built-in, asked of the owner before it runs. The arguments are bound
- * by their digest, so a grant for one set does not run another. Once signed,
+ * One built-in, asked of the owner before it runs. Its arguments after the
+ * target are bound as text, so a grant for one set does not run another. Once signed,
  * the built-in runs with its arguments and its done record comes first.
  **/
 static void
-builtin_run(agent_t *agent, int fd, int argc, char *argv[],
+builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
             approval_facts_t *facts) {
   approval_challenge_t challenge;
 
-  args_digest(argc, argv, facts->args);
+  if(builtin_args(argc, argv, first, facts)) {
+    audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
+    return;
+  }
+  facts->argc = (uint64_t)argc;
   if(!gate_pass(agent, fd, facts, &challenge)) {
     return;
   }
@@ -2041,7 +2048,7 @@ builtin_run(agent_t *agent, int fd, int argc, char *argv[],
 }
 
 
-/** pkg_install, hbldr, hbdbg and sfocreate: a file the built-in reads. **/
+/** pkg_install, hbldr and hbdbg: a file the built-in reads. **/
 static void
 builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
   approval_facts_t facts;
@@ -2061,7 +2068,7 @@ builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
   snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
   snprintf(facts.target, sizeof(facts.target), "%s", argv[1]);
-  builtin_run(agent, fd, argc, argv, &facts);
+  builtin_run(agent, fd, argc, argv, 2, &facts);
 }
 
 
@@ -2086,8 +2093,7 @@ builtin_word_command(agent_t *agent, int fd, int argc, char *argv[]) {
   memset(&facts, 0, sizeof(facts));
   snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
   snprintf(facts.target, sizeof(facts.target), "%s", target);
-  facts.argc = (uint64_t)argc;
-  builtin_run(agent, fd, argc, argv, &facts);
+  builtin_run(agent, fd, argc, argv, target == argv[0] ? 1 : 2, &facts);
 }
 
 
@@ -2132,7 +2138,7 @@ reptyr_command(agent_t *agent, int fd, int argc, char *argv[]) {
   snprintf(facts.target, sizeof(facts.target), "%s", pid_str);
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", identity);
   snprintf(facts.start, sizeof(facts.start), "%s", start);
-  builtin_run(agent, fd, argc, argv, &facts);
+  builtin_run(agent, fd, argc, argv, 2, &facts);
 }
 
 
@@ -2141,7 +2147,7 @@ builtin_command(agent_t *agent, int fd, int argc, char *argv[]) {
   if(!strcmp(argv[0], "reptyr")) {
     reptyr_command(agent, fd, argc, argv);
   } else if(!strcmp(argv[0], "pkg_install") || !strcmp(argv[0], "hbldr") ||
-            !strcmp(argv[0], "hbdbg") || !strcmp(argv[0], "sfocreate")) {
+            !strcmp(argv[0], "hbdbg")) {
     builtin_file_command(agent, fd, argc, argv);
   } else {
     builtin_word_command(agent, fd, argc, argv);

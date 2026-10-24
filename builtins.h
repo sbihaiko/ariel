@@ -22,8 +22,7 @@ along with this program; see the file COPYING. If not, see
 static inline int
 builtin_gated(const char *name) {
   static const char *const names[] = {
-    "launch", "pkg_install", "hbldr", "hbdbg", "suspend", "sfocreate",
-    "notify", "reptyr"
+    "launch", "pkg_install", "hbldr", "hbdbg", "suspend", "notify", "reptyr"
   };
   size_t i;
 

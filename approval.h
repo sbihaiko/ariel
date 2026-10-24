@@ -94,6 +94,9 @@ int approval_canonical(const approval_action_t *action, char *out,
 /** Whether target is one the encoder accepts. Returns 1 when it is. **/
 int approval_target_valid(const char *target);
 
+/** Whether value is an option value the encoder accepts. Returns 1 when it is. **/
+int approval_value_valid(const char *value);
+
 /**
  * Build the message a signature covers: a domain tag, the console
  * identity, the canonical action bytes, the nonce, issued-at and expiry

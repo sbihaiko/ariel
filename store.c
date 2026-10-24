@@ -869,12 +869,18 @@ value_key(const char *command) {
  * count and the hash of its arguments. env and export name one variable, so
  * they have no options.
  * A reptyr is an action on its pid with its start, and a PS5 built-in also
- * carries its arguments. text holds the numbers the options point at.
+ * carries its arguments after the target as text, arg1 first, so the owner
+ * reads them. text holds the numbers the options point at.
  **/
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
              approval_option_t options[APPROVAL_OPTIONS_MAX],
              char text[4][24]) {
+  static const char *const arg_keys[BUILTIN_ARGS_MAX] = {
+    "arg1", "arg2", "arg3", "arg4", "arg5",
+  };
+  size_t i;
+
   if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
@@ -940,9 +946,9 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[action->noptions].value = facts->value;
       action->noptions++;
     }
-    if(facts->args[0] && strcmp(facts->command, "exec")) {
-      options[action->noptions].key = "args";
-      options[action->noptions].value = facts->args;
+    for(i=0; i<BUILTIN_ARGS_MAX && facts->arg[i][0]; i++) {
+      options[action->noptions].key = arg_keys[i];
+      options[action->noptions].value = facts->arg[i];
       action->noptions++;
     }
   } else if(!strcmp(facts->command, "payload.rollback")) {
@@ -1100,8 +1106,8 @@ same_identity(const approval_facts_t *a, const approval_facts_t *b) {
          !strcmp(a->fstype, b->fstype) && !strcmp(a->from, b->from) &&
          !strcmp(a->type, b->type) && a->major == b->major &&
          a->minor == b->minor &&
-         !strcmp(a->sha256, b->sha256) && a->argc == b->argc &&
-         !strcmp(a->args, b->args);
+         !strcmp(a->sha256, b->sha256) &&
+         !memcmp(a->arg, b->arg, sizeof(a->arg));
 }
 
 
