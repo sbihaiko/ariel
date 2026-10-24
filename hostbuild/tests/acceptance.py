@@ -13,7 +13,9 @@ record and the object the new build replaced. Those facts have no reply of
 their own until payload run arrives.
 """
 
+import contextlib
 import hashlib
+import io
 import os
 import queue
 import re
@@ -871,8 +873,10 @@ CLOCK_SCENARIOS = {
     "the test clock is host-only and cannot enter the PS5 build",
     "a valid signature decides the approval and the gated command runs once",
     "a forged signature answers signature_invalid and runs nothing",
-    "a signature for a different command, target or hash is refused",
-    "a signature for another console is refused",
+    "a signature for a different command, target or hash answers "
+    "signature_action_mismatch",
+    "a signature for another console answers signature_console_mismatch",
+    "the signer refuses an action with bytes it cannot show",
     "a signature after the challenge expired is refused",
     "a malformed signature answers signature_malformed and exit 83",
     "the same signature twice is refused the second time",
@@ -964,6 +968,50 @@ def scripted_session(replies, answers=()):
     link = ScriptedLink(replies, events)
     operator = console.Operator(read=read, write=write, sleep=lambda s: None)
     return console, link, operator, console.Session(link, operator), events, shown
+
+
+class SilentSocket:
+    """A console connection that accepts a command and answers nothing."""
+
+    def sendall(self, data):
+        pass
+
+    def shutdown(self, how):
+        pass
+
+    def recv(self, size):
+        return b""
+
+    def close(self):
+        pass
+
+
+def scenario_console_run_reaches_checks(server):
+    """Console mode reaches its checks over an injected transport."""
+    del server  # the injected transport stands in for the console
+
+    import console
+
+    answers = ["0123456789abcdef0123456789abcdef"]
+    operator = console.Operator(
+        read=lambda prompt="": answers.pop(0) if answers else "",
+        write=lambda line="": None, sleep=lambda s: None)
+    real_clang = console.prospero_clang
+    console.prospero_clang = lambda: ["prospero-clang"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = console.run(
+                "192.0.2.1", [], operator=operator,
+                connect=lambda address, timeout=None: SilentSocket())
+    finally:
+        console.prospero_clang = real_clang
+
+    assert len(results) == len(console.CHECKS), (
+        "every console check must run, got %d of %d"
+        % (len(results), len(console.CHECKS)))
+    broken = [detail for _title, _ok, detail in results
+              if "NameError" in detail or "AttributeError" in detail]
+    assert not broken, "the harness itself is broken: %r" % broken
 
 
 def scenario_console_approval_prompts(server):
@@ -1665,10 +1713,21 @@ def sign_challenge(server, challenge, key=None):
     assert challenge_action(challenge) in done.stderr, (
         "the signer must print the canonical action as signed, got %r"
         % done.stderr)
-    signature = done.stdout.strip()
-    assert re.fullmatch(r"[0-9a-f]{128}", signature), (
-        "expected a 128-digit signature, got %r" % signature)
-    return signature
+    envelope = done.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{128} \S+ [0-9a-f]{64}", envelope), (
+        "expected a signature, the console and the action hash, got %r"
+        % envelope)
+    parts = challenge.split(" ")
+    action = bytes.fromhex(parts[6])
+    assert envelope.split(" ")[1:] == [
+        parts[2], hashlib.sha256(action).hexdigest()], (
+        "the envelope must name the console and the action it signed")
+    return envelope
+
+
+def signature_of(envelope):
+    """The bare signature of a signer's output line."""
+    return envelope.split(" ")[0]
 
 
 def retarget(challenge, old, new):
@@ -1753,6 +1812,9 @@ def scenario_signature_forged(server):
         forged = sign_challenge(server, challenge, key=key)
     assert grant(server, approval, forged) == ["signature_invalid",
                                                "exit 79"]
+    assert grant(server, approval, signature_of(forged)) == [
+        "signature_invalid", "exit 79"], (
+        "a bare forged signature is refused the same way")
     assert_not_run(server, "forged", staging, approval)
 
 
@@ -1769,7 +1831,7 @@ def scenario_signature_wrong_action(server):
     for what, old, new in swaps:
         signature = sign_challenge(server, retarget(challenge, old, new))
         assert grant(server, approval, signature) == [
-            "signature_invalid", "exit 79"], (
+            "signature_action_mismatch", "exit 85"], (
             "a signature for a different %s must be refused" % what)
     assert_not_run(server, "swapped", staging, approval)
 
@@ -1782,9 +1844,30 @@ def scenario_signature_wrong_console(server):
     parts = challenge.split(" ")
     parts[2] = console + "-two"
     signature = sign_challenge(server, " ".join(parts))
-    assert grant(server, approval, signature) == ["signature_invalid",
-                                                  "exit 79"]
+    assert grant(server, approval, signature) == [
+        "signature_console_mismatch", "exit 86"]
     assert_not_run(server, "elsewhere", staging, approval)
+
+
+def scenario_signer_refuses_hidden_bytes(server):
+    """The signer signs only what it can show: no NULs, no controls."""
+    data = b"hidden bytes"
+    _staging, _approval, challenge = push_for_challenge(
+        server, "hidden", data)
+    parts = challenge.split(" ")
+    action = bytes.fromhex(parts[6])
+    hidden = [("NUL", action + b"\0command=other\n"),
+              ("escape", action + b"\x1b[2J"),
+              ("carriage return", action.replace(b"\n", b"\r\n", 1)),
+              ("high byte", action + b"\xc3\xa9")]
+    for what, bad in hidden:
+        parts[6] = bad.hex()
+        done = subprocess.run(
+            [signer_path(server), "sign", test_key(), "--yes"],
+            input=" ".join(parts) + "\n", capture_output=True, text=True)
+        assert done.returncode != 0 and done.stdout == "", (
+            "the signer must refuse an action with a %s, got %r"
+            % (what, done.stdout))
 
 
 def scenario_signature_expired(server):
@@ -1803,7 +1886,7 @@ def scenario_signature_malformed(server):
     data = b"a bad signature"
     staging, approval, challenge = push_for_challenge(
         server, "malformed", data)
-    good = sign_challenge(server, challenge)
+    good = signature_of(sign_challenge(server, challenge))
     for what, signature in [("not hex", "zz" * 64),
                             ("too short", good[:-2]),
                             ("too long", good + "00"),
@@ -2053,10 +2136,12 @@ SCENARIOS = [
      "once", scenario_signature_loop, True),
     ("a forged signature answers signature_invalid and runs nothing",
      scenario_signature_forged, True),
-    ("a signature for a different command, target or hash is refused",
-     scenario_signature_wrong_action, True),
-    ("a signature for another console is refused",
+    ("a signature for a different command, target or hash answers "
+     "signature_action_mismatch", scenario_signature_wrong_action, True),
+    ("a signature for another console answers signature_console_mismatch",
      scenario_signature_wrong_console, True),
+    ("the signer refuses an action with bytes it cannot show",
+     scenario_signer_refuses_hidden_bytes, True),
     ("a signature after the challenge expired is refused",
      scenario_signature_expired, True),
     ("a malformed signature answers signature_malformed and exit 83",
@@ -2078,6 +2163,8 @@ SCENARIOS = [
     ("console mode prints what the owner should see on the console and "
      "waits for the owner's signature",
      scenario_console_approval_prompts, False),
+    ("console mode runs its checks over an injected transport",
+     scenario_console_run_reaches_checks, False),
 ]
 
 

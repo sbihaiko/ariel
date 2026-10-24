@@ -599,6 +599,8 @@ nonces_write(const unsigned char list[][APPROVAL_NONCE_LEN], size_t count) {
   char line[2 * APPROVAL_NONCE_LEN + 2];
   size_t i;
   int dirfd;
+  int synced;
+  int closed;
   int fd;
 
   if((dirfd=state_open()) < 0) {
@@ -620,8 +622,11 @@ nonces_write(const unsigned char list[][APPROVAL_NONCE_LEN], size_t count) {
     }
   }
 
-  if(fsync(fd) || close(fd)) {
-    fd = -1;
+  // Close on both outcomes: fail closes only a descriptor still open.
+  synced = fsync(fd);
+  closed = close(fd);
+  fd = -1;
+  if(synced || closed) {
     goto fail;
   }
 
@@ -831,8 +836,12 @@ store_approval_request(const approval_facts_t *facts,
 
 
 int
-store_approval_grant(const char *id, const unsigned char *signature) {
+store_approval_grant(const char *id, const unsigned char *signature,
+                     const char *console, const char *action_sha256) {
   unsigned char message[APPROVAL_MESSAGE_MAX];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char digest_hex[SHA256_HEX_LEN + 1];
+  sha256_t hash;
   struct approval *request;
   int len;
   int rc;
@@ -851,6 +860,16 @@ store_approval_grant(const char *id, const unsigned char *signature) {
     rc = STORE_GRANT_REPLAYED;
   } else if(request->decided) {
     rc = STORE_GRANT_DENIED;
+  } else if(console &&
+            strcmp(console, request->challenge.console)) {
+    rc = STORE_GRANT_WRONG_CONSOLE;
+  } else if(action_sha256 &&
+            (sha256_init(&hash),
+             sha256_update(&hash, request->challenge.action,
+                           request->challenge.action_len),
+             sha256_final(&hash, digest), sha256_hex(digest, digest_hex),
+             strcmp(action_sha256, digest_hex))) {
+    rc = STORE_GRANT_WRONG_ACTION;
   } else {
     len = approval_message(request->challenge.console,
                            request->challenge.action,

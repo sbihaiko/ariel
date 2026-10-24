@@ -76,6 +76,12 @@ static const char signature_invalid[] =
 static const char signature_malformed[] =
   "signature_malformed\n"
   "exit 83\n";
+static const char signature_action_mismatch[] =
+  "signature_action_mismatch\n"
+  "exit 85\n";
+static const char signature_console_mismatch[] =
+  "signature_console_mismatch\n"
+  "exit 86\n";
 static const char approval_replayed[] =
   "approval_replayed\n"
   "exit 84\n";
@@ -554,23 +560,31 @@ payload_commit(int fd, const char *staging_id) {
 
 
 /**
- * approval grant <id> <signature>: the owner's signature arrives here, on
- * whatever connection carries it, the agent's included. It cannot be
- * forged there, so relaying it is fine: the platform verifies it behind
- * the port, and nothing else makes an approval approved.
+ * approval grant <id> <signature> [<console> <action-sha256>]: the owner's
+ * signature arrives here, on whatever connection carries it, the agent's
+ * included. It cannot be forged there, so relaying it is fine: the platform
+ * verifies it behind the port, and nothing else makes an approval approved.
+ * The optional console and action hash are the signer's claim of what it
+ * signed. They only say which part is wrong; they never grant anything.
  **/
 static void
 approval_grant(agent_t *agent, int fd, const char *id,
-               const char *signature_text) {
+               const char *signature_text, const char *console,
+               const char *action_sha256) {
   unsigned char signature[APPROVAL_SIG_LEN];
+  unsigned char digest[SHA256_DIGEST_LEN];
   char answer[APPROVAL_ID_MAX + 32];
 
-  if(approval_hex_decode(signature_text, signature, sizeof(signature))) {
+  if(approval_hex_decode(signature_text, signature, sizeof(signature)) ||
+     (console && (strlen(console) > APPROVAL_CONSOLE_MAX ||
+                  approval_hex_decode(action_sha256, digest,
+                                      sizeof(digest))))) {
     reply(fd, signature_malformed);
     return;
   }
 
-  switch(agent->platform->approval_grant(agent->platform, id, signature)) {
+  switch(agent->platform->approval_grant(agent->platform, id, signature,
+                                         console, action_sha256)) {
   case STORE_GRANT_OK:
     snprintf(answer, sizeof(answer), "approval_granted %s\nexit 0\n", id);
     reply(fd, answer);
@@ -580,6 +594,12 @@ approval_grant(agent_t *agent, int fd, const char *id,
     return;
   case STORE_GRANT_INVALID:
     reply(fd, signature_invalid);
+    return;
+  case STORE_GRANT_WRONG_ACTION:
+    reply(fd, signature_action_mismatch);
+    return;
+  case STORE_GRANT_WRONG_CONSOLE:
+    reply(fd, signature_console_mismatch);
     return;
   case STORE_GRANT_REPLAYED:
     reply(fd, approval_replayed);
@@ -662,8 +682,12 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
-  if(argc == 4 && !strcmp(argv[0], "approval") && !strcmp(argv[1], "grant")) {
-    approval_grant(agent, fd, argv[2], argv[3]);
+  // approval grant <id> <signature> [<console> <action-sha256>]: the
+  // optional envelope is what the signer printed after the signature.
+  if((argc == 4 || argc == 6) && !strcmp(argv[0], "approval") &&
+     !strcmp(argv[1], "grant")) {
+    approval_grant(agent, fd, argv[2], argv[3], argc == 6 ? argv[4] : NULL,
+                   argc == 6 ? argv[5] : NULL);
     return;
   }
 

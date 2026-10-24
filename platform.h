@@ -123,10 +123,14 @@ struct platform {
   /**
    * Take the owner's signature for an approval: verify it behind the port
    * and, when it holds, mark the approval decided with its nonce recorded
-   * as consumed. Returns one of the STORE_GRANT_* outcomes.
+   * as consumed. console and action_sha256 are the signer's envelope, both
+   * NULL for a bare signature: a mismatch names the wrong console or action
+   * instead of an invalid signature. Returns one of the STORE_GRANT_*
+   * outcomes.
    **/
   int (*approval_grant)(platform_t *self, const char *id,
-                        const unsigned char *signature);
+                        const unsigned char *signature,
+                        const char *console, const char *action_sha256);
 
   /**
    * Run a payload in the foreground from its verified bytes: put the bytes

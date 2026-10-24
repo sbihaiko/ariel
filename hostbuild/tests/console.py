@@ -105,6 +105,63 @@ class Operator:
         return (self._read("Signature (128 hex digits): ") or "").strip()
 
 
+def read_reply(sock):
+    """Read a reply until the server closes the connection."""
+    data = b""
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except ConnectionResetError:
+        pass
+    return data.decode("ascii", "replace")
+
+
+def reply_lines(reply):
+    return [line for line in reply.replace("\r\n", "\n").split("\n")
+            if line != ""]
+
+
+class Link:
+    """One connection to a console's agent port."""
+
+    def __init__(self, host, port, token, connect=None, timeout=10.0):
+        self.host = host
+        self.port = port
+        self.token = token
+        self._connect = connect if connect is not None else socket.create_connection
+        self.timeout = timeout
+
+    def open(self, timeout=None):
+        return self._connect((self.host, self.port),
+                             timeout=timeout or self.timeout)
+
+    def exchange(self, command, body=None, token=None):
+        """Send one command after auth and return the lines the console replied."""
+        sock = self.open()
+        try:
+            sock.sendall(("auth %s\n%s\n" % (token or self.token, command))
+                         .encode("ascii"))
+            if body is not None:
+                sock.sendall(body)
+            sock.shutdown(socket.SHUT_WR)
+            return reply_lines(read_reply(sock))
+        finally:
+            sock.close()
+
+    def raw(self, payload):
+        """Send bytes with no auth line and return whatever came back."""
+        sock = self.open()
+        try:
+            sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+            return read_reply(sock)
+        finally:
+            sock.close()
+
+
 class Session:
     """The console checks, over one link to the agent port."""
 
@@ -309,13 +366,13 @@ def plan_lines(host, scenarios):
     return lines
 
 
-def run(host, scenarios, operator=None):
+def run(host, scenarios, operator=None, connect=None):
     """Run every console check and return its results."""
     operator = operator or Operator()
     token = operator.token(host)
     cc = prospero_clang()
     workdir = tempfile.mkdtemp(prefix="ariel-console-")
-    link = Link(host, PORT, token)
+    link = Link(host, PORT, token, connect=connect)
     session = Session(link, operator)
     context = Context(host=host, port=PORT, token=token, workdir=workdir,
                       cc=cc, document=document_path())

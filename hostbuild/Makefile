@@ -42,13 +42,13 @@ tweetnacl.o: ../tweetnacl.c ../tweetnacl.h
 # The offline signer is a separate program: it makes keys, which needs a
 # random source the server never has, so it compiles the approval code with
 # ARIEL_SIGNER and brings its own.
-signer.o: ../signer.c ../approval.h ../tweetnacl.h
+signer.o: ../signer.c ../approval.h ../sha256.h ../tweetnacl.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 approval_signer.o: ../approval.c ../approval.h ../tweetnacl.h
 	$(CC) $(CFLAGS) -DARIEL_SIGNER -c -o $@ $<
 
-$(SIGNER): signer.o approval_signer.o tweetnacl.o
+$(SIGNER): signer.o approval_signer.o sha256.o tweetnacl.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 # The encoder's own tests, with the ambiguous inputs it must refuse.

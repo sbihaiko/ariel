@@ -31,7 +31,9 @@ along with this program; see the file COPYING. If not, see
  * The signer prints the canonical action text on standard error exactly as
  * the bytes it is about to sign, not a summary of them, and asks the owner
  * to confirm on the terminal unless --yes is given. The signature, 128 hex
- * digits, goes to standard output; paste it into `approval grant <id>`.
+ * digits, goes to standard output followed by the console and the action's
+ * SHA-256, so Ariel can tell a wrong console or action from a forged
+ * signature; paste the whole line after `approval grant <id>`.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -44,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "approval.h"
+#include "sha256.h"
 #include "tweetnacl.h"
 
 #define LINE_MAX_LEN 4096
@@ -191,6 +194,23 @@ confirm(void) {
 }
 
 
+/**
+ * Zero when every byte is printable ASCII or a newline, which is all a
+ * canonical action holds. Anything else could be hidden by a terminal.
+ **/
+static int
+action_shown_whole(const unsigned char *bytes, size_t len) {
+  size_t i;
+
+  for(i=0; i<len; i++) {
+    if(bytes[i] != '\n' && (bytes[i] < 0x20 || bytes[i] > 0x7e)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+
 static int
 cmd_sign(const char *path, int assume_yes) {
   unsigned char pk[APPROVAL_PUBKEY_LEN];
@@ -201,7 +221,10 @@ cmd_sign(const char *path, int assume_yes) {
   unsigned char signed_msg[APPROVAL_SIG_LEN + APPROVAL_MESSAGE_MAX];
   unsigned long long signed_len = 0;
   char line[LINE_MAX_LEN];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char digest_hex[2 * SHA256_DIGEST_LEN + 1];
   char sig_hex[2 * APPROVAL_SIG_LEN + 1];
+  sha256_t hash;
   char *fields[7];
   char *save = NULL;
   char *end = NULL;
@@ -252,6 +275,13 @@ cmd_sign(const char *path, int assume_yes) {
   }
   action_bytes[action_len] = '\0';
 
+  // Show only what can be shown: a NUL or a control byte would hide part of
+  // the signed bytes from the owner.
+  if(!action_len || action_shown_whole(action_bytes, action_len)) {
+    fprintf(stderr, "the action has bytes that cannot be shown; not signed\n");
+    return 1;
+  }
+
   len = approval_message(fields[2], (const char*)action_bytes, action_len,
                          nonce, issued, expires, message, sizeof(message));
   if(len < 0) {
@@ -260,8 +290,9 @@ cmd_sign(const char *path, int assume_yes) {
   }
 
   // What the owner reads is the byte string that gets signed.
-  fprintf(stderr, "console %s, approval %s, valid %llu to %llu ms\n%s",
-          fields[2], fields[1], issued, expires, action_bytes);
+  fprintf(stderr, "console %s, approval %s, valid %llu to %llu ms\n",
+          fields[2], fields[1], issued, expires);
+  fwrite(action_bytes, 1, action_len, stderr);
   fflush(stderr);
 
   if(!assume_yes && !confirm()) {
@@ -271,7 +302,14 @@ cmd_sign(const char *path, int assume_yes) {
 
   crypto_sign(signed_msg, &signed_len, message, (unsigned long long)len, sk);
   approval_hex_encode(signed_msg, APPROVAL_SIG_LEN, sig_hex);
-  printf("%s\n", sig_hex);
+
+  // The envelope tells Ariel which console and action the owner signed, so
+  // it can say which one is wrong; the signature alone decides the grant.
+  sha256_init(&hash);
+  sha256_update(&hash, action_bytes, action_len);
+  sha256_final(&hash, digest);
+  sha256_hex(digest, digest_hex);
+  printf("%s %s %s\n", sig_hex, fields[2], digest_hex);
   return 0;
 }
 

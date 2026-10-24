@@ -103,6 +103,8 @@ int store_approval_request(const approval_facts_t *facts,
 #define STORE_GRANT_REPLAYED 4
 #define STORE_GRANT_DENIED   5
 #define STORE_GRANT_ERROR    6
+#define STORE_GRANT_WRONG_ACTION  7
+#define STORE_GRANT_WRONG_CONSOLE 8
 
 /**
  * Grant an approval with the owner's signature. The platform verifies it
@@ -110,8 +112,15 @@ int store_approval_request(const approval_facts_t *facts,
  * records the nonce as consumed on disk, then marks the approval decided;
  * the record is on disk before anything runs. This is the only way an
  * approval becomes approved. signature is APPROVAL_SIG_LEN bytes.
+ *
+ * console and action_sha256 are the envelope: what the signer says it
+ * signed, both NULL when the grant carries only a signature. They are not
+ * trusted. A mismatch with this approval's challenge answers
+ * STORE_GRANT_WRONG_CONSOLE or STORE_GRANT_WRONG_ACTION, so a client can
+ * tell those from a forgery; a match decides nothing, the signature does.
  **/
-int store_approval_grant(const char *id, const unsigned char *signature);
+int store_approval_grant(const char *id, const unsigned char *signature,
+                         const char *console, const char *action_sha256);
 
 /** Record a denial. Returns 0, or -1 for an unknown ID. **/
 int store_approval_deny(const char *id);

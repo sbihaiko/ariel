@@ -123,14 +123,14 @@ challenge a-81d0e3 ps5-living-room 0c5e9d1a7b3f4e62a8d0c1b9e7f35a24 120000 24000
 exit 75
 ```
 
-Approve it. The `challenge` line is what the owner signs: the approval ID, the console, a nonce, the window in milliseconds, and the canonical action as hex. Copy it to the owner's signer, which prints the action exactly as it signs it, shows it for confirmation and prints a signature (`ariel-sign sign <keyfile>`). The signer is offline and holds the owner's key; the agent only relays the signature it prints. Submit it on the agent port:
+Approve it. The `challenge` line is what the owner signs: the approval ID, the console, a nonce, the window in milliseconds, and the canonical action as hex. Copy it to the owner's signer, which prints the action exactly as it signs it, shows it for confirmation, and refuses an action with a NUL or other byte it cannot show. It prints one line: the signature, the console and the action's SHA-256 (`ariel-sign sign <keyfile>`). The signer is offline and holds the owner's key; the agent only relays the line it prints. Submit it on the agent port, with the whole line after the approval ID:
 
 ```text
 auth <token>
-approval grant a-81d0e3 <signature>
+approval grant a-81d0e3 <signature> <console> <action-sha256>
 ```
 
-Ariel answers `approval_granted a-81d0e3` and `exit 0`. A signature that does not verify, was made for another action or console, arrives after the window or a second time is refused, and nothing runs. Then commit the staged upload:
+Ariel answers `approval_granted a-81d0e3` and `exit 0`. Each of these is refused with its own error, and nothing runs: a signature that does not verify (`signature_invalid`), one made for another action (`signature_action_mismatch`) or another console (`signature_console_mismatch`), one that arrives after the window (`approval_expired`), a malformed one (`signature_malformed`) and a second use (`approval_replayed`). The console and hash after the signature are the signer's claim and only name what is wrong; a bare signature is also accepted and answers `signature_invalid` for any mismatch. Then commit the staged upload:
 
 ```console
 $ printf 'auth %s\npayload commit s-4f2a9c\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324

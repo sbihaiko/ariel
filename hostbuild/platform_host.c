@@ -284,10 +284,11 @@ host_approval_request(platform_t *self, const approval_facts_t *facts,
 
 static int
 host_approval_grant(platform_t *self, const char *id,
-                    const unsigned char *signature) {
+                    const unsigned char *signature,
+                    const char *console, const char *action_sha256) {
   (void)self;
 
-  return store_approval_grant(id, signature);
+  return store_approval_grant(id, signature, console, action_sha256);
 }
 
 
