@@ -1307,11 +1307,12 @@ store_gate_check(const approval_facts_t *facts,
   if(!row) {
     rc = STORE_GATE_NEW;
   } else if(!row->decided) {
-    if(same_identity(&row->facts, facts)) {
+    if(same_identity(&row->facts, facts) &&
+       row->challenge.generation == keyring_generation) {
       *challenge = row->challenge;
       rc = STORE_GATE_PENDING;
     } else {
-      // The entry changed while the owner was asked: the question is stale.
+      // The entry changed, or a rotation retired its key, while the owner was asked.
       row->decided = 1;
       row->approved = 0;
       row->released = 1;
@@ -1325,7 +1326,9 @@ store_gate_check(const approval_facts_t *facts,
     // The owner signed this command: the signature is spent by this answer.
     *challenge = row->challenge;
     row->consumed = 1;
-    rc = same_identity(&row->facts, facts) ? STORE_GATE_GO : STORE_GATE_STALE;
+    rc = same_identity(&row->facts, facts) &&
+         row->challenge.generation == keyring_generation
+             ? STORE_GATE_GO : STORE_GATE_STALE;
   }
 
   pthread_mutex_unlock(&lock);
