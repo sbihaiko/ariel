@@ -4,6 +4,8 @@ The registry of every `exit <n>` value the agent port answers. A number is assig
 
 `payload run --wait` reports the payload's own status on a `status <n>` line, then `exit 0`. A payload's status never appears on the `exit` line.
 
+A shell command (`pwd`, `ls <absolute path>`, `cd`) writes its output and its error word to the connection and ends with `exit <n>`, where `n` is the command's own status: 0 for success, 1 for an error such as `relative_path` or `no_working_directory`. A connection has no working directory, so every path is absolute and `cd` always fails.
+
 ## Assigned
 
 | Exit | Word | Meaning | What the agent does |

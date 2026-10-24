@@ -1464,6 +1464,44 @@ def scenario_unknown_command(server):
             sock.close()
 
 
+def run_command(server, command):
+    """One command on its own connection; the reply as lines."""
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
+        )
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def scenario_pwd_and_ls(server):
+    """A connection has no working directory, so pwd answers the root."""
+    lines = run_command(server, "pwd")
+    assert lines == ["/", "exit 0"], "pwd must answer '/', got %r" % lines
+    lines = run_command(server, "ls /")
+    assert lines[-1] == "exit 0" and len(lines) > 1, (
+        "ls / must list entries then exit 0, got %r" % lines
+    )
+    lines = run_command(server, "ls /ariel-no-such-path")
+    assert lines[-1] == "exit 1" and len(lines) > 1, (
+        "ls of a missing path must explain and exit 1, got %r" % lines
+    )
+    lines = run_command(server, "ls relative")
+    assert lines == ["relative_path", "exit 1"], (
+        "ls of a relative path must be refused, got %r" % lines
+    )
+
+
+def scenario_cd_is_an_error(server):
+    for command in ("cd /", "cd"):
+        lines = run_command(server, command)
+        assert lines == ["no_working_directory", "exit 1"], (
+            "%r must answer no_working_directory, got %r" % (command, lines)
+        )
+
+
 def scenario_no_system_change_on_agent_port(server):
     """Telnet is out of scope; the agent port opens no way past the gate.
 
@@ -2084,6 +2122,10 @@ SCENARIOS = [
     ("the agent port opens no system change outside the gate and the "
      "telnet shell stays out of scope",
      scenario_no_system_change_on_agent_port, False),
+    ("pwd and ls <absolute path> run through the agent port",
+     scenario_pwd_and_ls, False),
+    ("cd on the agent port answers an error: no working directory",
+     scenario_cd_is_an_error, False),
     ("two connections are served at the same time",
      scenario_two_connections, False),
     ("a fifth concurrent connection answers busy and exit 82",

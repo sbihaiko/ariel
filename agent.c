@@ -684,6 +684,26 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
 }
 
 
+/** One command, one connection: output and diagnostics both go to fd. **/
+static int
+run_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  char answer[32];
+  int status = 0;
+  int len;
+
+  argv[argc] = NULL;
+
+  if(agent->platform->run(agent->platform, argc, argv, fd, fd, &status)) {
+    return 0;
+  }
+
+  len = snprintf(answer, sizeof(answer), "exit %d\n", status);
+  write_all(fd, answer, (size_t)len);
+
+  return 1;
+}
+
+
 static void
 handle_command(agent_t *agent, int fd, int wake, char *line) {
   char *argv[MAX_ARGS + 1];
@@ -720,6 +740,10 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
      !strcmp(argv[2], "--wait")) {
     argv[argc] = NULL;
     payload_run(agent, fd, argv[3], &argv[3]);
+    return;
+  }
+
+  if(argc >= 1 && run_command(agent, fd, argc, argv)) {
     return;
   }
 

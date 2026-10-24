@@ -46,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #include "notify.h"
 #include "platform.h"
 #include "platform_ps5.h"
+#include "runner.h"
 #include "store.h"
 
 /** One prompt fits one notification. **/
@@ -265,6 +266,15 @@ ps5_spawn(platform_t *self, const unsigned char *bytes, size_t size,
 }
 
 
+static int
+ps5_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
+        int *status) {
+  (void)self;
+
+  return runner_run(argc, argv, outfd, errfd, status);
+}
+
+
 static platform_t ps5_platform = {
   // A console has no test clock, so no wait has a wake pipe and every
   // deadline runs on real time.
@@ -280,6 +290,7 @@ static platform_t ps5_platform = {
   .approval_request = ps5_approval_request,
   .approval_grant = ps5_approval_grant,
   .spawn = ps5_spawn,
+  .run = ps5_run,
 };
 
 

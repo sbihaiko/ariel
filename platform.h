@@ -141,6 +141,17 @@ struct platform {
    **/
   int (*spawn)(platform_t *self, const unsigned char *bytes, size_t size,
                char *const argv[], int outfd, int *status);
+
+  /**
+   * Run one noninteractive shell command: argv[0] is the command and
+   * argv[argc] is NULL. Its output goes to outfd and its diagnostics to
+   * errfd, and its own exit status comes back in status. A connection has
+   * no working directory, so every path is absolute and cd is an error.
+   * Returns 0 when the command ran, -1 when this platform has no such
+   * command.
+   **/
+  int (*run)(platform_t *self, int argc, char *const argv[], int outfd,
+             int errfd, int *status);
 };
 
 /**

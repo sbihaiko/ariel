@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "approval.h"
 #include "platform.h"
+#include "runner.h"
 #include "sha256.h"
 #include "store.h"
 #include "testclock.h"
@@ -530,6 +531,15 @@ out:
 }
 
 
+static int
+host_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
+         int *status) {
+  (void)self;
+
+  return runner_run(argc, argv, outfd, errfd, status);
+}
+
+
 static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
@@ -543,6 +553,7 @@ static platform_t host_platform = {
   .approval_request = host_approval_request,
   .approval_grant = host_approval_grant,
   .spawn = host_spawn,
+  .run = host_run,
 };
 
 
