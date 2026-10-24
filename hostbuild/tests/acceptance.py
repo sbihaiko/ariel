@@ -8670,6 +8670,250 @@ def safe_boot_approve_and_apply(server):
         "autoload safe-boot", "exit 0"], "a granted safe-boot must apply"
 
 
+def make_tree(server, name, files, dirs=()):
+    """A tree under the host test root's data directory: files maps paths to bytes."""
+    root = os.path.join(server.root, "data", name)
+    for rel in dirs:
+        os.makedirs(os.path.join(root, rel), exist_ok=True)
+    for rel, data in files.items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+    return root
+
+
+def scenario_ls_long_and_all(server):
+    """ls -l shows detail, ls -a adds . and .., and plain ls is unchanged."""
+    folder = make_tree(server, "ls-flags",
+                       {"visible.txt": b"hello", ".hidden": b"", "sub/keep": b""})
+    assert run_exit_zero(server, "ls " + folder) == [
+        ".hidden", "sub", "visible.txt"], "plain ls must list the names only"
+    assert run_exit_zero(server, "ls -a " + folder) == [
+        ".", "..", ".hidden", "sub", "visible.txt"], "ls -a must add . and .."
+    fields = {}
+    for line in run_exit_zero(server, "ls -l " + folder):
+        parts = line.split()
+        fields[parts[-1]] = parts
+    assert set(fields) == {".hidden", "sub", "visible.txt"}, (
+        "ls -l must list each name once, got %r" % sorted(fields))
+    assert fields["visible.txt"][0].startswith("-"), "a file's mode starts with -"
+    assert fields["visible.txt"][1] == "5", "ls -l must show the size in bytes"
+    assert fields["sub"][0].startswith("d"), "a directory's mode starts with d"
+    both = run_exit_zero(server, "ls -l -a " + folder)
+    assert [line.split()[-1] for line in both] == [
+        ".", "..", ".hidden", "sub", "visible.txt"], "ls -l -a must give both"
+    assert run_command(server, "ls -x " + folder) == ["bad_option", "exit 1"], (
+        "an unsupported ls option must answer bad_option")
+
+
+def scenario_grep_recursive_and_combined(server):
+    """grep -r searches a tree; -l names files, -c counts, and -l wins over -c."""
+    tree = make_tree(server, "grep-tree", {
+        "a.txt": b"needle one\nnothing\nneedle two\n",
+        "sub/b.txt": b"needle\n",
+        "d.txt": b"no match\n",
+    })
+    a = os.path.join(tree, "a.txt")
+    b = os.path.join(tree, "sub", "b.txt")
+    d = os.path.join(tree, "d.txt")
+    assert set(run_exit_zero(server, "grep -r needle " + tree)) == {
+        a + ":needle one", a + ":needle two", b + ":needle"}, (
+        "grep -r must print each matching line with its file")
+    assert set(run_exit_zero(server, "grep -r -l needle " + tree)) == {a, b}, (
+        "grep -r -l must name each file with a match")
+    assert set(run_exit_zero(server, "grep -r -c needle " + tree)) == {
+        a + ":2", b + ":1", d + ":0"}, "grep -r -c must count every file"
+    assert set(run_exit_zero(server, "grep -l -c -r needle " + tree)) == {a, b}, (
+        "-l must win over -c")
+    assert run_command(server, "grep -r -l absent " + tree) == ["exit 1"], (
+        "grep -r with no match must exit 1 and print nothing")
+    assert run_exit_zero(server, "grep -c needle " + a) == ["2"], (
+        "grep -c of one file must print its count")
+    assert run_exit_zero(server, "grep -l needle " + a) == [a], (
+        "grep -l of one file must print its name")
+    assert run_command(server, "grep -r . " + os.path.join(
+        server.root, "data", "ariel")) == ["protected", "exit 87"], (
+        "grep -r of Ariel's state directory must answer protected")
+    link = os.path.join(tree, "to-token")
+    make_link(link, secret_path(server, "token"), hard=False)
+    lines = run_command(server, "grep -r -l . " + tree)
+    assert lines[-2:] == ["protected", "exit 87"], (
+        "grep -r through a link to the token must answer protected, got %r"
+        % lines)
+    assert server.token not in "\n".join(lines), "the token must not be printed"
+    os.unlink(link)
+
+
+def scenario_grep_dash_pattern(server):
+    """-- ends grep's options, -e names its pattern, and a dash word is refused."""
+    folder = make_tree(server, "grep-dash", {"f.txt": b"-needle here\nplain\n"})
+    f = os.path.join(folder, "f.txt")
+    assert run_exit_zero(server, "grep -- -needle " + f) == ["-needle here"], (
+        "grep -- must take a pattern that begins with a dash")
+    assert run_exit_zero(server, "grep -e -needle " + f) == ["-needle here"], (
+        "grep -e must name a pattern that begins with a dash")
+    assert run_exit_zero(server, "grep -e plain " + f) == ["plain"], (
+        "grep -e must search for the pattern it names")
+    assert run_command(server, "grep -x a " + f) == ["bad_option", "exit 1"], (
+        "an unknown grep option must answer bad_option")
+    assert run_command(server, "grep -e") == ["bad_argument", "exit 1"], (
+        "grep -e with no pattern must answer bad_argument")
+    assert run_command(server, "grep -- -needle " + f + " x") == [
+        "bad_argument", "exit 1"], (
+        "grep -- must still take exactly a pattern and a path")
+
+
+def scenario_find_predicates(server):
+    """find -name and -type filter the walk; a bad predicate is refused."""
+    tree = make_tree(server, "find-tree", {"a.txt": b"x", "sub/b.txt": b"y"},
+                     dirs=("sub/dir",))
+    a = os.path.join(tree, "a.txt")
+    b = os.path.join(tree, "sub", "b.txt")
+    sub = os.path.join(tree, "sub")
+    empty = os.path.join(tree, "sub", "dir")
+    assert set(run_exit_zero(server, "find %s -name a.txt" % tree)) == {a}, (
+        "find -name must print the entry with that name")
+    assert set(run_exit_zero(server, "find %s -type d" % tree)) == {
+        tree, sub, empty}, "find -type d must print the directories"
+    assert set(run_exit_zero(server, "find %s -type f" % tree)) == {a, b}, (
+        "find -type f must print the regular files")
+    link = os.path.join(tree, "a-link")
+    make_link(link, a, hard=False)
+    assert set(run_exit_zero(server, "find %s -type l" % tree)) == {link}, (
+        "find -type l must print the symbolic link itself")
+    os.unlink(link)
+    assert run_command(server, "find %s -name" % tree) == [
+        "missing_operand", "exit 1"], "find -name needs a name"
+    assert run_command(server, "find %s -type x" % tree) == [
+        "bad_argument", "exit 1"], "find -type takes f, d or l"
+    assert run_command(server, "find %s -size 3" % tree) == [
+        "bad_option", "exit 1"], "a predicate find lacks answers bad_option"
+    assert run_command(server, "find /ariel-no-such-path -name a") == [
+        "no_such_file", "exit 1"], "find of a missing path must refuse it"
+    assert run_command(server, "find relative -name a") == [
+        "relative_path", "exit 1"], "find of a relative path must refuse it"
+
+
+def scenario_rm_recursive_needs_the_owner(server):
+    """rm -r asks once for the whole tree, removes it after the signature, and binds -r."""
+    tree = make_tree(server, "rm-tree", {"a.txt": b"x", "sub/b.txt": b"y"})
+    approval, challenge = gate_request(server, "rm -r " + tree)
+    assert os.path.isdir(tree), "an unsigned rm -r must not run"
+    action = decoded_action(challenge_action(challenge))
+    assert action.startswith("ariel-action-v1\ncommand=rm\n"), action
+    assert "\noption.recursive=1" in action, action
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "rm -r " + tree) == ["exit 0"], (
+        "a signed rm -r must run")
+    assert stat_exit(server, tree) == "exit 1", "rm -r must remove the tree"
+
+
+def scenario_rm_recursive_refusals(server):
+    """rm -r refuses before the owner is asked, and never touches Ariel's state."""
+    assert run_command(server, "rm -r") == ["missing_operand", "exit 1"]
+    token = secret_path(server, "token")
+    assert run_command(server, "rm -r " + token) == ["protected", "exit 87"], (
+        "rm -r of the token must answer protected")
+    state = os.path.join(server.root, "data", "ariel")
+    assert run_command(server, "rm -r " + state) == ["protected", "exit 87"], (
+        "rm -r of the state directory must answer protected")
+    tree = make_tree(server, "rm-alias-tree", {"a.txt": b"x"})
+    alias = os.path.join(tree, "to-token")
+    make_link(alias, token, hard=False)
+    assert run_command(server, "rm -r " + tree) == ["protected", "exit 87"], (
+        "rm -r through a link to the token must answer protected")
+    assert os.path.exists(token), "the token must survive"
+    os.unlink(alias)
+    make_link(os.path.join(tree, "plain"), os.path.join(tree, "a.txt"), hard=False)
+    assert run_command(server, "rm -r " + tree) == ["symbolic_link", "exit 1"], (
+        "rm -r over a symbolic link must refuse it before anything is removed")
+    assert os.path.exists(os.path.join(tree, "a.txt")), (
+        "a refused rm -r must remove nothing")
+    server.assert_no_line()
+
+
+def scenario_cp_recursive(server):
+    """cp -r copies a tree after the owner signs, and refuses an existing destination."""
+    src = make_tree(server, "cp-src", {"a.txt": TRANSFER_BYTES, "sub/b.txt": b"second\n"})
+    dst = os.path.join(server.root, "data", "cp-dst")
+    line = "cp -r %s %s" % (src, dst)
+    approval, challenge = transfer_request(server, line)
+    assert not os.path.lexists(dst), "an unsigned cp -r must not run"
+    action = decoded_action(challenge_action(challenge))
+    assert action.startswith("ariel-action-v1\ncommand=cp\n"), action
+    assert "\noption.recursive=1" in action, action
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], "a signed cp -r must run"
+    assert read_bytes(os.path.join(dst, "a.txt")) == TRANSFER_BYTES, (
+        "cp -r must copy the files")
+    assert read_bytes(os.path.join(dst, "sub", "b.txt")) == b"second\n", (
+        "cp -r must copy the files below a directory")
+    assert os.path.isdir(src), "cp -r must leave the source"
+    assert run_command(server, line) == ["exists", "exit 1"], (
+        "cp -r over an existing destination must refuse it")
+
+
+def scenario_cp_recursive_refusals(server):
+    """cp -r refuses a tree into itself, a link, a protected alias and a bad option."""
+    src = make_tree(server, "cp-refuse", {"a.txt": b"x"})
+    token = secret_path(server, "token")
+    state = os.path.join(server.root, "data", "ariel")
+    assert run_command(server, "cp -r %s" % src) == ["missing_operand", "exit 1"]
+    assert run_command(server, "cp -x %s %s" % (src, src + "-copy")) == [
+        "bad_option", "exit 1"], "cp -x must answer bad_option"
+    assert run_command(server, "cp -r %s %s" % (src, os.path.join(src, "inner"))) == [
+        "bad_path", "exit 1"], "cp -r into its own tree must be refused"
+    linked = make_tree(server, "cp-link", {"a.txt": b"x"})
+    make_link(os.path.join(linked, "plain"), os.path.join(linked, "a.txt"), hard=False)
+    dst = os.path.join(server.root, "data", "cp-link-dst")
+    assert run_command(server, "cp -r %s %s" % (linked, dst)) == [
+        "symbolic_link", "exit 1"], "cp -r over a symbolic link must refuse it"
+    assert not os.path.lexists(dst), "a refused cp -r must create nothing"
+    alias = make_tree(server, "cp-alias", {"a.txt": b"x"})
+    make_link(os.path.join(alias, "to-token"), token, hard=False)
+    assert run_command(server, "cp -r %s %s" % (alias, dst)) == [
+        "protected", "exit 87"], "cp -r through a link to the token must answer protected"
+    assert run_command(server, "cp -r %s %s" % (state, dst)) == [
+        "protected", "exit 87"], "cp -r of the state directory must answer protected"
+    assert run_command(server, "cp -r %s %s" % (src, os.path.join(state, "copy"))) == [
+        "protected", "exit 87"], "cp -r into the state directory must answer protected"
+    server.assert_no_line()
+
+
+def scenario_unsupported_options_answer_bad_option(server):
+    """An option a command does not take answers bad_option and asks nobody."""
+    scratch = write_scratch(server, "bad-option.txt", b"x\n")
+    folder = scratch_dir(server)
+    data = os.path.join(server.root, "data")
+    for command in (
+            "cat -x " + scratch, "stat -x " + scratch, "file -x " + scratch,
+            "hexdump -x " + scratch, "sha256sum -x " + scratch,
+            "cmp -x %s %s" % (scratch, scratch), "df -x " + folder,
+            "grep -x a " + scratch, "rm -x " + os.path.join(data, "none"),
+            "mkdir -x " + os.path.join(data, "none"),
+            "touch -x " + os.path.join(data, "none"),
+            "rmdir -x " + os.path.join(data, "none"),
+            "cp -x %s %s" % (scratch, data), "mv -x %s %s" % (scratch, data),
+            "ln -x %s %s" % (scratch, data)):
+        assert run_command(server, command) == ["bad_option", "exit 1"], (
+            "%r must answer bad_option and exit 1" % command)
+    server.assert_no_line()
+
+
+HOST_ROOT_SCENARIOS.update({
+    "ls -l shows detail, ls -a adds the hidden entries, and ls -x is bad_option",
+    "grep -r searches a tree; -l names files, -c counts, -l wins over -c",
+    "grep -- takes a dash-led pattern, -e names it, and -x stays bad_option",
+    "find -name and -type filter the walk, and a bad predicate is refused",
+    "rm -r asks once for the tree, removes it after the signature, and binds -r",
+    "rm -r refuses protected objects and links before anything is removed",
+    "cp -r copies a tree after the owner signs, and refuses an existing destination",
+    "cp -r refuses a tree into itself, a link, a protected alias and bad_option",
+    "an option a command does not take answers bad_option and asks nobody",
+})
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -8751,6 +8995,24 @@ SCENARIOS = [
      scenario_transfer_actions_are_audited, HOST_ROOT_REASON),
     ("the challenge of cp names both paths, sha256 none and the source's "
      "identity", scenario_transfer_action_names_its_facts, HOST_ROOT_REASON),
+    ("ls -l shows detail, ls -a adds the hidden entries, and ls -x is bad_option",
+     scenario_ls_long_and_all, HOST_ROOT_REASON),
+    ("grep -r searches a tree; -l names files, -c counts, -l wins over -c",
+     scenario_grep_recursive_and_combined, HOST_ROOT_REASON),
+    ("grep -- takes a dash-led pattern, -e names it, and -x stays bad_option",
+     scenario_grep_dash_pattern, HOST_ROOT_REASON),
+    ("find -name and -type filter the walk, and a bad predicate is refused",
+     scenario_find_predicates, HOST_ROOT_REASON),
+    ("rm -r asks once for the tree, removes it after the signature, and binds -r",
+     scenario_rm_recursive_needs_the_owner, HOST_ROOT_REASON),
+    ("rm -r refuses protected objects and links before anything is removed",
+     scenario_rm_recursive_refusals, HOST_ROOT_REASON),
+    ("cp -r copies a tree after the owner signs, and refuses an existing destination",
+     scenario_cp_recursive, HOST_ROOT_REASON),
+    ("cp -r refuses a tree into itself, a link, a protected alias and bad_option",
+     scenario_cp_recursive_refusals, HOST_ROOT_REASON),
+    ("an option a command does not take answers bad_option and asks nobody",
+     scenario_unsupported_options_answer_bad_option, HOST_ROOT_REASON),
     ("mount, umount, chroot and mknod ask the owner, and once signed answer "
      "not available on this platform",
      scenario_system_commands_need_the_owner, CLOCK_REASON),

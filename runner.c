@@ -334,6 +334,74 @@ name_cmp(const void *a, const void *b) {
 }
 
 
+static char *join_path(const char *dir, const char *name);
+
+
+static void
+mode_text(mode_t mode, char *text) {
+  static const char bits[] = "rwxrwxrwx";
+  size_t i;
+
+  if(S_ISDIR(mode)) {
+    text[0] = 'd';
+  } else if(S_ISLNK(mode)) {
+    text[0] = 'l';
+  } else if(S_ISREG(mode)) {
+    text[0] = '-';
+  } else {
+    text[0] = '?';
+  }
+  for(i=0; i<9; i++) {
+    text[i + 1] = (mode & (0400 >> i)) ? bits[i] : '-';
+  }
+  text[10] = '\0';
+}
+
+
+static int
+ls_detail(const char *dir, const char *name, int json, answer_t *answer,
+          int errfd) {
+  char text[11];
+  char line[2048];
+  struct stat st;
+  char *child;
+  size_t n;
+
+  if(!(child = join_path(dir, name))) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  if(lstat(child, &st)) {
+    report("ls", child, errfd, errno);
+    free(child);
+    return 1;
+  }
+  free(child);
+
+  mode_text(st.st_mode, text);
+  if(json) {
+    n = (size_t)snprintf(line, sizeof(line), "{\"mode\":\"%s\",\"size\":%llu,\"name\":",
+                         text, (unsigned long long)st.st_size);
+    if(n < sizeof(line)) {
+      n += json_format_string(line + n, sizeof(line) - n, name);
+    }
+    if(n < sizeof(line)) {
+      line[n++] = '}';
+    }
+  } else {
+    n = (size_t)snprintf(line, sizeof(line), "%s %llu %s", text,
+                         (unsigned long long)st.st_size, name);
+  }
+  // A row too long for the buffer is counted as cut, never streamed.
+  if(n >= sizeof(line)) {
+    answer_admit(answer, n);
+    return 0;
+  }
+  answer_line(answer, line, n);
+  return 0;
+}
+
+
 static int
 run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
   char **names = NULL;
@@ -341,32 +409,50 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
   size_t cap = 0;
   struct dirent *ent;
   answer_t answer;
-  size_t limit;
+  size_t limit = SIZE_MAX;
   DIR *dir;
+  const char *path;
+  int longform = 0;
+  int all = 0;
+  int first = 1;
   size_t i;
-  int skip;
   int rc = 0;
 
-  if(parse_limit(argc, argv, errfd, &limit, &skip)) {
-    return 1;
+  while(first < argc && argv[first][0] == '-') {
+    if(!strcmp(argv[first], "--")) {
+      first++;
+      break;
+    } else if(!strcmp(argv[first], "-l")) {
+      longform = 1;
+    } else if(!strcmp(argv[first], "-a")) {
+      all = 1;
+    } else if(!strcmp(argv[first], "--limit")) {
+      if(first + 1 >= argc || parse_count(argv[first + 1], &limit)) {
+        say(errfd, "bad_option\n");
+        return 1;
+      }
+      first++;
+    } else {
+      say(errfd, "bad_option\n");
+      return 1;
+    }
+    first++;
   }
-  argc -= skip;
-  argv += skip;
-
-  if(argc != 2 || argv[1][0] != '/') {
+  if(argc - first != 1 || argv[first][0] != '/') {
     say(errfd, "relative_path\n");
     return 1;
   }
+  path = argv[first];
 
-  if(!(dir = opendir(argv[1]))) {
+  if(!(dir = opendir(path))) {
     int err = errno;
 
-    report("ls", argv[1], errfd, err);
+    report("ls", path, errfd, err);
     return 1;
   }
 
   while((ent = readdir(dir))) {
-    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+    if(!all && (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))) {
       continue;
     }
     if(count == cap) {
@@ -393,7 +479,11 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
     qsort(names, count, sizeof(*names), name_cmp);
     answer_init(&answer, outfd, limit);
     for(i=0; i<count; i++) {
-      if(json) {
+      if(longform) {
+        if(ls_detail(path, names[i], json, &answer, errfd)) {
+          rc = 1;
+        }
+      } else if(json) {
         answer_json(&answer, "name", names[i]);
       } else {
         answer_line(&answer, names[i], strlen(names[i]));
@@ -654,66 +744,246 @@ next_line(FILE *file, char **line, size_t *cap) {
 }
 
 
+#define GREP_LINES 0
+#define GREP_COUNT 1
+#define GREP_LIST  2
+#define TREE_DEPTH_MAX 64
+
+
+/** One answer line, prefixed by its path when the search spans files. **/
+static void
+grep_line(answer_t *answer, const char *path, int named, const char *text,
+          size_t len) {
+  size_t plen = named ? strlen(path) + 1 : 0;
+  char *line;
+
+  if(!named) {
+    answer_line(answer, text, len);
+    return;
+  }
+  if(!(line = malloc(plen + len))) {
+    answer_admit(answer, plen + len);
+    return;
+  }
+  memcpy(line, path, plen - 1);
+  line[plen - 1] = ':';
+  memcpy(line + plen, text, len);
+  answer_line(answer, line, plen + len);
+  free(line);
+}
+
+
+/** Search one open regular file. named prefixes each line or count with its path. **/
 static int
-run_grep(int argc, char *const argv[], int outfd, int errfd) {
+grep_file(const regex_t *re, const char *path, int fd, int mode, int named,
+          answer_t *answer, int errfd, int *matched) {
   char *line = NULL;
   size_t cap = 0;
-  answer_t answer;
-  size_t limit;
-  regex_t re;
+  size_t hits = 0;
   ssize_t len;
-  int matched = 0;
   int failed;
-  int skip;
-  int fd;
-  int rc;
   FILE *file;
 
-  if(parse_limit(argc, argv, errfd, &limit, &skip)) {
-    return 1;
-  }
-  argc -= skip;
-  argv += skip;
-
-  if(argc != 3) {
-    return bad_arguments("grep", errfd);
-  }
-  if(regcomp(&re, argv[1], REG_NOSUB)) {
-    say(errfd, "bad_argument\n");
-    return 1;
-  }
-  if((rc=open_target("grep", argv[2], errfd, &fd))) {
-    regfree(&re);
-    return rc;
-  }
   if(!(file=fdopen(fd, "r"))) {
     close(fd);
-    regfree(&re);
     say(errfd, "operation_failed\n");
     return 1;
   }
 
-  answer_init(&answer, outfd, limit);
   while((len=next_line(file, &line, &cap)) >= 0) {
     size_t text = (size_t)len;
 
     if(line[text - 1] == '\n') {
       line[--text] = '\0';
     }
-    if(regexec(&re, line, 0, NULL, 0) == 0) {
-      matched = 1;
-      answer_line(&answer, line, text);
+    if(regexec(re, line, 0, NULL, 0) == 0) {
+      hits++;
+      if(mode == GREP_LINES) {
+        grep_line(answer, path, named, line, text);
+      }
     }
   }
 
   failed = len == -2 || ferror(file);
   fclose(file);
   free(line);
-  regfree(&re);
 
   if(failed) {
     say(errfd, "operation_failed\n");
     return 1;
+  }
+  if(hits) {
+    *matched = 1;
+  }
+  if(mode == GREP_COUNT) {
+    char count[32];
+    size_t n = (size_t)snprintf(count, sizeof(count), "%zu", hits);
+
+    grep_line(answer, path, named, count, n);
+  } else if(mode == GREP_LIST && hits) {
+    answer_line(answer, path, strlen(path));
+  }
+  return 0;
+}
+
+
+/**
+ * Search the directory at path and everything below it. Links are not
+ * followed: a link to a protected object answers protected, any other link is
+ * skipped. Returns 0, 1 for a failure, or STATUS_PROTECTED.
+ **/
+static int
+grep_walk(const regex_t *re, const char *path, int mode, answer_t *answer,
+          int errfd, int *matched, int depth) {
+  struct dirent *ent;
+  DIR *dir;
+  int failed = 0;
+
+  if(depth >= TREE_DEPTH_MAX) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  if(!(dir=opendir(path))) {
+    report("grep", path, errfd, errno);
+    return 1;
+  }
+
+  while((ent = readdir(dir))) {
+    char *child;
+    struct stat st;
+    struct stat target;
+    int rc = 0;
+
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(!(child=join_path(path, ent->d_name))) {
+      failed = 1;
+      break;
+    }
+    if(lstat(child, &st)) {
+      report("grep", child, errfd, errno);
+      rc = 1;
+    } else if(S_ISLNK(st.st_mode)) {
+      if(!stat(child, &target) && protected_stat(&target)) {
+        say(errfd, "protected\n");
+        rc = STATUS_PROTECTED;
+      }
+    } else if(protected_stat(&st)) {
+      say(errfd, "protected\n");
+      rc = STATUS_PROTECTED;
+    } else if(S_ISDIR(st.st_mode)) {
+      rc = grep_walk(re, child, mode, answer, errfd, matched, depth + 1);
+    } else if(S_ISREG(st.st_mode)) {
+      int fd;
+
+      if(!(rc=open_target("grep", child, errfd, &fd))) {
+        rc = grep_file(re, child, fd, mode, 1, answer, errfd, matched);
+      }
+    }
+    free(child);
+
+    if(rc == STATUS_PROTECTED) {
+      closedir(dir);
+      return rc;
+    }
+    if(rc) {
+      failed = 1;
+    }
+  }
+  closedir(dir);
+  return failed;
+}
+
+
+static int
+run_grep(int argc, char *const argv[], int outfd, int errfd) {
+  answer_t answer;
+  int recursive = 0;
+  int list = 0;
+  int count = 0;
+  size_t limit = SIZE_MAX;
+  int first = 1;
+  int matched = 0;
+  const char *pattern = NULL;
+  const char *path;
+  regex_t re;
+  struct stat st;
+  int mode;
+  int fd;
+  int rc;
+
+  // `--` ends the options, so a pattern may begin with a dash; `-e PATTERN`
+  // names the pattern outright. Any other dash-led word is not an option.
+  while(first < argc && argv[first][0] == '-') {
+    if(!strcmp(argv[first], "--")) {
+      first++;
+      break;
+    } else if(!strcmp(argv[first], "-r")) {
+      recursive = 1;
+    } else if(!strcmp(argv[first], "-l")) {
+      list = 1;
+    } else if(!strcmp(argv[first], "-c")) {
+      count = 1;
+    } else if(!strcmp(argv[first], "--limit")) {
+      if(first + 1 >= argc || parse_count(argv[first + 1], &limit)) {
+        say(errfd, "bad_option\n");
+        return 1;
+      }
+      first++;
+    } else if(!strcmp(argv[first], "-e")) {
+      if(first + 1 >= argc) {
+        return bad_arguments("grep", errfd);
+      }
+      pattern = argv[++first];
+    } else {
+      say(errfd, "bad_option\n");
+      return 1;
+    }
+    first++;
+  }
+  if(pattern) {
+    if(argc - first != 1) {
+      return bad_arguments("grep", errfd);
+    }
+    path = argv[first];
+  } else {
+    if(argc - first != 2) {
+      return bad_arguments("grep", errfd);
+    }
+    pattern = argv[first];
+    path = argv[first + 1];
+  }
+  if(regcomp(&re, pattern, REG_NOSUB)) {
+    say(errfd, "bad_argument\n");
+    return 1;
+  }
+  mode = list ? GREP_LIST : count ? GREP_COUNT : GREP_LINES;
+
+  answer_init(&answer, outfd, limit);
+  if(!recursive) {
+    if((rc=open_target("grep", path, errfd, &fd))) {
+      regfree(&re);
+      return rc;
+    }
+    rc = grep_file(&re, path, fd, mode, 0, &answer, errfd, &matched);
+  } else if((rc=open_target("grep", path, errfd, &fd))) {
+    regfree(&re);
+    return rc;
+  } else if(fstat(fd, &st)) {
+    close(fd);
+    report("grep", path, errfd, errno);
+    rc = 1;
+  } else if(S_ISDIR(st.st_mode)) {
+    close(fd);
+    rc = grep_walk(&re, path, mode, &answer, errfd, &matched, 0);
+  } else {
+    rc = grep_file(&re, path, fd, mode, 1, &answer, errfd, &matched);
+  }
+  regfree(&re);
+
+  if(rc) {
+    return rc;
   }
   answer_done(&answer);
   return matched ? 0 : 1;
@@ -1152,6 +1422,29 @@ push_path(char ***stack, size_t *count, size_t *cap, char *path) {
 
 
 static int
+find_wanted(const char *path, const struct stat *st, const char *name, char type) {
+  const char *base;
+  char kind;
+
+  if(name) {
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if(strcmp(base, name)) {
+      return 0;
+    }
+  }
+  if(type) {
+    kind = S_ISREG(st->st_mode) ? 'f' : S_ISDIR(st->st_mode) ? 'd' :
+           S_ISLNK(st->st_mode) ? 'l' : '?';
+    if(kind != type) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+static int
 run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   char **todo = NULL;
   size_t count = 0;
@@ -1162,10 +1455,13 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   size_t limit;
   DIR *dir;
   char *root;
+  const char *name = NULL;
+  char type = 0;
   int failed = 0;
   int oom = 0;
   int skip;
   size_t i;
+  int next;
 
   if(parse_limit(argc, argv, errfd, &limit, &skip)) {
     return 1;
@@ -1173,8 +1469,32 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   argc -= skip;
   argv += skip;
 
-  if(argc != 2) {
+  if(argc < 2) {
     return bad_arguments("find", errfd);
+  }
+  for(next=2; next<argc; next+=2) {
+    if(!strcmp(argv[next], "-name") || !strcmp(argv[next], "-type")) {
+      if(next + 1 >= argc) {
+        say(errfd, "missing_operand\n");
+        return 1;
+      }
+    }
+    if(!strcmp(argv[next], "-name")) {
+      name = argv[next + 1];
+    } else if(!strcmp(argv[next], "-type")) {
+      const char *value = argv[next + 1];
+
+      if(strcmp(value, "f") && strcmp(value, "d") && strcmp(value, "l")) {
+        say(errfd, "bad_argument\n");
+        return 1;
+      }
+      type = value[0];
+    } else if(argv[next][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    } else {
+      return bad_arguments("find", errfd);
+    }
   }
   if(refuse_relative(argv[1], errfd)) {
     return 1;
@@ -1185,7 +1505,9 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   }
 
   answer_init(&answer, outfd, limit);
-  answer_path(&answer, json, argv[1]);
+  if(find_wanted(argv[1], &st, name, type)) {
+    answer_path(&answer, json, argv[1]);
+  }
   if(!S_ISDIR(st.st_mode)) {
     answer_done(&answer);
     return 0;
@@ -1226,7 +1548,9 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
         free(child);
         continue;
       }
-      answer_path(&answer, json, child);
+      if(find_wanted(child, &child_st, name, type)) {
+        answer_path(&answer, json, child);
+      }
 
       if(S_ISDIR(child_st.st_mode)) {
         if(push_path(&todo, &count, &cap, child)) {
@@ -1712,17 +2036,18 @@ typedef int (*file_command_fn)(int argc, char *const argv[], int outfd,
 static const struct {
   const char *name;
   file_command_fn run;
+  int options;
 } file_commands[] = {
-  {"file", run_file},
-  {"cat", run_cat},
-  {"grep", run_grep},
-  {"cmp", run_cmp},
-  {"hexdump", run_hexdump},
-  {"sha256sum", run_sha256sum},
-  {"read", run_read},
-  {"head", run_head},
-  {"tail", run_tail},
-  {"wc", run_wc},
+  {"file", run_file, 0},
+  {"cat", run_cat, 1},
+  {"grep", run_grep, 1},
+  {"cmp", run_cmp, 0},
+  {"hexdump", run_hexdump, 0},
+  {"sha256sum", run_sha256sum, 0},
+  {"read", run_read, 1},
+  {"head", run_head, 0},
+  {"tail", run_tail, 0},
+  {"wc", run_wc, 0},
 };
 
 
@@ -1762,13 +2087,27 @@ refuse_option(int errfd, int *status) {
 
 static int
 run_table(int json, int argc, char *const argv[], int outfd, int errfd) {
+  int i;
+
   if(!strcmp(argv[0], "ls")) {
     return run_ls(json, argc, argv, outfd, errfd);
   }
   if(!strcmp(argv[0], "stat")) {
+    for(i=1; i<argc; i++) {
+      if(argv[i][0] == '-') {
+        say(errfd, "bad_option\n");
+        return 1;
+      }
+    }
     return run_stat(json, argc, argv, outfd, errfd);
   }
   if(!strcmp(argv[0], "df")) {
+    for(i=1; i<argc; i++) {
+      if(argv[i][0] == '-') {
+        say(errfd, "bad_option\n");
+        return 1;
+      }
+    }
     return run_df(json, argc, argv, outfd, errfd);
   }
   return run_find(json, argc, argv, outfd, errfd);
@@ -1896,6 +2235,17 @@ runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
 
   for(i=0; argc >= 1 && i<sizeof(file_commands)/sizeof(file_commands[0]); i++) {
     if(!strcmp(argv[0], file_commands[i].name)) {
+      size_t j;
+
+      if(!file_commands[i].options) {
+        for(j=1; j<(size_t)argc; j++) {
+          if(argv[j][0] == '-') {
+            say(errfd, "bad_option\n");
+            *status = 1;
+            return 0;
+          }
+        }
+      }
       *status = file_commands[i].run(argc, argv, outfd, errfd);
       return 0;
     }

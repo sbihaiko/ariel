@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_NOT_TAR   21
 #define FILEOPS_ESCAPE    22
 #define FILEOPS_BAD_MEMBER 23
+#define FILEOPS_BAD_OPTION 24
 
 /** The largest executable a run reads into memory. **/
 #define FILEOPS_RUN_MAX (64UL * 1024 * 1024)
@@ -98,6 +99,39 @@ int fileops_transfer_check(const char *root, const char *source,
 int fileops_transfer_act(const char *root, const char *command,
                          const char *source, const char *destination,
                          const approval_facts_t *expected);
+
+/**
+ * Check a recursive rm of path, the whole tree below it included, without
+ * acting. Every entry must be a regular file or a directory: a link answers
+ * FILEOPS_LINK, a link to a protected object or a protected entry answers
+ * FILEOPS_PROTECTED. The root's kind, device and inode go into facts.
+ **/
+int fileops_tree_check(const char *root, const char *path,
+                       approval_facts_t *facts);
+
+/**
+ * Perform a recursive rm after checking that the root is still the object
+ * expected names. The tree is checked again before its first entry goes.
+ **/
+int fileops_tree_act(const char *root, const char *path,
+                     const approval_facts_t *expected);
+
+/**
+ * Check a recursive cp of source to destination, the tree below source
+ * included, without acting. The destination must not exist and must not lie
+ * below the source. Links refuse as in fileops_tree_check.
+ **/
+int fileops_tree_transfer_check(const char *root, const char *source,
+                                const char *destination,
+                                approval_facts_t *facts);
+
+/**
+ * Perform a recursive cp after checking that the source is still the object
+ * expected names. A copy that fails part way is removed again.
+ **/
+int fileops_tree_transfer_act(const char *root, const char *source,
+                              const char *destination,
+                              const approval_facts_t *expected);
 
 /**
  * Open the regular file at path for reading, without following a link, after
