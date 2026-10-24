@@ -109,17 +109,26 @@ New and extended commands in this stage:
 - Diagnostics: `date`, `dmesg`, `du`, a `sysinfo` command that aggregates `uname`, `uptime` and memory, and `timeout` so a command cannot hang the connection.
 - Optional: `diff` and network diagnostics (`ifconfig`, `netstat`, `ping`).
 
-### Stage 4: see the console
+### Stage 4: addons, and sight as the first one
 
-An agent that can see the screen can diagnose what no text tells it: a game stuck on a menu, a system dialog waiting for an answer, a crash screen. This stage gives it sight, and the pixels always travel as a file, never as a stream on the agent port.
+An agent can read text all day and still be blind to what the console is doing: a game stuck on a menu, a system dialog waiting for an answer, a crash screen. This stage gives it sight, and it gives the console a way to gain capabilities that were not built into the payload.
 
-- `screenshot`, gated like every command that does more than read: one capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash ([#53](https://github.com/sbihaiko/ariel/issues/53)).
-- A shot lands under `/data`, never in Ariel's protected state directory, and Stage 3's reader returns it under its size limit.
-- The capture API is measured on a real console before anything is built on it, including a capture while a game runs and a capture of a protected screen.
+An **addon** is an ELF and a manifest, and it runs in a process of its own ([ADR-0010](docs/adr/0010-an-addon-is-a-process-of-its-own.md)):
+
+- Ariel is the gate and the router. An addon's command goes through the one gate every other command uses: a single-use approval of the canonical action, the audit words of the same shape, and codes from `docs/exit-codes.md`. There is no second gate.
+- The agent cannot install, replace or remove an addon. Addons live in a protected directory that the file commands refuse like the token, and they enter only by the owner, out of band.
+- The process is the isolation, and it is bounded on three sides: a timeout, an output cap and a kill. An addon that crashes, hangs or floods costs a refusal, not a reboot.
+- A manifest that names another ABI version or another platform is refused before the owner is asked.
+
+The first addon is the screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)):
+
+- One capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash.
+- The shot lands under `/data`, never in Ariel's protected state directory, and Stage 3's reader returns it under its size limit.
+- The capture API is measured on a real console first ([#55](https://github.com/sbihaiko/ariel/issues/55)), including a capture while a game runs and a capture of a protected screen, before anything is built on it.
 
 ### Stage 5 (optional): sessions
 
-Stages 1 to 4 are enough for an agent to operate and see the console. Stages 5 and 6 are optional conveniences on top of them.
+Stages 1 to 4 are enough for an agent to operate the console and to see it. Stages 5 and 6 are optional conveniences on top of them.
 
 Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
 

@@ -16,3 +16,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0007](0007-ps5-at-calls-use-the-compat-header.md) | PS5 *at() calls go through the compat header |
 | [0008](0008-the-telnet-shell-stays-outside-the-gate.md) | The telnet shell stays outside the gate |
 | [0009](0009-the-key-hierarchy-has-a-primary-and-a-recovery-key.md) | The key hierarchy has a primary and a recovery key |
+| [0010](0010-an-addon-is-a-process-of-its-own.md) | A capability beyond the gate is an addon in a process of its own |
