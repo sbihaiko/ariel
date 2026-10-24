@@ -2,13 +2,13 @@
 
 Notes from running `controller-spike.elf` on a real console (shsrv 0.20, elfldr on port 9021, read back on port 9150). Each item below was observed on the console, not inferred. The runbook for the spike stays in [controller-spike.md](controller-spike.md).
 
-**Status: the pad has never opened. The question the spike exists to answer is still unanswered.**
+**Status: the foreground title reads the pad. The payload process does not. No button edge was captured.**
 
 ## The question
 
 Can a payload read the controller while another app is in the foreground? (Issue [#3](https://github.com/sbihaiko/ariel/issues/3), the approval source in [ADR-0006](adr/0006-the-controller-is-the-approval-source.md).)
 
-**Important gap:** every run so far happened on the home screen with nothing in the foreground. The one condition that matters — a title in front — has not been tested.
+**What is confirmed:** with a title in front, `scePadReadState` inside that title returns 0 and `connected` is 1. The same handle is rejected in the payload process. No button went down during the samples, so a live button edge is still missing.
 
 ## Where the work lives
 
@@ -95,7 +95,7 @@ Note: `pt_resolve` cannot find these functions. It only looks at library handles
 
 ## Next steps, in order
 
-1. **Run with a title in the foreground.** This is the actual question. The payload waits for `sceSystemServiceGetAppIdOfRunningBigApp` to return an id, finds that title's `eboot.bin` through `sceKernelGetAppInfo`, and calls `scePadGetHandle` / `scePadReadState` there. The first send produced no transcript; see the run note below. The next send uses a 30 second window.
+1. **See a button edge from the foreground title.** The title read already returns 0 with `connected` 1. What is missing is one sample where a face button is down, so the bits are known to track the pad. Hold Cross for the whole 30 seconds.
 2. **If that fails, reproduce the PoorDS4 path**: the context setters (`scePadSetLoginUserNumber`, `scePadSetUserNumber`, `scePadSetProcessFocus`) before the handle probe, and port type 3 with indexes 0–7. The spike still only tries port types 0 and 2, index 0.
 3. **Only then consider a virtual device.** That creates a controller rather than reading the real one, so it does not answer #3 — it is a different design.
 
@@ -120,5 +120,30 @@ Sent `controller-spike.elf` (commit `f173589`, 120 second build) to `192.168.68.
 - The elfldr connection printed `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while the payload was starting. `0x80940004` is the same code the notes already have for "no app info".
 - Port 9150 accepted a TCP connection. The payload wrote no line. The first probe inside the title had not returned.
 - The operator rebooted the console from that state. A reboot ends the payload. Nothing was read from the pad.
+
+## Run with PPSA99177 in front
+
+Sent the 30 second build (commit `6099943`) to `192.168.68.77:9021`. The operator had a game in the foreground. The transcript:
+
+```
+running big app 0x00000018
+eboot pid 109 app 0x00000018 title PPSA99177 off 16
+eboot pid 66 app 0x0000000d title NPXS40039 off 16
+user candidates 1 362804492 268435456
+title pid 109 getHandle 8009f1560 readState 8009f2a80
+title getHandle user 1 type 0 -> 0x80920008
+title getHandle user 1 type 2 -> 0x80920008
+title getHandle user 362804492 type 0 -> 0x03e50700
+title readState -> 0x00000000 buttons 0x00000000 connected 1
+payload init 0x00000000 readState 0x80920003 buttons 0x00000000 connected 0
+stop after 30 s, presses 0, errors 0, title handle left open
+```
+
+- `sceSystemServiceGetAppIdOfRunningBigApp` returned `0x18`. That matched `eboot.bin` pid 109. The title id `PPSA99177` sits at offset 16 in the `sceKernelGetAppInfo` buffer, which is the layout with `app_type` before the title id.
+- Another eboot, pid 66, is the system title `NPXS40039`. The probe did not attach to it.
+- User id `1` still gets `DEVICE_NO_HANDLE` for port types 0 and 2. User id `362804492`, port type 0, returns handle `0x03e50700`.
+- `scePadReadState` of that handle inside pid 109 returns 0. `connected` is 1. Buttons stayed 0 for the whole window, and the later samples reported no errors, so those reads also returned 0.
+- In the payload process, `scePadInit` returns 0 and `scePadReadState` of the same handle returns `0x80920003`. The payload does not read the title's pad by borrowing the integer.
+- The elfldr connection again printed `[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004` while a big app was running. That line does not mean the foreground title is absent.
 
 The worktree is `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`.
