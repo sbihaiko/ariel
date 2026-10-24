@@ -66,7 +66,8 @@ sh.elf.inc: sh.elf
 # The controller spike is a separate payload. It is never linked into
 # shsrv-ps5.elf; the operator sends it to elfldr on its own.
 controller-spike.elf: controller_spike.o notify.o pt.o
-	$(CC) -lkernel_sys -lScePad -lSceUserService -lSceRegMgr -o $@ $^
+	$(CC) -lkernel_sys -lScePad -lSceUserService -lSceSystemService \
+	      -lSceRegMgr -o $@ $^
 
 clean:
 	rm -f *.o *.elf

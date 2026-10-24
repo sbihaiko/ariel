@@ -12,7 +12,7 @@ Can a payload read the controller while another app is in the foreground? (Issue
 
 ## Where the work lives
 
-All changes are in a run worktree, uncommitted:
+All changes are in a run worktree:
 
 ```
 worktrees/run/20261023-181518-99180-89b2ed/
@@ -95,12 +95,22 @@ Note: `pt_resolve` cannot find these functions. It only looks at library handles
 
 ## Next steps, in order
 
-1. **Run with a title in the foreground.** This is the actual question, and it has not been tried. Open a game or media app, then run the spike, then attach to the title (`eboot.bin`, found through `sceKernelGetAppInfo`) instead of `SceShellCore`, and call `scePadGetHandle` / `scePadReadState` there. The title is a registered pad client, so it should hold a handle.
-2. **If that fails, reproduce the PoorDS4 path**: the context setters (`scePadSetLoginUserNumber`, `scePadSetUserNumber`, `scePadSetProcessFocus`) before the handle probe, and port type 3 with indexes 0–7. The spike currently only tries port types 0–2 and index 0.
+1. **Run with a title in the foreground.** This is the actual question. The payload now waits for `sceSystemServiceGetAppIdOfRunningBigApp` to return an id, finds that title's `eboot.bin` through `sceKernelGetAppInfo`, and calls `scePadGetHandle` / `scePadReadState` there. It has not been run on the console yet.
+2. **If that fails, reproduce the PoorDS4 path**: the context setters (`scePadSetLoginUserNumber`, `scePadSetUserNumber`, `scePadSetProcessFocus`) before the handle probe, and port type 3 with indexes 0–7. The spike still only tries port types 0 and 2, index 0.
 3. **Only then consider a virtual device.** That creates a controller rather than reading the real one, so it does not answer #3 — it is a different design.
+
+## What this build does
+
+Not a console result. The home-screen attempts (local `scePadOpen`, the registry sign-in flag, `np-fake-signin`, and `SceShellCore`) are no longer in the loop.
+
+- A big app id at or below 0 means nothing is in front. The spike says so once and retries for the rest of the 120 seconds, so the title can come to the foreground during the run.
+- It lists every `eboot.bin` with the app id `sceKernelGetAppInfo` writes and any title id string in that buffer. The title id offset is logged because the two SDK samples disagree on the struct layout.
+- It attaches to the eboot whose app id equals the big app. If none equals it, it attaches to eboots whose title id is not `NPXS`.
+- Inside that process it calls `scePadGetHandle` for user ids `1`, the foreground user and `0x10000000`, port types 0 and 2, index 0, then `scePadReadState`.
+- It also tries `scePadReadState` in the payload with that handle. When the payload read works, later samples stay in the payload. When it does not, the spike attaches about once a second and reads inside the title. The title's handle is not closed.
 
 ## Caveat for whoever continues
 
-The spike's current `pad_attempt` tries the login list, then the foreground user, then `pad_from_shell`. All of that runs on the home screen in one pass. The attach/detach around `SceShellCore` is slow (the loop prints several attempts per second), so keep `SPIKE_SECONDS` in mind when reading the transcript.
+Attaching stops the title for the duration of the call. `pt_call` single-steps the target function, so a long `scePadReadState` can consume a lot of the 120 seconds. Hold a button while the spike is running. `nc -z ... 9150` tells you whether a run is still in progress.
 
-Nothing here was committed. The worktree is `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`.
+The worktree is `worktrees/run/20261023-181518-99180-89b2ed`, branch `squad/run/20261023-181518-99180-89b2ed`.
