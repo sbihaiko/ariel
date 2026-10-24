@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "builtins.h"
+#include "json.h"
 #include "readers.h"
 
 extern char **environ;
@@ -59,20 +60,17 @@ say(int fd, const char *text) {
 }
 
 
-/* Run a host tool and copy its standard output to outfd. Returns its exit
-   status, or 1 when it cannot run. */
-static int
-capture(const char *file, char *const argv[], int outfd, int errfd) {
+/* Start a host tool with its standard output on a pipe. Returns its pid and
+   sets readfd to the pipe, or -1 when it cannot run. */
+static pid_t
+spawn_tool(const char *file, char *const argv[], int errfd, int *readfd) {
   posix_spawn_file_actions_t actions;
-  char buf[4096];
   int fds[2];
-  int status = 1;
   pid_t pid;
-  ssize_t n;
   int rc;
 
   if(pipe(fds)) {
-    return 1;
+    return -1;
   }
 
   posix_spawn_file_actions_init(&actions);
@@ -85,10 +83,41 @@ capture(const char *file, char *const argv[], int outfd, int errfd) {
 
   if(rc) {
     close(fds[0]);
+    return -1;
+  }
+  *readfd = fds[0];
+  return pid;
+}
+
+
+/* Wait for a host tool. Returns its exit status, or 1 when it did not exit. */
+static int
+reap(pid_t pid) {
+  int status = 1;
+
+  while(waitpid(pid, &status, 0) < 0) {
+    if(errno != EINTR) {
+      return 1;
+    }
+  }
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+
+/* Run a host tool and copy its standard output to outfd. Returns its exit
+   status, or 1 when it cannot run. */
+static int
+capture(const char *file, char *const argv[], int outfd, int errfd) {
+  char buf[4096];
+  ssize_t n;
+  int fd;
+  pid_t pid = spawn_tool(file, argv, errfd, &fd);
+
+  if(pid < 0) {
     return 1;
   }
 
-  while((n = read(fds[0], buf, sizeof(buf))) != 0) {
+  while((n = read(fd, buf, sizeof(buf))) != 0) {
     if(n < 0) {
       if(errno == EINTR) {
         continue;
@@ -97,14 +126,75 @@ capture(const char *file, char *const argv[], int outfd, int errfd) {
     }
     say_bytes(outfd, buf, (size_t)n);
   }
-  close(fds[0]);
+  close(fd);
+  return reap(pid);
+}
 
-  while(waitpid(pid, &status, 0) < 0) {
-    if(errno != EINTR) {
-      return 1;
+
+/* Write one line of host ps output as a JSON object. Returns 0 when the line
+   has the fields of PS_FORMAT, or -1 when it does not. */
+static int
+say_ps_object(int outfd, char *line) {
+  char head[128];
+  char state[16];
+  int pid;
+  int ppid;
+  int pgid;
+  int sid;
+  unsigned uid;
+  int used = 0;
+
+  if(sscanf(line, " %d %d %d %d %u %15s %n", &pid, &ppid, &pgid, &sid, &uid,
+            state, &used) != 6) {
+    return -1;
+  }
+  line[used + strcspn(line + used, "\n")] = '\0';
+
+  snprintf(head, sizeof(head),
+           "{\"pid\":%d,\"ppid\":%d,\"pgid\":%d,\"sid\":%d,\"uid\":%u,"
+           "\"state\":",
+           pid, ppid, pgid, sid, uid);
+  say(outfd, head);
+  json_say_string(outfd, state);
+  say(outfd, ",\"command\":");
+  json_say_string(outfd, line + used);
+  say(outfd, "}\n");
+  return 0;
+}
+
+
+static int
+capture_ps_objects(char *const argv[], int outfd, int errfd) {
+  char *line = NULL;
+  size_t cap = 0;
+  int failed = 0;
+  ssize_t len;
+  int fd;
+  FILE *in;
+  pid_t pid = spawn_tool("ps", argv, errfd, &fd);
+
+  if(pid < 0) {
+    return 1;
+  }
+  if(!(in = fdopen(fd, "r"))) {
+    close(fd);
+    reap(pid);
+    return 1;
+  }
+
+  while((len = getline(&line, &cap, in)) >= 0) {
+    if(say_ps_object(outfd, line)) {
+      failed = 1;
     }
   }
-  return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+  free(line);
+  fclose(in);
+
+  if(reap(pid) || failed) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  return 0;
 }
 
 
@@ -127,9 +217,13 @@ parse_pid(const char *text, pid_t *pid) {
 
 
 static int
-run_ps(int outfd, int errfd, int *status) {
+run_ps(int json, int outfd, int errfd, int *status) {
   char *const argv[] = {"ps", "-axo", PS_FORMAT, NULL};
 
+  if(json) {
+    *status = capture_ps_objects(argv, outfd, errfd);
+    return 0;
+  }
   say(outfd, PS_HEADER);
   *status = capture("ps", argv, outfd, errfd);
   return 0;
@@ -189,13 +283,14 @@ run_sysctl(int argc, char *const argv[], int outfd, int errfd, int *status) {
 
 
 int
-readers_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
+readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
+             int *status) {
   if(argc < 1) {
     return -1;
   }
 
   if(argc == 1 && !strcmp(argv[0], "ps")) {
-    return run_ps(outfd, errfd, status);
+    return run_ps(json, outfd, errfd, status);
   }
 
   if(!strcmp(argv[0], "procstat")) {

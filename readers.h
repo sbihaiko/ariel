@@ -19,11 +19,12 @@ along with this program; see the file COPYING. If not, see
 
 /**
  * Run one platform reader of the agent port: ps, procstat, sysctl and
- * authid. The arguments are as for runner_run. Returns 0 and the reader's
- * status when argv[0] is a reader, or -1 when it is not one, or when the
- * arguments ask for something a reader does not do, such as a sysctl write.
+ * authid. The arguments are as for runner_run, and json is 1 for the --json
+ * form, which only ps answers. Returns 0 and the reader's status when argv[0]
+ * is a reader, or -1 when it is not one, or when the arguments ask for
+ * something a reader does not do, such as a sysctl write.
  **/
-int readers_run(int argc, char *const argv[], int outfd, int errfd,
+int readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
                 int *status);
 
 #endif /* ARIEL_READERS_H */

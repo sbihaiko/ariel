@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 #include <time.h>
 #include <unistd.h>
 
+#include "json.h"
 #include "protected.h"
 #include "readers.h"
 #include "runner.h"
@@ -194,7 +195,7 @@ name_cmp(const void *a, const void *b) {
 
 
 static int
-run_ls(int argc, char *const argv[], int outfd, int errfd) {
+run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
   char **names = NULL;
   size_t count = 0;
   size_t cap = 0;
@@ -242,8 +243,14 @@ run_ls(int argc, char *const argv[], int outfd, int errfd) {
   } else {
     qsort(names, count, sizeof(*names), name_cmp);
     for(i=0; i<count; i++) {
-      say(outfd, names[i]);
-      say(outfd, "\n");
+      if(json) {
+        say(outfd, "{\"name\":");
+        json_say_string(outfd, names[i]);
+        say(outfd, "}\n");
+      } else {
+        say(outfd, names[i]);
+        say(outfd, "\n");
+      }
     }
   }
 
@@ -308,7 +315,7 @@ stat_target(const char *cmd, const char *path, int errfd, struct stat *st) {
 
 
 static int
-run_stat(int argc, char *const argv[], int outfd, int errfd) {
+run_stat(int json, int argc, char *const argv[], int outfd, int errfd) {
   char line[OUT_LINE_CAP];
   struct stat st;
   int rc;
@@ -318,6 +325,17 @@ run_stat(int argc, char *const argv[], int outfd, int errfd) {
   }
   if((rc=stat_target("stat", argv[1], errfd, &st))) {
     return rc;
+  }
+
+  if(json) {
+    say(outfd, "{\"path\":");
+    json_say_string(outfd, argv[1]);
+    snprintf(line, sizeof(line),
+             ",\"bytes\":%lld,\"mode\":\"%o\",\"inode\":%llu}\n",
+             (long long)st.st_size, (unsigned)(st.st_mode & 07777),
+             (unsigned long long)st.st_ino);
+    say(outfd, line);
+    return 0;
   }
 
   snprintf(line, sizeof(line), "%s: %lld bytes, mode %o, inode %llu\n",
@@ -622,7 +640,7 @@ run_hexdump(int argc, char *const argv[], int outfd, int errfd) {
 
 
 static int
-run_df(int argc, char *const argv[], int outfd, int errfd) {
+run_df(int json, int argc, char *const argv[], int outfd, int errfd) {
   char line[OUT_LINE_CAP];
   struct statvfs vfs;
 
@@ -635,6 +653,18 @@ run_df(int argc, char *const argv[], int outfd, int errfd) {
   if(statvfs(argv[1], &vfs)) {
     report("df", argv[1], errfd, errno);
     return 1;
+  }
+
+  if(json) {
+    say(outfd, "{\"path\":");
+    json_say_string(outfd, argv[1]);
+    snprintf(line, sizeof(line),
+             ",\"total_bytes\":%llu,\"free_bytes\":%llu,\"available_bytes\":%llu}\n",
+             (unsigned long long)vfs.f_blocks * vfs.f_frsize,
+             (unsigned long long)vfs.f_bfree * vfs.f_frsize,
+             (unsigned long long)vfs.f_bavail * vfs.f_frsize);
+    say(outfd, line);
+    return 0;
   }
 
   snprintf(line, sizeof(line),
@@ -682,8 +712,21 @@ push_path(char ***stack, size_t *count, size_t *cap, char *path) {
 }
 
 
+static void
+say_path(int json, int fd, const char *path) {
+  if(json) {
+    say(fd, "{\"path\":");
+    json_say_string(fd, path);
+    say(fd, "}\n");
+  } else {
+    say(fd, path);
+    say(fd, "\n");
+  }
+}
+
+
 static int
-run_find(int argc, char *const argv[], int outfd, int errfd) {
+run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   char **todo = NULL;
   size_t count = 0;
   size_t cap = 0;
@@ -706,8 +749,7 @@ run_find(int argc, char *const argv[], int outfd, int errfd) {
     return 1;
   }
 
-  say(outfd, argv[1]);
-  say(outfd, "\n");
+  say_path(json, outfd, argv[1]);
   if(!S_ISDIR(st.st_mode)) {
     return 0;
   }
@@ -747,8 +789,7 @@ run_find(int argc, char *const argv[], int outfd, int errfd) {
         free(child);
         continue;
       }
-      say(outfd, child);
-      say(outfd, "\n");
+      say_path(json, outfd, child);
 
       if(S_ISDIR(child_st.st_mode)) {
         if(push_path(&todo, &count, &cap, child)) {
@@ -1094,16 +1135,103 @@ static const struct {
   const char *name;
   file_command_fn run;
 } file_commands[] = {
-  {"stat", run_stat},
   {"file", run_file},
   {"cat", run_cat},
   {"grep", run_grep},
-  {"find", run_find},
   {"cmp", run_cmp},
   {"hexdump", run_hexdump},
-  {"df", run_df},
   {"sha256sum", run_sha256sum},
 };
+
+
+static int
+table_command(const char *name) {
+  return !strcmp(name, "ls") || !strcmp(name, "stat") || !strcmp(name, "df") ||
+         !strcmp(name, "find");
+}
+
+
+static int
+json_command(const char *name) {
+  return !strcmp(name, "ps") || table_command(name);
+}
+
+
+static int
+json_requested(int argc, char *const argv[]) {
+  int i;
+
+  for(i=1; i<argc; i++) {
+    if(!strncmp(argv[i], "--json", 6)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+static int
+refuse_option(int errfd, int *status) {
+  say(errfd, "bad_option\n");
+  *status = 1;
+  return 0;
+}
+
+
+static int
+run_table(int json, int argc, char *const argv[], int outfd, int errfd) {
+  if(!strcmp(argv[0], "ls")) {
+    return run_ls(json, argc, argv, outfd, errfd);
+  }
+  if(!strcmp(argv[0], "stat")) {
+    return run_stat(json, argc, argv, outfd, errfd);
+  }
+  if(!strcmp(argv[0], "df")) {
+    return run_df(json, argc, argv, outfd, errfd);
+  }
+  return run_find(json, argc, argv, outfd, errfd);
+}
+
+
+/* A refused option is found before anything runs, so nothing else is printed. */
+static int
+run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
+  char **plain;
+  int count = 0;
+  int refused = 0;
+  int rc = 0;
+  int i;
+
+  plain = calloc((size_t)argc, sizeof(*plain));
+  if(!plain) {
+    say(errfd, "operation_failed\n");
+    *status = 1;
+    return 0;
+  }
+  plain[count++] = argv[0];
+  for(i=1; i<argc; i++) {
+    if(!strcmp(argv[i], "--json")) {
+      continue;
+    }
+    if(argv[i][0] == '-') {
+      refused = 1;
+      break;
+    }
+    plain[count++] = argv[i];
+  }
+
+  if(refused || (!strcmp(argv[0], "ps") && count != 1)) {
+    free(plain);
+    return refuse_option(errfd, status);
+  }
+  if(!strcmp(argv[0], "ps")) {
+    rc = readers_run(1, count, plain, outfd, errfd, status);
+  } else {
+    *status = run_table(1, count, plain, outfd, errfd);
+  }
+  free(plain);
+  return rc;
+}
 
 
 int
@@ -1114,14 +1242,18 @@ runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
     return -1;
   }
 
+  if(json_command(argv[0]) && json_requested(argc, argv)) {
+    return run_json(argc, argv, outfd, errfd, status);
+  }
+
   if(argc == 1 && !strcmp(argv[0], "pwd")) {
     say(outfd, "/\n");
     *status = 0;
     return 0;
   }
 
-  if(argc >= 1 && !strcmp(argv[0], "ls")) {
-    *status = run_ls(argc, argv, outfd, errfd);
+  if(table_command(argv[0])) {
+    *status = run_table(0, argc, argv, outfd, errfd);
     return 0;
   }
 
@@ -1174,5 +1306,5 @@ runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
     }
   }
 
-  return readers_run(argc, argv, outfd, errfd, status);
+  return readers_run(0, argc, argv, outfd, errfd, status);
 }

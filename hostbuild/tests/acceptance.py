@@ -3586,6 +3586,214 @@ def scenario_ps_and_procstat(server):
         "no_such_process", "exit 1"]
 
 
+# The table commands' fixed tree: alpha is 5 bytes at mode 0640, and the escape
+# directory holds a name with a quote, a backslash and a tab.
+TABLE_ENTRIES = ("", "alpha", "beta", "empty", "escape", "escape/a\"b\\c",
+                 "escape/x\ty", "gamma", "gamma/delta")
+FAKE_PS = (
+    "#!/bin/sh\n"
+    "/bin/cat <<'EOF'\n"
+    "  1     0     1     1     0 Ss   launchd\n"
+    "421     1   421   421   501 S+   Some App\n"
+    "EOF\n"
+)
+
+
+def table_fixture(server):
+    """Rebuild the fixed tree the table commands read, and return its root."""
+    root = os.path.join(scratch_dir(server), "table")
+    shutil.rmtree(root, ignore_errors=True)
+    for folder in ("gamma", "empty", "escape"):
+        os.makedirs(os.path.join(root, folder))
+    with open(os.path.join(root, "alpha"), "wb") as handle:
+        handle.write(b"hello")
+    os.chmod(os.path.join(root, "alpha"), 0o640)
+    for path in ("beta", "gamma/delta", "escape/a\"b\\c", "escape/x\ty"):
+        open(os.path.join(root, path), "wb").close()
+    return root
+
+
+def table_path(root, entry):
+    return os.path.join(root, entry) if entry else root
+
+
+def scenario_ls_json_is_one_object_per_entry(server):
+    """ls --json answers one object per entry, in the plain listing's order."""
+    root = table_fixture(server)
+    assert run_command(server, "ls --json %s" % root) == [
+        '{"name":"alpha"}', '{"name":"beta"}', '{"name":"empty"}',
+        '{"name":"escape"}', '{"name":"gamma"}', "exit 0"], (
+        "ls --json of the fixed tree")
+    assert run_command(server, "ls --json %s/empty" % root) == [
+        "exit 0"], "an empty directory has no objects, only exit 0"
+    lines = run_command(server, "ls --json %s/escape" % root)
+    assert sorted(lines[:-1]) == [
+        '{"name":"a\\"b\\\\c"}', '{"name":"x\\u0009y"}'], (
+        "a quote, a backslash and a tab must be escaped in the object, "
+        "got %r" % lines)
+
+
+def scenario_stat_json_is_one_object(server):
+    """stat --json answers one object: the path, its size, its octal mode and inode."""
+    root = table_fixture(server)
+    path = os.path.join(root, "alpha")
+    inode = os.stat(path).st_ino
+    assert run_command(server, "stat --json %s" % path) == [
+        '{"path":"%s","bytes":5,"mode":"640","inode":%d}' % (path, inode),
+        "exit 0"], "stat --json of the fixed file"
+    assert run_command(server, "stat %s" % path) == [
+        "%s: 5 bytes, mode 640, inode %d" % (path, inode), "exit 0"], (
+        "the plain stat line must keep its wording")
+
+
+def scenario_df_json_is_one_object(server):
+    """df --json answers one object whose numbers are the plain listing's."""
+    root = table_fixture(server)
+    lines = run_command(server, "df --json %s" % root)
+    assert len(lines) == 2 and lines[-1] == "exit 0", (
+        "df --json must answer one object then exit 0, got %r" % lines)
+    assert re.fullmatch(
+        r'\{"path":"[^"]*","total_bytes":\d+,"free_bytes":\d+,'
+        r'"available_bytes":\d+\}', lines[0]), (
+        "df --json must use its documented keys, got %r" % lines[0])
+    obj = json.loads(lines[0])
+    assert obj["path"] == root, "df --json must name the path it was given"
+    vfs = os.statvfs(root)
+    assert obj["total_bytes"] == vfs.f_blocks * vfs.f_frsize, (
+        "df --json total must be the filesystem's total")
+    plain = run_command(server, "df %s" % root)
+    found = re.fullmatch(
+        r"%s: (\d+) bytes total, (\d+) bytes free, (\d+) bytes available"
+        % re.escape(root), plain[0])
+    assert found and int(found.group(1)) == obj["total_bytes"], (
+        "the plain df total must equal the JSON total, got %r" % plain)
+
+
+def scenario_find_json_is_one_object_per_path(server):
+    """find --json answers one object per path, the root first, and exit 0."""
+    root = table_fixture(server)
+    lines = run_command(server, "find --json %s" % root)
+    assert lines[-1] == "exit 0", "find --json must exit 0, got %r" % lines
+    objects = lines[:-1]
+    assert objects[0] == '{"path":"%s"}' % root, (
+        "find --json must name the root first, got %r" % objects[0])
+    assert sorted(objects[1:]) == sorted(
+        ['{"path":"%s"}' % table_path(root, "alpha"),
+         '{"path":"%s"}' % table_path(root, "beta"),
+         '{"path":"%s"}' % table_path(root, "empty"),
+         '{"path":"%s"}' % table_path(root, "escape"),
+         '{"path":"%s/escape/a\\"b\\\\c"}' % root,
+         '{"path":"%s/escape/x\\u0009y"}' % root,
+         '{"path":"%s"}' % table_path(root, "gamma"),
+         '{"path":"%s/gamma/delta"}' % root]), (
+        "find --json must list every path once, got %r" % objects)
+
+
+def scenario_ps_json_from_a_fixed_ps(server):
+    """ps --json answers one object per row of ps, and the plain listing keeps its header."""
+    folder = os.path.join(scratch_dir(server), "fake-ps")
+    os.makedirs(folder, exist_ok=True)
+    fake = os.path.join(folder, "ps")
+    with open(fake, "w") as handle:
+        handle.write(FAKE_PS)
+    os.chmod(fake, 0o755)
+    saved = server.env
+    server.env = dict(saved or {}, PATH=folder)
+    server.restart()
+    try:
+        assert run_command(server, "ps") == [
+            "PID PPID PGID SID UID STATE COMMAND",
+            "  1     0     1     1     0 Ss   launchd",
+            "421     1   421   421   501 S+   Some App",
+            "exit 0"], "plain ps must keep its header and rows"
+        assert run_command(server, "ps --json") == [
+            '{"pid":1,"ppid":0,"pgid":1,"sid":1,"uid":0,"state":"Ss",'
+            '"command":"launchd"}',
+            '{"pid":421,"ppid":1,"pgid":421,"sid":421,"uid":501,"state":"S+",'
+            '"command":"Some App"}',
+            "exit 0"], "ps --json must answer one object per row, no header"
+    finally:
+        server.env = saved
+        server.restart()
+
+
+def scenario_table_plain_output_is_unchanged(server):
+    """Without --json the table commands print what they printed before."""
+    root = table_fixture(server)
+    alpha = os.path.join(root, "alpha")
+    assert run_command(server, "ls %s" % root) == [
+        "alpha", "beta", "empty", "escape", "gamma", "exit 0"], (
+        "ls must list names")
+    assert run_command(server, "ls %s/empty" % root) == [
+        "exit 0"], "ls of an empty directory prints nothing but exit 0"
+    lines = run_command(server, "find %s" % root)
+    assert lines[-1] == "exit 0", "find must exit 0, got %r" % lines
+    assert sorted(lines[:-1]) == sorted(
+        table_path(root, entry) for entry in TABLE_ENTRIES), (
+        "find must print every path as a bare line, got %r" % lines)
+    assert run_command(server, "stat %s" % alpha)[-1] == "exit 0"
+    lines = run_command(server, "df %s" % root)
+    assert lines[-1] == "exit 0" and re.fullmatch(
+        r"%s: \d+ bytes total, \d+ bytes free, \d+ bytes available"
+        % re.escape(root), lines[0]), "df must keep its plain line"
+
+
+def scenario_table_bad_option_answers_nothing_else(server):
+    """An unsupported option or operand answers bad_option and no partial output."""
+    root = table_fixture(server)
+    cases = (
+        "ls --json=yaml %s" % root,
+        "ls -l --json %s" % root,
+        "stat --json --yaml %s/alpha" % root,
+        "find --json --limit=3 %s" % root,
+        "df --json -h %s" % root,
+        "ps --json extra",
+        "ps --json=yaml",
+    )
+    for command in cases:
+        assert run_command(server, command) == ["bad_option", "exit 1"], (
+            "%r must answer bad_option and nothing else" % command)
+
+
+def scenario_table_json_errors_answer_their_word(server):
+    """A table command's JSON failure answers its error word and exit 1, as plain does."""
+    assert run_command(server, "ls --json relative") == [
+        "relative_path", "exit 1"]
+    assert run_command(server, "stat --json /ariel-no-such-path") == [
+        "no_such_file", "exit 1"]
+    assert run_command(server, "df --json relative") == [
+        "relative_path", "exit 1"]
+    assert run_command(server, "find --json /ariel-no-such-path") == [
+        "no_such_file", "exit 1"]
+
+
+def scenario_table_json_keys_are_documented(server):
+    """The JSON keys are documented, and a rename is named a protocol change."""
+    del server
+    with open(os.path.join(repo_dir(), "docs", "json-output.md")) as handle:
+        doc = handle.read()
+    keys = {
+        "ps": ("pid", "ppid", "pgid", "sid", "uid", "state", "command"),
+        "ls": ("name",),
+        "stat": ("path", "bytes", "mode", "inode"),
+        "df": ("path", "total_bytes", "free_bytes", "available_bytes"),
+        "find": ("path",),
+    }
+    for command, names in keys.items():
+        assert "## `%s`" % command in doc, (
+            "docs/json-output.md must have a section for %s" % command)
+        for name in names:
+            assert "| `%s` |" % name in doc, (
+                "docs/json-output.md must document the %s key of %s"
+                % (name, command))
+    assert "protocol change" in doc, (
+        "docs/json-output.md must say that a key rename is a protocol change")
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    assert "`bad_option`" in registry, (
+        "docs/exit-codes.md must name bad_option before the code uses it")
+
+
 def scenario_sysctl_reads_and_refuses_writes(server):
     name, value = OSTYPE[platform.system()]
     assert run_command(server, "sysctl %s" % name) == [value, "exit 0"]
@@ -6002,7 +6210,7 @@ def scenario_ps5_has_no_pad(server):
 
 # A file action has no payload hash, so its line records none in the sha256 field.
 AUDIT_LINE = re.compile(
-    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64}|none|status-\d+)$")
+    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64}|none|-|status-\d+)$")
 
 
 def audit_log_path(server):
@@ -7978,6 +8186,15 @@ SCENARIOS = [
      scenario_inspection_runs_at_once, False),
     ("ps and procstat list Ariel's own process and refuse a missing or "
      "unknown pid", scenario_ps_and_procstat, False),
+    ("ls --json answers one object per entry", scenario_ls_json_is_one_object_per_entry, False),
+    ("stat --json answers one object and plain stat keeps its line", scenario_stat_json_is_one_object, False),
+    ("df --json answers one object and plain df keeps its line", scenario_df_json_is_one_object, False),
+    ("find --json answers one object per path", scenario_find_json_is_one_object_per_path, False),
+    ("ps --json answers one object per row from a fixed ps", scenario_ps_json_from_a_fixed_ps, False),
+    ("table commands without --json print what they printed", scenario_table_plain_output_is_unchanged, False),
+    ("table commands answer bad_option with no partial output", scenario_table_bad_option_answers_nothing_else, False),
+    ("table commands' JSON failures answer their error word", scenario_table_json_errors_answer_their_word, False),
+    ("the table commands' JSON keys are documented", scenario_table_json_keys_are_documented, False),
     ("sysctl reads a kernel parameter, and a sysctl write is refused and "
      "changes nothing", scenario_sysctl_reads_and_refuses_writes, False),
     ("sum and sfoinfo read absolute paths and refuse relative ones",

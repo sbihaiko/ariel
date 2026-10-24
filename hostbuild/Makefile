@@ -14,7 +14,7 @@ CANONICAL_TEST := canonical_test
 SHARED_SRCS := ../agent.c ../agent_server.c ../store.c ../state.c \
                ../token.c ../approval.c ../runner.c ../protected.c \
                ../runs.c ../fileops.c ../autoload.c ../zip.c ../tar.c \
-               ../http.c ../allowlist.c ../release.c
+               ../http.c ../allowlist.c ../release.c ../json.c
 SHARED_OBJS := $(notdir $(SHARED_SRCS:.c=.o))
 
 SRCS := main.c platform_host.c readers_host.c vcontroller.c testclock.c

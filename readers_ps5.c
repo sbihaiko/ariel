@@ -29,6 +29,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "builtins.h"
 #include "elfldr.h"
+#include "json.h"
 #include "readers.h"
 
 extern unsigned char sh_elf[];
@@ -95,10 +96,10 @@ parse_pid(const char *text, long *pid) {
 }
 
 
-/* Print the processes whose pid is only, or all of them when only is negative.
-   Sets found to the number printed. */
+/* Print the processes whose pid is only, or all of them when only is negative,
+   as text or as JSON objects. Sets found to the number printed. */
 static int
-print_procs(int outfd, int errfd, long only, int *found) {
+print_procs(int json, int outfd, int errfd, long only, int *found) {
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
   char *buf;
   char *end;
@@ -139,10 +140,21 @@ print_procs(int outfd, int errfd, long only, int *found) {
 
     state = (ki->ki_stat >= 0 && ki->ki_stat < PS_STATES) ?
             state_names[(int)ki->ki_stat] : "?";
-    snprintf(line, sizeof(line), "%d %d %d %d %u %s %s\n",
-             ki->ki_pid, ki->ki_ppid, ki->ki_pgid, ki->ki_sid,
-             (unsigned)ki->ki_uid, state, ki->ki_comm);
-    say(outfd, line);
+    if(json) {
+      snprintf(line, sizeof(line),
+               "{\"pid\":%d,\"ppid\":%d,\"pgid\":%d,\"sid\":%d,\"uid\":%u,"
+               "\"state\":\"%s\",\"command\":",
+               ki->ki_pid, ki->ki_ppid, ki->ki_pgid, ki->ki_sid,
+               (unsigned)ki->ki_uid, state);
+      say(outfd, line);
+      json_say_string(outfd, ki->ki_comm);
+      say(outfd, "}\n");
+    } else {
+      snprintf(line, sizeof(line), "%d %d %d %d %u %s %s\n",
+               ki->ki_pid, ki->ki_ppid, ki->ki_pgid, ki->ki_sid,
+               (unsigned)ki->ki_uid, state, ki->ki_comm);
+      say(outfd, line);
+    }
     (*found)++;
   }
 
@@ -152,11 +164,13 @@ print_procs(int outfd, int errfd, long only, int *found) {
 
 
 static int
-run_ps(int outfd, int errfd, int *status) {
+run_ps(int json, int outfd, int errfd, int *status) {
   int found;
 
-  say(outfd, PS_HEADER);
-  *status = print_procs(outfd, errfd, -1, &found);
+  if(!json) {
+    say(outfd, PS_HEADER);
+  }
+  *status = print_procs(json, outfd, errfd, -1, &found);
   return 0;
 }
 
@@ -178,7 +192,7 @@ run_procstat(int argc, char *const argv[], int outfd, int errfd, int *status) {
   }
 
   say(outfd, PS_HEADER);
-  if(print_procs(outfd, errfd, pid, &found)) {
+  if(print_procs(0, outfd, errfd, pid, &found)) {
     *status = 1;
   } else if(!found) {
     say(errfd, "no_such_process\n");
@@ -307,13 +321,14 @@ run_builtin(int argc, char *const argv[], int outfd, int errfd, int *status) {
 
 
 int
-readers_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
+readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
+             int *status) {
   if(argc < 1) {
     return -1;
   }
 
   if(argc == 1 && !strcmp(argv[0], "ps")) {
-    return run_ps(outfd, errfd, status);
+    return run_ps(json, outfd, errfd, status);
   }
 
   if(!strcmp(argv[0], "procstat")) {
