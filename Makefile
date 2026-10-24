@@ -33,6 +33,12 @@ ifeq ($(ARIEL_RECOVERY_PUBKEY),$(ARIEL_TEST_PUBKEY))
     $(error ARIEL_RECOVERY_PUBKEY is the host test key; the PS5 build never pins it)
 endif
 
+ifneq ($(ARIEL_PUBKEY),)
+ifeq ($(ARIEL_RECOVERY_PUBKEY),)
+    $(error ARIEL_PUBKEY is set but ARIEL_RECOVERY_PUBKEY is empty; the anchor needs both keys)
+endif
+endif
+
 ifneq ($(ARIEL_RECOVERY_PUBKEY),)
 ifeq ($(ARIEL_RECOVERY_PUBKEY),$(ARIEL_PUBKEY))
     $(error ARIEL_RECOVERY_PUBKEY must differ from ARIEL_PUBKEY)
