@@ -71,7 +71,7 @@ The elfldr connection also prints `[SceLncUtil] getAppStatus: LNC_ISOK::0x809400
 
 `pt_call` single-steps the target. The 30 second deadline is checked between probes. It does not interrupt a call that is already inside the title.
 
-One run read the title about once a second with no button held, reported no errors, and printed `stop after 30 s, presses 0`. The Cross run got one good sample (`press CROSS`) and the next in-title read never returned. Port 9150 stayed open and the transcript stopped growing. The operator has had to reboot out of a stuck probe. A reboot ends the payload.
+One run read the title about once a second with no button held, reported no errors, and printed `stop after 30 s, presses 0`. The Cross run got one good sample (`press CROSS`) and the next in-title read never returned. Port 9150 stayed open and the transcript stopped growing. On the console the last frame stays up, the controller does nothing, and the picture looks frozen. elfldr on 9021 and the spike on 9150 still accept connections, so the system is up and the title is stopped. The operator has had to reboot out of a stuck probe. A reboot ends the payload.
 
 The first send of the 120 second build, before any of the successful reads, also produced no transcript. Port 9150 accepted a connection and the payload wrote nothing. That boot was rebooted. The same probe returned on the next boot.
 
