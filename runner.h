@@ -17,6 +17,9 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_RUNNER_H
 #define ARIEL_RUNNER_H
 
+/** The most bytes of output one answer carries. A reader cuts past it. **/
+#define OUTPUT_CAP (64UL * 1024)
+
 /**
  * Run one command of the agent port: argv[0] is the command, argv[argc] is
  * NULL. Output goes to outfd and diagnostics to errfd. A connection has no

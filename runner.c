@@ -72,6 +72,7 @@ static const struct {
   {"procstat", "print one process by pid"},
   {"ps", "list the processes"},
   {"pwd", "print the working directory"},
+  {"read", "print a range of an absolute file, with its size and SHA-256"},
   {"sfoinfo", "print the entries of an absolute PARAM.SFO"},
   {"sha256sum", "print the SHA-256 of an absolute file"},
   {"sleep", "pause for up to 60 seconds"},
@@ -862,6 +863,144 @@ run_sha256sum(int argc, char *const argv[], int outfd, int errfd) {
 
 
 static int
+read_number(const char *text, uint64_t *value) {
+  unsigned long long parsed;
+  char *end;
+
+  if(!isdigit((unsigned char)text[0])) {
+    return -1;
+  }
+  errno = 0;
+  parsed = strtoull(text, &end, 10);
+  if(errno || *end) {
+    return -1;
+  }
+  *value = parsed;
+  return 0;
+}
+
+
+static int
+run_read(int argc, char *const argv[], int outfd, int errfd) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char hex[SHA256_HEX_LEN + 1];
+  char header[128];
+  char marker[96];
+  char buf[IO_CHUNK];
+  uint64_t offset = 0;
+  uint64_t limit = UINT64_MAX;
+  uint64_t value;
+  uint64_t size = 0;
+  uint64_t wanted;
+  uint64_t shown;
+  sha256_t hash;
+  struct stat st;
+  ssize_t got;
+  ssize_t n;
+  char *body;
+  int seen = 0;
+  int fd;
+  int rc;
+  int i;
+
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+
+  for(i=2; i<argc; i+=2) {
+    int is_offset = !strcmp(argv[i], "--offset");
+    int bit = is_offset ? 1 : 2;
+
+    if(i + 1 == argc || (!is_offset && strcmp(argv[i], "--limit")) ||
+       (seen & bit) || read_number(argv[i + 1], &value)) {
+      say(errfd, "bad_option\n");
+      return 1;
+    }
+    seen |= bit;
+    if(is_offset) {
+      offset = value;
+    } else {
+      limit = value;
+    }
+  }
+
+  if((rc=open_target("read", argv[1], errfd, &fd))) {
+    return rc;
+  }
+  if(fstat(fd, &st)) {
+    int err = errno;
+
+    close(fd);
+    report("read", argv[1], errfd, err);
+    return 1;
+  }
+  if(!S_ISREG(st.st_mode)) {
+    close(fd);
+    say(errfd, S_ISDIR(st.st_mode) ? "is_a_directory\n" : "not_a_file\n");
+    return 1;
+  }
+
+  // The header carries the whole file's hash, so the whole file is read first.
+  sha256_init(&hash);
+  for(;;) {
+    n = fill(fd, buf, sizeof(buf));
+    if(n < 0) {
+      int err = errno;
+
+      close(fd);
+      report("read", argv[1], errfd, err);
+      return 1;
+    }
+    if(n == 0) {
+      break;
+    }
+    sha256_update(&hash, buf, (size_t)n);
+    size += (uint64_t)n;
+  }
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  if(offset > size) {
+    close(fd);
+    say(errfd, "bad_range\n");
+    return 1;
+  }
+
+  wanted = size - offset < limit ? size - offset : limit;
+  shown = wanted < OUTPUT_CAP ? wanted : OUTPUT_CAP;
+
+  body = malloc(shown ? shown : 1);
+  if(!body) {
+    close(fd);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  got = lseek(fd, (off_t)offset, SEEK_SET) < 0 ? -1 :
+        fill(fd, body, (size_t)shown);
+  close(fd);
+  if(got != (ssize_t)shown) {
+    free(body);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  snprintf(header, sizeof(header), "bytes %llu %s %llu\n",
+           (unsigned long long)size, hex, (unsigned long long)shown);
+  say(outfd, header);
+  put(outfd, body, (size_t)shown);
+  free(body);
+
+  if(wanted > shown) {
+    snprintf(marker, sizeof(marker), "truncated %llu of %llu\n",
+             (unsigned long long)shown, (unsigned long long)wanted);
+    say(outfd, marker);
+  }
+  return 0;
+}
+
+
+static int
 run_echo(int argc, char *const argv[], int outfd) {
   for(int i=1; i<argc; i++) {
     if(i > 1) {
@@ -1141,6 +1280,7 @@ static const struct {
   {"cmp", run_cmp},
   {"hexdump", run_hexdump},
   {"sha256sum", run_sha256sum},
+  {"read", run_read},
 };
 
 
