@@ -373,6 +373,19 @@ def check_install_bad_name_is_audited(session, context):
         "a refused install must reach audit tail, got %r" % events)
 
 
+def check_commit_stale_is_audited(session, context):
+    del context
+    staging = "s-0123456789abcdef"
+    assert session.link.exchange("payload commit %s" % staging) == [
+        "approval_stale", "exit 78"], (
+        "a commit of an unknown staging ID must answer approval_stale and exit 78")
+    events = [line.split() for line in session.link.exchange("audit tail")
+              if line != "exit 0"]
+    assert any(event[1:4] == ["payload.commit.stale", "-", staging]
+               for event in events), (
+        "a stale commit must reach audit tail, got %r" % events)
+
+
 def check_approval_then_install(session, context):
     del context
     data = b"console approval\n"
@@ -871,6 +884,8 @@ CHECKS = [
     ("a name outside the grammar answers bad_name", check_bad_name),
     ("an install with a name outside the grammar answers bad_name and is "
      "audited", check_install_bad_name_is_audited),
+    ("a commit of an unknown staging ID answers approval_stale, exit 78, and "
+     "is audited", check_commit_stale_is_audited),
     ("a commit before the decision answers approval_required and exit 75, the "
      "owner signs the challenge, and the commit installs the build",
      check_approval_then_install),

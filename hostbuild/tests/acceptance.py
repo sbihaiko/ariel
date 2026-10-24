@@ -2499,6 +2499,10 @@ def scenario_commit_denied(server):
     assert not os.path.exists(staging_path(server, staging)), (
         "the denied staging object must be deleted"
     )
+    assert ("payload.commit.denied", "refused") in [
+        event[:2] for event in audit_events(server)], (
+        "a denied commit must reach audit tail under its payload's name"
+    )
     assert commit(server, staging) == ["approval_stale", "exit 78"], (
         "a consumed denial must not be replayed"
     )
@@ -2529,6 +2533,9 @@ def scenario_approval_expired(server):
         "and exit 88, so 77 stays a refusal")
     assert not os.path.exists(staging_path(server, staging)), (
         "an expired approval's staging object must be deleted")
+    assert ("payload.commit.expired", "expired") in [
+        event[:2] for event in audit_events(server)], (
+        "an expired commit must reach audit tail under its payload's name")
     assert commit(server, staging) == ["approval_stale", "exit 78"], (
         "once its object is gone, an expired approval is only stale")
 
@@ -7612,6 +7619,28 @@ def scenario_install_refused_while_approvals_are_full_is_audited(_server):
     with_install(data, run, allowlist="default")
 
 
+def scenario_push_after_install_still_commits(_server):
+    """A pushed build of a name whose hash is pinned still commits once the owner approves it."""
+    first = healthy_build(INSTALL_NAME)
+    second = healthy_build("pushed-build")
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        staging, approval = assert_staged(fx.server, lines, INSTALL_NAME, first)
+        sign_and_grant(fx.server, approval, challenge_of(lines))
+        assert commit(fx.server, staging) == [
+            "installed %s %s" % (INSTALL_NAME, hashlib.sha256(first).hexdigest()),
+            "exit 0"]
+
+        pushed, _ = approve_push(fx.server, INSTALL_NAME, second)
+        assert commit(fx.server, pushed) == [
+            "installed %s %s" % (INSTALL_NAME, hashlib.sha256(second).hexdigest()),
+            "exit 0"], (
+            "an approved push must still install when the name's hash is pinned "
+            "to another build")
+    with_install(first, run, allowlist="default")
+
+
 INSTALL_SCENARIOS = [
     ("install refuses a host outside the allowlist",
      scenario_install_refused_outside_the_allowlist_host, RELEASE_FIXTURE_REASON),
@@ -7671,6 +7700,8 @@ INSTALL_SCENARIOS = [
      scenario_install_bad_name_is_refused_and_audited, RELEASE_FIXTURE_REASON),
     ("an install refused while approvals are full is audited",
      scenario_install_refused_while_approvals_are_full_is_audited, RELEASE_FIXTURE_REASON),
+    ("an approved push still commits when its name's hash is pinned",
+     scenario_push_after_install_still_commits, RELEASE_FIXTURE_REASON),
 ]
 
 RELEASE_SCENARIOS = {title for title, _check, _reason in INSTALL_SCENARIOS}

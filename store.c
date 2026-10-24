@@ -2331,35 +2331,62 @@ out:
   return rc;
 }
 
-/**
- * Whether the allowlist pins name to a hash other than sha256 now. An allowlist
- * that cannot be read counts as a conflict: the pin cannot be shown unchanged.
- **/
 static int
-pin_conflicts(const char *name, const char *sha256) {
+allowlist_load(int state_fd, char *text, allowlist_t *list) {
+  return text_read(state_fd, ALLOWLIST_FILE, text, ALLOWLIST_TEXT_MAX) < 0 ||
+         allowlist_parse(text, list);
+}
+
+
+/**
+ * The allowlist as it stands, parsed, read before the store lock is taken.
+ * Pins are only ever added, so a snapshot can miss a pin set after it but
+ * never reports a pin that is not there. NULL when it cannot be read; the
+ * caller frees it.
+ **/
+static allowlist_t *
+allowlist_snapshot(void) {
   allowlist_t *list;
   char *text;
-  const char *pinned;
-  int conflict = 1;
+  int state_fd;
+  int rc = -1;
 
   text = calloc(1, ALLOWLIST_TEXT_MAX);
   list = calloc(1, sizeof(*list));
   if(!text || !list) {
-    goto out;
+    free(text);
+    free(list);
+    return NULL;
   }
 
-  if(store_allowlist_read(text, ALLOWLIST_TEXT_MAX) ||
-     allowlist_parse(text, list)) {
-    goto out;
+  if((state_fd=root_open()) >= 0) {
+    rc = allowlist_load(state_fd, text, list);
+    close(state_fd);
+  }
+
+  free(text);
+  if(rc) {
+    free(list);
+    return NULL;
+  }
+  return list;
+}
+
+
+/**
+ * Whether the snapshot pins name to a hash other than sha256. A missing
+ * snapshot counts as a conflict: the pin cannot be shown unchanged.
+ **/
+static int
+pin_conflicts(const allowlist_t *list, const char *name, const char *sha256) {
+  const char *pinned;
+
+  if(!list) {
+    return 1;
   }
 
   pinned = allowlist_pin(list, name);
-  conflict = pinned && strcmp(pinned, sha256) ? 1 : 0;
-
-out:
-  free(text);
-  free(list);
-  return conflict;
+  return pinned && strcmp(pinned, sha256) ? 1 : 0;
 }
 
 
@@ -2378,13 +2405,19 @@ store_commit(const char *staging_id, store_install_t *install,
              char *approval_id, size_t idlen) {
   struct staged *entry;
   struct approval *request;
+  allowlist_t *pins;
   int outcome;
+
+  pins = allowlist_snapshot();
 
   pthread_mutex_lock(&lock);
   expire_locked(now_ms());
 
   entry = staged_find(staging_id);
   request = entry ? approval_find(entry->approval_id) : NULL;
+  if(entry) {
+    install_provenance(&entry->facts, install);
+  }
 
   if(!request) {
     // An unknown staging ID and a lost approval both mean: push again.
@@ -2406,18 +2439,17 @@ store_commit(const char *staging_id, store_install_t *install,
     // approval stays, answered as decided and not approved.
     staged_leave(entry);
     outcome = STORE_APPROVAL_DENIED;
+  } else if(!strcmp(entry->facts.command, "payload.install") &&
+            pin_conflicts(pins, entry->facts.name, entry->facts.sha256)) {
+    // Another build of this name was pinned after the owner was asked.
+    staged_leave(entry);
+    outcome = STORE_APPROVAL_STALE;
   } else {
-    install_provenance(&entry->facts, install);
-    if(pin_conflicts(entry->facts.name, entry->facts.sha256)) {
-      // Another build of this name was pinned after the owner was asked.
-      staged_leave(entry);
-      outcome = STORE_APPROVAL_STALE;
-    } else {
-      outcome = staged_install(entry, request, install);
-    }
+    outcome = staged_install(entry, request, install);
   }
 
   pthread_mutex_unlock(&lock);
+  free(pins);
   return outcome;
 }
 
@@ -2480,9 +2512,7 @@ store_allowlist_pin(const char *name, const char *sha256) {
 
   pthread_mutex_lock(&lock);
 
-  if((state_fd=root_open()) < 0 ||
-     text_read(state_fd, ALLOWLIST_FILE, text, ALLOWLIST_TEXT_MAX) < 0 ||
-     allowlist_parse(text, list)) {
+  if((state_fd=root_open()) < 0 || allowlist_load(state_fd, text, list)) {
     goto out_locked;
   }
 
