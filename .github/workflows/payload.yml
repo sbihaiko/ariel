@@ -2,12 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [master, dev]
     tags:
       - "*"
     paths-ignore:
       - "**/*.md"
       - "**/*.txt"
   pull_request:
+    branches: [master, dev]
     paths-ignore:
       - "**/*.md"
       - "**/*.txt"

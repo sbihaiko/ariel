@@ -1,6 +1,11 @@
 name: Host
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master, dev]
+  workflow_dispatch:
 
 concurrency:
   group: host-${{ github.ref }}-${{ github.event_name }}
