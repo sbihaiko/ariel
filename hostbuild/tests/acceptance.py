@@ -705,7 +705,7 @@ def running_flag(server, name):
     """The running= field of one payload's list line."""
     line = listed(payload_list(server), name)
     assert line is not None, "payload list must name %s" % name
-    return line.rsplit("running=", 1)[1]
+    return line.rsplit("running=", 1)[1].split()[0]
 
 
 def scenario_background_run_returns_pid(server):
@@ -1652,7 +1652,7 @@ main(int argc, char* argv[]) {
 """
 
 
-def audit_events(server):
+def journal_events(server):
     """The (kind, name, sha256) of every audit line, in order."""
     events = []
     for line in read_audit_log(server).decode("ascii").splitlines():
@@ -1721,9 +1721,9 @@ def scenario_crash_in_prepared_leaves_old_version(server):
                          os.path.join(store, JOURNAL_FILE)):
             assert not os.path.exists(leftover), (
                 "a rolled back change must leave %s behind" % leftover)
-        assert ("rollback", JOURNAL_NAME, second_hash) in audit_events(crashed), (
+        assert ("rollback", JOURNAL_NAME, second_hash) in journal_events(crashed), (
             "the rollback must be audited, the log holds %r"
-            % audit_events(crashed))
+            % journal_events(crashed))
     finally:
         crashed.stop()
 
@@ -1744,10 +1744,10 @@ def scenario_crash_in_committed_leaves_new_version(server):
         assert second_hash in objects and first_hash in objects, (
             "the new build and its previous version must be stored, it holds %r"
             % objects)
-        assert ("rollforward", JOURNAL_NAME, second_hash) in audit_events(
+        assert ("rollforward", JOURNAL_NAME, second_hash) in journal_events(
             crashed), (
             "the roll forward must be audited, the log holds %r"
-            % audit_events(crashed))
+            % journal_events(crashed))
     finally:
         crashed.stop()
 
@@ -1772,9 +1772,9 @@ def scenario_committed_journal_without_its_object_is_refused(server):
         assert read_state(crashed) == before, (
             "a refused recovery must not change the state file")
         assert ("rollforward_refused", JOURNAL_NAME, second_hash) in (
-            audit_events(crashed)), (
+            journal_events(crashed)), (
             "the refused roll forward must be audited, the log holds %r"
-            % audit_events(crashed))
+            % journal_events(crashed))
     finally:
         crashed.stop()
 
@@ -1812,9 +1812,9 @@ def scenario_recovery_crash_matches_one_crash(server):
         assert read_state(twice) == read_state(once), (
             "a recovery that crashed once must write the state file a single "
             "crash writes")
-        assert audit_events(twice) == audit_events(once), (
+        assert journal_events(twice) == journal_events(once), (
             "a recovery that crashed once must audit what a single crash "
-            "audits, the log holds %r" % audit_events(twice))
+            "audits, the log holds %r" % journal_events(twice))
     finally:
         once.stop()
         twice.stop()
