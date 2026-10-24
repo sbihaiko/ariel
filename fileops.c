@@ -20,6 +20,7 @@ along with this program; see the file COPYING. If not, see
 #define _DARWIN_C_SOURCE 1
 #endif
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -970,6 +971,321 @@ fileops_transfer_act(const char *root, const char *command,
 }
 
 
+#define TREE_DEPTH_MAX 64
+
+
+/** Whether destination is source itself or below it, by path. **/
+static int
+inside(const char *source, const char *destination) {
+  size_t n = strlen(source);
+
+  return !strncmp(destination, source, n) &&
+         (destination[n] == '/' || destination[n] == '\0');
+}
+
+
+/**
+ * Check the entry at leaf below parent and everything in it, without following
+ * a link. A link to a protected object answers protected, any other link
+ * answers FILEOPS_LINK, and nothing is changed.
+ **/
+static int
+tree_scan(int parent, const char *leaf, int depth) {
+  struct stat st;
+  struct stat target;
+  struct dirent *ent;
+  DIR *dir;
+  int fd;
+  int rc = FILEOPS_OK;
+
+  if(fstatat(parent, leaf, &st, AT_SYMLINK_NOFOLLOW)) {
+    return errno == ENOENT ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
+  }
+  if(S_ISLNK(st.st_mode)) {
+    if(!fstatat(parent, leaf, &target, 0) && protected_stat(&target)) {
+      return FILEOPS_PROTECTED;
+    }
+    return FILEOPS_LINK;
+  }
+  if(S_ISREG(st.st_mode)) {
+    return FILEOPS_OK;
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    return FILEOPS_NOT_FILE;
+  }
+  if(depth >= TREE_DEPTH_MAX) {
+    return FILEOPS_FAILED;
+  }
+
+  fd = openat(parent, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if(fd < 0) {
+    return walk_refusal(errno);
+  }
+  if(!(dir=fdopendir(fd))) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  while(rc == FILEOPS_OK && (ent = readdir(dir))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    rc = tree_scan(dirfd(dir), ent->d_name, depth + 1);
+  }
+  closedir(dir);
+  return rc;
+}
+
+
+/**
+ * Remove the entry at leaf below parent, and everything in it, without
+ * following a link. Each entry is checked for protection before it goes.
+ **/
+static int
+tree_remove(int parent, const char *leaf, int depth) {
+  struct stat st;
+  struct dirent *ent;
+  DIR *dir;
+  int fd;
+  int rc = FILEOPS_OK;
+
+  if(fstatat(parent, leaf, &st, AT_SYMLINK_NOFOLLOW)) {
+    return errno == ENOENT ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    return unlinkat(parent, leaf, 0) ? FILEOPS_FAILED : FILEOPS_OK;
+  }
+  if(depth >= TREE_DEPTH_MAX) {
+    return FILEOPS_FAILED;
+  }
+
+  fd = openat(parent, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if(fd < 0) {
+    return walk_refusal(errno);
+  }
+  if(!(dir=fdopendir(fd))) {
+    close(fd);
+    return FILEOPS_FAILED;
+  }
+  while(rc == FILEOPS_OK && (ent = readdir(dir))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    rc = tree_remove(dirfd(dir), ent->d_name, depth + 1);
+  }
+  closedir(dir);
+  if(rc) {
+    return rc;
+  }
+  return unlinkat(parent, leaf, AT_REMOVEDIR) ? FILEOPS_FAILED : FILEOPS_OK;
+}
+
+
+/**
+ * Copy the entry at sleaf below from to a new entry dleaf below to: a regular
+ * file, or a directory with everything in it. Links and other kinds refuse.
+ * The destination is made exclusively; EXISTS means it was already there.
+ **/
+static int
+tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth) {
+  approval_facts_t expected;
+  struct dirent *ent;
+  struct stat st;
+  DIR *dir;
+  int sfd;
+  int dfd;
+  int rc = FILEOPS_OK;
+
+  if(fstatat(from, sleaf, &st, AT_SYMLINK_NOFOLLOW)) {
+    return errno == ENOENT ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+  if(S_ISREG(st.st_mode)) {
+    memset(&expected, 0, sizeof(expected));
+    expected.dev = (uint64_t)st.st_dev;
+    expected.ino = (uint64_t)st.st_ino;
+    return copy_entry(from, sleaf, &expected, to, dleaf);
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    return FILEOPS_NOT_FILE;
+  }
+  if(depth >= TREE_DEPTH_MAX) {
+    return FILEOPS_FAILED;
+  }
+
+  if(mkdirat(to, dleaf, 0755)) {
+    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+  sfd = openat(from, sleaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if(sfd < 0) {
+    return FILEOPS_CHANGED;
+  }
+  dfd = openat(to, dleaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if(dfd < 0) {
+    close(sfd);
+    return FILEOPS_FAILED;
+  }
+  if(!(dir=fdopendir(sfd))) {
+    close(sfd);
+    close(dfd);
+    return FILEOPS_FAILED;
+  }
+  while(rc == FILEOPS_OK && (ent = readdir(dir))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    rc = tree_copy(dirfd(dir), ent->d_name, dfd, ent->d_name, depth + 1);
+  }
+  closedir(dir);
+  close(dfd);
+  return rc;
+}
+
+
+int
+fileops_tree_check(const char *root, const char *path,
+                   approval_facts_t *facts) {
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  rc = inspect(root, path, facts, &dirfd, leaf, sizeof(leaf), 1);
+  if(rc) {
+    return rc;
+  }
+  if(!strcmp(facts->kind, "absent")) {
+    close(dirfd);
+    return FILEOPS_NO_FILE;
+  }
+
+  rc = tree_scan(dirfd, leaf, 0);
+  close(dirfd);
+  return rc;
+}
+
+
+int
+fileops_tree_act(const char *root, const char *path,
+                 const approval_facts_t *expected) {
+  approval_facts_t now;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  memset(&now, 0, sizeof(now));
+  rc = inspect(root, path, &now, &dirfd, leaf, sizeof(leaf), 1);
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(now.kind, expected->kind) || now.dev != expected->dev ||
+     now.ino != expected->ino) {
+    close(dirfd);
+    return FILEOPS_CHANGED;
+  }
+
+  rc = tree_scan(dirfd, leaf, 0);
+  if(!rc) {
+    rc = tree_remove(dirfd, leaf, 0);
+  }
+  close(dirfd);
+  return rc;
+}
+
+
+int
+fileops_tree_transfer_check(const char *root, const char *source,
+                            const char *destination, approval_facts_t *facts) {
+  approval_facts_t into;
+  char sleaf[PATH_MAX];
+  char dleaf[PATH_MAX];
+  int sdir;
+  int ddir;
+  int rc;
+
+  if(inside(source, destination)) {
+    return FILEOPS_BAD_PATH;
+  }
+
+  rc = transfer_inspect(root, source, facts, &sdir, sleaf, sizeof(sleaf));
+  if(rc) {
+    return rc;
+  }
+  if(!strcmp(facts->kind, "absent")) {
+    close(sdir);
+    return FILEOPS_NO_FILE;
+  }
+  rc = tree_scan(sdir, sleaf, 0);
+  close(sdir);
+  if(rc) {
+    return rc;
+  }
+
+  memset(&into, 0, sizeof(into));
+  rc = transfer_inspect(root, destination, &into, &ddir, dleaf, sizeof(dleaf));
+  if(rc) {
+    return rc;
+  }
+  close(ddir);
+  return strcmp(into.kind, "absent") ? FILEOPS_EXISTS : FILEOPS_OK;
+}
+
+
+int
+fileops_tree_transfer_act(const char *root, const char *source,
+                          const char *destination,
+                          const approval_facts_t *expected) {
+  approval_facts_t now;
+  approval_facts_t into;
+  char sleaf[PATH_MAX];
+  char dleaf[PATH_MAX];
+  int sdir;
+  int ddir;
+  int rc;
+
+  if(inside(source, destination)) {
+    return FILEOPS_BAD_PATH;
+  }
+
+  memset(&now, 0, sizeof(now));
+  rc = transfer_inspect(root, source, &now, &sdir, sleaf, sizeof(sleaf));
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(now.kind, expected->kind) || now.dev != expected->dev ||
+     now.ino != expected->ino) {
+    close(sdir);
+    return FILEOPS_CHANGED;
+  }
+
+  memset(&into, 0, sizeof(into));
+  rc = transfer_inspect(root, destination, &into, &ddir, dleaf, sizeof(dleaf));
+  if(rc) {
+    close(sdir);
+    return rc;
+  }
+
+  if(strcmp(into.kind, "absent")) {
+    rc = FILEOPS_EXISTS;
+  } else {
+    rc = tree_scan(sdir, sleaf, 0);
+    if(!rc) {
+      rc = tree_copy(sdir, sleaf, ddir, dleaf, 0);
+    }
+    if(rc && rc != FILEOPS_EXISTS) {
+      tree_remove(ddir, dleaf, 0);
+    }
+  }
+
+  close(sdir);
+  close(ddir);
+  return rc;
+}
+
+
 /** Whether text fits in size bytes, its NUL included. **/
 static int
 fits(const char *text, size_t size) {
@@ -1666,6 +1982,8 @@ fileops_word(int rc) {
     return "escaping_member";
   case FILEOPS_BAD_MEMBER:
     return "bad_member";
+  case FILEOPS_BAD_OPTION:
+    return "bad_option";
   default:
     return "ok";
   }

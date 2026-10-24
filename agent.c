@@ -88,6 +88,9 @@ static const char bad_path[] =
 static const char missing_operand[] =
   "missing_operand\n"
   "exit 1\n";
+static const char bad_option[] =
+  "bad_option\n"
+  "exit 1\n";
 static const char list_failed[] =
   "list_failed\n"
   "exit 1\n";
@@ -984,18 +987,21 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
 
 /**
  * One file command on one absolute path: mkdir, rmdir, touch, rm, or chmod,
- * chown or chgrp with its operand. operand is NULL for the first four.
+ * chown or chgrp with its operand. operand is NULL for the first four. A
+ * recursive rm takes the whole tree below path.
  **/
 static void
 file_command(agent_t *agent, int fd, const char *command, const char *path,
-             const char *operand) {
+             const char *operand, int recursive) {
   const char *root = agent->platform->fs_root;
   approval_challenge_t challenge;
   approval_facts_t facts;
   int rc;
 
   memset(&facts, 0, sizeof(facts));
-  rc = fileops_check(root, command, path, operand, &facts);
+  facts.recursive = recursive;
+  rc = recursive ? fileops_tree_check(root, path, &facts) :
+       fileops_check(root, command, path, operand, &facts);
   if(rc != FILEOPS_OK) {
     file_outcome(fd, command, path, "-", rc);
     return;
@@ -1007,15 +1013,19 @@ file_command(agent_t *agent, int fd, const char *command, const char *path,
     return;
   }
 
-  rc = fileops_act(root, command, path, operand, &facts);
+  rc = recursive ? fileops_tree_act(root, path, &facts) :
+       fileops_act(root, command, path, operand, &facts);
   file_outcome(fd, command, path, challenge.id, rc);
 }
 
 
-/** One transfer, cp, mv or ln, from source to destination: two absolute paths. **/
+/**
+ * One transfer, cp, mv or ln, from source to destination: two absolute paths.
+ * A recursive cp takes the whole tree below source.
+ **/
 static void
 transfer_command(agent_t *agent, int fd, const char *command,
-                 const char *source, const char *destination) {
+                 const char *source, const char *destination, int recursive) {
   const char *root = agent->platform->fs_root;
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
@@ -1028,7 +1038,10 @@ transfer_command(agent_t *agent, int fd, const char *command,
   }
 
   memset(&facts, 0, sizeof(facts));
-  rc = fileops_transfer_check(root, source, destination, &facts);
+  facts.recursive = recursive;
+  rc = recursive ?
+       fileops_tree_transfer_check(root, source, destination, &facts) :
+       fileops_transfer_check(root, source, destination, &facts);
   if(rc != FILEOPS_OK) {
     file_outcome(fd, command, subject_of(source, destination, subject), "-",
                  rc);
@@ -1042,9 +1055,55 @@ transfer_command(agent_t *agent, int fd, const char *command,
     return;
   }
 
-  rc = fileops_transfer_act(root, command, source, destination, &facts);
+  rc = recursive ?
+       fileops_tree_transfer_act(root, source, destination, &facts) :
+       fileops_transfer_act(root, command, source, destination, &facts);
   file_outcome(fd, command, subject_of(source, destination, subject),
                challenge.id, rc);
+}
+
+
+/**
+ * The options of the file commands. rm -r and cp -r take the tree below their
+ * operands; any other option answers bad_option and asks nobody. Returns 1
+ * when the line was answered here.
+ **/
+static int
+file_options(agent_t *agent, int fd, int argc, char *argv[]) {
+  int cp = !strcmp(argv[0], "cp");
+  int recursive;
+  int i;
+
+  if(!cp && strcmp(argv[0], "rm") && strcmp(argv[0], "mkdir") &&
+     strcmp(argv[0], "rmdir") && strcmp(argv[0], "touch") &&
+     strcmp(argv[0], "mv") && strcmp(argv[0], "ln")) {
+    return 0;
+  }
+
+  recursive = argc >= 2 && !strcmp(argv[1], "-r") &&
+              (cp || !strcmp(argv[0], "rm"));
+  if(recursive) {
+    int operands = argc - 2;
+
+    if(operands < (cp ? 2 : 1)) {
+      audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+    } else if(operands > (cp ? 2 : 1)) {
+      audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
+    } else if(cp) {
+      transfer_command(agent, fd, "cp", argv[2], argv[3], 1);
+    } else {
+      file_command(agent, fd, "rm", argv[2], NULL, 1);
+    }
+    return 1;
+  }
+
+  for(i=1; i<argc; i++) {
+    if(argv[i][0] == '-') {
+      audit_reply(fd, argv[0], "refused", "-", "-", bad_option);
+      return 1;
+    }
+  }
+  return 0;
 }
 
 
@@ -1426,7 +1485,7 @@ attribute_command(agent_t *agent, int fd, int argc, char *argv[]) {
     unlisted_command(agent, fd, argc, argv);
     return;
   }
-  file_command(agent, fd, argv[0], argv[2], argv[1]);
+  file_command(agent, fd, argv[0], argv[2], argv[1], 0);
 }
 
 
@@ -3892,9 +3951,13 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
+  if(argc >= 2 && file_options(agent, fd, argc, argv)) {
+    return;
+  }
+
   if(argc == 2 && (!strcmp(argv[0], "mkdir") || !strcmp(argv[0], "rmdir") ||
                    !strcmp(argv[0], "touch") || !strcmp(argv[0], "rm"))) {
-    file_command(agent, fd, argv[0], argv[1], NULL);
+    file_command(agent, fd, argv[0], argv[1], NULL, 0);
     return;
   }
 
@@ -3906,7 +3969,7 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && (!strcmp(argv[0], "cp") || !strcmp(argv[0], "mv") ||
                    !strcmp(argv[0], "ln"))) {
-    transfer_command(agent, fd, argv[0], argv[1], argv[2]);
+    transfer_command(agent, fd, argv[0], argv[1], argv[2], 0);
     return;
   }
 

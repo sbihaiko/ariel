@@ -75,6 +75,7 @@ typedef struct {
   char kind[8];  /** file, dir, link, other or absent. **/
   uint64_t dev;
   uint64_t ino;
+  int recursive;  /** rm or cp: the whole tree below the target. **/
   uint64_t argc;
   char signal[SIGNAL_NAME_MAX + 1];
   char start[PROCESS_START_MAX + 1];

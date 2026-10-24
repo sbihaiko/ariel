@@ -1059,6 +1059,10 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[n++].value = text[0];
       options[n].key = "ino";
       options[n++].value = text[1];
+      if(facts->recursive) {
+        options[n].key = "recursive";
+        options[n++].value = "1";
+      }
       if(facts->fstype[0]) {
         options[n].key = "fstype";
         options[n++].value = facts->fstype;
@@ -1331,6 +1335,7 @@ same_args(const approval_facts_t *a, const approval_facts_t *b) {
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
   return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
+         a->recursive == b->recursive &&
          a->argc == b->argc && !strcmp(a->args, b->args) &&
          !strcmp(a->url, b->url) &&
          !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start) &&
