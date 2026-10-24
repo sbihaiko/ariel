@@ -1111,6 +1111,12 @@ CLOCK_SCENARIOS = {
     "are audited",
     "a chmod approved for one mode answers approval_stale for another, and "
     "the signed mode runs",
+    "mount, umount, chroot and mknod ask the owner, and once signed answer "
+    "not available on this platform",
+    "an object created under a mknod's name after approval answers "
+    "approval_stale and exit 78",
+    "the challenge of mount and mknod names its command, target and options",
+    "a system command's audit lines reach audit tail",
 }
 
 # The scenarios that act on a process only the host build starts, or on
@@ -1149,6 +1155,8 @@ HOST_ROOT_SCENARIOS = {
     "cp, mv and ln audit each action and refusal, and audit tail shows them",
     "the challenge of cp names both paths, sha256 none and the source's "
     "identity",
+    "a system command on Ariel's token or outside the writable roots answers "
+    "protected and exit 87 without asking",
 }
 
 
@@ -2515,6 +2523,9 @@ def scenario_no_system_change_on_agent_port(server):
     clock. A write outside the host test root is protected (87), so the
     host's own /data is never asked about or touched; chmod is protected the
     same way, where it used to ask (75) before attribute commands were gated.
+    mount was once an unlisted command answering 75 or 76; it is a gated
+    system command now, and its target /mnt is outside the writable roots, so
+    it answers 87 without asking.
     """
     secret = secret_path(server, "token")
     for command in (
@@ -2537,9 +2548,11 @@ def scenario_no_system_change_on_agent_port(server):
             lines = reply_lines(read_reply(sock))
         finally:
             sock.close()
-        # mv is a gated command of its own now. Its paths are outside the host
-        # test root, so it answers protected before it asks the owner.
-        if command.startswith(("rm ", "mkdir ", "touch ", "chmod ", "mv ")):
+        # mv and mount are gated commands of their own now. Their paths are
+        # outside the host test root, so they answer protected before they ask
+        # the owner.
+        if command.startswith(("rm ", "mkdir ", "touch ", "chmod ", "mv ",
+                               "mount ")):
             assert lines == ["protected", "exit 87"], (
                 "%s must answer protected, got %r" % (command, lines))
         else:
@@ -3154,6 +3167,133 @@ def scenario_transfer_action_names_its_facts(server):
     assert "\nsha256=none\n" in action, action
     assert "\noption.kind=file\n" in action, action
     assert "\noption.dev=" in action and "\noption.ino=" in action, action
+
+
+SYSTEM_NOT_AVAILABLE = ["not available on this platform", "exit 1"]
+
+
+def scenario_system_commands_need_the_owner(server):
+    """mount, umount, chroot and mknod ask first, and once signed are not available on the host."""
+    mount_point = os.path.join(server.root, "data", "mount-point")
+    jail = os.path.join(server.root, "data", "jail")
+    node = os.path.join(server.root, "data", "node")
+    source = os.path.join(server.root, "data", "src")
+    os.makedirs(mount_point, exist_ok=True)
+    os.makedirs(jail, exist_ok=True)
+    os.makedirs(source, exist_ok=True)
+
+    for command in (
+        "mount -t nullfs %s %s" % (source, mount_point),
+        "umount " + mount_point,
+        "chroot " + jail,
+        "mknod %s b 8 0" % node,
+    ):
+        approval, challenge = gate_request(server, command)
+        assert not os.path.exists(node), "an unsigned mknod must not create the node"
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, command) == SYSTEM_NOT_AVAILABLE, (
+            "%s must answer not available on this platform after a grant"
+            % command)
+    assert not os.path.exists(node), "the host must not create the node"
+
+
+def scenario_system_command_bad_argument(server):
+    """A system command with a missing or malformed argument is refused before the owner is asked."""
+    node = os.path.join(server.root, "data", "bad-node")
+    for command in (
+        "mknod %s q 8 0" % node,
+        "mknod %s b 256 0" % node,
+        "mknod %s b 8" % node,
+        "mount -t nullfs " + node,
+        "chroot",
+        "umount",
+    ):
+        assert run_command(server, command) == ["bad_argument", "exit 1"], (
+            "%s must answer bad_argument and exit 1" % command)
+    assert not os.path.exists(node), "a refused mknod must not create the node"
+    server.assert_no_line()
+
+
+def scenario_system_commands_protected_without_asking(server):
+    """Ariel's token, through a hard or symbolic link, and a mount outside the writable roots answer protected."""
+    secret = secret_path(server, "token")
+    hard = os.path.join(server.root, "data", "token-hard")
+    soft = os.path.join(server.root, "data", "token-soft")
+    make_link(hard, secret, hard=True)
+    make_link(soft, secret, hard=False)
+    mount_point = os.path.join(server.root, "data", "mount-point")
+    os.makedirs(mount_point, exist_ok=True)
+
+    for command in (
+        "mount -t nullfs / /mnt",
+        "umount " + hard,
+        "mknod %s c 1 0" % hard,
+        "chroot " + soft,
+    ):
+        assert_protected(server, command)
+    server.assert_no_line()
+
+
+def scenario_system_command_stale_answers_78(server):
+    """An object that appears under a mknod's name after the owner signs answers approval_stale."""
+    node = os.path.join(server.root, "data", "stale-node")
+    approval, challenge = gate_request(server, "mknod %s c 1 0" % node)
+    sign_and_grant(server, approval, challenge)
+
+    open(node, "wb").close()
+    assert run_command(server, "mknod %s c 1 0" % node) == [
+        "approval_stale", "exit 78"], (
+        "an object created after approval must answer approval_stale")
+    assert stat_exit(server, node) == "exit 0", (
+        "a stale approval must not touch the object")
+
+
+def scenario_system_command_names_its_facts(server):
+    """The challenge of mount and mknod names the command, its target and its options."""
+    mount_point = os.path.join(server.root, "data", "mount-point")
+    source = os.path.join(server.root, "data", "src")
+    node = os.path.join(server.root, "data", "node")
+    os.makedirs(mount_point, exist_ok=True)
+    os.makedirs(source, exist_ok=True)
+
+    approval, challenge = gate_request(
+        server, "mount -t nullfs %s %s" % (source, mount_point))
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\ncommand=mount\n"), action
+    assert "\ntarget=%s\n" % mount_point in action, action
+    assert "\noption.fstype=nullfs\n" in action, action
+    assert "\noption.from=%s\n" % source in action, action
+    sign_and_grant(server, approval, challenge)
+
+    approval, challenge = gate_request(server, "mknod %s b 8 0" % node)
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\ncommand=mknod\n"), action
+    assert "\ntarget=%s\n" % node in action, action
+    assert "\noption.type=b\n" in action, action
+    assert "\noption.major=8\n" in action and "\noption.minor=0\n" in action, action
+    sign_and_grant(server, approval, challenge)
+
+
+def scenario_system_commands_are_audited(server):
+    """Requests, unavailable runs and protected refusals of system commands reach audit tail."""
+    mount_point = os.path.join(server.root, "data", "mount-point")
+    hard = os.path.join(server.root, "data", "token-audit")
+    os.makedirs(mount_point, exist_ok=True)
+    make_link(hard, secret_path(server, "token"), hard=True)
+
+    approval, challenge = gate_request(server, "umount " + mount_point)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "umount " + mount_point) == SYSTEM_NOT_AVAILABLE
+    assert_protected(server, "mknod %s c 1 0" % hard)
+
+    kinds = set()
+    for line in run_exit_zero(server, "audit tail 64"):
+        fields = line.split()
+        if len(fields) == 5:
+            kinds.add(fields[1])
+    for kind in ("umount.request", "umount.unavailable", "mknod.protected"):
+        assert kind in kinds, "audit tail must show %s, got %r" % (
+            kind, sorted(kinds))
 
 
 def scenario_two_connections(server):
@@ -4178,6 +4318,22 @@ SCENARIOS = [
      scenario_transfer_actions_are_audited, HOST_ROOT_REASON),
     ("the challenge of cp names both paths, sha256 none and the source's "
      "identity", scenario_transfer_action_names_its_facts, HOST_ROOT_REASON),
+    ("mount, umount, chroot and mknod ask the owner, and once signed answer "
+     "not available on this platform",
+     scenario_system_commands_need_the_owner, CLOCK_REASON),
+    ("a system command with a bad argument answers bad_argument before the "
+     "owner is asked",
+     scenario_system_command_bad_argument, None),
+    ("a system command on Ariel's token or outside the writable roots answers "
+     "protected and exit 87 without asking",
+     scenario_system_commands_protected_without_asking, HOST_ROOT_REASON),
+    ("an object created under a mknod's name after approval answers "
+     "approval_stale and exit 78",
+     scenario_system_command_stale_answers_78, CLOCK_REASON),
+    ("the challenge of mount and mknod names its command, target and options",
+     scenario_system_command_names_its_facts, CLOCK_REASON),
+    ("a system command's audit lines reach audit tail",
+     scenario_system_commands_are_audited, CLOCK_REASON),
     ("pwd and ls <absolute path> run through the agent port",
      scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",

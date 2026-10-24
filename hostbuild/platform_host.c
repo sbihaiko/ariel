@@ -743,6 +743,15 @@ host_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
 }
 
 
+static int
+host_system_act(platform_t *self, const approval_facts_t *facts) {
+  (void)self;
+  (void)facts;
+
+  return 1;
+}
+
+
 /**
  * ARIEL_HOST_FAULT names the step at which this build ends itself. The
  * process aborts there, with nothing flushed after the step, so a restart
@@ -777,6 +786,7 @@ static platform_t host_platform = {
   .spawn_poll = host_spawn_poll,
   .spawn_kill = host_spawn_kill,
   .run = host_run,
+  .system_act = host_system_act,
   .fault = host_fault,
   .processes = host_processes,
   .process_start = host_process_start,

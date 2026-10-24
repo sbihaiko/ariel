@@ -191,6 +191,19 @@ option_key_ok(const char *key) {
 }
 
 
+/**
+ * An option value is a word of the grammar, or the absolute path of a mount
+ * source, which is a target.
+ **/
+static int
+option_value_ok(const approval_option_t *option) {
+  if(!strcmp(option->key, "from")) {
+    return option->value[0] == '/' && target_ok(option->value);
+  }
+  return in_set(option->value, 1, VALUE_MAX, "._-", 0);
+}
+
+
 /** Append text at *pos, never past the NUL that ends out. **/
 static int
 put(char *out, size_t size, size_t *pos, const char *text) {
@@ -229,8 +242,7 @@ approval_canonical(const approval_action_t *action, char *out, size_t size) {
   for(i=0; i<action->noptions; i++) {
     const approval_option_t *option = &action->options[i];
 
-    if(!option_key_ok(option->key) ||
-       !in_set(option->value, 1, VALUE_MAX, "._-", 0)) {
+    if(!option_key_ok(option->key) || !option_value_ok(option)) {
       return -1;
     }
 

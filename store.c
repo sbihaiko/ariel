@@ -850,7 +850,7 @@ value_key(const char *command) {
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
              approval_option_t options[APPROVAL_OPTIONS_MAX],
-             char text[3][24]) {
+             char text[4][24]) {
   if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
@@ -864,15 +864,33 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[1].value = facts->start;
       action->noptions = 2;
     } else if(facts->kind[0]) {
+      size_t n = 0;
+
       decimal(facts->dev, text[0], sizeof(text[0]));
       decimal(facts->ino, text[1], sizeof(text[1]));
-      options[0].key = "kind";
-      options[0].value = facts->kind;
-      options[1].key = "dev";
-      options[1].value = text[0];
-      options[2].key = "ino";
-      options[2].value = text[1];
-      action->noptions = 3;
+      options[n].key = "kind";
+      options[n++].value = facts->kind;
+      options[n].key = "dev";
+      options[n++].value = text[0];
+      options[n].key = "ino";
+      options[n++].value = text[1];
+      if(facts->fstype[0]) {
+        options[n].key = "fstype";
+        options[n++].value = facts->fstype;
+        options[n].key = "from";
+        options[n++].value = facts->from;
+      }
+      if(facts->type[0]) {
+        decimal(facts->major, text[2], sizeof(text[2]));
+        decimal(facts->minor, text[3], sizeof(text[3]));
+        options[n].key = "type";
+        options[n++].value = facts->type;
+        options[n].key = "major";
+        options[n++].value = text[2];
+        options[n].key = "minor";
+        options[n++].value = text[3];
+      }
+      action->noptions = n;
     } else {
       decimal(facts->argc, text[0], sizeof(text[0]));
       options[0].key = "argc";
@@ -905,7 +923,7 @@ int
 store_approval_request(const approval_facts_t *facts,
                        approval_challenge_t *challenge, char *prompt,
                        size_t promptlen) {
-  char text[3][24];
+  char text[4][24];
   char id[APPROVAL_ID_MAX] = {0};
   approval_option_t options[APPROVAL_OPTIONS_MAX];
   approval_action_t action;
@@ -1001,14 +1019,18 @@ store_approval_request(const approval_facts_t *facts,
 
 
 /**
- * Whether two targets are the same object: the same kind, device and inode,
- * the same requested value, and for a kill the same signal and process start.
+ * Whether two targets are the same object, asked the same thing: the same
+ * kind, device and inode, the same requested value and destination, the same
+ * mount or mknod options, and for a kill the same signal and process start.
  **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
   return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
          !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start) &&
-         !strcmp(a->value, b->value);
+         !strcmp(a->value, b->value) && !strcmp(a->dest, b->dest) &&
+         !strcmp(a->fstype, b->fstype) && !strcmp(a->from, b->from) &&
+         !strcmp(a->type, b->type) && a->major == b->major &&
+         a->minor == b->minor;
 }
 
 
@@ -1039,7 +1061,7 @@ gate_row(const approval_facts_t *facts) {
 int
 store_gate_check(const approval_facts_t *facts,
                  approval_challenge_t *challenge) {
-  char text[3][24];
+  char text[4][24];
   approval_option_t options[APPROVAL_OPTIONS_MAX];
   approval_action_t action;
   char canonical[APPROVAL_ACTION_MAX + 1];

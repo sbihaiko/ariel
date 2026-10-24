@@ -66,6 +66,11 @@ typedef struct {
   char signal[SIGNAL_NAME_MAX + 1];
   char start[PROCESS_START_MAX + 1];
   char value[16];  /** The requested mode or owner or group, canonical. **/
+  char fstype[16];  /** mount: the file system type. **/
+  char from[APPROVAL_TARGET_MAX + 1];  /** mount: the source path. **/
+  char type[2];  /** mknod: b or c. **/
+  uint64_t major;
+  uint64_t minor;
 } approval_facts_t;
 
 /**
@@ -202,6 +207,14 @@ struct platform {
    **/
   int (*run)(platform_t *self, int argc, char *const argv[], int outfd,
              int errfd, int *status);
+
+  /**
+   * Perform a gated system command, mount, umount, chroot or mknod, on the
+   * target the facts name, once the owner has signed them and the entry is
+   * checked again. Returns 0 when it ran, 1 when this platform cannot run
+   * such a command, and -1 on a platform error.
+   **/
+  int (*system_act)(platform_t *self, const approval_facts_t *facts);
 
   /**
    * Called at each named step of a store change, so a host build can end

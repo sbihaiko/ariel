@@ -18,17 +18,19 @@ The file commands `mkdir`, `rmdir`, `touch` and `rm` take one absolute path. Eac
 
 The transfers `cp`, `mv` and `ln` take a source and a destination, both absolute. The source must be a regular file (a directory answers `is_a_directory`, a symbolic link `symbolic_link`, a file that is not regular `not_a_file`), and the destination must not exist (`exists`, exit 1); nothing is ever replaced. Each one answers 75 with a challenge that binds both paths, sha256 `none`, and the source's identity, and runs only after the owner signs it. `cp` copies the bytes and leaves the source; `mv` moves the name and removes the source; `ln` makes a hard link. A source that changed after the signature answers `approval_stale` (78), and nothing moves. Every path involved is checked for protection: the source and destination, the directories above them, and the target of a symbolic link, so a link to the token answers `protected` (87) even when approved. A pair of paths whose audit subject would be longer than 180 characters answers `bad_path` before anything is asked.
 
+The system commands `mount -t <fstype> <from> <dir>`, `umount <dir>`, `chroot <dir>` and `mknod <path> b|c <major> <minor>` are gated like the file commands. Their challenge binds the target, the options (the file system type and source for `mount`; the type, major and minor for `mknod`) and the target's identity. A wrong argument count or shape answers `bad_argument` (1) without asking. A target, or a symbolic link to one, that is a protected object answers `protected` (87) even with an approval. On the host build, which cannot run them, a signed command answers `not available on this platform` and `exit 1`; the attempt is audited as `<command>.unavailable`.
+
 ## Assigned
 
 | Exit | Word | Meaning | What the agent does |
 |---|---|---|---|
 | 0 | | Success | |
-| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, others | Any other error | Read the word; do not retry as is |
+| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `bad_argument`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, others | Any other error | Read the word; do not retry as is |
 | 70 | | Missing or wrong token; the connection is closed | Fix the token |
 | 75 | `approval_required` | The action waits for the owner's signature; the reply carries the challenge | Have the owner sign, send `approval grant`, then repeat the command |
 | 76 | `approval_busy` | Too many pending approvals, or a notification shown less than 10 s ago | Wait and push again |
 | 77 | `approval_denied` | The owner refused. Only the host build's virtual source can refuse; the PS5 has no refusal, an unsigned approval expires | Do not retry |
-| 78 | `approval_stale` | The approved target changed, or the approval is gone. A file command or a transfer answers it when the entry at its source or path is no longer the one the owner signed (replaced, or removed and created again), or when a chmod, chown or chgrp asks for another mode, owner or group than the one signed; the approval is spent | Request a new challenge |
+| 78 | `approval_stale` | The approved target changed, or the approval is gone. A file command, a transfer or a system command answers it when the entry at its source or path is no longer the one the owner signed (replaced, or removed and created again), or when a chmod, chown or chgrp asks for another mode, owner or group than the one signed; the approval is spent | Request a new challenge |
 | 79 | `signature_invalid` | The signature does not verify against the pinned key | Do not retry with the same signature |
 | 80 | `staging_full` | Staging is over its count or size limit | Wait for the TTL or commit pending objects |
 | 81 | `upload_mismatch` | The upload ended early, ran past its size, or its hash differs | Push again |
@@ -37,7 +39,7 @@ The transfers `cp`, `mv` and `ln` take a source and a destination, both absolute
 | 84 | `approval_replayed` | The signature's nonce was already consumed | Push again for a fresh challenge |
 | 85 | `signature_action_mismatch` | The signer signed a different action than this approval | Sign this approval's challenge |
 | 86 | `signature_console_mismatch` | The signer signed for another console | Sign with this console's identity |
-| 87 | `protected` | The command reads or writes one of Ariel's protected objects: the token, the approval state, the consumed nonces, the audit log, the state file or the state directory itself, directly, through a symbolic link or through a hard link. A file command that writes outside `/data`, `/user` and `/mnt/usb*` is also refused here. Refused even with an approval | Do not retry; these files are Ariel's own |
+| 87 | `protected` | The command reads or writes one of Ariel's protected objects: the token, the approval state, the consumed nonces, the audit log, the state file or the state directory itself, directly, through a symbolic link or through a hard link. A file or system command that writes outside `/data`, `/user` and `/mnt/usb*` is also refused here. Refused even with an approval | Do not retry; these files are Ariel's own |
 | 88 | `approval_expired` | The approval passed its expiry before it was granted or used | Push again |
 
 Free from 89. The `status <n>` line is outside this registry.

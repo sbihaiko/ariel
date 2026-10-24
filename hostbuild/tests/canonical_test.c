@@ -155,6 +155,30 @@ main(void) {
   other.target = "hello\nworld";
   refused(&other, "a newline in a target is refused");
 
+  // A mount source is an absolute path, held to the rules of a target. Any
+  // other option value is still a word.
+  {
+    approval_option_t source[1];
+
+    source[0].key = "from";
+    source[0].value = "/data/src";
+    other = action;
+    other.options = source;
+    other.noptions = 1;
+    expect(encode(&other, out, sizeof(out)) > 0 &&
+           strstr(out, "option.from=/data/src\n"),
+           "an absolute mount source encodes as written");
+    source[0].value = "/data/../src";
+    refused(&other, "a '..' in a mount source is refused");
+    source[0].value = "data/src";
+    refused(&other, "a relative mount source is refused");
+    source[0].value = "/data/s rc";
+    refused(&other, "a space in a mount source is refused");
+    source[0].key = "fspath";
+    source[0].value = "/data/src";
+    refused(&other, "a path in an option other than from is refused");
+  }
+
   // An omitted field must not encode as an empty one.
   other = action;
   other.command = NULL;

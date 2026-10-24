@@ -43,6 +43,12 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include <ps5/klog.h>
+#include <ps5/kernel.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 
 #include "approval.h"
 #include "elfldr.h"
@@ -353,6 +359,64 @@ procs_snapshot(char **buf, size_t *size) {
 
 
 static int
+ps5_mount(const approval_facts_t *facts) {
+  const char *names[3] = {"fstype", "fspath", "from"};
+  const char *values[3] = {facts->fstype, facts->target, facts->from};
+  struct iovec iov[6];
+  int i;
+
+  for(i=0; i<3; i++) {
+    iov[2*i].iov_base = (void *)names[i];
+    iov[2*i].iov_len = strlen(names[i]) + 1;
+    iov[2*i+1].iov_base = (void *)values[i];
+    iov[2*i+1].iov_len = strlen(values[i]) + 1;
+  }
+  return nmount(iov, 6, 0);
+}
+
+
+static int
+ps5_unmount(const char *path) {
+  return syscall(22, path, (uint64_t)0);
+}
+
+
+static int
+ps5_mknod(const approval_facts_t *facts) {
+  int mode = 0666 | (!strcmp(facts->type, "b") ? S_IFBLK : S_IFCHR);
+
+  return syscall(SYS_mknod, facts->target, mode,
+                 makedev((int)facts->major, (int)facts->minor));
+}
+
+
+/**
+ * The root change is made in a child, so Ariel itself is never jailed. The
+ * child ends at once, so the new root does not outlive this command.
+ **/
+static int
+ps5_chroot(const char *path) {
+  pid_t self = getpid();
+  pid_t child;
+  int status;
+
+  child = fork();
+  if(child < 0) {
+    return -1;
+  }
+  if(child == 0) {
+    kernel_set_ucred_authid(self, 0x4800000000000007l);
+    _exit(chroot(path) ? 1 : 0);
+  }
+  if(waitpid(child, &status, 0) < 0 || !WIFEXITED(status) ||
+     WEXITSTATUS(status)) {
+    return -1;
+  }
+  return 0;
+}
+
+
+static int
 proc_find(int32_t pid, struct kinfo_proc *out) {
   char *buf;
   char *p;
@@ -455,6 +519,25 @@ ps5_process_signal(platform_t *self, int32_t pid, int sig) {
 }
 
 
+static int
+ps5_system_act(platform_t *self, const approval_facts_t *facts) {
+  int rc;
+
+  (void)self;
+
+  if(!strcmp(facts->command, "mount")) {
+    rc = ps5_mount(facts);
+  } else if(!strcmp(facts->command, "umount")) {
+    rc = ps5_unmount(facts->target);
+  } else if(!strcmp(facts->command, "mknod")) {
+    rc = ps5_mknod(facts);
+  } else {
+    rc = ps5_chroot(facts->target);
+  }
+  return rc ? -1 : 0;
+}
+
+
 static platform_t ps5_platform = {
   // A console has no test clock, so no wait has a wake pipe and every
   // deadline runs on real time.
@@ -479,6 +562,7 @@ static platform_t ps5_platform = {
   .process_start = ps5_process_start,
   .process_critical = ps5_process_critical,
   .process_signal = ps5_process_signal,
+  .system_act = ps5_system_act,
 };
 
 

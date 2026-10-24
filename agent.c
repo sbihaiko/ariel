@@ -795,6 +795,54 @@ attribute_command(agent_t *agent, int fd, int argc, char *argv[]) {
 }
 
 
+static int
+system_name(const char *command) {
+  return !strcmp(command, "mount") || !strcmp(command, "umount") ||
+         !strcmp(command, "chroot") || !strcmp(command, "mknod");
+}
+
+
+/**
+ * One gated system command. Its arguments and target are checked before the
+ * owner is asked, and the check is made again after the signature, before the
+ * platform acts.
+ **/
+static void
+system_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  const char *root = agent->platform->fs_root;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int act;
+  int rc;
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_system_parse(argc, argv, &facts);
+  if(rc == FILEOPS_OK) {
+    rc = fileops_system_check(root, &facts);
+  }
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, argv[0], facts.target, "-", rc);
+    return;
+  }
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_system_recheck(root, &facts);
+  if(rc == FILEOPS_OK) {
+    act = agent->platform->system_act(agent->platform, &facts);
+    if(act == 1) {
+      audit_reply(fd, facts.command, "unavailable", facts.target,
+                  challenge.id, "not available on this platform\nexit 1\n");
+      return;
+    }
+    rc = act ? FILEOPS_FAILED : FILEOPS_OK;
+  }
+  file_outcome(fd, facts.command, facts.target, challenge.id, rc);
+}
+
+
 static void
 payload_push(agent_t *agent, int fd, int wake, const char *name,
              const char *size_text, const char *hash_text) {
@@ -1532,6 +1580,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc == 3 && (!strcmp(argv[0], "cp") || !strcmp(argv[0], "mv") ||
                    !strcmp(argv[0], "ln"))) {
     transfer_command(agent, fd, argv[0], argv[1], argv[2]);
+    return;
+  }
+
+  if(argc >= 1 && system_name(argv[0])) {
+    system_command(agent, fd, argc, argv);
     return;
   }
 

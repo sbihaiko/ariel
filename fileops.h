@@ -1,4 +1,5 @@
-/* Ariel: the gated file commands, mkdir, rmdir, touch and rm.
+/* Ariel: the gated file commands, mkdir, rmdir, touch and rm, and the gated
+   system commands, mount, umount, chroot and mknod.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
@@ -35,6 +36,7 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_BAD_MODE  12
 #define FILEOPS_BAD_OWNER 13
 #define FILEOPS_BAD_GROUP 14
+#define FILEOPS_BAD_ARG   15
 
 /**
  * Check one file command without acting. path must be absolute and inside a
@@ -73,6 +75,27 @@ int fileops_transfer_check(const char *root, const char *source,
 int fileops_transfer_act(const char *root, const char *command,
                          const char *source, const char *destination,
                          const approval_facts_t *expected);
+
+/**
+ * Parse one system command's arguments into facts: its command, target and
+ * options. Returns FILEOPS_OK, or FILEOPS_BAD_ARG for a wrong count or shape.
+ **/
+int fileops_system_parse(int argc, char *argv[], approval_facts_t *facts);
+
+/**
+ * Check a parsed system command without acting: its target's path and
+ * identity, a symbolic link to a protected object included, and a mount
+ * source that must be a directory. The target's kind, device and inode go
+ * into facts. What the target is, file or absent, is judged after the
+ * signature, so a target changed since then answers FILEOPS_CHANGED.
+ **/
+int fileops_system_check(const char *root, approval_facts_t *facts);
+
+/**
+ * Check again, after the owner signed, that the target is still the entry
+ * the facts name. Returns FILEOPS_OK, FILEOPS_CHANGED, or the refusal.
+ **/
+int fileops_system_recheck(const char *root, const approval_facts_t *expected);
 
 /** The protocol word of a refusal, and its exit status. **/
 const char *fileops_word(int rc);

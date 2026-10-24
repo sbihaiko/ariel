@@ -293,6 +293,31 @@ link_refusal(const char *command, int dirfd, const char *leaf) {
 }
 
 
+/**
+ * Resolve path like inspect, but when the entry is a symbolic link, refuse it
+ * as protected if the object it leads to is one. A system command follows
+ * links the way the kernel does, so an alias of a protected object is caught.
+ **/
+static int
+system_entry(const char *root, const char *path, approval_facts_t *facts,
+             int *dirfd, char *leaf, size_t size) {
+  struct stat st;
+  int rc;
+
+  rc = inspect(root, path, facts, dirfd, leaf, size);
+  if(rc) {
+    return rc;
+  }
+
+  if(!strcmp(facts->kind, "link") && !fstatat(*dirfd, leaf, &st, 0) &&
+     protected_stat(&st)) {
+    close(*dirfd);
+    return FILEOPS_PROTECTED;
+  }
+  return FILEOPS_OK;
+}
+
+
 /** Whether the entry's kind lets the command run. **/
 static int
 precondition(const char *command, const char *kind) {
@@ -301,6 +326,19 @@ precondition(const char *command, const char *kind) {
   int dir = !strcmp(kind, "dir");
   int link = !strcmp(kind, "link");
 
+  if(!strcmp(command, "mknod")) {
+    return absent ? FILEOPS_OK : FILEOPS_EXISTS;
+  }
+  if(!strcmp(command, "mount") || !strcmp(command, "umount") ||
+     !strcmp(command, "chroot")) {
+    if(absent) {
+      return FILEOPS_NO_FILE;
+    }
+    if(link) {
+      return FILEOPS_LINK;
+    }
+    return dir ? FILEOPS_OK : FILEOPS_NOT_DIR;
+  }
   if(attribute(command)) {
     if(absent) {
       return FILEOPS_NO_FILE;
@@ -713,9 +751,148 @@ fileops_transfer_act(const char *root, const char *command,
 }
 
 
+/** Whether text fits in size bytes, its NUL included. **/
+static int
+fits(const char *text, size_t size) {
+  return strlen(text) < size;
+}
+
+
+/** A file system type: one to fifteen lowercase letters or digits. **/
+static int
+fstype_ok(const char *text) {
+  size_t i;
+
+  if(!text[0] || !fits(text, 16)) {
+    return 0;
+  }
+  for(i=0; text[i]; i++) {
+    if(!((text[i] >= 'a' && text[i] <= 'z') ||
+         (text[i] >= '0' && text[i] <= '9'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+/** A device number: decimal, from 0 to 255. **/
+static int
+device_number(const char *text, uint64_t *value) {
+  uint64_t n = 0;
+  size_t i;
+
+  if(!text[0] || strlen(text) > 3) {
+    return 0;
+  }
+  for(i=0; text[i]; i++) {
+    if(text[i] < '0' || text[i] > '9') {
+      return 0;
+    }
+    n = n * 10 + (uint64_t)(text[i] - '0');
+  }
+  if(n > 255) {
+    return 0;
+  }
+  *value = n;
+  return 1;
+}
+
+
+int
+fileops_system_parse(int argc, char *argv[], approval_facts_t *facts) {
+  const char *command = argv[0];
+  const char *target;
+
+  if(!strcmp(command, "mount")) {
+    if(argc != 5 || strcmp(argv[1], "-t") || !fstype_ok(argv[2]) ||
+       !fits(argv[3], APPROVAL_TARGET_MAX + 1)) {
+      return FILEOPS_BAD_ARG;
+    }
+    snprintf(facts->fstype, sizeof(facts->fstype), "%s", argv[2]);
+    snprintf(facts->from, sizeof(facts->from), "%s", argv[3]);
+    target = argv[4];
+  } else if(!strcmp(command, "mknod")) {
+    if(argc != 5 || (strcmp(argv[2], "b") && strcmp(argv[2], "c")) ||
+       !device_number(argv[3], &facts->major) ||
+       !device_number(argv[4], &facts->minor)) {
+      return FILEOPS_BAD_ARG;
+    }
+    snprintf(facts->type, sizeof(facts->type), "%s", argv[2]);
+    target = argv[1];
+  } else {
+    if(argc != 2) {
+      return FILEOPS_BAD_ARG;
+    }
+    target = argv[1];
+  }
+
+  if(!fits(target, APPROVAL_TARGET_MAX + 1)) {
+    return FILEOPS_BAD_ARG;
+  }
+  snprintf(facts->command, sizeof(facts->command), "%s", command);
+  snprintf(facts->target, sizeof(facts->target), "%s", target);
+  return FILEOPS_OK;
+}
+
+
+int
+fileops_system_check(const char *root, approval_facts_t *facts) {
+  approval_facts_t source;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  rc = system_entry(root, facts->target, facts, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  close(dirfd);
+  if(!facts->from[0]) {
+    return FILEOPS_OK;
+  }
+
+  memset(&source, 0, sizeof(source));
+  rc = system_entry(root, facts->from, &source, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  rc = precondition("mount", source.kind);
+  close(dirfd);
+  return rc;
+}
+
+
+int
+fileops_system_recheck(const char *root, const approval_facts_t *expected) {
+  approval_facts_t now;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  memset(&now, 0, sizeof(now));
+  rc = system_entry(root, expected->target, &now, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+
+  if(strcmp(now.kind, expected->kind) || now.dev != expected->dev ||
+     now.ino != expected->ino) {
+    close(dirfd);
+    return FILEOPS_CHANGED;
+  }
+
+  rc = precondition(expected->command, now.kind);
+  close(dirfd);
+  return rc;
+}
+
+
 const char *
 fileops_word(int rc) {
   switch(rc) {
+  case FILEOPS_BAD_ARG:
+    return "bad_argument";
   case FILEOPS_RELATIVE:
     return "relative_path";
   case FILEOPS_BAD_PATH:
