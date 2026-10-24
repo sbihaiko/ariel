@@ -10,7 +10,7 @@ Ariel asks the owner to approve an action. The first version of that asked for t
 
 The first version of [ADR-0006](adr/0006-the-controller-is-the-approval-source.md) made the controller the approval source on a console. This spike was how that choice was validated on a real console.
 
-The run showed that the payload cannot read the pad, and that borrowing the read from the foreground title freezes the game. The source changed behind the platform port, and ADR-0006 now names a signature by a key the owner holds. The result is recorded in [controller-spike-notes.md](controller-spike-notes.md).
+The run showed that the payload cannot read the pad, and that borrowing the read from the foreground title freezes the game. The source changed behind the platform port, and ADR-0006 now names a signature by a key the owner holds. The result is recorded in [console-findings.md](console-findings.md) and, with the transcripts, in [controller-spike-notes.md](controller-spike-notes.md).
 
 ## What the payload does
 

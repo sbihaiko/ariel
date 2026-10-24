@@ -148,7 +148,7 @@ Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `s
 An agent that can download, write and execute code on a console with kernel privileges needs firm limits. Ariel is designed around these rules:
 
 - **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token. Output is size-limited. `env` is gated, and Ariel's own secrets (its token and approval state) cannot be read through any command.
-- **Change is approved by the owner's signature.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. Approving a payload version (at install or commit) also approves running that exact version, so a build is approved once, not once per run. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and the owner's signer shows the exact action (command, target, hash, console, expiry) before they confirm. The action runs only after that signature verifies on the console. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it never holds the key. A flag such as `--confirm` would not be enough, since the agent could simply pass it. The [controller spike](docs/controller-spike.md) measured the alternative on a real console and ruled it out: a payload cannot read the pad, and borrowing it from the foreground title freezes the game ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md)).
+- **Change is approved by the owner's signature.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. Approving a payload version (at install or commit) also approves running that exact version, so a build is approved once, not once per run. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and the owner's signer shows the exact action (command, target, hash, console, expiry) before they confirm. The action runs only after that signature verifies on the console. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it never holds the key. A flag such as `--confirm` would not be enough, since the agent could simply pass it. The alternative was measured on a real console and ruled out: a payload cannot read the pad, and borrowing it from the foreground title freezes the game ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md), [console findings](docs/console-findings.md)).
 - **Allowlisted sources and trusted hashes.** Downloads come only from approved hosts and repositories, and a payload runs only if its hash is pinned in the allowlist or was approved by the owner.
 - **Protected areas.** System partitions stay read-only. Critical system processes (such as SceShellCore) cannot be killed.
 - **Designed to recover.** Every change is atomic and journaled, every payload has a previous version to fall back to, and `autoload safe-boot` disables autoload for one boot. This covers crashes, failed health checks and interrupted updates, but not every possible failure.
@@ -183,6 +183,12 @@ The PS5's internal codename is **Prospero**, the sorcerer of Shakespeare's *The 
 That is exactly the role of this project. Ariel is the servant that lives on Prospero's island (the console), takes orders from whoever is in charge (you, through an AI agent), reports what it finds, and never acts beyond what it was told. The name also fits the ecosystem's tradition of Prospero-themed projects, such as prospero-win.
 
 ## References and related projects
+
+**Project documents**
+
+- [Console findings](docs/console-findings.md): what the console allows the payload, the foreground title and the shell to do with the pad, with the error codes and addresses measured.
+- [Controller spike](docs/controller-spike.md): the payload that produced those measurements.
+- [Decisions](docs/adr/README.md): the architecture decision records, including [ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) on the approval source.
 
 **Upstream and core tooling** (ps5-payload-dev, GPLv3+)
 

@@ -1,6 +1,6 @@
 # Controller spike: what the console actually does
 
-Notes from running `controller-spike.elf` on a real console (shsrv 0.20, elfldr on port 9021, read back on port 9150). Each item below was observed on the console, not inferred. The runbook for how to operate the spike stays in [controller-spike.md](controller-spike.md).
+Notes from running `controller-spike.elf` on a real console (shsrv 0.20, elfldr on port 9021, read back on port 9150). Each item below was observed on the console, not inferred. The runbook for how to operate the spike stays in [controller-spike.md](controller-spike.md). The distilled reference is [console-findings.md](console-findings.md); this page is the evidence behind it.
 
 **Answer: the foreground title can read the pad. The payload process cannot.**
 
