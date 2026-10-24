@@ -32,7 +32,7 @@ Set the SDK as in the [quick start](quick-start.md#1-install-the-ps5-payload-sdk
 $ make clean all
 ```
 
-The build writes `controller-spike.elf` next to `shsrv-ps5.elf`. To build only the spike, run `make controller-spike.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console.
+The build writes `controller-spike.elf` next to `shsrv-ps5.elf`. To build only the spike, run `make controller-spike.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console, and refuses unless `ARIEL_DEPLOY=yes` is given.
 
 ## 2. Send it to elfldr on port 9021
 

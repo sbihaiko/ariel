@@ -138,7 +138,7 @@ Measured on 2026-10-24 on a CFI-2014 on firmware 11.200.005: every primitive hel
 
 ### Run procedure
 
-1. Build with the PS5 SDK set, as in the [quick start](quick-start.md). `make clean all` writes `primitives-probe.elf`. To build only the probe, run `make primitives-probe.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console.
+1. Build with the PS5 SDK set, as in the [quick start](quick-start.md). `make clean all` writes `primitives-probe.elf`. To build only the probe, run `make primitives-probe.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console, and refuses unless `ARIEL_DEPLOY=yes` is given.
 2. Send the probe to the ELF loader. The loader copies the payload's standard output back over this connection, so leave it open:
 
 ```console

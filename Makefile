@@ -45,6 +45,14 @@ ifeq ($(ARIEL_RECOVERY_PUBKEY),$(ARIEL_PUBKEY))
 endif
 endif
 
+# `make test` sends shsrv-ps5.elf to a console. It runs only when the owner
+# asks for it by name, and refuses before the SDK is read or anything is built.
+ifneq ($(filter test,$(MAKECMDGOALS)),)
+ifneq ($(ARIEL_DEPLOY),yes)
+    $(error make test sends shsrv-ps5.elf to the console at $(PS5_HOST); run it with ARIEL_DEPLOY=yes to deploy on purpose)
+endif
+endif
+
 ifdef PS5_PAYLOAD_SDK
     include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 else
