@@ -98,6 +98,29 @@ The current build runs 30 seconds and then closes port 9150, unless a `pt_call` 
 
 The current loop does not repeat the ruled-out home-screen attempts. It waits for a big app, attaches to the matching `eboot.bin`, probes `scePadGetHandle` for user ids `1`, the foreground user and `0x10000000` on port types 0 and 2, reads once inside the title, tries the same handle in the payload, and, when that fails, attaches about once a second for another read. It does not close the title's handle.
 
+## Issues
+
+Checked against `sbihaiko/ariel` on 2026-10-23. Three issues are open. Nine are closed.
+
+| Issue | State | What it is |
+| --- | --- | --- |
+| [#1](https://github.com/sbihaiko/ariel/issues/1) | open | Stage 1: hello world, end to end. The parent of the Stage 1 tickets. |
+| [#2](https://github.com/sbihaiko/ariel/issues/2) | open | Stage 2: persist and recover. Depends on #1. |
+| [#11](https://github.com/sbihaiko/ariel/issues/11) | open | Run the console acceptance suite on a real PS5 before Stage 1 ships, with the owner approving on the controller. Label `ready-for-human`. Its text still says it is blocked by #3, #9 and #10. |
+| [#3](https://github.com/sbihaiko/ariel/issues/3) | closed | The controller spike. |
+| [#4](https://github.com/sbihaiko/ariel/issues/4) through [#10](https://github.com/sbihaiko/ariel/issues/10), [#12](https://github.com/sbihaiko/ariel/issues/12) | closed | The rest of the Stage 1 build: agent port, push, commit, run, deadlines, the PS5 platform port, the console suite mode, and the spike payload plus runbook. |
+
+#3 was closed when `fix/3-spike-login-users` landed on `dev` as `a1782a1` (2026-10-23). That close records the home-screen runs, which never opened the pad. It does not record the later foreground-title runs in this file. Those runs are the result ADR-0006 asked the spike for, and the ADR has not been rewritten since.
+
+#11 is the ticket that still needs a console. Its acceptance criteria are unmet: the console suite has not passed on a PS5, and the quick start's "After Stage 1" section has not been checked there. The blocker list is stale. The real gap is the approval source. ADR-0006 still says the PS5 platform port takes approvals from the controller. This console showed that the payload process cannot read that controller while a title is in front, and that reading it by attaching to the title stops the game.
+
+What follows from that, and what does not:
+
+- Rewrite ADR-0006 with this result. The payload is not the approval source. A fallback the agent cannot reach from the network is what the ADR already requires before Stage 1 ships, and it is not designed yet. A virtual controller stays on the host build only.
+- Do not send this spike again. Do not attach to the foreground title to sample the pad. That is the run that froze the console.
+- PoorDS4 and a virtual device on the console stay unused. They are a different design.
+- #1 and #2 stay as they are. #2 waits on #1. #11 cannot be run as written until the approval source in ADR-0006 matches what the console did.
+
 ## What other projects do
 
 Recorded here so the next change does not rediscover them. These are other people's notes, not results from this console, except where this console has since agreed.
