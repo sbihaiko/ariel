@@ -826,6 +826,12 @@ copy_entry(int sdir, const char *sleaf, const approval_facts_t *expected,
     close(in);
     return FILEOPS_FAILED;
   }
+  // The descriptor is what matters: an entry swapped for a link to one of
+  // Ariel's secrets between the scan and this open is caught here.
+  if(protected_stat(&st)) {
+    close(in);
+    return FILEOPS_PROTECTED;
+  }
   if(!S_ISREG(st.st_mode) || (uint64_t)st.st_dev != expected->dev ||
      (uint64_t)st.st_ino != expected->ino) {
     close(in);
@@ -1144,9 +1150,15 @@ tree_remove(int parent, const char *leaf, int depth) {
  * Copy the entry at sleaf below from to a new entry dleaf below to: a regular
  * file, or a directory with everything in it. Links and other kinds refuse.
  * The destination is made exclusively; EXISTS means it was already there.
+ * Each entry is checked for protection as it is opened, as tree_scan checked
+ * it before the signature: an object swapped for one of Ariel's secrets in
+ * between answers protected, and nothing of it is read.
+ * created is set when this call made the destination root, so the caller
+ * knows a failure here is its own to remove.
  **/
 static int
-tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth) {
+tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth,
+          int *created) {
   approval_facts_t expected;
   struct dirent *ent;
   struct stat st;
@@ -1157,6 +1169,9 @@ tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth) {
 
   if(fstatat(from, sleaf, &st, AT_SYMLINK_NOFOLLOW)) {
     return errno == ENOENT ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
   }
   if(S_ISREG(st.st_mode)) {
     memset(&expected, 0, sizeof(expected));
@@ -1174,9 +1189,20 @@ tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth) {
   if(mkdirat(to, dleaf, 0755)) {
     return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
   }
+  if(created) {
+    *created = 1;
+  }
   sfd = openat(from, sleaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if(sfd < 0) {
     return FILEOPS_CHANGED;
+  }
+  if(fstat(sfd, &st)) {
+    close(sfd);
+    return FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    close(sfd);
+    return FILEOPS_PROTECTED;
   }
   dfd = openat(to, dleaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if(dfd < 0) {
@@ -1192,7 +1218,7 @@ tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth) {
     if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
       continue;
     }
-    rc = tree_copy(dirfd(dir), ent->d_name, dfd, ent->d_name, depth + 1);
+    rc = tree_copy(dirfd(dir), ent->d_name, dfd, ent->d_name, depth + 1, NULL);
   }
   closedir(dir);
   close(dfd);
@@ -1325,11 +1351,16 @@ fileops_tree_transfer_act(const char *root, const char *source,
   if(strcmp(into.kind, "absent")) {
     rc = FILEOPS_EXISTS;
   } else {
+    int created = 0;
+
     rc = tree_scan(sdir, sleaf, 0);
     if(!rc) {
-      rc = tree_copy(sdir, sleaf, ddir, dleaf, 0);
+      rc = tree_copy(sdir, sleaf, ddir, dleaf, 0, &created);
     }
-    if(rc && rc != FILEOPS_EXISTS) {
+    // Whatever failed, a destination this call made is taken away again: a
+    // nested entry another writer created answers EXISTS like the root does,
+    // and a half-built tree must not stay behind under the destination name.
+    if(rc && created) {
       tree_remove(ddir, dleaf, 0);
     }
   }
