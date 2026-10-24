@@ -690,6 +690,9 @@ def scenario_run_exec_failure(server):
     assert commit(server, staging) == [
         "health_failed notexec %s" % digest, "exit 1"], (
         "a build that cannot be executed must fail its one-shot check")
+    assert ("health.fail", "notexec", "spawn", digest) in health_events(server), (
+        "a check that could not be spawned must be audited as health.fail, "
+        "got %r" % health_events(server))
     lines = run_payload(server, "notexec")
     assert lines == ["spawn_failed", "exit 1"], (
         "a stored object that cannot be executed must answer spawn_failed "
@@ -1106,6 +1109,8 @@ HOST_FILE_SCENARIOS = {
     "second start changes nothing",
     "a state file whose payload lines have eight fields starts and lists "
     "previous=-",
+    "a state file in format v1 starts, lists its payloads, and the next save "
+    "writes v2",
     "a rollback whose record the store cannot read answers rollback_failed "
     "and keeps the grant",
 }
@@ -1233,13 +1238,15 @@ HOST_RESTART_SCENARIOS = {
     "a granted reboot is audited as its request, grant and done",
 }
 
-# The read-only scenarios that need the host test root: they write scratch
-# files or links there, and the token, approval state and nonces live there.
+# The scenarios that need the host test root: they write scratch files or
+# links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
     "each gated built-in answers 75 and its challenge before anything runs",
     "a built-in's challenge names each argument after the target, in order",
     "a built-in that names Ariel's token answers protected and asks nothing",
     "a file replaced after a built-in grant answers approval_stale and exit 78",
+    "a health check whose log cannot be opened fails and is audited as "
+    "health.fail",
     "each read-only command runs with no approval and exits 0 with its output",
     "sha256sum prints the digest openssl dgst -sha256 prints",
     "the token, approval state and nonces answer protected and exit 87 when "
@@ -1625,17 +1632,20 @@ def listed(lines, name):
     return matches[0] if matches else None
 
 
-def expected_listing(name, hash_hex, previous_hex=None):
+def expected_listing(name, hash_hex, previous_hex=None, failed=False):
     """The payload list line a push of name committed as hash_hex shows.
 
     Stage 1 records only a name and a hash. A push has no release, so its
     version identifiers and source say so, and nothing is running: the commit
     approved running the build, it did not start it. previous names the build
-    the commit replaced, or "-" for a first build.
+    the commit replaced, or "-" for a first build. failed is always shown,
+    before previous, which stays the last field.
     """
     return ("payload %s source=push version=- release=- asset=- "
             "sha256=%s path=/data/ariel/store/objects/%s running=no "
-            "previous=%s" % (name, hash_hex, hash_hex, previous_hex or "-"))
+            "failed=%s previous=%s" % (name, hash_hex, hash_hex,
+                                       "yes" if failed else "no",
+                                       previous_hex or "-"))
 
 
 def state_path(server):
@@ -1735,9 +1745,10 @@ def scenario_state_without_previous_starts(server):
         legacy.stop()
         with open(state_path(legacy), "r") as fh:
             lines = fh.read().splitlines()
-        # Keep the word "payload" and the eight fields through running.
-        eight = [" ".join(line.split(" ")[:9]) if line.startswith("payload ")
-                 else line for line in lines]
+        # Keep the word "payload" and the eight fields through running, under
+        # the v1 marker such a file carries.
+        eight = ["ariel-state-v1"] + [" ".join(line.split(" ")[:9])
+                                      for line in lines[1:]]
         with open(state_path(legacy), "w") as fh:
             fh.write("\n".join(eight) + "\n")
         legacy._start()
@@ -1746,6 +1757,51 @@ def scenario_state_without_previous_starts(server):
             "legacy", hash_hex), (
             "a state file of eight fields must list its payloads with "
             "previous=-, got %r" % payload_list(legacy))
+    finally:
+        legacy.stop()
+
+
+def scenario_state_v1_nine_fields_loads_and_saves_as_v2(server):
+    """A state file in format v1 starts and lists its payloads, and the next save writes v2.
+
+    A v1 payload line has nine fields, the last being previous. It carries no
+    timeout and no failed flag, so its payloads get the defaults.
+    """
+    del server  # a start that fails must not take the suite's Ariel with it
+    legacy = Server(SERVER_BINARY)
+    try:
+        first = healthy_build("v1-first-build")
+        second = healthy_build("v1-second-build")
+        first_hash = hashlib.sha256(first).hexdigest()
+        second_hash = hashlib.sha256(second).hexdigest()
+        install_payload(legacy, "v1old", first)
+        install_payload(legacy, "v1old", second)
+
+        legacy.stop()
+        with open(state_path(legacy), "r") as fh:
+            lines = fh.read().splitlines()
+        nine = ["ariel-state-v1"] + [" ".join(line.split(" ")[:10])
+                                     for line in lines[1:]]
+        with open(state_path(legacy), "w") as fh:
+            fh.write("\n".join(nine) + "\n")
+        legacy._start()
+
+        assert listed(payload_list(legacy), "v1old") == expected_listing(
+            "v1old", second_hash, first_hash), (
+            "a v1 state file must list its payloads, got %r"
+            % payload_list(legacy))
+
+        install_payload(legacy, "v1new", healthy_build("v1-new-build"))
+        saved = read_state(legacy).decode("ascii").splitlines()
+        assert saved[0] == "ariel-state-v2", (
+            "the next save must write format v2, wrote %r" % saved[0])
+        old_line = [line for line in saved if line.startswith("payload v1old ")]
+        assert old_line and old_line[0].split(" ")[-2:] == ["0", "0"], (
+            "a v1 payload must be saved with the default timeout and failed "
+            "flag, got %r" % old_line)
+        assert listed(payload_list(legacy), "v1old") == expected_listing(
+            "v1old", second_hash, first_hash), (
+            "the v1 payload must list the same after the save")
     finally:
         legacy.stop()
 
@@ -6203,7 +6259,7 @@ def scenario_one_shot_past_its_timeout_fails(server):
         "health_failed hunglate %s" % digest, "exit 1"], (
         "a one-shot past its timeout must answer health_failed and exit 1")
     assert listed(payload_list(server), "hunglate") == expected_listing(
-        "hunglate", digest) + " failed=yes", (
+        "hunglate", digest, failed=True), (
         "a build with no previous version must be marked failed")
     assert any(event[0] == "health.timeout" and event[1] == "hunglate"
                and event[3] == digest for event in health_events(server)), (
@@ -6233,11 +6289,41 @@ def scenario_failed_one_shot_leaves_autoload(server):
     assert "autoload sleepy" not in autoload_listing(server), (
         "a failed payload with no previous version must leave autoload")
     assert listed(payload_list(server), "sleepy") == expected_listing(
-        "sleepy", digest) + " failed=yes", (
+        "sleepy", digest, failed=True), (
         "a build with no previous version must be marked failed")
     assert any(event[0] == "autoload_remove" and event[1] == "sleepy"
                for event in health_events(server)), (
         "the removal from autoload must be audited")
+
+
+def scenario_health_log_unopenable_fails_and_is_audited(server):
+    """A health check whose log cannot be opened fails, and is audited as health.fail."""
+    fresh = Server(server.binary)
+    try:
+        data = healthy_build("nolog")
+        digest = hashlib.sha256(data).hexdigest()
+        # A directory where the payload's log goes makes the log unopenable.
+        os.makedirs(os.path.join(fresh.root, "data", "ariel", "logs",
+                                 "nolog.log"))
+        staging, _ = approve_push(fresh, "nolog", data)
+        assert commit(fresh, staging) == [
+            "health_failed nolog %s" % digest, "exit 1"], (
+            "a check whose log cannot be opened must fail")
+        events = health_events(fresh)
+        assert ("health.fail", "nolog", "-", digest) in events, (
+            "a check that could not open its log must be audited as "
+            "health.fail, got %r" % events)
+    finally:
+        fresh.stop()
+
+
+def scenario_config_refuses_a_timeout_over_an_hour(server):
+    """payload config refuses a timeout over one hour before it asks the owner."""
+    install_payload(server, "capped", healthy_build("capped-build"))
+    for seconds in ("3601", "999999999"):
+        command = "payload config capped kind=one-shot timeout=%s" % seconds
+        assert run_command(server, command) == ["bad_argument", "exit 1"], (
+            "a timeout of %s s must be refused without a prompt" % seconds)
 
 
 def scenario_ad_hoc_run_starts_no_health_check(server):
@@ -6503,6 +6589,9 @@ SCENARIOS = [
      HOST_FILE_REASON),
     ("a state file whose payload lines have eight fields starts and lists "
      "previous=-", scenario_state_without_previous_starts, HOST_FILE_REASON),
+    ("a state file in format v1 starts, lists its payloads, and the next save "
+     "writes v2", scenario_state_v1_nine_fields_loads_and_saves_as_v2,
+     HOST_FILE_REASON),
     ("a build two names share is kept while either still names it",
      scenario_shared_build_survives_a_replacement, None),
     ("a second commit of the same name replaces the first build",
@@ -6779,6 +6868,11 @@ SCENARIOS = [
      "marked failed", scenario_one_shot_past_its_timeout_fails, CLOCK_REASON),
     ("a failed one-shot with no previous version is removed from autoload",
      scenario_failed_one_shot_leaves_autoload, CLOCK_REASON),
+    ("a health check whose log cannot be opened fails and is audited as "
+     "health.fail", scenario_health_log_unopenable_fails_and_is_audited,
+     HOST_ROOT_REASON),
+    ("payload config refuses a timeout over one hour before it asks",
+     scenario_config_refuses_a_timeout_over_an_hour, None),
     ("an ad-hoc payload run starts no health check",
      scenario_ad_hoc_run_starts_no_health_check, None),
     ("a healthy one-shot's output is in payload logs, never in the reply",

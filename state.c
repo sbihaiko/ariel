@@ -44,7 +44,10 @@ along with this program; see the file COPYING. If not, see
 #define STATE_FILE "state"
 
 /** The state file's marker, so a later reader can tell this text apart. **/
-#define STATE_MARKER "ariel-state-v1"
+#define STATE_MARKER "ariel-state-v2"
+
+/** The marker of the format before health checks, which is still read. **/
+#define STATE_MARKER_V1 "ariel-state-v1"
 
 /** One read of a file moving through memory. **/
 #define READ_CHUNK 65536
@@ -295,9 +298,10 @@ state_save_locked(void) {
 /**
  * Read one payload line of the state file into a free slot. A line that is
  * not well formed is an error: a record Ariel cannot read is not a record.
+ * A v1 line has no timeout and no failed flag, so both take their defaults.
  **/
 static int
-parse_payload(char *line) {
+parse_payload(char *line, int v1) {
   struct state_payload parsed;
   struct state_payload *slot;
   char version[64];
@@ -315,17 +319,15 @@ parse_payload(char *line) {
                parsed.sha256, parsed.path, &running, parsed.previous,
                &timeout, &failed);
 
-  // A line from before previous was recorded has eight fields; its payload
-  // had no previous version. A line from before health checks has nine.
-  if(got == 8) {
+  // A v1 line from before previous was recorded has eight fields; its payload
+  // had no previous version.
+  if(v1 && got == 8) {
     snprintf(parsed.previous, sizeof(parsed.previous), "-");
     got = 9;
   }
-  if(got == 9) {
-    got = 11;
-  }
 
-  if(got != 11 || !store_name_valid(parsed.name) || !hash_text(parsed.sha256) ||
+  if(got != (v1 ? 9 : 11) || !store_name_valid(parsed.name) ||
+     !hash_text(parsed.sha256) ||
      (running != 0 && running != 1) || (failed != 0 && failed != 1) ||
      (strcmp(parsed.previous, "-") && !hash_text(parsed.previous))) {
     return -1;
@@ -426,6 +428,7 @@ state_read(void) {
   size_t len;
   int dirfd;
   int seen = 0;
+  int v1 = 0;
   int rc = -1;
 
   if((dirfd=open(state_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
@@ -450,12 +453,14 @@ state_read(void) {
     }
 
     if(!seen) {
-      if(strcmp(line, STATE_MARKER)) {
+      if(!strcmp(line, STATE_MARKER_V1)) {
+        v1 = 1;
+      } else if(strcmp(line, STATE_MARKER)) {
         free(text);
         return -1;
       }
       seen = 1;
-    } else if(*line && parse_payload(line)) {
+    } else if(*line && parse_payload(line, v1)) {
       free(text);
       return -1;
     }

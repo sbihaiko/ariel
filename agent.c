@@ -208,6 +208,14 @@ static const char health_unrecorded[] =
   "health_unrecorded\n"
   "exit 1\n";
 
+static const char health_not_run[] =
+  "health_not_run\n"
+  "exit 1\n";
+
+static const char health_partial[] =
+  "health_partial\n"
+  "exit 1\n";
+
 static const char config_failed[] =
   "config_failed\n"
   "exit 1\n";
@@ -1534,7 +1542,8 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
  * the change is audited, the failure is answered and 0 is returned.
  **/
 static int
-activation_healthy(agent_t *agent, int fd, const char *name) {
+activation_healthy(agent_t *agent, int fd, const char *name,
+                   const char *sha256) {
   store_object_t object;
   char failed[SHA256_HEX_LEN + 1];
   char restored[SHA256_HEX_LEN + 1];
@@ -1546,7 +1555,11 @@ activation_healthy(agent_t *agent, int fd, const char *name) {
 
   if(state_health_get(name, &timeout, &flagged) ||
      store_run_load(name, &object) != STORE_RUN_OK) {
-    reply(fd, approval_stale);
+    if(store_audit_append("health.skipped", name, "-", sha256)) {
+      reply(fd, audit_failed);
+      return 0;
+    }
+    reply(fd, health_not_run);
     return 0;
   }
   snprintf(failed, sizeof(failed), "%s", object.sha256);
@@ -1578,7 +1591,21 @@ activation_healthy(agent_t *agent, int fd, const char *name) {
       return 0;
     }
     break;
+  case STORE_HEALTH_UNAUDITED:
+    reply(fd, audit_failed);
+    return 0;
+  case STORE_HEALTH_PARTIAL:
+    if(store_audit_append("health.partial", name, "-", failed)) {
+      reply(fd, audit_failed);
+      return 0;
+    }
+    reply(fd, health_partial);
+    return 0;
   default:
+    if(store_audit_append("health.skipped", name, "-", failed)) {
+      reply(fd, audit_failed);
+      return 0;
+    }
     reply(fd, health_unrecorded);
     return 0;
   }
@@ -1611,7 +1638,7 @@ payload_commit(agent_t *agent, int fd, const char *staging_id) {
       reply(fd, audit_failed);
       return;
     }
-    if(!activation_healthy(agent, fd, install.name)) {
+    if(!activation_healthy(agent, fd, install.name, install.sha256)) {
       return;
     }
     snprintf(answer, sizeof(answer), "installed %s %s\nexit 0\n",
@@ -1670,12 +1697,12 @@ payload_list(int fd) {
     number_text(entries[i].asset, asset, sizeof(asset));
     snprintf(line, sizeof(line),
              "payload %s source=%s version=%s release=%s asset=%s sha256=%s "
-             "path=%s running=%s previous=%s%s\n",
+             "path=%s running=%s failed=%s previous=%s\n",
              entries[i].name, entries[i].source,
              entries[i].version[0] ? entries[i].version : "-",
              release, asset, entries[i].sha256, entries[i].path,
-             entries[i].running ? "yes" : "no", entries[i].previous,
-             entries[i].failed ? " failed=yes" : "");
+             entries[i].running ? "yes" : "no",
+             entries[i].failed ? "yes" : "no", entries[i].previous);
     reply(fd, line);
   }
 
@@ -1847,7 +1874,7 @@ refuse(int fd, const char *name, const char *word, const char *answer) {
 }
 
 
-/** 1 when digits is a timeout in seconds from 1 to 999999999. **/
+/** 1 when digits is a timeout in seconds from 1 to HEALTH_TIMEOUT_MAX_S. **/
 static int
 timeout_seconds(const char *digits, uint64_t *seconds) {
   size_t i;
@@ -1862,7 +1889,7 @@ timeout_seconds(const char *digits, uint64_t *seconds) {
   }
 
   *seconds = strtoull(digits, NULL, 10);
-  return *seconds > 0;
+  return *seconds > 0 && *seconds <= HEALTH_TIMEOUT_MAX_S;
 }
 
 
@@ -1983,7 +2010,7 @@ payload_rollback(agent_t *agent, int fd, const char *name) {
       reply(fd, audit_failed);
       return;
     }
-    if(!activation_healthy(agent, fd, install.name)) {
+    if(!activation_healthy(agent, fd, install.name, install.sha256)) {
       return;
     }
     snprintf(answer, sizeof(answer), "rolled_back %s %s\nexit 0\n",

@@ -256,17 +256,28 @@ int store_run_load(const char *name, store_object_t *object);
 /** The one-shot health timeout, in seconds, until payload config sets one. **/
 #define HEALTH_TIMEOUT_S 30
 
+/**
+ * The longest one-shot health timeout payload config accepts, in seconds. A
+ * check runs on the connection that activates the build, so it is bounded.
+ **/
+#define HEALTH_TIMEOUT_MAX_S 3600
+
 /** What a failed one-shot health check changed. **/
-#define STORE_HEALTH_REPLACED 0
-#define STORE_HEALTH_MARKED   1
-#define STORE_HEALTH_FAILED   2
+#define STORE_HEALTH_REPLACED  0
+#define STORE_HEALTH_MARKED    1
+#define STORE_HEALTH_FAILED    2
+#define STORE_HEALTH_UNAUDITED 3
+#define STORE_HEALTH_PARTIAL   4
 
 /**
  * Answer a failed one-shot health check of the build failed, which is the
  * current build of name. With a previous build, that build becomes current
  * and its hash is copied into restored (STORE_HEALTH_REPLACED). With none, the
- * payload is marked failed and taken out of autoload when it is listed there
- * (STORE_HEALTH_MARKED). STORE_HEALTH_FAILED leaves the store as it was.
+ * payload is taken out of autoload when it is listed there and marked failed
+ * (STORE_HEALTH_MARKED). STORE_HEALTH_UNAUDITED is a marking whose autoload
+ * removal took effect but whose audit line failed. STORE_HEALTH_PARTIAL is a
+ * removal from autoload whose marking failed. STORE_HEALTH_FAILED leaves the
+ * store as it was.
  **/
 int store_health_failed(const char *name, const char *failed, char *restored,
                         size_t size);

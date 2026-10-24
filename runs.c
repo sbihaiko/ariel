@@ -184,6 +184,13 @@ runs_start(platform_t *platform, const char *name, const char *sha256,
 }
 
 
+static int
+health_failed_event(const char *name, const char *id, const char *sha256) {
+  return store_audit_append("health.fail", name, id, sha256) ? RUNS_AUDIT
+                                                            : RUNS_UNHEALTHY;
+}
+
+
 int
 runs_health(platform_t *platform, const char *name, const char *sha256,
             const unsigned char *bytes, size_t size, uint64_t timeout_ms) {
@@ -197,7 +204,7 @@ runs_health(platform_t *platform, const char *name, const char *sha256,
   int logfd;
 
   if((logfd=store_log_open(name, 1)) < 0) {
-    return RUNS_UNHEALTHY;
+    return health_failed_event(name, "-", sha256);
   }
 
   argv[0] = (char*)name;
@@ -205,7 +212,7 @@ runs_health(platform_t *platform, const char *name, const char *sha256,
   deadline = platform_ms(platform) + timeout_ms;
   if(platform->spawn_start(platform, bytes, size, argv, logfd, &pid)) {
     close(logfd);
-    return RUNS_UNHEALTHY;
+    return health_failed_event(name, "spawn", sha256);
   }
   close(logfd);
 
@@ -244,8 +251,7 @@ runs_health(platform_t *platform, const char *name, const char *sha256,
     return store_audit_append("health.ok", name, id, sha256) ? RUNS_AUDIT
                                                           : RUNS_HEALTHY;
   }
-  return store_audit_append("health.fail", name, id, sha256) ? RUNS_AUDIT
-                                                            : RUNS_UNHEALTHY;
+  return health_failed_event(name, id, sha256);
 }
 
 

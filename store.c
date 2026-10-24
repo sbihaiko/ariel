@@ -2716,7 +2716,9 @@ out:
 
 /**
  * A failed health check with no previous build: the payload leaves autoload,
- * when it is listed there, and is marked failed. The caller holds the lock.
+ * when it is listed there, and is marked failed. The autoload change comes
+ * first, so a failed build cannot start at boot even if its mark is lost. The
+ * caller holds the lock.
  **/
 static int
 health_mark_locked(const char *name) {
@@ -2728,6 +2730,8 @@ health_mark_locked(const char *name) {
   int store_fd = -1;
   int len;
   int edit;
+  int removed = 0;
+  int applied = 0;
   int rc = STORE_HEALTH_FAILED;
 
   if((state_fd=root_open()) < 0 ||
@@ -2748,18 +2752,22 @@ health_mark_locked(const char *name) {
   edit = autoload_edit(text, 0, name, next, sizeof(next));
   if(edit == AUTOLOAD_OK) {
     text_hash(next, strlen(next), next_hex);
-    if(autoload_transaction_locked(state_fd, store_fd, next, hex, next_hex,
-                                   "autoload_remove", name, "-") < 0) {
+    applied = autoload_transaction_locked(state_fd, store_fd, next, hex,
+                                          next_hex, "autoload_remove", name,
+                                          "-");
+    if(applied < 0) {
       goto out;
     }
+    removed = 1;
   } else if(edit != AUTOLOAD_ABSENT) {
     goto out;
   }
 
   if(state_failed_set(name, 1)) {
+    rc = removed ? STORE_HEALTH_PARTIAL : STORE_HEALTH_FAILED;
     goto out;
   }
-  rc = STORE_HEALTH_MARKED;
+  rc = applied ? STORE_HEALTH_UNAUDITED : STORE_HEALTH_MARKED;
 
 out:
   if(store_fd >= 0) {

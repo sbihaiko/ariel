@@ -49,7 +49,9 @@ int runs_start(platform_t *platform, const char *name, const char *sha256,
  * payload's log and the run is cut at timeout_ms on the platform clock. Waits
  * for the run to end and returns RUNS_HEALTHY for exit 0 within the timeout,
  * RUNS_TIMED_OUT when it was cut, RUNS_UNHEALTHY for any other exit or a run
- * that could not start, or RUNS_AUDIT when the audit log refused a line.
+ * that could not start (audited as health.fail with id "-" when the log cannot
+ * be opened, or "spawn" when the build cannot be spawned), or RUNS_AUDIT when
+ * the audit log refused a line.
  **/
 int runs_health(platform_t *platform, const char *name, const char *sha256,
                 const unsigned char *bytes, size_t size, uint64_t timeout_ms);
