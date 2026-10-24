@@ -674,7 +674,10 @@ subject_of(const char *target, const char *destination, char *out) {
   if(!approval_target_valid(target) || !approval_target_valid(destination)) {
     return "-";
   }
-  snprintf(out, TRANSFER_SUBJECT_MAX + 1, "%s>%s", target, destination);
+  if(snprintf(out, TRANSFER_SUBJECT_MAX + 1, "%s>%s", target, destination)
+     > TRANSFER_SUBJECT_MAX) {
+    return "-";
+  }
   return out;
 }
 
@@ -1164,7 +1167,13 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
   }
 
   snprintf(facts.command, sizeof(facts.command), "%s", "run");
-  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  if(snprintf(facts.target, sizeof(facts.target), "%s", path)
+     >= (int)sizeof(facts.target)) {
+    // A PATH lookup found a path longer than a target: it cannot be approved.
+    free(bytes);
+    audit_reply(fd, "run", "refused", "-", "-", unknown);
+    return 1;
+  }
   if(run_arguments(&facts, argc, argv)) {
     free(bytes);
     audit_reply(fd, "run", "refused", path, "-", unknown);
@@ -1752,7 +1761,7 @@ struct asset_sink {
   sha256_t hash;
   uint64_t size;
   uint64_t total;
-  const int *status;
+  int status;
 };
 
 
@@ -1778,7 +1787,7 @@ static int
 asset_sink(void *ctx, const unsigned char *data, size_t len) {
   struct asset_sink *asset = ctx;
 
-  if(*asset->status != 200) {
+  if(asset->status != 200) {
     return 0;
   }
 
@@ -1825,27 +1834,25 @@ fetch_asset(platform_t *platform, const allowlist_t *list, const char *url,
   char current[RELEASE_URL_MAX + 1];
   char location[RELEASE_URL_MAX + 1];
   char authority[ALLOWLIST_TOKEN_MAX];
-  int status = 0;
   int hop;
 
   snprintf(current, sizeof(current), "%s", url);
-  asset->status = &status;
 
   for(hop=0; hop<2; hop++) {
-    status = 0;
+    asset->status = 0;
     location[0] = '\0';
 
     if(platform->http_get(platform, current, asset->size, asset_sink, asset,
-                          &status, location, sizeof(location))) {
+                          &asset->status, location, sizeof(location))) {
       *refusal = "download_failed";
       return -1;
     }
 
-    if(status == 200) {
+    if(asset->status == 200) {
       return 0;
     }
 
-    if(status < 300 || status > 399) {
+    if(asset->status < 300 || asset->status > 399) {
       *refusal = "download_failed";
       return -1;
     }
@@ -3082,7 +3089,6 @@ audit_tail_reply(int fd, const char *count_text) {
 static void
 autoload_show(int fd) {
   char text[AUTOLOAD_TEXT_MAX];
-  char line[PAYLOAD_NAME_MAX + 16];
   char *p;
   char *nl;
 
@@ -3093,8 +3099,9 @@ autoload_show(int fd) {
 
   for(p=text; (nl=strchr(p, '\n')); p=nl + 1) {
     *nl = '\0';
-    snprintf(line, sizeof(line), "autoload %s\n", p);
-    reply(fd, line);
+    reply(fd, "autoload ");
+    reply(fd, p);
+    reply(fd, "\n");
     *nl = '\n';
   }
 

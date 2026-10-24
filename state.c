@@ -560,7 +560,11 @@ state_migrate(void) {
 
     memset(slot, 0, sizeof(*slot));
     slot->used = 1;
-    snprintf(slot->name, sizeof(slot->name), "%s", entry->d_name);
+    if(snprintf(slot->name, sizeof(slot->name), "%s", entry->d_name)
+       >= (int)sizeof(slot->name)) {
+      slot->used = 0;
+      continue;
+    }
     snprintf(slot->source, sizeof(slot->source), "push");
     snprintf(slot->sha256, sizeof(slot->sha256), "%s", hash);
     snprintf(slot->previous, sizeof(slot->previous), "-");

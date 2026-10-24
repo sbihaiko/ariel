@@ -136,11 +136,15 @@ connect_to(const char *authority) {
   int fd = -1;
 
   colon = strchr(authority, ':');
+  // A host or port that does not fit is refused, never truncated.
   if(colon) {
-    snprintf(host, sizeof(host), "%.*s", (int)(colon - authority), authority);
-    snprintf(port, sizeof(port), "%s", colon + 1);
-  } else {
-    snprintf(host, sizeof(host), "%s", authority);
+    if(snprintf(host, sizeof(host), "%.*s", (int)(colon - authority),
+                authority) >= (int)sizeof(host) ||
+       snprintf(port, sizeof(port), "%s", colon + 1) >= (int)sizeof(port)) {
+      return -1;
+    }
+  } else if(snprintf(host, sizeof(host), "%s", authority) >= (int)sizeof(host)) {
+    return -1;
   }
 
   memset(&hints, 0, sizeof(hints));
