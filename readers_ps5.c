@@ -20,14 +20,18 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/user.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <ps5/kernel.h>
 
 #include "builtins.h"
+#include "diagnostics.h"
 #include "elfldr.h"
 #include "json.h"
 #include "readers.h"
@@ -291,6 +295,120 @@ run_authid(int outfd, int *status) {
 }
 
 
+/* The console's uptime, in whole seconds. */
+static int
+ps5_uptime_seconds(unsigned long long *uptime) {
+  struct timeval boot;
+  size_t size = sizeof(boot);
+  time_t now;
+
+  if(sysctlbyname("kern.boottime", &boot, &size, NULL, 0)) {
+    return -1;
+  }
+  if((now = time(NULL)) == (time_t)-1 || now < boot.tv_sec) {
+    return -1;
+  }
+  *uptime = (unsigned long long)(now - boot.tv_sec);
+  return 0;
+}
+
+
+/* The console's total and free memory, in bytes. */
+static int
+ps5_memory(unsigned long long *total, unsigned long long *free_bytes) {
+  unsigned long physical;
+  unsigned int free_pages;
+  size_t size = sizeof(physical);
+  long page = sysconf(_SC_PAGE_SIZE);
+
+  if(sysctlbyname("hw.physmem", &physical, &size, NULL, 0)) {
+    return -1;
+  }
+  size = sizeof(free_pages);
+  if(sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &size, NULL, 0)) {
+    return -1;
+  }
+  if(page <= 0) {
+    return -1;
+  }
+  *total = (unsigned long long)physical;
+  *free_bytes = (unsigned long long)free_pages * (unsigned long long)page;
+  return 0;
+}
+
+
+/* The kernel log. The console keeps it in kern.msgbuf; when the kernel does
+   not expose it, the refusal is named rather than answered as empty. */
+static int
+run_dmesg(int argc, char *const argv[], int outfd, int errfd, int *status) {
+  size_t size = 0;
+  char *buf;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+    } else {
+      say(errfd, "bad_argument\n");
+    }
+    *status = 1;
+    return 0;
+  }
+
+  if(sysctlbyname("kern.msgbuf", NULL, &size, NULL, 0) || !size ||
+     !(buf = malloc(size))) {
+    say(errfd, "not available on this platform\n");
+    *status = 1;
+    return 0;
+  }
+  if(sysctlbyname("kern.msgbuf", buf, &size, NULL, 0)) {
+    free(buf);
+    say(errfd, "not available on this platform\n");
+    *status = 1;
+    return 0;
+  }
+
+  diagnostics_say_log(outfd, buf, size);
+  free(buf);
+  *status = 0;
+  return 0;
+}
+
+
+static int
+run_sysinfo(int json, int argc, char *const argv[], int outfd, int errfd,
+            int *status) {
+  unsigned long long total;
+  unsigned long long free_bytes;
+  unsigned long long uptime;
+  struct utsname name;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+    } else {
+      say(errfd, "bad_argument\n");
+    }
+    *status = 1;
+    return 0;
+  }
+  if(uname(&name)) {
+    say(errfd, "operation_failed\n");
+    *status = 1;
+    return 0;
+  }
+  if(ps5_uptime_seconds(&uptime) || ps5_memory(&total, &free_bytes)) {
+    say(errfd, "not available on this platform\n");
+    *status = 1;
+    return 0;
+  }
+
+  diagnostics_say_sysinfo(json, outfd, name.sysname, name.release,
+                          name.machine, uptime, total, free_bytes);
+  *status = 0;
+  return 0;
+}
+
+
 /** A gated built-in runs in its own shell, once, as sh.elf --run NAME ARGS. **/
 static int
 run_builtin(int argc, char *const argv[], int outfd, int errfd, int *status) {
@@ -329,6 +447,14 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
 
   if(argc == 1 && !strcmp(argv[0], "ps")) {
     return run_ps(json, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "dmesg")) {
+    return run_dmesg(argc, argv, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "sysinfo")) {
+    return run_sysinfo(json, argc, argv, outfd, errfd, status);
   }
 
   if(!strcmp(argv[0], "procstat")) {

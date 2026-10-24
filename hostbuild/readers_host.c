@@ -14,6 +14,14 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+/* The uptime figures need the BSD and sysconf names the strict POSIX level
+   hides: kern.boottime on the Mac, the free page count on Linux. */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#else
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
@@ -22,10 +30,19 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#endif
+
 #include "builtins.h"
+#include "diagnostics.h"
 #include "json.h"
 #include "readers.h"
 
@@ -282,6 +299,135 @@ run_sysctl(int argc, char *const argv[], int outfd, int errfd, int *status) {
 }
 
 
+/* The host has no kernel log an unprivileged process may read, so dmesg
+   names the refusal instead of answering an empty success. */
+static int
+run_dmesg(int argc, char *const argv[], int outfd, int errfd, int *status) {
+  (void)outfd;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+    } else {
+      say(errfd, "bad_argument\n");
+    }
+    *status = 1;
+    return 0;
+  }
+
+  say(errfd, "not available on this platform\n");
+  *status = 1;
+  return 0;
+}
+
+
+/* The host's uptime, in whole seconds. */
+static int
+host_uptime_seconds(unsigned long long *uptime) {
+#if defined(__APPLE__)
+  struct timeval boot;
+  size_t size = sizeof(boot);
+  time_t now;
+
+  if(sysctlbyname("kern.boottime", &boot, &size, NULL, 0)) {
+    return -1;
+  }
+  if((now = time(NULL)) == (time_t)-1 || now < boot.tv_sec) {
+    return -1;
+  }
+  *uptime = (unsigned long long)(now - boot.tv_sec);
+  return 0;
+#else
+  double seconds;
+  FILE *file;
+
+  if(!(file = fopen("/proc/uptime", "r"))) {
+    return -1;
+  }
+  if(fscanf(file, "%lf", &seconds) != 1 || seconds < 0) {
+    fclose(file);
+    return -1;
+  }
+  fclose(file);
+  *uptime = (unsigned long long)seconds;
+  return 0;
+#endif
+}
+
+
+/* The host's total and free memory, in bytes. */
+static int
+host_memory(unsigned long long *total, unsigned long long *free_bytes) {
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long size = sysconf(_SC_PAGE_SIZE);
+
+  if(pages <= 0 || size <= 0) {
+    return -1;
+  }
+  *total = (unsigned long long)pages * (unsigned long long)size;
+
+#if defined(__APPLE__)
+  {
+    vm_statistics64_data_t stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                         (host_info64_t)&stats, &count) != KERN_SUCCESS) {
+      return -1;
+    }
+    *free_bytes = ((unsigned long long)stats.free_count +
+                   (unsigned long long)stats.speculative_count) *
+                  (unsigned long long)size;
+  }
+#else
+  {
+    long available = sysconf(_SC_AVPHYS_PAGES);
+
+    if(available < 0) {
+      return -1;
+    }
+    *free_bytes = (unsigned long long)available * (unsigned long long)size;
+  }
+#endif
+  return 0;
+}
+
+
+static int
+run_sysinfo(int json, int argc, char *const argv[], int outfd, int errfd,
+            int *status) {
+  unsigned long long total;
+  unsigned long long free_bytes;
+  unsigned long long uptime;
+  struct utsname name;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+    } else {
+      say(errfd, "bad_argument\n");
+    }
+    *status = 1;
+    return 0;
+  }
+  if(uname(&name)) {
+    say(errfd, "operation_failed\n");
+    *status = 1;
+    return 0;
+  }
+  if(host_uptime_seconds(&uptime) || host_memory(&total, &free_bytes)) {
+    say(errfd, "not available on this platform\n");
+    *status = 1;
+    return 0;
+  }
+
+  diagnostics_say_sysinfo(json, outfd, name.sysname, name.release,
+                          name.machine, uptime, total, free_bytes);
+  *status = 0;
+  return 0;
+}
+
+
 int
 readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
              int *status) {
@@ -291,6 +437,14 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
 
   if(argc == 1 && !strcmp(argv[0], "ps")) {
     return run_ps(json, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "dmesg")) {
+    return run_dmesg(argc, argv, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "sysinfo")) {
+    return run_sysinfo(json, argc, argv, outfd, errfd, status);
   }
 
   if(!strcmp(argv[0], "procstat")) {

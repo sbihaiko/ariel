@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 #include <time.h>
 #include <unistd.h>
 
+#include "answer.h"
 #include "json.h"
 #include "protected.h"
 #include "readers.h"
@@ -60,7 +61,10 @@ static const struct {
   {"authid", "print the authid of this process"},
   {"cat", "print an absolute file"},
   {"cmp", "compare two absolute files"},
+  {"date", "print the current time in UTC"},
   {"df", "print the free space of an absolute path"},
+  {"dmesg", "print the kernel log"},
+  {"du", "print the bytes under an absolute path, one line per directory"},
   {"echo", "print the operands"},
   {"file", "print the kind of an absolute path"},
   {"find", "list an absolute tree"},
@@ -81,6 +85,7 @@ static const struct {
   {"sum", "print the BSD checksum of an absolute file"},
   {"sync", "write cached data to disk"},
   {"sysctl", "print a kernel parameter"},
+  {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
   {"wc", "count the lines, words and bytes of an absolute file"},
 };
@@ -189,100 +194,6 @@ fill(int fd, char *buf, size_t cap) {
     total += (size_t)n;
   }
   return (ssize_t)total;
-}
-
-
-#define MARKER_RESERVE 64
-#define CONTENT_CAP (OUTPUT_CAP - MARKER_RESERVE)
-
-typedef struct {
-  int fd;
-  size_t limit;
-  size_t shown;
-  size_t total;
-  size_t bytes;
-  int full;
-} answer_t;
-
-
-static void
-say_cut(int fd, size_t shown, size_t total) {
-  char line[64];
-
-  snprintf(line, sizeof(line), "truncated %zu of %zu\n", shown, total);
-  say(fd, line);
-}
-
-
-static void
-answer_init(answer_t *answer, int fd, size_t limit) {
-  answer->fd = fd;
-  answer->limit = limit;
-  answer->shown = 0;
-  answer->total = 0;
-  answer->bytes = 0;
-  answer->full = 0;
-}
-
-
-// A line that does not fit stops the answer, so the lines shown are a prefix.
-static int
-answer_admit(answer_t *answer, size_t len) {
-  answer->total++;
-  if(answer->full) {
-    return 0;
-  }
-  if(answer->shown >= answer->limit || len + 1 > CONTENT_CAP - answer->bytes) {
-    answer->full = 1;
-    return 0;
-  }
-  answer->shown++;
-  answer->bytes += len + 1;
-  return 1;
-}
-
-
-static void
-answer_line(answer_t *answer, const char *text, size_t len) {
-  if(answer_admit(answer, len)) {
-    put(answer->fd, text, len);
-    say(answer->fd, "\n");
-  }
-}
-
-
-static void
-answer_done(answer_t *answer) {
-  if(answer->shown < answer->total) {
-    say_cut(answer->fd, answer->shown, answer->total);
-  }
-}
-
-
-// A JSON object of one string member, budgeted by its encoded length.
-static void
-answer_json(answer_t *answer, const char *key, const char *value) {
-  size_t klen = strlen(key);
-  size_t len = klen + 5 + json_format_string(NULL, 0, value);
-
-  if(answer_admit(answer, len)) {
-    put(answer->fd, "{\"", 2);
-    put(answer->fd, key, klen);
-    put(answer->fd, "\":", 2);
-    json_say_string(answer->fd, value);
-    say(answer->fd, "}\n");
-  }
-}
-
-
-// say_path, bounded: the same object, cut like any other answer line.
-static void
-answer_path(answer_t *answer, int json, const char *path) {
-  if(json) {
-    answer_json(answer, "path", path);
-  } else {
-    answer_line(answer, path, strlen(path));
-  }
 }
 
 
@@ -1352,6 +1263,32 @@ run_hexdump(int argc, char *const argv[], int outfd, int errfd) {
 
 
 static int
+run_date(int argc, char *const argv[], int outfd, int errfd) {
+  char line[64];
+  struct tm tm;
+  time_t now;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    }
+    return bad_arguments("date", errfd);
+  }
+
+  if((now=time(NULL)) == (time_t)-1 || !gmtime_r(&now, &tm)) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d UTC\n",
+           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+           tm.tm_hour, tm.tm_min, tm.tm_sec);
+  say(outfd, line);
+  return 0;
+}
+
+
+static int
 run_df(int json, int argc, char *const argv[], int outfd, int errfd) {
   char line[OUT_LINE_CAP];
   struct statvfs vfs;
@@ -1580,6 +1517,151 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   }
   answer_done(&answer);
   return failed;
+}
+
+
+typedef struct {
+  answer_t *answer;
+  int errfd;
+  int failed;
+  int oom;
+} du_walk_t;
+
+
+// One directory's line, after the totals of everything below it.
+static void
+du_say(du_walk_t *walk, const char *path, uint64_t bytes) {
+  int need = snprintf(NULL, 0, "%llu %s", (unsigned long long)bytes, path);
+  char *line;
+
+  if(need < 0) {
+    walk->failed = 1;
+    return;
+  }
+  if(!(line = malloc((size_t)need + 1))) {
+    walk->oom = 1;
+    return;
+  }
+  snprintf(line, (size_t)need + 1, "%llu %s", (unsigned long long)bytes, path);
+  answer_line(walk->answer, line, (size_t)need);
+  free(line);
+}
+
+
+// Sums the regular files under path and writes one line for each directory,
+// children first. A link is never followed, and a file that is not regular
+// counts as no bytes.
+static uint64_t
+du_walk(du_walk_t *walk, const char *path) {
+  char **names = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+  struct stat st;
+  struct dirent *ent;
+  uint64_t total = 0;
+  size_t i;
+  DIR *dir;
+
+  if(lstat(path, &st)) {
+    report("du", path, walk->errfd, errno);
+    walk->failed = 1;
+    return 0;
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    return S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;
+  }
+
+  if(!(dir=opendir(path))) {
+    report("du", path, walk->errfd, errno);
+    walk->failed = 1;
+    du_say(walk, path, 0);
+    return 0;
+  }
+  while((ent = readdir(dir))) {
+    char **grown;
+
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(count == cap) {
+      grown = realloc(names, (cap ? cap * 2 : 16) * sizeof(*names));
+      if(!grown) {
+        walk->oom = 1;
+        break;
+      }
+      names = grown;
+      cap = cap ? cap * 2 : 16;
+    }
+    if(!(names[count] = strdup(ent->d_name))) {
+      walk->oom = 1;
+      break;
+    }
+    count++;
+  }
+  closedir(dir);
+
+  if(!walk->oom) {
+    qsort(names, count, sizeof(*names), name_cmp);
+    for(i=0; i<count; i++) {
+      char *child = join_path(path, names[i]);
+
+      if(!child) {
+        walk->oom = 1;
+        break;
+      }
+      total += du_walk(walk, child);
+      free(child);
+    }
+  }
+
+  for(i=0; i<count; i++) {
+    free(names[i]);
+  }
+  free(names);
+
+  du_say(walk, path, total);
+  return total;
+}
+
+
+static int
+run_du(int argc, char *const argv[], int outfd, int errfd) {
+  answer_t answer;
+  du_walk_t walk;
+  struct stat st;
+  uint64_t total;
+
+  if(argc != 2) {
+    if(argc > 1 && argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    }
+    return bad_arguments("du", errfd);
+  }
+  if(refuse_relative(argv[1], errfd)) {
+    return 1;
+  }
+  if(lstat(argv[1], &st)) {
+    report("du", argv[1], errfd, errno);
+    return 1;
+  }
+
+  answer_init(&answer, outfd, SIZE_MAX);
+  walk.answer = &answer;
+  walk.errfd = errfd;
+  walk.failed = 0;
+  walk.oom = 0;
+  total = du_walk(&walk, argv[1]);
+  if(!S_ISDIR(st.st_mode)) {
+    du_say(&walk, argv[1], total);
+  }
+
+  if(walk.oom) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  answer_done(&answer);
+  return walk.failed;
 }
 
 
@@ -2051,6 +2133,8 @@ static const struct {
   {"head", run_head, 0},
   {"tail", run_tail, 0},
   {"wc", run_wc, 0},
+  {"date", run_date, 0},
+  {"du", run_du, 0},
 };
 
 
@@ -2063,7 +2147,7 @@ table_command(const char *name) {
 
 static int
 json_command(const char *name) {
-  return !strcmp(name, "ps") || table_command(name);
+  return !strcmp(name, "ps") || !strcmp(name, "sysinfo") || table_command(name);
 }
 
 
@@ -2161,7 +2245,7 @@ run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
     free(plain);
     return refuse_option(errfd, status);
   }
-  if(!strcmp(argv[0], "ps")) {
+  if(!strcmp(argv[0], "ps") || !strcmp(argv[0], "sysinfo")) {
     rc = readers_run(1, count, plain, outfd, errfd, status);
   } else {
     *status = run_table(1, count, plain, outfd, errfd);
