@@ -23,12 +23,12 @@ Ariel closes that gap. The idea is that an agent connects to one endpoint on the
 
 ### Stage 1: hello world, end to end
 
-The first milestone is the smallest loop that proves the whole idea: an agent builds a payload on a computer, pushes it to the console, a human approves it with the controller, and the agent runs it and reads its output. The [quick start](docs/quick-start.md#after-stage-1) is this stage's acceptance test, and it runs headless in CI against a host build of Ariel.
+The first milestone is the smallest loop that proves the whole idea: an agent builds a payload on a computer, pushes it to the console, the owner approves it with a key they hold, and the agent runs it and reads its output. The [quick start](docs/quick-start.md#after-stage-1) is this stage's acceptance test, and it runs headless in CI against a host build of Ariel.
 
 - **An agent port (2324)** next to the telnet shell: raw TCP with no telnet negotiation, so a binary upload arrives intact. One command per connection after `auth`, no prompts, and every reply ends with an `exit <status>` line.
 - **An access token** on the agent port. Every connection starts with `auth <token>`; Ariel shows the token on the console at first start.
 - **`payload push <name> <size> <sha256>`** uploads a locally built ELF over the same connection, so no FTP server is needed. Ariel stages it and the console shows its hash.
-- **Approval on the console.** A push answers `approval_required <id>`; a human approves with the controller. Approving a pushed build also approves running that exact build.
+- **Approval by the owner's key.** A push answers `approval_required <id>`; the owner signs the exact action with a key the agent does not hold. Approving a pushed build also approves running that exact build.
 - **`payload commit <staging-id>`** moves an approved upload into Ariel's store. The bytes are sent once.
 - **`payload run --wait <name>`** runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports the payload's exit status on a `status <n>` line, apart from the protocol's `exit` line.
 - **A host build** of Ariel behind a platform port, with a virtual controller for tests. It never ships in the PS5 build.
@@ -40,7 +40,7 @@ The agent port offers only these commands. Everything else, including every comm
 Make the console safe to leave in an agent's hands:
 
 1. **Download a payload from a GitHub release**, by repository name, following the latest release or a pinned tag, and only from an allowlist of sources. Ariel records the immutable identifiers of what it downloaded (release ID, asset ID), since tags can be moved.
-2. **Verify it** with SHA-256 before anything is executed. A hash published in the same release only detects corruption, not tampering, so the expected hash must come from somewhere Ariel trusts: either it is pinned in the allowlist, or a human approves the new hash on the console (see [Safety model](#safety-model)), after which it is pinned.
+2. **Verify it** with SHA-256 before anything is executed. A hash published in the same release only detects corruption, not tampering, so the expected hash must come from somewhere Ariel trusts: either it is pinned in the allowlist, or the owner approves the new hash with their key (see [Safety model](#safety-model)), after which it is pinned.
 3. **Run it in the background** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
 4. **Persist it**: record what is installed (source, identifiers, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot. Approving an installation explicitly includes approving that the payload runs on every boot. `autoload safe-boot` skips autoload on the next boot, so a payload that crashes the console at startup can always be removed.
 5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
@@ -86,7 +86,7 @@ Stages 1 to 3 are enough for an agent to operate the console. Stages 4 and 5 are
 Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
 
 - `session new` returns a random 128-bit session ID and its TTL. Prefixing a command with `@<sid>` runs it inside that session, and `session close` ends it.
-- A session holds only minimal state: working directory, environment and timestamps. It carries no authorization. Creating a session requires the access token, and every gated command still needs its own approval on the console. Payloads started from a session are not tied to it and keep running after it ends.
+- A session holds only minimal state: working directory, environment and timestamps. It carries no authorization. Creating a session requires the access token, and every gated command still needs its own approval. Payloads started from a session are not tied to it and keep running after it ends.
 - Sessions expire after a period of inactivity, and the number of concurrent sessions is capped, so a client that forgets to close them cannot exhaust the console's RAM.
 - An unknown or expired ID returns an explicit `session_expired` error instead of silently falling back, so the agent knows to open a new session (for example after a reboot).
 - Session IDs are generated by a cryptographically secure random number generator and treated as secrets. Over plain-text connections they can still be sniffed, which is why they never authorize anything on their own.
@@ -101,7 +101,7 @@ Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server
 
 Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-**Today:** ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S4 are Stages 1 to 4. "Gated" commands need approval on the console before they run (see [Safety model](#safety-model)).
+**Today:** ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S4 are Stages 1 to 4. "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
 
 | Ariel | bash equivalent | Today (shsrv) | Plan |
 |---|---|---|---|
@@ -126,7 +126,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `procstat` | `/proc/<pid>/*` | ✅ | |
 | `kill` | | ✅ | S2: gated, critical processes protected |
 | `payload run` | `cmd &`, `nohup` | ❌ | S1: `--wait` runs an approved build in the foreground. S2: background runs with a log |
-| `payload push`, `payload commit` | `scp`, `curl -T` | ❌ | S1, hash approved on the console |
+| `payload push`, `payload commit` | `scp`, `curl -T` | ❌ | S1, hash approved by the owner |
 | `timeout` | | ❌ | S3 |
 | `sleep`, `id`, `sync` | | ✅ | |
 | `env`, `export`, `exec` | | ✅ | S2: gated |
@@ -148,12 +148,12 @@ Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `s
 An agent that can download, write and execute code on a console with kernel privileges needs firm limits. Ariel is designed around these rules:
 
 - **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token. Output is size-limited. `env` is gated, and Ariel's own secrets (its token and approval state) cannot be read through any command.
-- **Change is approved on the console.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. Approving a payload version (at install or commit) also approves running that exact version, so a build is approved once, not once per run. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and shows a notification on the console describing the exact action (command, target, hash). The action runs only after a human approves it with the controller. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it runs on another machine and has no access to the controller. A flag such as `--confirm` would not be enough, since the agent could simply pass it. The approval source on a console is the controller ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md)); the [controller spike](docs/controller-spike.md) validates on a real console that a payload can read it while another app is in the foreground, and if it cannot, the source changes behind the platform port.
-- **Allowlisted sources and trusted hashes.** Downloads come only from approved hosts and repositories, and a payload runs only if its hash is pinned in the allowlist or was approved on the console.
+- **Change is approved by the owner's signature.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. Approving a payload version (at install or commit) also approves running that exact version, so a build is approved once, not once per run. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and the owner's signer shows the exact action (command, target, hash, console, expiry) before they confirm. The action runs only after that signature verifies on the console. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it never holds the key. A flag such as `--confirm` would not be enough, since the agent could simply pass it. The [controller spike](docs/controller-spike.md) measured the alternative on a real console and ruled it out: a payload cannot read the pad, and borrowing it from the foreground title freezes the game ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md)).
+- **Allowlisted sources and trusted hashes.** Downloads come only from approved hosts and repositories, and a payload runs only if its hash is pinned in the allowlist or was approved by the owner.
 - **Protected areas.** System partitions stay read-only. Critical system processes (such as SceShellCore) cannot be killed.
 - **Designed to recover.** Every change is atomic and journaled, every payload has a previous version to fall back to, and `autoload safe-boot` disables autoload for one boot. This covers crashes, failed health checks and interrupted updates, but not every possible failure.
-- **Trusted network only.** The shell protocol is plain text, so the access token and session IDs can be sniffed by anyone on the same network. Ariel is meant for a trusted home network. On any other network, use an encrypted tunnel. On-console approval keeps destructive actions safe even if the token leaks.
-- **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. On-console approval ensures that injected instructions cannot silently turn into code execution.
+- **Trusted network only.** The shell protocol is plain text, so the access token and session IDs can be sniffed by anyone on the same network. Ariel is meant for a trusted home network. On any other network, use an encrypted tunnel. The owner's signature keeps destructive actions safe even if the token leaks.
+- **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. Approval by a key the agent does not hold ensures that injected instructions cannot silently turn into code execution.
 - **Auditable.** Ariel is open source and every action it takes is logged on the console.
 
 From Stage 5, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
