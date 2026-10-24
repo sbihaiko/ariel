@@ -220,6 +220,8 @@ Three things the console taught that the host build cannot:
 - **`ariel-sign` must be built from the branch under test.** The signer on `master` answers `not a challenge line` to a challenge from `dev`, whose line carries a generation field the older parser does not read. Signing with the wrong binary fails before a signature is made, not after, which is the good failure.
 - **One notification at a time.** A second gated command inside the 10 s notification window answers `approval_busy` (76) and asks nothing; the client retries. The driver that ran these checks waits 11 s and tries again.
 
+**A console in rest is not a console that is down.** It keeps answering `ping` on the LAN and answers nothing else: 2323, 2324 and 9021 are all closed. A deploy sent in that state is lost with no error from the console, which reads exactly like a crashed payload. The wake that worked here was a magic packet to the broadcast address (the console has Wake-on-LAN on, MAC `50:b0:3b:42:ed:17`); about 25 s later 9021 answered, and the payloads had to be sent again because none of them survives rest.
+
 One more, from the deploy rather than the commands: sending the ELF with a plain `nc` that closed early crashed the console into a reboot, and the payloads that had been running did not come back (only the loader did). The working shape is to send every byte, shut the writing side, and read until the peer closes.
 
 ## What other projects say
