@@ -226,20 +226,28 @@ answer_init(answer_t *answer, int fd, size_t limit) {
 
 
 // A line that does not fit stops the answer, so the lines shown are a prefix.
-static void
-answer_line(answer_t *answer, const char *text, size_t len) {
+static int
+answer_admit(answer_t *answer, size_t len) {
   answer->total++;
   if(answer->full) {
-    return;
+    return 0;
   }
   if(answer->shown >= answer->limit || len + 1 > CONTENT_CAP - answer->bytes) {
     answer->full = 1;
-    return;
+    return 0;
   }
-  put(answer->fd, text, len);
-  say(answer->fd, "\n");
   answer->shown++;
   answer->bytes += len + 1;
+  return 1;
+}
+
+
+static void
+answer_line(answer_t *answer, const char *text, size_t len) {
+  if(answer_admit(answer, len)) {
+    put(answer->fd, text, len);
+    say(answer->fd, "\n");
+  }
 }
 
 
@@ -251,23 +259,19 @@ answer_done(answer_t *answer) {
 }
 
 
-// A JSON object of one string member, bounded like every other answer line.
+// A JSON object of one string member, budgeted by its encoded length.
 static void
 answer_json(answer_t *answer, const char *key, const char *value) {
-  char line[OUT_LINE_CAP];
-  size_t n;
+  size_t klen = strlen(key);
+  size_t len = klen + 5 + json_format_string(NULL, 0, value);
 
-  n = (size_t)snprintf(line, sizeof(line), "{\"%s\":", key);
-  if(n < sizeof(line)) {
-    n += json_format_string(line + n, sizeof(line) - n, value);
+  if(answer_admit(answer, len)) {
+    put(answer->fd, "{\"", 2);
+    put(answer->fd, key, klen);
+    put(answer->fd, "\":", 2);
+    json_say_string(answer->fd, value);
+    say(answer->fd, "}\n");
   }
-  if(n >= sizeof(line)) {
-    answer->total++;
-    answer->full = 1;
-    return;
-  }
-  line[n++] = '}';
-  answer_line(answer, line, n);
 }
 
 
@@ -1771,6 +1775,12 @@ run_table(int json, int argc, char *const argv[], int outfd, int errfd) {
 }
 
 
+static int
+limit_command(const char *name) {
+  return !strcmp(name, "ls") || !strcmp(name, "find");
+}
+
+
 /* A refused option is found before anything runs, so nothing else is printed. */
 static int
 run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
@@ -1789,6 +1799,13 @@ run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
   plain[count++] = argv[0];
   for(i=1; i<argc; i++) {
     if(!strcmp(argv[i], "--json")) {
+      continue;
+    }
+    if(!strcmp(argv[i], "--limit") && limit_command(argv[0])) {
+      plain[count++] = argv[i];
+      if(i+1 < argc) {
+        plain[count++] = argv[++i];
+      }
       continue;
     }
     if(argv[i][0] == '-') {

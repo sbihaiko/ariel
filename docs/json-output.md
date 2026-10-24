@@ -1,6 +1,8 @@
 # JSON output of the table commands
 
-`ps`, `ls`, `stat`, `df` and `find` take `--json`, which answers one JSON object per line in place of the aligned text. The answer ends with the `exit <n>` line, as every answer does (ADR-0012, decision 8). `--json` may stand anywhere after the command name, and it is the only option these commands take. Any other option (a word that starts with `-`), an operand `ps` does not take, or `--json` with a command that has no JSON form answers `bad_option` (exit 1) and nothing else. A command without `--json` prints what it always printed.
+`ps`, `ls`, `stat`, `df` and `find` take `--json`, which answers one JSON object per line in place of the aligned text. The answer ends with the `exit <n>` line, as every answer does (ADR-0012, decision 8). `--json` may stand anywhere after the command name. `ls` and `find` also take `--limit N` before their operands, in either order with `--json`, and answer the same objects bounded by N. Any other option (a word that starts with `-`), an operand `ps` does not take, or `--json` with a command that has no JSON form answers `bad_option` (exit 1) and nothing else. A command without `--json` prints what it always printed.
+
+An object is kept whole or left out: its encoded length counts against the answer's content cap of 64 KiB less the 64 bytes the marker may need, and an object that does not fit ends the answer. A cut answer then ends with `truncated <shown> of <total>` as plain output does, before `exit 0`.
 
 An error keeps its word line, as without the flag: `relative_path`, `no_such_file` and the rest answer on the error channel, then `exit 1`. Objects printed before a failure, as with `find`, stay printed.
 
