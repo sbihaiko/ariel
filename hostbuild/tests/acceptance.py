@@ -9037,12 +9037,11 @@ SCENARIOS.extend(HTTP2_SCENARIOS)
 # Freeze (SPEC 2, #47): the owner creates /data/ariel/freeze and Ariel records
 # it in the keyring. From then on every ordinary approval, gated commit and run
 # answers frozen and exit 89, including one granted or installed before the
-# freeze. Only recovery-signed key commands pass; a recovery-signed key unfreeze
-# lifts it, and deleting the file does not.
+# freeze. Only a recovery-signed key unfreeze passes and lifts it; deleting the
+# file does not. key rotate-recovery is refused too (owner's proxy, 2026-10-24).
 # ---------------------------------------------------------------------------
 
 FROZEN_REPLY = ["frozen", "exit 89"]
-ROTATE_RECOVERY_ACTION = "command=key.rotate-recovery"
 FREEZE_STEPS = ("prepared", "committed", "renamed", "audited")
 RUN_OK = ["status 0", "exit 0"]
 APPROVALS_TABLE_SIZE = 16  # APPROVALS_MAX in store.c
@@ -9058,8 +9057,8 @@ FREEZE_RESTART_TITLE = ("a freeze holds after a restart with its file "
                         "deleted")
 FREEZE_SLOTS_TITLE = ("while frozen, a recovery-signed key unfreeze passes "
                       "with the approval table full")
-FREEZE_ROTATE_TITLE = ("a freeze refuses key rotate and still asks for key "
-                       "rotate-recovery")
+FREEZE_ROTATE_TITLE = ("a freeze refuses key rotate and key rotate-recovery "
+                       "with frozen and exit 89")
 FREEZE_PRIMARY_TITLE = ("a freeze is lifted only by the recovery key: a "
                         "primary signature over key unfreeze answers 79")
 FREEZE_RACE_TITLE = ("a freeze racing a grant, a commit and a run admits "
@@ -9214,11 +9213,10 @@ def scenario_freeze_refuses_key_rotate(server):
         set_freeze(keys)
         assert run_command(keys, "key rotate " + second) == FROZEN_REPLY, (
             "a primary key rotate must not be asked while frozen")
-        lines = run_command(keys, "key rotate-recovery " + second)
-        assert lines[-1] == "exit 75" and ROTATE_RECOVERY_ACTION in (
-            challenge_action(lines[1]).split("\n")), (
-            "a recovery-signed key rotate-recovery must still be asked while "
-            "frozen, got %r" % lines)
+        assert run_command(keys, "key rotate-recovery " + second) == (
+            FROZEN_REPLY), (
+            "while frozen only key unfreeze may be asked; key rotate-recovery "
+            "must answer frozen")
     finally:
         keys.stop()
 
