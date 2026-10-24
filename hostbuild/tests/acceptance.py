@@ -1391,8 +1391,8 @@ HOST_ROOT_SCENARIOS = {
     "a run of a missing path, a directory or a file without execute bits "
     "answers its word and exit 1 without asking",
     "a run of Ariel's token answers protected and exit 87 without asking",
-    "a run with an argument the signer cannot show, or with too many, answers "
-    "unknown and exit 1 without asking",
+    "a run with an argument outside printable ASCII answers bad_path and "
+    "with too many arguments answers unknown_command, without asking",
     "a run of a file over 64 MiB answers too_large and exit 1 without asking",
     "a run never follows a symbolic link, by path or on the PATH, and answers "
     "symbolic_link",
@@ -2467,7 +2467,7 @@ def scenario_rollback_restores_the_previous_version(server):
         "challenge and exit 75, got %r" % lines)
     approval = APPROVAL_LINE.match(lines[0]).group(1)
 
-    action = challenge_action(challenge_of(lines)).splitlines()
+    action = action_facts(challenge_of(lines))
     for fact in ("command=payload.rollback", "target=rollb",
                  "sha256=%s" % previous, "option.replaces=%s" % current):
         assert fact in action, (
@@ -3045,7 +3045,7 @@ def assert_closed(sock):
 
 
 def scenario_line_limit(server):
-    """A line is at most 1 KiB; past that the connection closes."""
+    """A command line is at most 4 KiB; an auth line has its own short limit."""
     sock = server.connect()
     try:
         sock.sendall(b"auth " + b"0" * 1100 + b"\n")
@@ -3053,23 +3053,165 @@ def scenario_line_limit(server):
     finally:
         sock.close()
 
-    # Exactly 1 KiB is still a line: an unknown command, not a close.
+    # Exactly 4 KiB is still a line: an unknown command, not a close.
     sock = server.connect()
     try:
         sock.sendall(("auth %s\n" % server.token).encode("ascii") +
-                     b"a" * 1024 + b"\n")
+                     b"a" * 4096 + b"\n")
         assert_unknown(read_reply(sock))
     finally:
         sock.close()
 
-    # One byte past the limit closes the connection after auth too.
+    # One byte past the limit answers too_many_arguments and closes.
     sock = server.connect()
     try:
         sock.sendall(("auth %s\n" % server.token).encode("ascii") +
-                     b"a" * 1025 + b"\n")
-        assert_closed(sock)
+                     b"a" * 4097 + b"\n")
+        assert read_reply(sock) == "too_many_arguments\nexit 1\n", (
+            "a line over 4 KiB must answer too_many_arguments and exit 1")
     finally:
         sock.close()
+
+
+def run_command_bytes(server, command):
+    """One command of raw bytes on its own connection; the reply as lines."""
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\n" % server.token).encode("ascii") +
+                     command + b"\n")
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def scenario_quoted_path_runs(server):
+    """Quotes group a token and are removed; no byte is globbed or expanded."""
+    folder = scratch_dir(server)
+    spaced = os.path.join(folder, "a file.txt")
+    with open(spaced, "wb") as handle:
+        handle.write(b"quoted\n")
+    assert run_command(server, 'cat "%s"' % spaced) == ["quoted", "exit 0"], (
+        "a double-quoted path with a space must be addressable")
+    assert run_command(server, "cat '%s'" % spaced) == ["quoted", "exit 0"], (
+        "a single-quoted path with a space must be addressable")
+
+    quoted = os.path.join(folder, 'a"b.txt')
+    with open(quoted, "wb") as handle:
+        handle.write(b"quote\n")
+    escaped = quoted.replace("\\", "\\\\").replace('"', '\\"')
+    assert run_command(server, 'cat "%s"' % escaped) == ["quote", "exit 0"], (
+        "a double quote inside double quotes must be escaped")
+
+    slashed = os.path.join(folder, "a\\b.txt")
+    with open(slashed, "wb") as handle:
+        handle.write(b"slash\n")
+    escaped = slashed.replace("\\", "\\\\").replace('"', '\\"')
+    assert run_command(server, 'cat "%s"' % escaped) == ["slash", "exit 0"], (
+        "a backslash inside double quotes must be escaped")
+
+    assert run_command(server, "echo *") == ["*", "exit 0"], (
+        "a * is a literal byte, never a glob")
+    assert run_command(server, 'echo "a b" \'c d\'') == [
+        "a b c d", "exit 0"], "each quoted token must stay one token"
+
+
+def scenario_dangling_quote_is_refused(server):
+    """An unbalanced quote answers bad_quoting before anything runs."""
+    for command in ('cat "unterminated', "cat 'unterminated"):
+        assert run_command(server, command) == ["bad_quoting", "exit 1"], (
+            "%r must answer bad_quoting and exit 1" % command)
+    # A backslash is an ordinary byte outside double quotes and in single
+    # quotes: only \" and \\ inside double quotes escape.
+    assert run_command(server, "echo a\\b") == ["a\\b", "exit 0"], (
+        "a backslash outside quotes must be literal")
+    assert run_command(server, "echo 'a\\b'") == ["a\\b", "exit 0"], (
+        "a backslash in single quotes must be literal")
+
+
+def scenario_token_count_is_bounded(server):
+    """64 tokens are a command; a 65th answers too_many_arguments."""
+    args = ["a%d" % i for i in range(63)]
+    assert run_command(server, "echo " + " ".join(args)) == [
+        " ".join(args), "exit 0"], "64 tokens must still be one command"
+    args.append("a63")
+    assert run_command(server, "echo " + " ".join(args)) == [
+        "too_many_arguments", "exit 1"], (
+        "a 65th token must answer too_many_arguments and exit 1")
+
+
+def scenario_non_printable_gated_target_answers_bad_path(server):
+    """A target outside printable ASCII answers bad_path and asks nothing."""
+    base = os.path.join(server.root, "data", "badpath").encode("ascii")
+    for what, bad in (("Unicode", b"\xc3\xa9"),
+                      ("combining mark", b"\xcc\x81"),
+                      ("right-to-left override", b"\xe2\x80\xae"),
+                      ("DEL", b"\x7f")):
+        lines = run_command_bytes(server, b'mkdir "' + base + b"/" + bad + b'"')
+        assert lines == ["bad_path", "exit 1"], (
+            "a %s in a gated target must answer bad_path, got %r"
+            % (what, lines))
+        server.assert_no_line()
+
+
+def scenario_quoted_path_is_escaped_and_signed(server):
+    """A quoted path is %XX-escaped in the action and decoded by the signer."""
+    server.advance(120000)
+    folder = os.path.join(server.root, "data", "quote dir")
+    approval, challenge = gate_request(server, 'mkdir "%s"' % folder)
+    action = challenge_action(challenge)
+    assert "\ntarget=%s\n" % escape_value(folder) in action, (
+        "a space in the signed target must be escaped as %%20, got %r" % action)
+    assert "target=%s\n" % folder in decoded_action(action), (
+        "the owner must read the decoded path")
+    # sign_challenge asserts the signer prints the decoded action.
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, 'mkdir "%s"' % folder) == ["exit 0"], (
+        "a quoted path granted by the owner must run")
+    assert os.path.isdir(folder), "the quoted directory must exist"
+
+
+def scenario_a_slow_command_times_out(server):
+    """A command still running at the 60 s deadline answers timed_out."""
+    server.advance(120000)
+    sock = server.connect(timeout=10.0)
+    try:
+        sock.sendall(("auth %s\nsleep 60\n" % server.token).encode("ascii"))
+        # The watchdog is the one waiter on this connection; wait for it,
+        # then pass the deadline without sleeping.
+        server.settle(1)
+        server.advance(60000)
+        assert reply_lines(read_reply(sock)) == ["timed_out", "exit 1"], (
+            "a command past the connection deadline must answer timed_out")
+    finally:
+        sock.close()
+
+
+def scenario_legacy_commands_name_their_error(server):
+    """Commands that predate Stage 1 answer a named word and its exit."""
+    cases = (
+        ("cd /", "no_working_directory"),
+        ("ls relative", "relative_path"),
+        ("ls /ariel-no-such-path", "no_such_file"),
+        ("cat relative", "relative_path"),
+        ("cat /ariel-no-such-path", "no_such_file"),
+        ("stat /ariel-no-such-path", "no_such_file"),
+        ("file /ariel-no-such-path", "no_such_file"),
+        ("grep . /ariel-no-such-path", "no_such_file"),
+        ("find /ariel-no-such-path", "no_such_file"),
+        ("cmp /ariel-no-such-path /ariel-other", "no_such_file"),
+        ("hexdump /ariel-no-such-path", "no_such_file"),
+        ("df /ariel-no-such-path", "no_such_file"),
+        ("sha256sum /ariel-no-such-path", "no_such_file"),
+        ("sum /ariel-no-such-path", "no_such_file"),
+        ("sfoinfo /ariel-no-such-path", "no_such_file"),
+        ("sleep soon", "bad_duration"),
+        ("procstat not-a-pid", "not_a_pid"),
+        ("sysctl", "missing_operand"),
+    )
+    for command, word in cases:
+        lines = run_command(server, command)
+        assert lines == [word, "exit 1"], (
+            "%r must answer %r and exit 1, got %r" % (command, word, lines))
 
 
 def scenario_wrong_token(server):
@@ -3613,7 +3755,7 @@ def scenario_file_action_names_its_facts(server):
     assert run_command(server, "touch " + target) == ["exit 0"]
 
     _, challenge = gate_request(server, "rm " + target)
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert action.startswith("ariel-action-v1\ncommand=rm\n"), action
     assert "\ntarget=%s\n" % target in action, action
     assert "\nsha256=none\n" in action, action
@@ -3962,7 +4104,7 @@ def scenario_transfer_action_names_its_facts(server):
     source = make_transfer_file(server, "xfacts-src")
     destination = os.path.join(server.root, "data", "xfacts-dst")
     _, challenge = transfer_request(server, transfer_line("cp", source, destination))
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert action.startswith("ariel-action-v1\ncommand=cp\n"), action
     assert "\ntarget=%s\n" % source in action, action
     assert "\ndestination=%s\n" % destination in action, action
@@ -4043,7 +4185,8 @@ def scenario_elf_on_path_needs_the_owner(server):
     server.restart()
     try:
         approval, challenge = gate_request(server, "elf-path-hello")
-        assert "\ntarget=%s\n" % binary in challenge_action(challenge), (
+        assert "\ntarget=%s\n" % binary in decoded_action(
+            challenge_action(challenge)), (
             "the challenge must name the resolved path, not the bare name")
         sign_and_grant(server, approval, challenge)
         assert run_command(server, "elf-path-hello") == [
@@ -4107,7 +4250,7 @@ def scenario_elf_action_names_its_facts(server):
     data = compile_payload(HELLO_SOURCE, "hello")
     path = install_elf(server, "elf-facts", data)
     _, challenge = gate_request(server, path)
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert action.startswith("ariel-action-v1\ncommand=run\n"), action
     assert "\ntarget=%s\n" % path in action, action
     assert "\nsha256=%s\n" % hashlib.sha256(data).hexdigest() in action, action
@@ -4204,7 +4347,7 @@ def scenario_system_command_names_its_facts(server):
 
     approval, challenge = gate_request(
         server, "mount -t nullfs %s %s" % (source, mount_point))
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert action.startswith("ariel-action-v1\ncommand=mount\n"), action
     assert "\ntarget=%s\n" % mount_point in action, action
     assert "\noption.fstype=nullfs\n" in action, action
@@ -4212,7 +4355,7 @@ def scenario_system_command_names_its_facts(server):
     sign_and_grant(server, approval, challenge)
 
     approval, challenge = gate_request(server, "mknod %s b 8 0" % node)
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert action.startswith("ariel-action-v1\ncommand=mknod\n"), action
     assert "\ntarget=%s\n" % node in action, action
     assert "\noption.type=b\n" in action, action
@@ -4441,7 +4584,7 @@ def scenario_elf_arguments_are_signed(server):
     server.assert_no_line()
 
     approval, challenge = gate_request(server, path + " extra")
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert "\noption.argc=1\n" in action and "\noption.arg0=extra\n" in action, (
         "the challenge must carry the arguments, got %r" % action)
     sign_and_grant(server, approval, challenge)
@@ -4451,11 +4594,26 @@ def scenario_elf_arguments_are_signed(server):
 
 
 def scenario_elf_arguments_the_signer_cannot_show_are_refused(server):
-    """A run with an argument the signer cannot show, or with too many, answers unknown and never asks."""
+    """A printable argument is signed as an escaped option; a byte outside printable ASCII answers bad_path; over eight answers unknown."""
+    server.advance(120000)
     path = install_elf(server, "elf-args-refused", compile_payload(HELLO_SOURCE, "hello"))
-    assert run_command(server, path + " /user") == ["unknown_command", "exit 1"], (
-        "an argument with a slash cannot be signed, so the run must be refused")
-    server.assert_no_line()
+    approval, challenge = gate_request(server, path + " /user")
+    action = challenge_action(challenge)
+    assert "\noption.arg0=%2Fuser\n" in action, (
+        "a slash in an argument must be escaped in the signed action, got %r"
+        % action)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, path + " /user") == [
+        HELLO_OUTPUT, "argv[1] = /user", "status 0", "exit 0"], (
+        "a printable argument the owner signed must run")
+    for what, bad in (("Unicode", b"\xc3\xa9"),
+                      ("combining mark", b"\xcc\x81"),
+                      ("right-to-left override", b"\xe2\x80\xae"),
+                      ("DEL", b"\x7f")):
+        assert run_command_bytes(server, path.encode("ascii") + b" " +
+                                 bad) == ["bad_path", "exit 1"], (
+            "a %s in an argument must answer bad_path" % what)
+        server.assert_no_line()
     assert run_command(server, path + " " + " ".join(["a"] * 9)) == [
         "unknown_command", "exit 1"], (
         "more arguments than the signer carries must be refused")
@@ -4733,15 +4891,49 @@ def challenge_action(challenge):
         "ascii")
 
 
-def sign_challenge(server, challenge, key=None):
-    """Sign a challenge line with the offline signer; return the hex."""
-    done = subprocess.run(
+def decoded_action(action):
+    """The action as the owner reads it: the encoder's %XX escapes undone."""
+    return re.sub(r"%([0-9A-F]{2})",
+                  lambda match: chr(int(match.group(1), 16)), action)
+
+
+SAFE_ACTION_BYTES = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+
+
+def escape_value(value):
+    """The encoder's rule: bytes outside letters, digits, '.', '_' and '-'."""
+    return "".join(char if char in SAFE_ACTION_BYTES
+                   else "%%%02X" % ord(char) for char in value)
+
+
+def escape_option_line(line):
+    """One canonical 'key=value' line with its value escaped."""
+    newline = "\n" if line.endswith("\n") else ""
+    key, sep, value = line[:-len(newline) if newline else None].partition("=")
+    return line if not sep else key + "=" + escape_value(value) + newline
+
+
+def action_facts(challenge):
+    """The action's lines as the owner reads them."""
+    return decoded_action(challenge_action(challenge)).split("\n")
+
+
+def run_signer(server, challenge, key=None):
+    """Sign a challenge line with the offline signer."""
+    return subprocess.run(
         [signer_path(server), "sign", key or test_key(), "--yes"],
         input=challenge + "\n", capture_output=True, text=True)
+
+
+def sign_challenge(server, challenge, key=None):
+    """Sign a challenge line with the offline signer; return the hex."""
+    done = run_signer(server, challenge, key)
     assert done.returncode == 0, "the signer failed: %r" % done.stderr
-    # The signer shows exactly the action it signs, never a summary.
-    assert challenge_action(challenge) in done.stderr, (
-        "the signer must print the canonical action as signed, got %r"
+    # The signer decodes the action it signs before showing it, never a
+    # summary and never the raw escapes the owner would have to read.
+    assert decoded_action(challenge_action(challenge)) in done.stderr, (
+        "the signer must print the decoded action as signed, got %r"
         % done.stderr)
     envelope = done.stdout.strip()
     assert re.fullmatch(r"[0-9a-f]{128} \S+ [0-9a-f]{64}", envelope), (
@@ -4889,7 +5081,11 @@ def scenario_signer_refuses_hidden_bytes(server):
     hidden = [("NUL", action + b"\0command=other\n"),
               ("escape", action + b"\x1b[2J"),
               ("carriage return", action.replace(b"\n", b"\r\n", 1)),
-              ("high byte", action + b"\xc3\xa9")]
+              ("high byte", action + b"\xc3\xa9"),
+              ("escaped control", action + b"%1B"),
+              ("escaped newline", action + b"%0A"),
+              ("broken escape", action + b"%2"),
+              ("lowercase escape", action + b"%2f")]
     for what, bad in hidden:
         parts[6] = bad.hex()
         done = subprocess.run(
@@ -6542,7 +6738,7 @@ def builtin_approval(server, line, command, target):
     challenge = CHALLENGE_LINE.match(lines[1])
     assert approval and challenge and challenge.group(1) == approval.group(1), (
         "expected approval_required and a matching challenge, got %r" % lines)
-    action = challenge_action(lines[1]).split("\n")
+    action = action_facts(lines[1])
     assert "command=%s" % command in action and "target=%s" % target in action, (
         "the challenge of %r must name its command and target: %r"
         % (line, action))
@@ -6587,7 +6783,7 @@ def scenario_builtin_arguments_are_bound(server):
     """A grant for one argument does not run a built-in with another."""
     approval, challenge = builtin_approval(
         server, "launch PPSA01234 one", "launch", "PPSA01234")
-    action = challenge_action(challenge).split("\n")
+    action = action_facts(challenge)
     assert "option.arg1=one" in action, (
         "the owner must read the argument itself, not a digest: %r" % action)
     sign_and_grant(server, approval, challenge)
@@ -6604,8 +6800,8 @@ def scenario_builtin_bad_arguments_are_refused_without_asking(server):
     for command, answer in (
             ("hbldr", ["missing_operand", "exit 1"]),
             ("hbldr app", ["relative_path", "exit 1"]),
-            ("notify a=b", ["bad_argument", "exit 1"]),
-            ("launch PPSA01234 a/b", ["bad_argument", "exit 1"]),
+            ("notify a\x7fb", ["bad_path", "exit 1"]),
+            ("launch PPSA01234 a\x7fb", ["bad_path", "exit 1"]),
             ("launch PPSA01234 %s" % ("x" * 65), ["bad_argument", "exit 1"]),
             ("launch PPSA01234 1 2 3 4 5 6", ["bad_argument", "exit 1"])):
         lines = run_command(server, command)
@@ -6620,7 +6816,7 @@ def scenario_builtin_arguments_are_named_in_order(server):
     app = write_scratch(server, "ordered", b"app\n")
     _, challenge = builtin_approval(
         server, "hbldr %s two one" % app, "hbldr", app)
-    action = challenge_action(challenge).split("\n")
+    action = action_facts(challenge)
     assert "option.arg1=two" in action and "option.arg2=one" in action, (
         "the arguments must be named in the order given: %r" % action)
     assert not [field for field in action if field.startswith("option.args=")], (
@@ -6711,7 +6907,7 @@ def gated_request(server, command, expected_action, prompt, wait_ms=120000):
     challenge = CHALLENGE_LINE.match(lines[1])
     assert approval and challenge and challenge.group(1) == approval.group(1), (
         "expected approval_required and a matching challenge, got %r" % lines)
-    action = challenge_action(lines[1]).split("\n")
+    action = action_facts(lines[1])
     for line in expected_action:
         assert line in action, (
             "%s: the challenge must carry %r, got %r" % (command, line, action))
@@ -6975,7 +7171,7 @@ def scenario_tar_extract_needs_the_owner(server):
     dest = make_dest(server, "t-good-out")
     line = "tar -x %s %s" % (archive, dest)
     approval, challenge = gate_request(server, line)
-    action = challenge_action(challenge)
+    action = decoded_action(challenge_action(challenge))
     assert action.startswith("ariel-action-v1\ncommand=tar\n"), action
     assert "\ntarget=%s\n" % archive in action, action
     assert "\ndestination=%s\n" % dest in action, action
@@ -7620,7 +7816,22 @@ SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
      scenario_auth_deadline, CLOCK_REASON),
-    ("a line over 1 KiB closes the connection", scenario_line_limit, None),
+    ("a command line over 4 KiB answers too_many_arguments, and an auth "
+     "line over its own limit closes", scenario_line_limit, None),
+    ("a quoted path with a space runs, and a quote or backslash is escaped",
+     scenario_quoted_path_runs, HOST_ROOT_REASON),
+    ("an unbalanced quote answers bad_quoting before anything runs",
+     scenario_dangling_quote_is_refused, None),
+    ("a command line holds at most 64 tokens",
+     scenario_token_count_is_bounded, None),
+    ("a target outside printable ASCII answers bad_path and asks nothing",
+     scenario_non_printable_gated_target_answers_bad_path, HOST_ROOT_REASON),
+    ("a quoted path is escaped in the signed action and decoded by the "
+     "signer", scenario_quoted_path_is_escaped_and_signed, CLOCK_REASON),
+    ("a command still running at the 60 s deadline answers timed_out",
+     scenario_a_slow_command_times_out, CLOCK_REASON),
+    ("each command that predates Stage 1 answers a named error word and its "
+     "exit", scenario_legacy_commands_name_their_error, None),
     ("wrong token closes with exit 70", scenario_wrong_token, None),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, None),
@@ -7726,8 +7937,8 @@ SCENARIOS = [
      scenario_elf_action_names_its_facts, True),
     ("a run's arguments are part of the signed action, and other arguments "
      "answer approval_stale", scenario_elf_arguments_are_signed, True),
-    ("a run with an argument the signer cannot show, or with too many, answers "
-     "unknown and exit 1 without asking",
+    ("a run with an argument outside printable ASCII answers bad_path, and a "
+     "run with too many arguments answers unknown_command, without asking",
      scenario_elf_arguments_the_signer_cannot_show_are_refused, HOST_ROOT_REASON),
     ("a run of a file over 64 MiB answers too_large and exit 1 without asking",
      scenario_elf_too_large_answers_too_large, HOST_ROOT_REASON),
@@ -8639,7 +8850,7 @@ def scenario_unknown_hash_asks_with_release_facts(_server):
     def run(fx):
         lines = install_request(fx.server, INSTALL_NAME)
         assert_staged(fx.server, lines, INSTALL_NAME, data)
-        action = challenge_action(challenge_of(lines))
+        action = decoded_action(challenge_action(challenge_of(lines)))
         for fact in install_action_facts(data):
             assert fact in action, (
                 "the challenge must carry %r, got %r" % (fact, action))
@@ -8655,7 +8866,8 @@ def scenario_signature_over_a_challenge_missing_a_fact_is_refused(_server):
         staging, approval = assert_staged(fx.server, lines, INSTALL_NAME, data)
         challenge = challenge_of(lines)
         for fact in install_action_facts(data):
-            signature = sign_challenge(fx.server, retarget(challenge, fact, ""))
+            signature = sign_challenge(
+                fx.server, retarget(challenge, escape_option_line(fact), ""))
             assert grant(fx.server, approval, signature) == [
                 "signature_action_mismatch", "exit 85"], (
                 "a signature over an action without %r must be refused" % fact)

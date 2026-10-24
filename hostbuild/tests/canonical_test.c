@@ -63,6 +63,7 @@ main(void) {
   static const approval_option_t repeated[] = {{"run", "1"}, {"run", "0"}};
   static const approval_option_t injected[] = {{"run", "1\ncommand=rm"}};
   static const approval_option_t spaced[] = {{"run", "1 2"}};
+  static const approval_option_t equals[] = {{"run", "1=2"}};
   static const approval_option_t bad_key[] = {{"Run", "1"}};
   static const approval_option_t no_value[] = {{"run", ""}};
   static const approval_option_t unicode[] = {{"run", "caf\xc3\xa9"}};
@@ -108,8 +109,8 @@ main(void) {
   // as the owner wrote it. A path that is not canonical still reads two ways.
   other.target = "/data/ariel/store/objects/helloworld";
   expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
-         "target=/data/ariel/store/objects/helloworld\n"),
-         "an absolute target encodes as written");
+         "target=%2Fdata%2Fariel%2Fstore%2Fobjects%2Fhelloworld\n"),
+         "an absolute target encodes as written, every unsafe byte escaped");
   other.target = "/";
   refused(&other, "a target of only '/' is refused");
   other.target = "/etc/../passwd";
@@ -122,6 +123,36 @@ main(void) {
   refused(&other, "a trailing slash in an absolute target is refused");
   other.target = "//etc/passwd";
   refused(&other, "a doubled leading slash is refused");
+
+  // Printable ASCII the word rule used to refuse is now carried, escaped
+  // as %XX in uppercase so the encoding is injective. '.' is an ordinary
+  // byte inside a segment; only '.' and '..' as a whole segment climb.
+  other.target = "hello world";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=hello%20world\n"),
+         "a space in a target is escaped");
+  other.target = "hello%world";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=hello%25world\n"),
+         "a percent in a target is escaped as %25");
+  other.target = "a[b]";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=a%5Bb%5D\n"),
+         "brackets in a target use uppercase escapes");
+  other.target = "a.b";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=a.b\n"),
+         "a dot inside a segment encodes as written");
+  other.target = "/data/a b/c.d";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=%2Fdata%2Fa%20b%2Fc.d\n"),
+         "a path with a space and a dot encodes as written, escaped");
+  other.target = "a%2e%2e";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=a%252e%252e\n"),
+         "an escape-looking segment is a literal name, not traversal");
+  other.target = "a\x7f";
+  refused(&other, "a DEL byte in a target is refused");
 
   // Unicode has more than one spelling of the same text.
   other.target = "caf\xc3\xa9";
@@ -146,7 +177,13 @@ main(void) {
   other.noptions = 1;
   refused(&other, "a newline in an option value is refused");
   other.options = spaced;
-  refused(&other, "a space in an option value is refused");
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "option.run=1%202\n"),
+         "a space in an option value is escaped");
+  other.options = equals;
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "option.run=1%3D2\n"),
+         "an equals sign in an option value is escaped");
   other.options = bad_key;
   refused(&other, "an option key outside the grammar is refused");
   other.options = no_value;
@@ -166,14 +203,16 @@ main(void) {
     other.options = source;
     other.noptions = 1;
     expect(encode(&other, out, sizeof(out)) > 0 &&
-           strstr(out, "option.from=/data/src\n"),
-           "an absolute mount source encodes as written");
+           strstr(out, "option.from=%2Fdata%2Fsrc\n"),
+           "an absolute mount source encodes as written, escaped");
     source[0].value = "/data/../src";
     refused(&other, "a '..' in a mount source is refused");
     source[0].value = "data/src";
     refused(&other, "a relative mount source is refused");
     source[0].value = "/data/s rc";
-    refused(&other, "a space in a mount source is refused");
+    expect(encode(&other, out, sizeof(out)) > 0 &&
+           strstr(out, "option.from=%2Fdata%2Fs%20rc\n"),
+           "a space in a mount source is escaped");
     source[0].key = "fspath";
     source[0].value = "/data/src";
     refused(&other, "a path in an option other than from is refused");
@@ -226,7 +265,7 @@ main(void) {
          "ariel-action-v1\n"
          "command=cp\n"
          "target=helloworld\n"
-         "destination=/data/ariel/xfer-dst\n"
+         "destination=%2Fdata%2Fariel%2Fxfer-dst\n"
          "sha256=" HASH "\n"
          "option.run=1\n"
          "option.size=12\n"),
@@ -234,7 +273,15 @@ main(void) {
   other.destination = "/data/../etc";
   refused(&other, "a '..' in a destination is refused");
   other.destination = "/data/xfer.dst";
-  refused(&other, "a '.' in a destination is refused");
+  expect(encode(&other, out, sizeof(out)) > 0 &&
+         strstr(out, "destination=%2Fdata%2Fxfer.dst\n"),
+         "a dot inside a segment of a destination encodes as written");
+  other.destination = "/data/./xfer";
+  refused(&other, "a '.' segment in a destination is refused");
+  other.destination = "/data/xfer dir";
+  expect(encode(&other, out, sizeof(out)) > 0 &&
+         strstr(out, "destination=%2Fdata%2Fxfer%20dir\n"),
+         "a space in a destination is escaped");
 
   // A built-in's name may hold an underscore, and must still start with a letter.
   other = action;
