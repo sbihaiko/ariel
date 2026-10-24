@@ -1,0 +1,16 @@
+RED (before any implementation), against the unchanged tree:
+$ cc -std=c11 -I.. tests/canonical_test.c   -> approval.h: no such file (encoder does not exist)
+$ python3 tests/acceptance.py ./ariel-host
+FAIL a valid signature decides the approval and the gated command runs once: AssertionError: expected four reply lines, got ['staged s-27', 'approval_required a-21', 'exit 75']
+FAIL a forged signature answers signature_invalid and runs nothing: (cascade from the unread prompt)
+FAIL a signature for a different command, target or hash is refused: expected four reply lines, got ['approval_busy', 'exit 76']
+FAIL a signature for another console is refused: (same cascade)
+FAIL a signature after the challenge expired is refused: (same cascade)
+FAIL a malformed signature answers signature_malformed and exit 83: (same cascade)
+FAIL the same signature twice is refused the second time: (same cascade)
+FAIL a consumed nonce is refused after Ariel restarts: AssertionError: expected four reply lines, got ['staged s-1', 'approval_required a-1', 'exit 75']
+FAIL the PS5 build rejects the host test key: FileNotFoundError: [Errno 2] No such file or directory: '.../hostbuild/ariel-sign'
+FAIL the PS5 platform no longer reads the controller: AssertionError: platform_ps5.c still uses scePadInit
+FAIL one function builds the canonical action text: only approval.c may spell the canonical action: []
+FAIL the canonical encoder refuses ambiguous inputs: FileNotFoundError: [Errno 2] No such file or directory: '.../hostbuild/canonical_test'
+13 scenario(s) failed
