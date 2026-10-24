@@ -308,6 +308,13 @@ parse_payload(char *line) {
                parsed.name, parsed.source, version, &release, &asset,
                parsed.sha256, parsed.path, &running, parsed.previous);
 
+  // A line from before previous was recorded has eight fields; its payload
+  // had no previous version, and the next save writes the ninth.
+  if(got == 8) {
+    snprintf(parsed.previous, sizeof(parsed.previous), "-");
+    got = 9;
+  }
+
   if(got != 9 || !store_name_valid(parsed.name) || !hash_text(parsed.sha256) ||
      (running != 0 && running != 1) ||
      (strcmp(parsed.previous, "-") && !hash_text(parsed.previous))) {
@@ -628,6 +635,28 @@ state_previous(const char *name, char *previous, size_t size) {
 
   pthread_mutex_unlock(&lock);
   return 0;
+}
+
+
+int
+state_referenced(const char *hash, const char *name) {
+  size_t i;
+  int found = 0;
+
+  pthread_mutex_lock(&lock);
+  for(i=0; i<STATE_PAYLOADS_MAX; i++) {
+    struct state_payload *entry = &payloads[i];
+
+    if(!entry->used || !strcmp(entry->name, name)) {
+      continue;
+    }
+    if(!strcmp(entry->sha256, hash) || !strcmp(entry->previous, hash)) {
+      found = 1;
+    }
+  }
+  pthread_mutex_unlock(&lock);
+
+  return found;
 }
 
 

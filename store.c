@@ -1194,6 +1194,19 @@ object_path(const char *hash, char *out, size_t size) {
 }
 
 
+/** Whether objects holds hash as a regular file. **/
+static int
+object_present(int objects_fd, const char *hash) {
+  struct stat st;
+
+  if(fstatat(objects_fd, hash, &st, AT_SYMLINK_NOFOLLOW)) {
+    return 0;
+  }
+
+  return S_ISREG(st.st_mode) ? 1 : 0;
+}
+
+
 /** One transaction's record, as the journal holds it between phases. **/
 struct journal {
   char phase[16];
@@ -1423,6 +1436,12 @@ transaction_roll_forward_locked(int store_fd, const struct journal *j) {
      (renameat(current_fd, tmp_current, current_fd, j->name) &&
       errno != ENOENT) ||
      fsync(objects_fd) || fsync(current_fd)) {
+    goto out;
+  }
+
+  // The name may point only at an object the store holds.
+  if(!object_present(objects_fd, j->hash)) {
+    audit_append_locked("rollforward_refused", j->name, "-", j->hash);
     goto out;
   }
 
@@ -1684,14 +1703,15 @@ staged_install(struct staged *entry, struct approval *request,
   snprintf(j.hash, sizeof(j.hash), "%s", entry->facts.sha256);
 
   // The build the record names now becomes previous, unless this commit
-  // repeats it; the build previous named before is dropped once replaced.
+  // repeats it; the build previous named before is dropped once replaced,
+  // unless another name still holds it.
   if(strcmp(old, "-") && strcmp(old, j.hash)) {
     snprintf(j.previous, sizeof(j.previous), "%s", old);
   } else {
     snprintf(j.previous, sizeof(j.previous), "%s", previous);
   }
   if(strcmp(previous, "-") && strcmp(previous, j.previous) &&
-     strcmp(previous, j.hash)) {
+     strcmp(previous, j.hash) && !state_referenced(previous, j.name)) {
     snprintf(j.drop, sizeof(j.drop), "%s", previous);
   } else {
     snprintf(j.drop, sizeof(j.drop), "-");
@@ -1703,9 +1723,11 @@ staged_install(struct staged *entry, struct approval *request,
   }
   fault_at("prepared");
 
+  // A failed committed mark may still have reached the disk, so nothing is
+  // rolled back here. The journal names what the next start must finish.
   snprintf(j.phase, sizeof(j.phase), "committed");
   if(journal_write(store_fd, &j)) {
-    goto out_rollback;
+    goto out;
   }
   fault_at("committed");
 

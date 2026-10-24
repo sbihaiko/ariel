@@ -159,6 +159,25 @@ $ $PS5_PAYLOAD_SDK/bin/prospero-deploy -h $PS5_HOST -p 9021 primitives-probe.elf
 | 11.200.005 | CFI-2014 | fsync of a file | 0 | 0 | PASS |
 | 11.200.005 | CFI-2014 | fsync of a directory | 0 | 0 | PASS |
 
+## The journal's primitives
+
+The journal in `store.c` makes every store change in four steps: **prepared**, **committed**, then **done** or **rolled back**. A journal mark is a temporary file, flushed, renamed over `store/journal` and the store directory flushed. The table maps each step to the calls it makes and to what the #18 probe confirmed.
+
+| Step | Calls | Confirmed by the probe |
+| --- | --- | --- |
+| prepared | `openat` with `O_CREAT\|O_EXCL\|O_NOFOLLOW` for `objects/<hash>.tmp`, `current/<name>.tmp` and `store/journal.tmp`; `fsync` of each; `renameat` of the journal over `store/journal`; `fsync` of the store directory | `openat` and `fsync` of a file. `O_EXCL` and `O_NOFOLLOW` were not run. |
+| committed | `renameat` of `objects/<hash>.tmp` and `current/<name>.tmp` over their final names; `fsync` of the objects and current directories; `renameat` of the committed mark | `renameat` over an existing file, `fsync` of a directory |
+| state record | `openat` of `state.tmp` with `O_EXCL`, `fsync`, `renameat` over `state`, `fsync` of the state directory | as above; `O_EXCL` not run |
+| recovery at start | `openat` of `store/journal` with `O_NOFOLLOW`; `fstatat` of `objects/<hash>` with `AT_SYMLINK_NOFOLLOW` | `fstatat` of a file and of a missing name (the libc table above). The journal's `O_NOFOLLOW` and `AT_SYMLINK_NOFOLLOW` were not part of those runs. |
+| done | `unlinkat` of `store/journal` and of the dropped object; `fsync` of the store and objects directories | `unlinkat` of an existing file, and of a missing one (`ENOENT`) |
+| rolled back | `unlinkat` of the temporary objects and current records | as above |
+
+Deviations from the probe:
+
+- The probe opened its files with `O_WRONLY|O_CREAT|O_TRUNC` and its directories with `O_RDONLY|O_DIRECTORY`. The journal also depends on `O_EXCL`, `O_NOFOLLOW` and `AT_SYMLINK_NOFOLLOW`. None of them has been run on a console. A console run of the journal scenarios is what confirms them.
+- The probe checked return values and the file contents it read back. It did not cut power. The host crash scenarios end the process with `abort`, so they test the order of the steps, not what survives a power loss. Durability after a power cut rests on POSIX `fsync` semantics and is not measured here.
+- `openat`, `renameat`, `unlinkat` and `fstatat` go through the carry-checking wrappers in `ps5_at.h`, the form the table above measured. `fsync` is the libkernel symbol, which the probe called directly.
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.

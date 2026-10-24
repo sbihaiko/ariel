@@ -64,6 +64,12 @@ int state_record(const char *name, const char *hash, const char *previous);
 int state_previous(const char *name, char *previous, size_t size);
 
 /**
+ * Whether the record names hash, as the current or the previous build, under
+ * a name other than name. Returns 1 when it does.
+ **/
+int state_referenced(const char *hash, const char *name);
+
+/**
  * Copy the installed payloads into entries, at most max of them, and set
  * count. Returns 0, or -1 before state_open has loaded the record.
  **/

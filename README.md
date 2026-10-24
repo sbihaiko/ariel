@@ -30,7 +30,7 @@ The first milestone is the smallest loop that proves the whole idea: an agent bu
 - **`payload push <name> <size> <sha256>`** uploads a locally built ELF over the same connection, so no FTP server is needed. Ariel stages it and the console shows its hash.
 - **Approval by the owner's key.** A push answers `approval_required <id>`; the owner signs the exact action with a key the agent does not hold. Approving a pushed build also approves running that exact build.
 - **`payload commit <staging-id>`** moves an approved upload into Ariel's store. The bytes are sent once.
-- **`payload list`** reads the state file and answers one `payload <name> ...` line per installed payload, with its source, version identifiers, hash, path and whether it is running. It changes nothing.
+- **`payload list`** reads the state file and answers one `payload <name> ...` line per installed payload, with its source, version identifiers, hash, path, whether it is running and `previous=<sha256|->`, the build the last commit replaced (`-` when there is none). It changes nothing.
 - **`payload run --wait <name>`** runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports the payload's exit status on a `status <n>` line, apart from the protocol's `exit` line.
 - **A host build** of Ariel behind a platform port, with a test clock and a virtual controller that can only deny, for tests. It never ships in the PS5 build.
 

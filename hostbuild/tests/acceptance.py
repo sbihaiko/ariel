@@ -75,7 +75,7 @@ class Server:
         self.token = None
         self._start()
 
-    def _start(self):
+    def _spawn(self):
         self.port = free_port()
         self.proc = subprocess.Popen(
             [self.binary, "--port", str(self.port), "--root", self.root],
@@ -87,6 +87,23 @@ class Server:
         self.lines = queue.Queue()
         self.reader = threading.Thread(target=self._pump, daemon=True)
         self.reader.start()
+
+    def start_until_exit(self, env=None):
+        """Start Ariel with env and return its exit status once it has ended.
+
+        Ariel that cannot recover its store ends before it prints a token, so
+        this waits for the exit instead of reading one.
+        """
+        self.env = env
+        self._spawn()
+        try:
+            return self.proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self.stop()
+            raise AssertionError("Ariel started instead of ending on its own")
+
+    def _start(self):
+        self._spawn()
         try:
             token = self._read_token()
         except Exception:
@@ -1011,13 +1028,26 @@ PLAN_SKIP = re.compile(r"^skip (\S.*) \((needs [^()]+)\)$")
 CLOCK_REASON = "needs the test clock"
 FAULT_REASON = "needs the fault injector"
 FAULT_ENV = "ARIEL_HOST_FAULT"
+HOST_FILE_REASON = "needs the state file on the host"
 
 # The scenarios that crash Ariel at a named commit step, which only a host
 # build with the fault injector can do.
 FAULT_SCENARIOS = {
     "a crash in prepared leaves the old version in payload list after restart",
     "a crash in committed leaves the new version in payload list after restart",
-    "running recovery twice after a crash in renamed gives the same state",
+    "a committed change whose new object is gone is refused at start and "
+    "audited, and the state file is left as it was",
+    "a recovery killed after its renames, then a clean start, leaves the "
+    "listing, state file and audit of one crash",
+}
+
+# The scenarios that rewrite or remove the state file on the host's disk,
+# which the agent port cannot do on a console.
+HOST_FILE_SCENARIOS = {
+    "a store written by Stage 1 is migrated on the first start, and a "
+    "second start changes nothing",
+    "a state file whose payload lines have eight fields starts and lists "
+    "previous=-",
 }
 
 # The scenarios whose behavior is defined by moving the host test clock.
@@ -1096,10 +1126,12 @@ def scenario_console_mode_plan(server):
         assert match, "a skipped scenario must name its reason: %r" % line
         skipped.append(match.group(1))
 
-    expected_skips = CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
+    expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
+                      | HOST_FILE_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
-        "clock, the host test root or the fault injector:\nmissing %r\nunexpected %r"
+        "clock, the host test root, the fault injector or the host's files:"
+        "\nmissing %r\nunexpected %r"
         % (sorted(expected_skips - set(skipped)),
            sorted(set(skipped) - expected_skips)))
     assert run, "console mode must run its scenarios against the console"
@@ -1484,6 +1516,37 @@ def scenario_stage1_store_migrates_once(server):
         "stage1", hash_hex), "a second start must list the same payload"
 
 
+def scenario_state_without_previous_starts(server):
+    """A state file whose payload lines have no previous field still starts.
+
+    Ariel once wrote payload lines with eight fields, the last being running.
+    Such a payload had no previous version, so payload list shows previous=-,
+    and the next save writes the ninth field.
+    """
+    del server  # a start that fails must not take the suite's Ariel with it
+    legacy = Server(SERVER_BINARY)
+    try:
+        data = b"eight field build\n"
+        hash_hex = hashlib.sha256(data).hexdigest()
+        install_payload(legacy, "legacy", data)
+
+        legacy.stop()
+        with open(state_path(legacy), "r") as fh:
+            lines = fh.read().splitlines()
+        eight = [line.rsplit(" ", 1)[0] if line.startswith("payload ") else line
+                 for line in lines]
+        with open(state_path(legacy), "w") as fh:
+            fh.write("\n".join(eight) + "\n")
+        legacy._start()
+
+        assert listed(payload_list(legacy), "legacy") == expected_listing(
+            "legacy", hash_hex), (
+            "a state file of eight fields must list its payloads with "
+            "previous=-, got %r" % payload_list(legacy))
+    finally:
+        legacy.stop()
+
+
 def scenario_commit_installed(server):
     data = b"committed bytes\n"
     staging, _ = approve_push(server, "committed", data)
@@ -1537,9 +1600,33 @@ def scenario_commit_replaces(server):
     )
 
 
+def scenario_shared_build_survives_a_replacement(server):
+    """A build two names share is kept while either of them still names it.
+
+    shared-a and shared-b commit the same ELF. shared-a then moves on twice,
+    and the second move would drop the shared build if nothing checked
+    shared-b's record. shared-b still lists it and still runs it.
+    """
+    shared = compile_payload(HELLO_SOURCE, "shared")
+    shared_hash = hashlib.sha256(shared).hexdigest()
+    install_payload(server, "shared-a", shared)
+    install_payload(server, "shared-b", shared)
+    install_payload(server, "shared-a", b"shared-a second build\n")
+    install_payload(server, "shared-a", b"shared-a third build\n")
+
+    assert listed(payload_list(server), "shared-b") == expected_listing(
+        "shared-b", shared_hash), (
+        "shared-b must still list the build it committed")
+    lines = run_payload(server, "shared-b")
+    assert lines == [
+        "Hello, world from Ariel!", "status 0", "exit 0"], (
+        "shared-b must still run the build it committed, got %r" % lines)
+
+
 FIRST_BUILD = b"journal first build\n"
 SECOND_BUILD = b"journal second build\n"
 JOURNAL_NAME = "journal"
+JOURNAL_FILE = "journal"
 
 COUNT_SOURCE = """
 #include <stdio.h>
@@ -1592,10 +1679,10 @@ def commit_until_crash(server, staging):
     return reply
 
 
-def crash_replacement(server, step):
+def crash_commit(server, step):
     """Install FIRST_BUILD, then crash the commit of SECOND_BUILD at step.
 
-    The restart after the crash is the recovery under test.
+    Ariel is left stopped, with the journal as the crash left it.
     """
     install_payload(server, JOURNAL_NAME, FIRST_BUILD)
     server.env = {FAULT_ENV: step}
@@ -1604,6 +1691,11 @@ def crash_replacement(server, step):
     assert commit_until_crash(server, staging) == [], (
         "a commit that crashes must answer nothing"
     )
+
+
+def crash_replacement(server, step):
+    """crash_commit at step, then the restart whose recovery is under test."""
+    crash_commit(server, step)
     server.env = None
     server.restart()
 
@@ -1620,9 +1712,15 @@ def scenario_crash_in_prepared_leaves_old_version(server):
         assert listed(payload_list(crashed), JOURNAL_NAME) == (
             expected_listing(JOURNAL_NAME, first_hash)), (
             "a crash in prepared must leave the old version listed")
-        objects = os.listdir(os.path.join(store_dir(crashed), "objects"))
-        assert second_hash not in objects, (
+        store = store_dir(crashed)
+        objects = os.listdir(os.path.join(store, "objects"))
+        assert not [name for name in objects if name.startswith(second_hash)], (
             "a rolled back build must leave the store, it holds %r" % objects)
+        for leftover in (os.path.join(store, "current", JOURNAL_NAME + ".tmp"),
+                         os.path.join(store, JOURNAL_FILE + ".tmp"),
+                         os.path.join(store, JOURNAL_FILE)):
+            assert not os.path.exists(leftover), (
+                "a rolled back change must leave %s behind" % leftover)
         assert ("rollback", JOURNAL_NAME, second_hash) in audit_events(crashed), (
             "the rollback must be audited, the log holds %r"
             % audit_events(crashed))
@@ -1654,27 +1752,72 @@ def scenario_crash_in_committed_leaves_new_version(server):
         crashed.stop()
 
 
-def scenario_recovery_twice_gives_the_same_state(server):
-    """Recovery that runs again after it finished changes nothing."""
+def scenario_committed_journal_without_its_object_is_refused(server):
+    """A committed change whose new object is gone is not rolled forward.
+
+    Recovery must not point a name at an object the store does not hold. Ariel
+    refuses to start, leaves the state file as it was and audits the refusal.
+    """
     del server  # each crash needs an Ariel started with the fault injector
     crashed = Server(SERVER_BINARY)
     try:
-        crash_replacement(crashed, "renamed")
-        listing = payload_list(crashed)
-        state = read_state(crashed)
-        events = audit_events(crashed)
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+        crash_commit(crashed, "committed")
+        os.remove(os.path.join(store_dir(crashed), "objects",
+                               second_hash + ".tmp"))
+        before = read_state(crashed)
 
-        crashed.restart()
-
-        assert payload_list(crashed) == listing, (
-            "a second recovery must list the same payloads")
-        assert read_state(crashed) == state, (
-            "a second recovery must write the same state file")
-        assert audit_events(crashed) == events, (
-            "a second recovery must not act again, the log holds %r"
+        assert crashed.start_until_exit() != 0, (
+            "a committed change without its object must stop Ariel")
+        assert read_state(crashed) == before, (
+            "a refused recovery must not change the state file")
+        assert ("rollforward_refused", JOURNAL_NAME, second_hash) in (
+            audit_events(crashed)), (
+            "the refused roll forward must be audited, the log holds %r"
             % audit_events(crashed))
     finally:
         crashed.stop()
+
+
+def scenario_recovery_crash_matches_one_crash(server):
+    """A recovery killed after its renames, then a clean start, gives one crash's state.
+
+    The first recovery is killed at renamed: the objects are renamed, the
+    state record is not written and the journal still says committed. A clean
+    start rolls the change forward again, so its listing, state file and audit
+    log match a store that crashed only once.
+    """
+    del server  # each crash needs an Ariel started with the fault injector
+    once = Server(SERVER_BINARY)
+    twice = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+
+        crash_commit(once, "committed")
+        once.env = None
+        once.restart()
+
+        crash_commit(twice, "committed")
+        assert twice.start_until_exit({FAULT_ENV: "renamed"}) != 0, (
+            "a recovery killed at renamed must end Ariel")
+        twice.env = None
+        twice.restart()
+
+        assert listed(payload_list(twice), JOURNAL_NAME) == expected_listing(
+            JOURNAL_NAME, second_hash, first_hash), (
+            "the recovery must roll the change forward once it is run again")
+        assert payload_list(twice) == payload_list(once), (
+            "a recovery that crashed once must list what a single crash lists")
+        assert read_state(twice) == read_state(once), (
+            "a recovery that crashed once must write the state file a single "
+            "crash writes")
+        assert audit_events(twice) == audit_events(once), (
+            "a recovery that crashed once must audit what a single crash "
+            "audits, the log holds %r" % audit_events(twice))
+    finally:
+        once.stop()
+        twice.stop()
 
 
 def scenario_previous_version_is_kept_then_dropped(server):
@@ -3296,7 +3439,11 @@ SCENARIOS = [
      "rewritten by listing", scenario_state_survives_restart, None),
     ("a store written by Stage 1 is migrated on the first start, and a "
      "second start changes nothing", scenario_stage1_store_migrates_once,
-     False),
+     HOST_FILE_REASON),
+    ("a state file whose payload lines have eight fields starts and lists "
+     "previous=-", scenario_state_without_previous_starts, HOST_FILE_REASON),
+    ("a build two names share is kept while either still names it",
+     scenario_shared_build_survives_a_replacement, None),
     ("a second commit of the same name replaces the first build",
      scenario_commit_replaces, None),
     ("an approval does not survive a restart of Ariel",
@@ -3416,8 +3563,12 @@ SCENARIOS = [
      scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
     ("a crash in committed leaves the new version in payload list after restart",
      scenario_crash_in_committed_leaves_new_version, FAULT_REASON),
-    ("running recovery twice after a crash in renamed gives the same state",
-     scenario_recovery_twice_gives_the_same_state, FAULT_REASON),
+    ("a committed change whose new object is gone is refused at start and "
+     "audited, and the state file is left as it was",
+     scenario_committed_journal_without_its_object_is_refused, FAULT_REASON),
+    ("a recovery killed after its renames, then a clean start, leaves the "
+     "listing, state file and audit of one crash",
+     scenario_recovery_crash_matches_one_crash, FAULT_REASON),
     ("the previous version is kept and listed, and the one before it is dropped",
      scenario_previous_version_is_kept_then_dropped, None),
     ("a payload the record marks running is not started again on restart",
