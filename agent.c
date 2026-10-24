@@ -111,6 +111,12 @@ static const char grant_failed[] =
 static const char approval_stale[] =
   "approval_stale\n"
   "exit 78\n";
+static const char key_refused[] =
+  "key_refused\n"
+  "exit 1\n";
+static const char key_failed[] =
+  "key_failed\n"
+  "exit 1\n";
 static const char unknown_payload[] =
   "unknown_payload\n"
   "exit 1\n";
@@ -1304,6 +1310,47 @@ env_name_valid(const char *name) {
     }
   }
   return 1;
+}
+
+
+/** key rotate <primary>: the current primary signs the key that replaces it. **/
+static void
+key_rotate_command(agent_t *agent, int fd, const char *hex) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  char answer[32];
+  uint32_t generation = 0;
+
+  if(store_key_check(hex)) {
+    audit_reply(fd, "key.rotate", "refused", "keyring", "-", key_refused);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "key.rotate");
+  snprintf(facts.target, sizeof(facts.target), "%s", "keyring");
+  snprintf(facts.arg[0], sizeof(facts.arg[0]), "%s", hex);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  switch(store_key_rotate(&challenge, hex, &generation)) {
+  case STORE_KEY_ROTATED:
+    snprintf(answer, sizeof(answer), "key_rotated %u\nexit 0\n",
+             (unsigned)generation);
+    reply(fd, answer);
+    return;
+  case STORE_KEY_STALE:
+    audit_reply(fd, "key.rotate", "stale", "keyring", challenge.id,
+                approval_stale);
+    return;
+  case STORE_KEY_UNRECORDED:
+    reply(fd, audit_failed);
+    return;
+  default:
+    audit_reply(fd, "key.rotate", "failed", "keyring", challenge.id, key_failed);
+    return;
+  }
 }
 
 
@@ -3402,6 +3449,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc >= 1 && system_name(argv[0])) {
     system_command(agent, fd, argc, argv);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "key") && !strcmp(argv[1], "rotate")) {
+    key_rotate_command(agent, fd, argv[2]);
     return;
   }
 

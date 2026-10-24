@@ -96,8 +96,10 @@ struct staged {
 #define KEYRING_TMP "keyring.tmp"
 #define KEYRING_MAX 512
 
-/** The keyring generation a new approval is bound to. **/
+/** The keyring generation a new approval is bound to, and its active primary. **/
 static uint32_t keyring_generation;
+static unsigned char keyring_primary[APPROVAL_PUBKEY_LEN];
+static int keyring_ready;
 
 /** The audit log: one appended line per action Ariel takes. **/
 #define AUDIT_FILE "audit.log"
@@ -923,6 +925,14 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     options[5].key = "autoload";
     options[5].value = "yes";
     action->noptions = 6;
+  } else if(!strcmp(facts->command, "key.rotate")) {
+    action->command = facts->command;
+    action->target = facts->target;
+    action->destination = NULL;
+    action->sha256 = APPROVAL_NO_HASH;
+    options[0].key = "primary";
+    options[0].value = facts->arg[0];
+    action->noptions = 1;
   } else if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
@@ -1169,6 +1179,8 @@ store_approval_request(const approval_facts_t *facts,
   } else if(!strncmp(facts->command, "autoload.", 9)) {
     snprintf(prompt, promptlen, "%s %s (list sha256 %s) will change autoload",
              facts->command, facts->name, facts->sha256);
+  } else if(!strcmp(facts->command, "key.rotate")) {
+    snprintf(prompt, promptlen, "key rotate will run");
   } else if(rollback) {
     snprintf(prompt, promptlen,
              "payload %s rolls back to %s, replacing %s",
@@ -1321,8 +1333,6 @@ store_gate_check(const approval_facts_t *facts,
 int
 store_approval_grant(const char *id, const unsigned char *signature,
                      const char *console, const char *action_sha256) {
-  unsigned char primary[APPROVAL_PUBKEY_LEN];
-  unsigned char recovery[APPROVAL_PUBKEY_LEN];
   unsigned char message[APPROVAL_MESSAGE_MAX];
   unsigned char digest[SHA256_DIGEST_LEN];
   char digest_hex[SHA256_HEX_LEN + 1];
@@ -1356,6 +1366,9 @@ store_approval_grant(const char *id, const unsigned char *signature,
              sha256_final(&hash, digest), sha256_hex(digest, digest_hex),
              strcmp(action_sha256, digest_hex))) {
     rc = STORE_GRANT_WRONG_ACTION;
+  } else if(request->challenge.generation != keyring_generation) {
+    // Issued under a primary that a rotation has since retired.
+    rc = STORE_GRANT_INVALID;
   } else {
     len = approval_message(request->challenge.console,
                            request->challenge.action,
@@ -1366,10 +1379,11 @@ store_approval_grant(const char *id, const unsigned char *signature,
                            request->challenge.expires_ms,
                            message, sizeof(message));
 
-    // The platform checks the signature against the primary of the anchor
-    // pinned in the build, over the exact bytes of this approval's challenge.
-    if(len < 0 || platform->anchor(platform, primary, recovery) ||
-       platform->verify(platform, primary, message, (size_t)len, signature)) {
+    // The platform checks the signature against the keyring's active primary,
+    // over the exact bytes of this approval's challenge.
+    if(!keyring_ready || len < 0 ||
+       platform->verify(platform, keyring_primary, message, (size_t)len,
+                        signature)) {
       rc = STORE_GRANT_INVALID;
     } else if(nonce_consume(request->challenge.nonce)) {
       // Not recorded on disk: the action must not be allowed to run.
@@ -1767,7 +1781,8 @@ journal_read(int store_fd, struct journal *j) {
     return -1;
   }
 
-  if((strcmp(j->kind, "payload") && strcmp(j->kind, "autoload")) ||
+  if((strcmp(j->kind, "payload") && strcmp(j->kind, "autoload") &&
+      strcmp(j->kind, "keyring")) ||
      (strcmp(j->phase, "prepared") && strcmp(j->phase, "committed")) ||
      !store_name_valid(j->name) || !hash_text(j->hash) ||
      (strcmp(j->previous, "-") && !hash_text(j->previous)) ||
@@ -1927,124 +1942,116 @@ text_read(int dirfd, const char *name, char *buf, size_t size) {
 
 
 /**
- * Write a generation 0 keyring through a temporary file and an atomic rename.
- * The file is on disk when this returns 0.
+ * The keyring text of a generation whose active primary is primary. The
+ * recovery key and the anchor come from the build's pinned pair, so a keyring
+ * file must render back to exactly the text Ariel wrote.
  **/
 static int
-keyring_write(int state_fd, const char *primary, const char *recovery,
-              const char *anchor) {
-  char text[KEYRING_MAX];
-  int fd;
-  int rc;
+keyring_render(char *text, size_t size, uint32_t generation,
+               const unsigned char primary[APPROVAL_PUBKEY_LEN]) {
+  unsigned char anchor_primary[APPROVAL_PUBKEY_LEN];
+  unsigned char recovery[APPROVAL_PUBKEY_LEN];
+  char anchor_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char pinned[4 * APPROVAL_PUBKEY_LEN + 1];
+  char anchor[SHA256_HEX_LEN + 1];
 
-  snprintf(text, sizeof(text),
-           "generation 0\nprimary %s\nrecovery %s\nanchor %s\n",
-           primary, recovery, anchor);
-
-  if((fd=open_entry(state_fd, KEYRING_TMP, O_WRONLY | O_CREAT | O_TRUNC)) < 0) {
+  if(platform->anchor(platform, anchor_primary, recovery)) {
     return -1;
   }
 
-  rc = (write_all(fd, text, strlen(text)) || fsync(fd)) ? -1 : 0;
-  if(close(fd)) {
-    rc = -1;
-  }
+  approval_hex_encode(anchor_primary, APPROVAL_PUBKEY_LEN, anchor_hex);
+  approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, primary_hex);
+  approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, recovery_hex);
+  snprintf(pinned, sizeof(pinned), "%s%s", anchor_hex, recovery_hex);
+  text_hash(pinned, 4 * APPROVAL_PUBKEY_LEN, anchor);
 
-  if(!rc && renameat(state_fd, KEYRING_TMP, state_fd, KEYRING_FILE)) {
-    rc = -1;
-  }
-
-  if(!rc && fsync(state_fd)) {
-    rc = -1;
-  }
-
-  if(rc) {
-    unlinkat(state_fd, KEYRING_TMP, 0);
-  }
-  return rc;
+  snprintf(text, size, "generation %lu\nprimary %s\nrecovery %s\nanchor %s\n",
+           (unsigned long)generation, primary_hex, recovery_hex, anchor);
+  return 0;
 }
 
 
 /**
  * Load the keyring at start, or make it at generation 0 from the build's
- * anchor when none exists. A keyring made from another anchor is refused.
- * A build that pins no anchor keeps no keyring, so every grant is refused.
+ * anchor when none exists. A file that does not render back from its own
+ * generation and primary is refused. A build that pins no anchor keeps no
+ * keyring, so every grant is refused.
  **/
 static int
 keyring_open(int state_fd) {
   unsigned char primary[APPROVAL_PUBKEY_LEN];
   unsigned char recovery[APPROVAL_PUBKEY_LEN];
   char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
-  char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
-  char keys[4 * APPROVAL_PUBKEY_LEN + 1];
-  char anchor[SHA256_HEX_LEN + 1];
   char text[KEYRING_MAX];
-  char want[KEYRING_MAX];
-  unsigned long generation;
+  char expect[KEYRING_MAX];
+  unsigned long generation = 0;
   struct stat st;
 
-  keyring_generation = 0;
+  keyring_ready = 0;
   if(platform->anchor(platform, primary, recovery)) {
+    keyring_generation = 0;
     return 0;
   }
 
-  approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, primary_hex);
-  approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, recovery_hex);
-  snprintf(keys, sizeof(keys), "%s%s", primary_hex, recovery_hex);
-  text_hash(keys, 4 * APPROVAL_PUBKEY_LEN, anchor);
-
   if(fstatat(state_fd, KEYRING_FILE, &st, AT_SYMLINK_NOFOLLOW)) {
-    if(errno != ENOENT) {
+    if(errno != ENOENT ||
+       keyring_render(expect, sizeof(expect), 0, primary) ||
+       tmp_write(state_fd, KEYRING_TMP, expect, strlen(expect)) ||
+       renameat(state_fd, KEYRING_TMP, state_fd, KEYRING_FILE) ||
+       fsync(state_fd)) {
+      unlinkat(state_fd, KEYRING_TMP, 0);
       return -1;
     }
-    return keyring_write(state_fd, primary_hex, recovery_hex, anchor);
-  }
-
-  if(text_read(state_fd, KEYRING_FILE, text, sizeof(text)) < 0 ||
-     sscanf(text, "generation %lu\n", &generation) != 1 ||
-     generation > UINT32_MAX) {
-    return -1;
-  }
-
-  snprintf(want, sizeof(want), "\nanchor %s\n", anchor);
-  if(!strstr(text, want)) {
+  } else if(text_read(state_fd, KEYRING_FILE, text, sizeof(text)) < 0 ||
+            sscanf(text, "generation %lu\nprimary %64s\n", &generation,
+                   primary_hex) != 2 ||
+            generation > UINT32_MAX ||
+            approval_pubkey_parse(primary_hex, primary) ||
+            keyring_render(expect, sizeof(expect), (uint32_t)generation,
+                           primary) ||
+            strcmp(text, expect)) {
     return -1;
   }
 
   keyring_generation = (uint32_t)generation;
+  memcpy(keyring_primary, primary, sizeof(keyring_primary));
+  keyring_ready = 1;
   return 0;
 }
 
 
 /**
- * Write the list's first text, with a journal record, at the moment of the
- * change: prepared, then committed, then the rename that makes the new list
- * the list. A failure before the rename leaves the old list. Returns -1 when
- * the list did not change, 0 when it changed and is audited, and 1 when it
- * changed but its audit line or journal close failed. The caller holds the
- * lock.
+ * Write the file's first text, with a journal record, at the moment of the
+ * change: prepared, then committed, then the rename that makes the new text
+ * the file. The journal kind is the file's name. A failure before the rename
+ * leaves the old text. Returns -1 when the file did not change, 0 when it
+ * changed and is audited, and 1 when it changed but its audit line or journal
+ * close failed. The caller holds the lock.
  **/
 static int
-autoload_transaction_locked(int state_fd, int store_fd, const char *text,
-                            const char *old_hash, const char *new_hash,
-                            const char *kind, const char *name, const char *id) {
+file_transaction_locked(int state_fd, int store_fd, const char *text,
+                        const char *old_hash, const char *new_hash,
+                        const char *file, const char *tmp,
+                        const char *kind, const char *name, const char *id) {
   struct journal j;
   int unrecorded;
 
   memset(&j, 0, sizeof(j));
-  snprintf(j.kind, sizeof(j.kind), "autoload");
+  snprintf(j.kind, sizeof(j.kind), "%s", file);
   snprintf(j.phase, sizeof(j.phase), "prepared");
-  snprintf(j.name, sizeof(j.name), "%s", AUTOLOAD_FILE);
+  snprintf(j.name, sizeof(j.name), "%s", file);
   snprintf(j.hash, sizeof(j.hash), "%s", new_hash);
   snprintf(j.previous, sizeof(j.previous), "%s", old_hash);
   snprintf(j.drop, sizeof(j.drop), "-");
 
-  if(tmp_write(state_fd, AUTOLOAD_TMP, text, strlen(text))) {
+  if(tmp_write(state_fd, tmp, text, strlen(text))) {
     return -1;
   }
 
   if(journal_write(store_fd, &j)) {
-    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    unlinkat(state_fd, tmp, 0);
     return -1;
   }
 
@@ -2052,15 +2059,15 @@ autoload_transaction_locked(int state_fd, int store_fd, const char *text,
 
   snprintf(j.phase, sizeof(j.phase), "committed");
   if(journal_write(store_fd, &j)) {
-    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    unlinkat(state_fd, tmp, 0);
     journal_clear(store_fd);
     return -1;
   }
 
   fault_at("committed");
 
-  if(renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE)) {
-    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+  if(renameat(state_fd, tmp, state_fd, file)) {
+    unlinkat(state_fd, tmp, 0);
     journal_clear(store_fd);
     return -1;
   }
@@ -2080,46 +2087,46 @@ autoload_transaction_locked(int state_fd, int store_fd, const char *text,
 
 
 /**
- * Finish an autoload change the journal names: a prepared one is dropped, a
+ * Finish a file change the journal names: a prepared one is dropped, a
  * committed one is put in place, and each is audited. The caller holds the
  * lock.
  **/
 static int
-autoload_recover_locked(int state_fd, int store_fd, const struct journal *j) {
+file_recover_locked(int state_fd, int store_fd, const struct journal *j,
+                    const char *file, const char *tmp) {
   char text[AUTOLOAD_TEXT_MAX];
   char hex[SHA256_HEX_LEN + 1];
   int len;
 
   if(!strcmp(j->phase, "prepared")) {
-    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    unlinkat(state_fd, tmp, 0);
     if(fsync(state_fd) ||
-       audit_append_locked("rollback", AUTOLOAD_FILE, "-", j->hash)) {
+       audit_append_locked("rollback", file, "-", j->hash)) {
       return -1;
     }
     return journal_clear(store_fd);
   }
 
-  len = text_read(state_fd, AUTOLOAD_TMP, text, sizeof(text));
+  len = text_read(state_fd, tmp, text, sizeof(text));
   if(len >= 0) {
     text_hash(text, (size_t)len, hex);
-    if(strcmp(hex, j->hash) || renameat(state_fd, AUTOLOAD_TMP, state_fd,
-                                        AUTOLOAD_FILE) ||
+    if(strcmp(hex, j->hash) || renameat(state_fd, tmp, state_fd, file) ||
        fsync(state_fd)) {
       return -1;
     }
   } else {
-    len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
+    len = text_read(state_fd, file, text, sizeof(text));
     if(len < 0) {
       return -1;
     }
     text_hash(text, (size_t)len, hex);
     if(strcmp(hex, j->hash)) {
-      audit_append_locked("rollforward_refused", AUTOLOAD_FILE, "-", j->hash);
+      audit_append_locked("rollforward_refused", file, "-", j->hash);
       return -1;
     }
   }
 
-  if(audit_append_locked("rollforward", AUTOLOAD_FILE, "-", j->hash)) {
+  if(audit_append_locked("rollforward", file, "-", j->hash)) {
     return -1;
   }
   return journal_clear(store_fd);
@@ -2145,8 +2152,14 @@ transaction_recover_locked(int state_fd, int store_fd) {
     return -1;
   }
 
-  if(!strcmp(j.kind, "autoload")) {
-    return autoload_recover_locked(state_fd, store_fd, &j);
+  if(!strcmp(j.kind, AUTOLOAD_FILE)) {
+    return file_recover_locked(state_fd, store_fd, &j, AUTOLOAD_FILE,
+                               AUTOLOAD_TMP);
+  }
+
+  if(!strcmp(j.kind, KEYRING_FILE)) {
+    return file_recover_locked(state_fd, store_fd, &j, KEYRING_FILE,
+                               KEYRING_TMP);
   }
 
   if(!strcmp(j.phase, "prepared")) {
@@ -2951,9 +2964,9 @@ autoload_apply_locked(struct approval *request) {
     } else {
       text_hash(next, strlen(next), next_hex);
       kind = add ? "autoload_add" : "autoload_remove";
-      applied = autoload_transaction_locked(state_fd, store_fd, next, hex,
-                                            next_hex, kind,
-                                            request->facts.name, request->id);
+      applied = file_transaction_locked(state_fd, store_fd, next, hex,
+                                        next_hex, AUTOLOAD_FILE, AUTOLOAD_TMP,
+                                        kind, request->facts.name, request->id);
       if(applied >= 0) {
         request->consumed = 1;
         request->released = 1;
@@ -2964,6 +2977,68 @@ autoload_apply_locked(struct approval *request) {
 
   close(store_fd);
   close(state_fd);
+  return outcome;
+}
+
+
+int
+store_key_check(const char *hex) {
+  unsigned char key[APPROVAL_PUBKEY_LEN];
+  unsigned char primary[APPROVAL_PUBKEY_LEN];
+  unsigned char recovery[APPROVAL_PUBKEY_LEN];
+
+  if(approval_pubkey_parse(hex, key) || approval_pin(key) ||
+     platform->anchor(platform, primary, recovery) ||
+     !memcmp(key, recovery, APPROVAL_PUBKEY_LEN)) {
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+store_key_rotate(const approval_challenge_t *challenge, const char *hex,
+                 uint32_t *generation) {
+  unsigned char next[APPROVAL_PUBKEY_LEN];
+  char current[KEYRING_MAX];
+  char text[KEYRING_MAX];
+  char old_hash[SHA256_HEX_LEN + 1];
+  char new_hash[SHA256_HEX_LEN + 1];
+  int state_fd;
+  int store_fd;
+  int applied;
+  int outcome = STORE_KEY_FAILED;
+
+  if(store_key_check(hex) || approval_pubkey_parse(hex, next)) {
+    return STORE_KEY_FAILED;
+  }
+
+  pthread_mutex_lock(&lock);
+  if(!keyring_ready || challenge->generation != keyring_generation) {
+    outcome = STORE_KEY_STALE;
+  } else if(!keyring_render(current, sizeof(current), keyring_generation,
+                            keyring_primary) &&
+            !keyring_render(text, sizeof(text), keyring_generation + 1, next) &&
+            (state_fd=root_open()) >= 0) {
+    if((store_fd=dir_open(state_fd, "store")) >= 0) {
+      text_hash(current, strlen(current), old_hash);
+      text_hash(text, strlen(text), new_hash);
+      applied = file_transaction_locked(state_fd, store_fd, text, old_hash,
+                                        new_hash, KEYRING_FILE, KEYRING_TMP,
+                                        "key_rotate", KEYRING_FILE,
+                                        challenge->id);
+      if(applied >= 0) {
+        keyring_generation++;
+        memcpy(keyring_primary, next, sizeof(keyring_primary));
+        *generation = keyring_generation;
+        outcome = applied ? STORE_KEY_UNRECORDED : STORE_KEY_ROTATED;
+      }
+      close(store_fd);
+    }
+    close(state_fd);
+  }
+
+  pthread_mutex_unlock(&lock);
   return outcome;
 }
 
@@ -3125,9 +3200,9 @@ health_mark_locked(const char *name) {
   edit = autoload_edit(text, 0, name, next, sizeof(next));
   if(edit == AUTOLOAD_OK) {
     text_hash(next, strlen(next), next_hex);
-    applied = autoload_transaction_locked(state_fd, store_fd, next, hex,
-                                          next_hex, "autoload_remove", name,
-                                          "-");
+    applied = file_transaction_locked(state_fd, store_fd, next, hex, next_hex,
+                                      AUTOLOAD_FILE, AUTOLOAD_TMP,
+                                      "autoload_remove", name, "-");
     if(applied < 0) {
       goto out;
     }
@@ -3250,9 +3325,9 @@ autoload_set_aside_locked(int state_fd, int store_fd, const char *id,
   }
 
   text_hash(AUTOLOAD_DEFAULT, strlen(AUTOLOAD_DEFAULT), next_hex);
-  applied = autoload_transaction_locked(state_fd, store_fd, AUTOLOAD_DEFAULT,
-                                        hex, next_hex, "autoload_safe_boot",
-                                        "autoload", id);
+  applied = file_transaction_locked(state_fd, store_fd, AUTOLOAD_DEFAULT, hex,
+                                    next_hex, AUTOLOAD_FILE, AUTOLOAD_TMP,
+                                    "autoload_safe_boot", "autoload", id);
   if(applied < 0) {
     unlinkat(state_fd, AUTOLOAD_SNAPSHOT, 0);
   }

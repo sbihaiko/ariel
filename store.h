@@ -199,6 +199,26 @@ int store_approval_facts(const char *id, approval_facts_t *facts);
 #define STORE_AUTOLOAD_FAILED  6
 #define STORE_AUTOLOAD_UNRECORDED 7
 
+/** What one key rotation ended in. **/
+#define STORE_KEY_ROTATED    0
+#define STORE_KEY_STALE      1
+#define STORE_KEY_FAILED     2
+#define STORE_KEY_UNRECORDED 3
+
+/**
+ * Whether hex is a public key this build accepts as a primary: 64 hex digits,
+ * a key the pinning checks allow, and not the recovery key. Returns 0 or -1.
+ **/
+int store_key_check(const char *hex);
+
+/**
+ * Move the keyring to the next generation with hex as its primary, for the
+ * granted approval challenge. The challenge must be for the current generation,
+ * or the answer is STORE_KEY_STALE. On success generation is the new one.
+ **/
+int store_key_rotate(const approval_challenge_t *challenge, const char *hex,
+                     uint32_t *generation);
+
 /**
  * Copy the autoload list into buf, NUL-terminated: one payload name per line,
  * Ariel first. Returns its length, or -1 when it cannot be read.

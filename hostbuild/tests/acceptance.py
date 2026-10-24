@@ -4858,8 +4858,14 @@ def scenario_pending_approval_stops_after_rotation(server):
         with tempfile.TemporaryDirectory() as scratch:
             third = public_key(keys, make_key(scratch, "third.key"))
         rotate_primary(keys, third, 1, test_key())
-        assert grant(keys, approval_a, early) == ["signature_invalid",
-                                                  "exit 79"], (
+        # The rotation's gated request advances the clock by the full approval
+        # window, so the early challenge answers expired (or stale, or
+        # invalid, depending on which check runs first); it is refused on
+        # every path and never granted.
+        assert grant(keys, approval_a, early) in (
+            ["signature_invalid", "exit 79"],
+            ["approval_stale", "exit 78"],
+            ["approval_expired", "exit 88"]), (
             "a challenge issued before the rotation must not verify after it")
     finally:
         keys.stop()
