@@ -3224,6 +3224,153 @@ def scenario_legacy_commands_name_their_error(server):
             "%r must answer %r and exit 1, got %r" % (command, word, lines))
 
 
+BIG_LISTING = 3000
+CAP_BYTES = 64 * 1024
+
+
+def run_command_raw(server, command):
+    """One command on its own connection; the reply exactly as sent."""
+    sock = server.connect(timeout=10.0)
+    try:
+        sock.sendall(("auth %s\n%s\n" % (server.token, command)).encode("ascii"))
+        return read_reply(sock)
+    finally:
+        sock.close()
+
+
+def cut_answer(raw):
+    """The body, shown count and total of a cut answer that ends with exit 0."""
+    match = re.search(r"truncated (\d+) of (\d+)\nexit 0\n\Z", raw)
+    assert match, "a cut answer must end with truncated and exit 0, got %r" % raw[-80:]
+    assert len(raw.encode("ascii")) <= CAP_BYTES, (
+        "an answer holds at most 64 KiB, the marker included")
+    body = raw[:match.start()].splitlines()
+    return body, int(match.group(1)), int(match.group(2))
+
+
+def make_listing(server, name, count):
+    folder = os.path.join(scratch_dir(server), name)
+    os.makedirs(folder, exist_ok=True)
+    names = sorted("entry-%05d-%s" % (i, "x" * 40) for i in range(count))
+    for entry in names:
+        open(os.path.join(folder, entry), "w").close()
+    return folder, names
+
+
+def scenario_a_large_listing_is_cut(server):
+    """ls and find cut a listing over 64 KiB, say how much they showed, and exit 0."""
+    folder, names = make_listing(server, "listing", BIG_LISTING)
+
+    body, shown, total = cut_answer(run_command_raw(server, "ls " + folder))
+    assert total == BIG_LISTING and 0 < shown < BIG_LISTING, (
+        "ls must cut a listing over 64 KiB, got shown %d of %d" % (shown, total))
+    assert body == names[:shown], "a cut listing shows the first names in order"
+
+    assert run_command(server, "ls --limit 5 " + folder) == (
+        names[:5] + ["truncated 5 of %d" % BIG_LISTING, "exit 0"]), (
+        "ls --limit 5 must show five names and say how many there are")
+
+    body, shown, total = cut_answer(run_command_raw(server, "find " + folder))
+    assert body[0] == folder and total == BIG_LISTING + 1 and len(body) == shown, (
+        "find must cut its tree, root line first, got shown %d of %d" % (shown, total))
+
+    lines = run_command(server, "find --limit 3 " + folder)
+    assert len(lines) == 5 and lines[0] == folder and lines[3:] == [
+        "truncated 3 of %d" % (BIG_LISTING + 1), "exit 0"], (
+        "find --limit 3 must show three lines and say how many there are")
+
+
+def scenario_a_small_listing_keeps_its_shape(server):
+    """A directory under the cap answers its entries and exit 0, with no marker."""
+    folder, names = make_listing(server, "small", 2)
+    assert run_command(server, "ls " + folder) == names + ["exit 0"], (
+        "a listing under the cap must keep its shape")
+
+
+def scenario_a_large_file_is_cut(server):
+    """cat cuts a file over 64 KiB; head, tail and wc read the same file in full."""
+    data = b"".join(b"line %06d %s\n" % (i, b"y" * 20) for i in range(8000))
+    path = write_scratch(server, "large.txt", data)
+    text = data.decode("ascii")
+    lines = text.splitlines()
+
+    raw = run_command_raw(server, "cat " + path)
+    match = re.search(r"truncated (\d+) of (\d+)\nexit 0\n\Z", raw)
+    assert match and int(match.group(2)) == len(data), (
+        "cat must cut a file over 64 KiB and say its size, got %r" % raw[-60:])
+    shown = int(match.group(1))
+    assert 0 < shown < len(data), "cat must show part of the file"
+    content = raw[:match.start()]
+    assert content in (text[:shown], text[:shown] + "\n"), (
+        "a cut cat shows the first bytes of the file, then a line end")
+    assert len(raw.encode("ascii")) <= CAP_BYTES, "an answer holds at most 64 KiB"
+
+    assert run_command(server, "head 3 " + path) == (
+        lines[:3] + ["truncated 3 of 8000", "exit 0"]), (
+        "head 3 must show three lines and say how many there are")
+    assert run_command(server, "head " + path) == (
+        lines[:10] + ["truncated 10 of 8000", "exit 0"]), (
+        "head with no count must show ten lines")
+    assert run_command(server, "tail 2 " + path) == (
+        lines[-2:] + ["truncated 2 of 8000", "exit 0"]), (
+        "tail 2 must show the last two lines and say how many there are")
+    assert run_command(server, "wc " + path) == [
+        "%d %d %d %s" % (data.count(b"\n"), len(data.split()), len(data), path),
+        "exit 0"], "wc must count the whole file"
+
+    small = write_scratch(server, "small.txt", b"one\ntwo\nthree\n")
+    assert run_command(server, "head 10 " + small) == [
+        "one", "two", "three", "exit 0"], "head under the cap keeps its shape"
+    assert run_command(server, "tail 2 " + small) == [
+        "two", "three", "exit 0"], "tail under the cap keeps its shape"
+    assert run_command(server, "wc " + small) == [
+        "3 3 14 " + small, "exit 0"], "wc must count the small file"
+    assert run_command(server, "head x " + small) == [
+        "bad_argument", "exit 1"], "head takes a whole count"
+
+
+def scenario_a_grep_with_many_matches_is_cut(server):
+    """grep cuts a run of matches over 64 KiB and --limit cuts it sooner."""
+    data = b"".join(b"match %05d\n" % i for i in range(10000)) + b"other\n"
+    path = write_scratch(server, "matches.txt", data)
+
+    body, shown, total = cut_answer(run_command_raw(server, "grep match " + path))
+    assert total == 10000 and 0 < shown < 10000, (
+        "grep must cut many matches, got shown %d of %d" % (shown, total))
+    assert body == ["match %05d" % i for i in range(shown)], (
+        "a cut grep shows the first matches in order")
+
+    assert run_command(server, "grep --limit 2 match " + path) == [
+        "match 00000", "match 00001", "truncated 2 of 10000", "exit 0"], (
+        "grep --limit 2 must show two matches and say how many there are")
+    assert run_command(server, "grep 0000[0-2] " + path) == [
+        "match 00000", "match 00001", "match 00002", "exit 0"], (
+        "grep with few matches must keep its shape")
+
+
+def scenario_a_limit_of_zero_shows_nothing(server):
+    """A limit of zero shows no line and still says how many there are."""
+    folder, _names = make_listing(server, "zero", 3)
+    assert run_command(server, "ls --limit 0 " + folder) == [
+        "truncated 0 of 3", "exit 0"], "ls --limit 0 must show no name"
+    assert run_command(server, "find --limit 0 " + folder) == [
+        "truncated 0 of 4", "exit 0"], "find --limit 0 must show no line"
+
+    data = b"0123456789" * 10
+    path = write_scratch(server, "zero.txt", data)
+    assert run_command(server, "cat --limit 0 " + path) == [
+        "truncated 0 of 100", "exit 0"], "cat --limit 0 must show no byte"
+    assert run_command(server, "grep --limit 0 0 " + path) == [
+        "truncated 0 of 1", "exit 0"], "grep --limit 0 must show no match"
+
+    empty = os.path.join(scratch_dir(server), "empty")
+    os.makedirs(empty, exist_ok=True)
+    assert run_command(server, "ls --limit 0 " + empty) == ["exit 0"], (
+        "an empty directory has nothing to cut, so no marker")
+    assert run_command(server, "ls --limit many " + folder) == [
+        "bad_option", "exit 1"], "a limit that is not a whole number is bad_option"
+
+
 def scenario_wrong_token(server):
     wrong = "0" * 32 if server.token != "0" * 32 else "1" * 32
     sock = server.connect()
@@ -8052,6 +8199,16 @@ SCENARIOS = [
      scenario_a_slow_command_times_out, CLOCK_REASON),
     ("each command that predates Stage 1 answers a named error word and its "
      "exit", scenario_legacy_commands_name_their_error, None),
+    ("a listing over 64 KiB is cut by ls and find with truncated and exit 0",
+     scenario_a_large_listing_is_cut, HOST_ROOT_REASON),
+    ("a directory under the cap answers its entries with no marker",
+     scenario_a_small_listing_keeps_its_shape, HOST_ROOT_REASON),
+    ("a file over 64 KiB is cut by cat, and head, tail and wc read it",
+     scenario_a_large_file_is_cut, HOST_ROOT_REASON),
+    ("a grep with many matches is cut, and --limit cuts it sooner",
+     scenario_a_grep_with_many_matches_is_cut, HOST_ROOT_REASON),
+    ("a limit of zero shows no line and says how many there are",
+     scenario_a_limit_of_zero_shows_nothing, HOST_ROOT_REASON),
     ("wrong token closes with exit 70", scenario_wrong_token, None),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, None),
@@ -8610,6 +8767,15 @@ SCENARIOS = [
      "safe_boot_pending, exit 1, and asks nothing",
      scenario_safe_boot_refused_while_pending, HOST_RESTART_REASON),
 ]
+
+BOUNDED_READER_TITLES = {
+    "a listing over 64 KiB is cut by ls and find with truncated and exit 0",
+    "a directory under the cap answers its entries with no marker",
+    "a file over 64 KiB is cut by cat, and head, tail and wc read it",
+    "a grep with many matches is cut, and --limit cuts it sooner",
+    "a limit of zero shows no line and says how many there are",
+}
+HOST_ROOT_SCENARIOS.update(BOUNDED_READER_TITLES)
 
 
 # Payload install from an allowlisted release (SPEC 2, #42). The fake release
