@@ -1092,8 +1092,7 @@ CLOCK_SCENARIOS = {
     "each gated built-in answers 75 and its challenge before anything runs",
     "a granted built-in on the host answers not available once and audits "
     "the grant and the run",
-    "a built-in asked with another argument asks again instead of reusing "
-    "the grant",
+    "a built-in run with another argument answers approval_stale and exit 78",
     "reptyr of a restarted process answers approval_stale and exit 78 and "
     "touches nothing",
     "a file replaced after a built-in grant answers approval_stale and exit 78",
@@ -5139,10 +5138,11 @@ def scenario_builtin_arguments_are_bound(server):
     approval, challenge = builtin_approval(
         server, "launch PPSA01234 one", "launch", "PPSA01234")
     sign_and_grant(server, approval, challenge)
-    other, _ = builtin_approval(
-        server, "launch PPSA01234 two", "launch", "PPSA01234")
-    assert other != approval, (
-        "a changed argument must ask for its own approval, not reuse the grant")
+    lines = run_command(server, "launch PPSA01234 two")
+    assert lines == ["approval_stale", "exit 78"], (
+        "a changed argument must not run on the grant, got %r" % (lines,))
+    assert kill_audit(server, "launch.stale", "PPSA01234"), (
+        "a stale built-in must be audited as launch.stale")
 
 
 @builtin_scenario
@@ -5680,8 +5680,8 @@ SCENARIOS = [
      scenario_builtins_ask_before_they_run, HOST_ROOT_REASON),
     ("a granted built-in on the host answers not available once and audits "
      "the grant and the run", scenario_builtin_grant_runs_once_on_host, True),
-    ("a built-in asked with another argument asks again instead of reusing "
-     "the grant", scenario_builtin_arguments_are_bound, True),
+    ("a built-in run with another argument answers approval_stale and exit 78",
+     scenario_builtin_arguments_are_bound, True),
     ("a built-in with a missing operand, a relative path or a bad value "
      "answers without asking", scenario_builtin_bad_arguments_are_refused_without_asking,
      False),

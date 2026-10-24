@@ -195,7 +195,7 @@ identity(int dirfd, const char *leaf, approval_facts_t *facts) {
  **/
 static int
 inspect(const char *root, const char *path, approval_facts_t *facts,
-        int *dirfd, char *leaf, size_t size) {
+        int *dirfd, char *leaf, size_t size, int writing) {
   const char *rel;
   int rc;
 
@@ -207,7 +207,7 @@ inspect(const char *root, const char *path, approval_facts_t *facts,
   }
 
   rel = below(root, path);
-  if(!rel || !writable(rel)) {
+  if(!rel || (writing && !writable(rel))) {
     return FILEOPS_PROTECTED;
   }
 
@@ -221,6 +221,23 @@ inspect(const char *root, const char *path, approval_facts_t *facts,
     close(*dirfd);
   }
   return rc;
+}
+
+
+int
+fileops_builtin_check(const char *root, const char *path,
+                      approval_facts_t *facts) {
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  rc = inspect(root, path, facts, &dirfd, leaf, sizeof(leaf), 0);
+  if(rc) {
+    return rc;
+  }
+  close(dirfd);
+
+  return strcmp(facts->kind, "file") ? FILEOPS_NOT_FILE : FILEOPS_OK;
 }
 
 
@@ -306,7 +323,7 @@ system_entry(const char *root, const char *path, approval_facts_t *facts,
   struct stat st;
   int rc;
 
-  rc = inspect(root, path, facts, dirfd, leaf, size);
+  rc = inspect(root, path, facts, dirfd, leaf, size, 1);
   if(rc) {
     return rc;
   }
@@ -555,7 +572,7 @@ fileops_check(const char *root, const char *command, const char *path,
     return rc;
   }
 
-  rc = inspect(root, path, facts, &dirfd, leaf, sizeof(leaf));
+  rc = inspect(root, path, facts, &dirfd, leaf, sizeof(leaf), 1);
   if(rc) {
     return rc;
   }
@@ -583,7 +600,7 @@ fileops_act(const char *root, const char *command, const char *path,
     return rc;
   }
 
-  rc = inspect(root, path, &now, &dirfd, leaf, sizeof(leaf));
+  rc = inspect(root, path, &now, &dirfd, leaf, sizeof(leaf), 1);
   if(rc) {
     return rc;
   }
@@ -621,7 +638,7 @@ transfer_inspect(const char *root, const char *path, approval_facts_t *facts,
   struct stat target;
   int rc;
 
-  rc = inspect(root, path, facts, dirfd, leaf, size);
+  rc = inspect(root, path, facts, dirfd, leaf, size, 1);
   if(rc) {
     return rc;
   }
@@ -1105,7 +1122,7 @@ destination_open(const char *root, const char *destination, int *dirfd) {
   int rc;
 
   memset(&facts, 0, sizeof(facts));
-  rc = inspect(root, destination, &facts, &parent, leaf, sizeof(leaf));
+  rc = inspect(root, destination, &facts, &parent, leaf, sizeof(leaf), 1);
   if(rc) {
     return rc;
   }

@@ -25,6 +25,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "builtins.h"
 #include "readers.h"
 
 extern char **environ;
@@ -205,7 +206,7 @@ readers_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
     return run_sysctl(argc, argv, outfd, errfd, status);
   }
 
-  if(argc == 1 && !strcmp(argv[0], "authid")) {
+  if((argc == 1 && !strcmp(argv[0], "authid")) || builtin_gated(argv[0])) {
     say(errfd, "not available on this platform\n");
     *status = 1;
     return 0;

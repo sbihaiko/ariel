@@ -22,11 +22,16 @@ along with this program; see the file COPYING. If not, see
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/user.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <ps5/kernel.h>
 
+#include "builtins.h"
+#include "elfldr.h"
 #include "readers.h"
+
+extern unsigned char sh_elf[];
 
 
 #define PS_HEADER "PID PPID PGID SID UID STATE COMMAND\n"
@@ -272,6 +277,35 @@ run_authid(int outfd, int *status) {
 }
 
 
+/** A gated built-in runs in its own shell, once, as sh.elf --run NAME ARGS. **/
+static int
+run_builtin(int argc, char *const argv[], int outfd, int errfd, int *status) {
+  char **child;
+  pid_t pid;
+  int st = 0;
+  int i;
+
+  child = calloc((size_t)argc + 3, sizeof(*child));
+  if(!child) {
+    return -1;
+  }
+  child[0] = "sh.elf";
+  child[1] = "--run";
+  for(i=0; i<argc; i++) {
+    child[i + 2] = argv[i];
+  }
+
+  pid = elfldr_spawn(-1, outfd, errfd, sh_elf, child);
+  free(child);
+  if(pid < 0 || waitpid(pid, &st, 0) < 0) {
+    return -1;
+  }
+
+  *status = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+  return 0;
+}
+
+
 int
 readers_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
   if(argc < 1) {
@@ -292,6 +326,10 @@ readers_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
 
   if(argc == 1 && !strcmp(argv[0], "authid")) {
     return run_authid(outfd, status);
+  }
+
+  if(builtin_gated(argv[0])) {
+    return run_builtin(argc, argv, outfd, errfd, status);
   }
 
   return -1;

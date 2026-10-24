@@ -61,6 +61,15 @@ int fileops_act(const char *root, const char *command, const char *path,
                 const char *operand, const approval_facts_t *expected);
 
 /**
+ * Check the file a built-in names, reading it and changing nothing. path must
+ * be absolute; it need not be in a writable root. The entry's kind, device
+ * and inode go into facts. Returns FILEOPS_OK when it is a regular file, or
+ * the refusal that stops it.
+ **/
+int fileops_builtin_check(const char *root, const char *path,
+                          approval_facts_t *facts);
+
+/**
  * Check one transfer, cp, mv or ln, from source to destination without acting.
  * Both paths are checked as fileops_check checks one. The source must be a
  * regular file and the destination must not exist. The source's kind, device

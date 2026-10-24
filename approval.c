@@ -96,7 +96,7 @@ in_set(const char *text, size_t min, size_t max, const char *extra,
 
 static int
 command_ok(const char *command) {
-  return in_set(command, 1, APPROVAL_COMMAND_MAX, ".-", 1) &&
+  return in_set(command, 1, APPROVAL_COMMAND_MAX, "._-", 1) &&
          is_lower(command[0]);
 }
 

@@ -867,7 +867,9 @@ value_key(const char *command) {
  * start. A rollback is an action on its name, with the build it replaces. An
  * exec is an action on its program, with the hash of its bytes, its argument
  * count and the hash of its arguments. env and export name one variable, so
- * they have no options. text holds the numbers the options point at.
+ * they have no options.
+ * A reptyr is an action on its pid with its start, and a PS5 built-in also
+ * carries its arguments. text holds the numbers the options point at.
  **/
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
@@ -894,6 +896,11 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     } else if(!strcmp(facts->command, "env") ||
               !strcmp(facts->command, "export")) {
       action->noptions = 0;
+    } else if(!strcmp(facts->command, "reptyr")) {
+      action->sha256 = facts->sha256;
+      options[0].key = "start";
+      options[0].value = facts->start;
+      action->noptions = 1;
     } else if(facts->kind[0]) {
       size_t n = 0;
 
@@ -931,6 +938,11 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     if(facts->value[0]) {
       options[action->noptions].key = value_key(facts->command);
       options[action->noptions].value = facts->value;
+      action->noptions++;
+    }
+    if(facts->args[0] && strcmp(facts->command, "exec")) {
+      options[action->noptions].key = "args";
+      options[action->noptions].value = facts->args;
       action->noptions++;
     }
   } else if(!strcmp(facts->command, "payload.rollback")) {
@@ -1082,6 +1094,7 @@ store_approval_request(const approval_facts_t *facts,
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
   return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
+         a->argc == b->argc && !strcmp(a->args, b->args) &&
          !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start) &&
          !strcmp(a->value, b->value) && !strcmp(a->dest, b->dest) &&
          !strcmp(a->fstype, b->fstype) && !strcmp(a->from, b->from) &&

@@ -544,6 +544,25 @@ sh_telnet_evt(telnet_t *telnet, telnet_event_t *ev, void *ctx) {
 }
 
 
+/** The one-shot a gated built-in runs as: its status is the exit status. **/
+static int
+sh_run_once(int argc, char **argv) {
+  int st = 0;
+  pid_t pid = builtin_cmd_run(argv[0], argc, argv);
+
+  if(pid < 0) {
+    return 1;
+  }
+  if(pid == 0) {
+    return 0;
+  }
+  if(waitpid(pid, &st, 0) < 0) {
+    return 1;
+  }
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
+
 /**
  * Launch sh.elf.
  **/
@@ -554,6 +573,10 @@ int main(int argc, char** argv) {
   int pipefds[2];
   pthread_t trd;
   ssize_t len;
+
+  if(argc > 2 && !strcmp(argv[1], "--run")) {
+    exit(sh_run_once(argc - 2, argv + 2));
+  }
 
   setsid();
 

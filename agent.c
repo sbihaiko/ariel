@@ -29,6 +29,7 @@ along with this program; see the file COPYING. If not, see
 #include "agent.h"
 #include "approval.h"
 #include "autoload.h"
+#include "builtins.h"
 #include "fileops.h"
 #include "runs.h"
 #include "sha256.h"
@@ -158,6 +159,9 @@ static const char value_too_long[] =
 
 /** Serializes the environment: setenv and getenv must not run at once. **/
 static pthread_mutex_t environ_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char bad_argument[] =
+  "bad_argument\n"
+  "exit 1\n";
 
 /** The signals kill accepts, by the name the owner reads. **/
 static const struct {
@@ -1882,6 +1886,25 @@ autoload_show(int fd) {
 }
 
 
+/** The digest of a built-in's arguments, joined by spaces. **/
+static void
+args_digest(int argc, char *argv[], char out[SHA256_HEX_LEN + 1]) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+  int i;
+
+  sha256_init(&hash);
+  for(i=1; i<argc; i++) {
+    if(i > 1) {
+      sha256_update(&hash, " ", 1);
+    }
+    sha256_update(&hash, argv[i], strlen(argv[i]));
+  }
+  sha256_final(&hash, digest);
+  sha256_hex(digest, out);
+}
+
+
 /**
  * autoload edit <add|remove> <name> [<approval-id>]: without an approval the
  * edit is asked (75); with one, it is applied if the owner granted it and the
@@ -1990,6 +2013,139 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
   }
 
   challenge_reply(fd, &challenge);
+}
+
+
+/**
+ * One built-in, asked of the owner before it runs. The arguments are bound
+ * by their digest, so a grant for one set does not run another. Once signed,
+ * the built-in runs with its arguments and its done record comes first.
+ **/
+static void
+builtin_run(agent_t *agent, int fd, int argc, char *argv[],
+            approval_facts_t *facts) {
+  approval_challenge_t challenge;
+
+  args_digest(argc, argv, facts->args);
+  if(!gate_pass(agent, fd, facts, &challenge)) {
+    return;
+  }
+
+  if(audit_line(argv[0], "done", facts->target, challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  if(!run_command(agent, fd, argc, argv)) {
+    reply(fd, spawn_failed);
+  }
+}
+
+
+/** pkg_install, hbldr, hbdbg and sfocreate: a file the built-in reads. **/
+static void
+builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  approval_facts_t facts;
+  int rc;
+
+  if(argc < 2) {
+    audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_builtin_check(agent->platform->fs_root, argv[1], &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, argv[0], argv[1], "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
+  snprintf(facts.target, sizeof(facts.target), "%s", argv[1]);
+  builtin_run(agent, fd, argc, argv, &facts);
+}
+
+
+/** launch and notify take one operand, a word; suspend takes none. **/
+static void
+builtin_word_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  approval_facts_t facts;
+  const char *target = argv[0];
+
+  if(strcmp(argv[0], "suspend")) {
+    if(argc < 2) {
+      audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+      return;
+    }
+    target = argv[1];
+    if(!approval_target_valid(target)) {
+      audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
+      return;
+    }
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
+  snprintf(facts.target, sizeof(facts.target), "%s", target);
+  facts.argc = (uint64_t)argc;
+  builtin_run(agent, fd, argc, argv, &facts);
+}
+
+
+/** reptyr PID: a process the built-in takes over, bound to its start. **/
+static void
+reptyr_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  platform_t *platform = agent->platform;
+  char start[PROCESS_START_MAX + 1];
+  char identity[SHA256_HEX_LEN + 1];
+  char pid_str[16];
+  approval_facts_t facts;
+  uint64_t value;
+  int32_t pid;
+
+  if(argc < 2) {
+    audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+    return;
+  }
+  if(argc > 2 || parse_size(argv[1], &value) || value == 0 ||
+     value > INT32_MAX) {
+    audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
+    return;
+  }
+  pid = (int32_t)value;
+  snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+
+  if(platform->process_start(platform, pid, start, sizeof(start))) {
+    reply(fd, no_such_process);
+    return;
+  }
+  if(kill_identity(pid_str, start, identity)) {
+    reply(fd, unknown);
+    return;
+  }
+  if(platform->process_critical(platform, pid)) {
+    audit_reply(fd, "reptyr", "protected", pid_str, "-", protected_process);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "reptyr");
+  snprintf(facts.target, sizeof(facts.target), "%s", pid_str);
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", identity);
+  snprintf(facts.start, sizeof(facts.start), "%s", start);
+  builtin_run(agent, fd, argc, argv, &facts);
+}
+
+
+static void
+builtin_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  if(!strcmp(argv[0], "reptyr")) {
+    reptyr_command(agent, fd, argc, argv);
+  } else if(!strcmp(argv[0], "pkg_install") || !strcmp(argv[0], "hbldr") ||
+            !strcmp(argv[0], "hbdbg") || !strcmp(argv[0], "sfocreate")) {
+    builtin_file_command(agent, fd, argc, argv);
+  } else {
+    builtin_word_command(agent, fd, argc, argv);
+  }
 }
 
 
@@ -2132,6 +2288,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     } else {
       unzip_command(agent, fd, argv[1], argv[2]);
     }
+    return;
+  }
+
+  if(argc >= 1 && builtin_gated(argv[0])) {
+    builtin_command(agent, fd, argc, argv);
     return;
   }
 
