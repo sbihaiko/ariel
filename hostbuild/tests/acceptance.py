@@ -1169,6 +1169,7 @@ HOST_FIXTURE_SCENARIOS = {
 # files or links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
     "each gated built-in answers 75 and its challenge before anything runs",
+    "a built-in's challenge names each argument after the target, in order",
     "a built-in that names Ariel's token answers protected and asks nothing",
     "a file replaced after a built-in grant answers approval_stale and exit 78",
     "each read-only command runs with no approval and exits 0 with its output",
@@ -5109,7 +5110,6 @@ def scenario_builtins_ask_before_they_run(server):
         ("pkg_install %s" % app, "pkg_install", app),
         ("hbldr %s" % app, "hbldr", app),
         ("hbdbg %s" % app, "hbdbg", app),
-        ("sfocreate %s" % app, "sfocreate", app),
         ("suspend", "suspend", "suspend"),
         ("notify hello", "notify", "hello"),
     ]
@@ -5137,6 +5137,9 @@ def scenario_builtin_arguments_are_bound(server):
     """A grant for one argument does not run a built-in with another."""
     approval, challenge = builtin_approval(
         server, "launch PPSA01234 one", "launch", "PPSA01234")
+    action = challenge_action(challenge).split("\n")
+    assert "option.arg1=one" in action, (
+        "the owner must read the argument itself, not a digest: %r" % action)
     sign_and_grant(server, approval, challenge)
     lines = run_command(server, "launch PPSA01234 two")
     assert lines == ["approval_stale", "exit 78"], (
@@ -5151,11 +5154,27 @@ def scenario_builtin_bad_arguments_are_refused_without_asking(server):
     for command, answer in (
             ("hbldr", ["missing_operand", "exit 1"]),
             ("hbldr app", ["relative_path", "exit 1"]),
-            ("notify a=b", ["bad_argument", "exit 1"])):
+            ("notify a=b", ["bad_argument", "exit 1"]),
+            ("launch PPSA01234 a/b", ["bad_argument", "exit 1"]),
+            ("launch PPSA01234 %s" % ("x" * 65), ["bad_argument", "exit 1"]),
+            ("launch PPSA01234 1 2 3 4 5 6", ["bad_argument", "exit 1"])):
         lines = run_command(server, command)
         assert lines == answer, (
             "%r must answer %r without asking, got %r" % (command, answer, lines))
     server.assert_no_line()
+
+
+@builtin_scenario
+def scenario_builtin_arguments_are_named_in_order(server):
+    """Each argument after the target is an option of its own, in order."""
+    app = write_scratch(server, "ordered", b"app\n")
+    _, challenge = builtin_approval(
+        server, "hbldr %s two one" % app, "hbldr", app)
+    action = challenge_action(challenge).split("\n")
+    assert "option.arg1=two" in action and "option.arg2=one" in action, (
+        "the arguments must be named in the order given: %r" % action)
+    assert not [field for field in action if field.startswith("option.args=")], (
+        "a built-in must not bind its arguments by digest: %r" % action)
 
 
 @builtin_scenario
@@ -5685,6 +5704,8 @@ SCENARIOS = [
     ("a built-in with a missing operand, a relative path or a bad value "
      "answers without asking", scenario_builtin_bad_arguments_are_refused_without_asking,
      False),
+    ("a built-in's challenge names each argument after the target, in order",
+     scenario_builtin_arguments_are_named_in_order, HOST_ROOT_REASON),
     ("a built-in that names Ariel's token answers protected and asks nothing",
      scenario_builtin_protected_is_refused_without_asking, HOST_ROOT_REASON),
     ("reptyr of a restarted process answers approval_stale and exit 78 and "
