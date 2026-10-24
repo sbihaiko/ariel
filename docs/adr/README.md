@@ -14,3 +14,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0005](0005-where-decisions-go.md) | Where decisions go |
 | [0006](0006-the-controller-is-the-approval-source.md) | The owner's signature is the approval source on PS5 |
 | [0007](0007-ps5-at-calls-use-the-compat-header.md) | PS5 *at() calls go through the compat header |
+| [0008](0008-the-telnet-shell-stays-outside-the-gate.md) | The telnet shell stays outside the gate |

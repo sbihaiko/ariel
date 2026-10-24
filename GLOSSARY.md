@@ -1,0 +1,64 @@
+# Glossary
+
+Domain terms of Ariel. Use these words, in this sense, in code, tests, issues and docs.
+
+## Console and ports
+
+- **Console**: the jailbroken PS5 Ariel runs on.
+- **ELF loader**: the payload (elfldr, port 9021) that loads ELF files sent to it. Ariel starts payloads through it.
+- **Payload**: an ELF that runs on the console through the ELF loader. Ariel is one; the builds an agent pushes or installs are others.
+- **Agent port**: TCP 2324. Raw, one command per connection after `auth`, every reply ends with an `exit <n>` line. The approval gate covers it.
+- **Telnet shell**: TCP 2323, the shell inherited from shsrv. No token and no approval; the owner's escape hatch, outside the gate (ADR-0008).
+- **Trusted-network rule**: the console sits on a network the owner trusts, or is reached through an encrypted tunnel. The only protection of the telnet shell.
+
+## People
+
+- **Owner**: the person who holds the signing key and decides what runs on the console.
+- **Agent**: the program (an AI agent or a script) that talks to the agent port. It holds the access token, never the key.
+
+## Access and approval
+
+- **Access token**: 32 hex digits Ariel generates on first start. The first line of every agent connection is `auth <token>`. It lets a client talk; it approves nothing.
+- **Gated command**: a command that does not run until the owner approves it. It answers `approval_required` (75) with a challenge.
+- **Approval**: a single-use, short-lived permission for one exact action, bound to its facts. Pending, granted, expired or consumed.
+- **Facts**: what an approval is bound to (name, size, hash, staging ID, path, release IDs, and so on). Ariel checks them again before it acts and answers `approval_stale` (78) if one changed.
+- **Challenge**: the line `challenge <id> <console> <nonce> <issued-ms> <expires-ms> <action-hex>` the owner signs.
+- **Canonical action**: the one byte encoding of an action, built by one function. The signer shows it and the signature covers it (ADR-0006).
+- **Owner key**: the Ed25519 key pair whose public half is pinned into the build (`ARIEL_PUBKEY`). The approval source on the console.
+- **Signer**: the owner's tool that shows a challenge's action and signs it (`ariel-sign`).
+- **Nonce**: random, single-use value in each challenge. Persisted as consumed before the action runs, so a replay answers `approval_replayed` (84).
+- **Console identity**: the name the console signs under (`ARIEL_CONSOLE_ID`, default `ps5`).
+
+## Store
+
+- **Staging object**: an uploaded build waiting for approval, outside the store. Limited in count, size and TTL.
+- **Store**: Ariel's hash-addressed directory of approved builds.
+- **Version**: one immutable build of a payload, identified by its SHA-256 and, for releases, by release and asset IDs.
+- **State file** (Stage 2): the single record of installed payloads, their versions, sources and health checks.
+- **Journal** (Stage 2): the log that makes each change to the store or autoload atomic: prepared, committed, done or rolled back.
+- **Previous version** (Stage 2): the version a rollback returns to.
+- **Health check** (Stage 2): what makes an activated version healthy: one-shot (exits 0 in time) or service (still running after its grace period, optionally with a port open).
+
+## Sources
+
+- **Download allowlist** (Stage 2): the hosts, repositories and CDN suffix a release may come from.
+- **Pinned hash** (Stage 2): a SHA-256 the allowlist trusts for a payload, set in advance or by an approval.
+
+## Boot
+
+- **Autoload**: the configuration of the loader that starts payloads at boot. Ariel manages it; it is not the boot loader.
+- **Safe-boot**: `autoload safe-boot`, which skips autoload for the next boot only.
+
+## Protection
+
+- **Protected object** (Stage 2): a file or process of Ariel's that no command may touch, approved or not. Answers `protected` (87).
+- **Critical process**: a system process, such as SceShellCore, that `kill` refuses even with an approval.
+- **Audit log** (Stage 2): the console-side record of every gated action, approval, install, run, rollback and recovery.
+
+## Testing
+
+- **Host build**: Ariel built for the computer, with a virtual approval source and a test clock, under `hostbuild/`.
+- **Headless suite**: the acceptance scenarios run against the host build (`make -C hostbuild test`).
+- **Console suite**: the scenarios that need no test clock, run against a real console when `PS5_HOST` is set.
+- **Platform port**: the one interface between Ariel's logic and the OS, with a PS5 and a host implementation.
+- **Test clock**: the host-only clock the suite moves instead of waiting.

@@ -19,11 +19,11 @@ Run this once per release that touches the shell or the agent port, on a console
 1. Connect to the telnet shell with no token: `nc $PS5_HOST 2323`. Expect a prompt and no request for a token.
 2. Run `mkdir /data/ariel-boundary-check`, then `ls /data`. Expect no approval prompt on the console, and the directory in the listing.
 3. Run `rmdir /data/ariel-boundary-check`, then `exit`. Expect the directory gone and no approval prompt.
-4. On the agent port, run `printf 'auth %s\nmkdir /data/ariel-boundary-check\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324`. Expect `unknown_command` and a nonzero `exit` line, and no directory.
+4. On the agent port, run `printf 'auth %s\nmkdir /data/ariel-boundary-check\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324`. Expect no directory. Before Stage 2 the reply is `unknown_command` and `exit 1`. From Stage 2, `mkdir` is a gated command on the agent port: the reply is `approval_required` and `exit 75`; do not sign the challenge.
 5. From a computer that is not on the owner's trusted network, or with the console's network blocked, `nc $PS5_HOST 2323` must not connect. This step shows that the network, not Ariel, is the protection. Skip it if no such computer is at hand, and say so in the release notes.
 
 A pass is steps 1 to 3 succeeding with no approval and step 4 refused. If step 2 asks for an approval, the telnet shell has been gated: update the README safety model and this page, because the boundary has moved.
 
 ## What happens to the telnet copies of commands the agent port gains
 
-Stage 2 moves several destructive commands onto the agent port, gated. Their telnet copies stay as they are: ungated, with no token, as in upstream shsrv. Gating them would make the escape hatch depend on the verifier, so a lost key would also lock the owner out of the console. That recovery path must be designed before any telnet command is gated, and it has no ticket yet.
+Stage 2 moves several destructive commands onto the agent port, gated. Their telnet copies stay as they are: ungated, with no token, as in upstream shsrv ([ADR-0008](adr/0008-the-telnet-shell-stays-outside-the-gate.md)). Gating them would make the escape hatch depend on the verifier, so a lost key would also lock the owner out of the console. That recovery path must be designed before any telnet command is gated: [#15](https://github.com/sbihaiko/ariel/issues/15).
