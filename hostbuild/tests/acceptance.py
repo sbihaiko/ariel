@@ -1138,6 +1138,12 @@ HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console 
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
+    "key rotate accepts only the current primary and refuses the recovery "
+    "key's signature",
+    "key rotate refuses a retired primary's signature",
+    "a signature over another generation's message is refused",
+    "a challenge issued before a rotation stops verifying after it",
+    "a nonce consumed before a rotation stays consumed after a restart",
     "a one-shot past its timeout fails, and with no previous version it is "
     "marked failed",
     "a failed one-shot with no previous version is removed from autoload",
@@ -1263,6 +1269,7 @@ HOST_RESTART_SCENARIOS = {
 # The scenarios that need the host test root: they write scratch files or
 # links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
+    "the keyring is a protected object",
     "http2_get -o answers protected for the token and its hard link, unasked",
     "each gated built-in answers 75 and its challenge before anything runs",
     "a built-in's challenge names each argument after the target, in order",
@@ -4685,6 +4692,224 @@ def scenario_signature_replay_after_restart(server):
         replay.stop()
 
 
+# ---------------------------------------------------------------------------
+# Key hierarchy (ADR-0009): a primary key signs everyday approvals, a recovery
+# key is never on the agent's side, and `key rotate` moves the primary to a
+# new key under a new generation. Each scenario gets its own Ariel, because a
+# rotation changes what every later approval must be signed with.
+# ---------------------------------------------------------------------------
+
+SECOND_PRIMARY_KEY = os.path.join(tests_dir(), "host-second-primary-testkey")
+RECOVERY_KEY = os.path.join(tests_dir(), "host-recovery-testkey")
+ROTATE_PROMPT = "key rotate will run"
+
+
+def public_key(server, key):
+    done = subprocess.run([signer_path(server), "pubkey", key],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+def make_key(scratch, name):
+    path = os.path.join(scratch, name)
+    signer = os.path.join(os.path.dirname(os.path.abspath(SERVER_BINARY)),
+                          "ariel-sign")
+    done = subprocess.run([signer, "keygen", path],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    return path
+
+
+def rotation_action(new_pub):
+    return ["command=key.rotate", "target=keyring", "sha256=none",
+            "option.primary=" + new_pub]
+
+
+def generation_of(challenge):
+    fields = challenge.split(" ")
+    assert len(fields) == 8, (
+        "a challenge must carry the keyring generation as its last field, "
+        "got %r" % challenge)
+    return fields[7]
+
+
+def with_generation(challenge, generation):
+    fields = challenge.split(" ")
+    fields[7] = generation
+    return " ".join(fields)
+
+
+def rotate_primary(server, new_pub, generation, signer):
+    """Request, sign with signer, grant and perform one rotation."""
+    approval, challenge = gated_request(
+        server, "key rotate " + new_pub, rotation_action(new_pub), ROTATE_PROMPT)
+    assert generation_of(challenge) == str(generation - 1), (
+        "the rotation must be signed under generation %d" % (generation - 1))
+    signature = sign_challenge(server, challenge, key=signer)
+    assert grant(server, approval, signature) == [
+        "approval_granted %s" % approval, "exit 0"]
+    assert run_command(server, "key rotate " + new_pub) == [
+        "key_rotated %d" % generation, "exit 0"]
+    return approval
+
+
+def scenario_key_rotate_needs_current_primary(server):
+    del server  # each rotation needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "rotate"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        recovery = public_key(keys, RECOVERY_KEY)
+        approval, challenge = gated_request(
+            keys, "key rotate " + second, rotation_action(second), ROTATE_PROMPT)
+        assert generation_of(challenge) == "0", (
+            "the first approval must be made under generation 0")
+        for what, key in [("the recovery key", RECOVERY_KEY),
+                          ("the key being added", SECOND_PRIMARY_KEY)]:
+            signature = sign_challenge(keys, challenge, key=key)
+            assert grant(keys, approval, signature) == [
+                "signature_invalid", "exit 79"], (
+                "a rotation signed by %s must be refused" % what)
+        assert recovery != second, "the test keys must be distinct"
+        sign_and_grant(keys, approval, challenge)
+        assert run_command(keys, "key rotate " + second) == [
+            "key_rotated 1", "exit 0"], (
+            "the current primary's approval must perform the rotation")
+        assert "key_rotate" in [kind for kind, _name, spent, _sha
+                                in audit_events(keys) if spent == approval], (
+            "the rotation must be recorded in the audit log")
+    finally:
+        keys.stop()
+
+
+def scenario_key_rotate_refuses_bad_targets(server):
+    """A bad or recovery target is refused before the owner is asked."""
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "targets"})
+    try:
+        recovery = public_key(keys, RECOVERY_KEY)
+        for what, target in [("the recovery key", recovery),
+                             ("a key that is not hex", "zz" * 32),
+                             ("a short key", recovery[:-2])]:
+            assert run_command(keys, "key rotate " + target) == [
+                "key_refused", "exit 1"], (
+                "a rotation to %s must be refused before the owner is asked"
+                % what)
+    finally:
+        keys.stop()
+
+
+def scenario_key_rotate_refuses_retired_primary(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "retired"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+        approval, challenge = gated_request(
+            keys, "key rotate " + third, rotation_action(third), ROTATE_PROMPT)
+        assert generation_of(challenge) == "1", (
+            "the rotation must be signed under generation 1")
+        retired = sign_challenge(keys, challenge, key=test_key())
+        assert grant(keys, approval, retired) == [
+            "signature_invalid", "exit 79"], (
+            "the retired primary must not verify a new rotation")
+        signature = sign_challenge(keys, challenge, key=SECOND_PRIMARY_KEY)
+        assert grant(keys, approval, signature) == [
+            "approval_granted %s" % approval, "exit 0"]
+        assert run_command(keys, "key rotate " + third) == [
+            "key_rotated 2", "exit 0"]
+    finally:
+        keys.stop()
+
+
+def scenario_signature_from_another_generation_is_refused(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "generation"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        rotate_primary(keys, second, 1, test_key())
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+        approval, challenge = gated_request(
+            keys, "key rotate " + third, rotation_action(third), ROTATE_PROMPT)
+        cross = sign_challenge(keys, with_generation(challenge, "0"),
+                               key=SECOND_PRIMARY_KEY)
+        assert grant(keys, approval, cross) == ["signature_invalid",
+                                                "exit 79"], (
+            "a signature over a generation 0 message must not verify in "
+            "generation 1")
+        honest = sign_challenge(keys, challenge, key=SECOND_PRIMARY_KEY)
+        assert grant(keys, approval, honest) == [
+            "approval_granted %s" % approval, "exit 0"]
+    finally:
+        keys.stop()
+
+
+def scenario_pending_approval_stops_after_rotation(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "pending"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        approval_a, challenge_a = gated_request(
+            keys, "key rotate " + second, rotation_action(second), ROTATE_PROMPT)
+        early = sign_challenge(keys, challenge_a, key=test_key())
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+        rotate_primary(keys, third, 1, test_key())
+        assert grant(keys, approval_a, early) == ["signature_invalid",
+                                                  "exit 79"], (
+            "a challenge issued before the rotation must not verify after it")
+    finally:
+        keys.stop()
+
+
+def scenario_consumed_nonce_survives_rotation_restart(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "spent"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        approval, challenge = gated_request(
+            keys, "key rotate " + second, rotation_action(second), ROTATE_PROMPT)
+        spent = CHALLENGE_LINE.match(challenge).group(3)
+        sign_and_grant(keys, approval, challenge)
+        assert run_command(keys, "key rotate " + second) == [
+            "key_rotated 1", "exit 0"]
+        keys.restart()
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+        _approval, fresh = gated_request(
+            keys, "key rotate " + third, rotation_action(third), ROTATE_PROMPT)
+        assert CHALLENGE_LINE.match(fresh).group(3) != spent, (
+            "a nonce consumed before the rotation and the restart must not be "
+            "offered again")
+    finally:
+        keys.stop()
+
+
+def scenario_keyring_is_protected(server):
+    path = secret_path(server, "keyring")
+    for template in SECRET_READS:
+        assert_protected(server, template.format(p=path))
+
+
+def scenario_adr_names_the_key_hierarchy(server):
+    del server
+    adr = os.path.join(repo_dir(), "docs", "adr",
+                       "0009-the-key-hierarchy-has-a-primary-and-a-recovery-key.md")
+    assert os.path.exists(adr), "ADR-0009 must exist at %s" % adr
+    with open(adr, encoding="utf-8") as handle:
+        text = handle.read()
+    for term in ["primary", "recovery", "anchor", "keyring", "generation",
+                 "ADR-0006", "## Trust boundary"]:
+        assert term in text, "ADR-0009 must define or cite %r" % term
+    with open(os.path.join(repo_dir(), "docs", "adr", "README.md"),
+              encoding="utf-8") as handle:
+        assert "0009-the-key-hierarchy" in handle.read(), (
+            "the ADR index must list ADR-0009")
+
+
 def compile_probe(scratch, name, defines):
     root = repo_dir()
     probe = os.path.join(scratch, name)
@@ -6844,6 +7069,22 @@ SCENARIOS = [
      scenario_signature_twice, CLOCK_REASON),
     ("a consumed nonce is refused after Ariel restarts",
      scenario_signature_replay_after_restart, CLOCK_REASON),
+    ("ADR-0009 defines the key hierarchy and the index lists it",
+     scenario_adr_names_the_key_hierarchy, False),
+    ("key rotate accepts only the current primary and refuses the recovery "
+     "key's signature", scenario_key_rotate_needs_current_primary, CLOCK_REASON),
+    ("key rotate refuses a recovery-key target and malformed keys before "
+     "asking the owner", scenario_key_rotate_refuses_bad_targets, False),
+    ("key rotate refuses a retired primary's signature",
+     scenario_key_rotate_refuses_retired_primary, CLOCK_REASON),
+    ("a signature over another generation's message is refused",
+     scenario_signature_from_another_generation_is_refused, CLOCK_REASON),
+    ("a challenge issued before a rotation stops verifying after it",
+     scenario_pending_approval_stops_after_rotation, CLOCK_REASON),
+    ("a nonce consumed before a rotation stays consumed after a restart",
+     scenario_consumed_nonce_survives_rotation_restart, CLOCK_REASON),
+    ("the keyring is a protected object", scenario_keyring_is_protected,
+     HOST_ROOT_REASON),
     ("kill with a bad signal, a bad pid or no such process answers an "
      "error and exit 1, and a wrong arity is gated", scenario_kill_bad_arguments, False),
     ("kill of the critical process answers protected and exit 87 and asks "
