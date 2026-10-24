@@ -93,7 +93,8 @@ class Server:
             stderr=subprocess.PIPE,
         )
         self.lines = queue.Queue()
-        self.reader = threading.Thread(target=self._pump, daemon=True)
+        self.reader = threading.Thread(
+            target=self._pump, args=(self.proc, self.lines), daemon=True)
         self.reader.start()
 
     def start_until_exit(self, env=None):
@@ -127,11 +128,11 @@ class Server:
         self.stop()
         self._start()
 
-    def _pump(self):
-        for raw in self.proc.stdout:
+    def _pump(self, proc, lines):
+        for raw in proc.stdout:
             line = raw.decode("ascii", "replace").rstrip("\r\n")
-            self.lines.put(line)
-        self.lines.put(None)
+            lines.put(line)
+        lines.put(None)
 
     def next_line(self, timeout=5.0):
         """Return the next line the server printed, or None on timeout."""
@@ -1247,6 +1248,8 @@ HOST_FIXTURE_SCENARIOS = {
 }
 
 HOST_RESTART_SCENARIOS = {
+    "a restart reads only the new server's output, even when the old one's "
+    "stream closes late",
     "a granted reboot restarts Ariel, keeps payloads listed and runs the "
     "autoload entries",
     "a crash restart runs no autoload entry and restarts nothing that was "
@@ -1715,6 +1718,37 @@ def scenario_state_survives_restart(server):
         "a restart of Ariel must not rewrite the state file")
     assert listed(payload_list(server), "survivor") == expected_listing(
         "survivor", hash_hex), "the payload must survive a restart of Ariel"
+
+
+FAKE_SERVER = """#!/bin/sh
+printf 'token 00112233445566778899aabbccddeeff\\n'
+sleep 1 &
+exec sleep 100
+"""
+
+
+def scenario_restart_ignores_the_old_server_stream(server):
+    """A restart reads only the new server's output, even when the old one's stream closes late.
+
+    The stub's background child keeps the old standard output open for a
+    second after the stub is stopped. That end of stream must not reach the
+    queue the restarted server reads from.
+    """
+    del server  # the stub stands in for Ariel and needs a Server of its own
+    workdir = tempfile.mkdtemp(prefix="ariel-stub-")
+    try:
+        stub_path = os.path.join(workdir, "ariel-stub")
+        with open(stub_path, "w", encoding="ascii") as handle:
+            handle.write(FAKE_SERVER)
+        os.chmod(stub_path, 0o755)
+        stub = Server(stub_path)
+        try:
+            stub.restart()
+            stub.assert_no_line(timeout=2.0)
+        finally:
+            stub.stop()
+    finally:
+        shutil.rmtree(workdir)
 
 
 def scenario_stage1_store_migrates_once(server):
@@ -6719,6 +6753,9 @@ SCENARIOS = [
      scenario_list_after_commit, None),
     ("the state file records a commit, survives a restart and is not "
      "rewritten by listing", scenario_state_survives_restart, None),
+    ("a restart reads only the new server's output, even when the old one's "
+     "stream closes late", scenario_restart_ignores_the_old_server_stream,
+     HOST_RESTART_REASON),
     ("a store written by Stage 1 is migrated on the first start, and a "
      "second start changes nothing", scenario_stage1_store_migrates_once,
      HOST_FILE_REASON),
