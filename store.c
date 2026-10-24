@@ -92,6 +92,12 @@ struct staged {
 
 /** The file in Ariel's directory that holds the consumed nonces. **/
 #define NONCES_FILE "nonces"
+#define KEYRING_FILE "keyring"
+#define KEYRING_TMP "keyring.tmp"
+#define KEYRING_MAX 512
+
+/** The keyring generation a new approval is bound to. **/
+static uint32_t keyring_generation;
 
 /** The audit log: one appended line per action Ariel takes. **/
 #define AUDIT_FILE "audit.log"
@@ -159,6 +165,7 @@ static int audit_append_locked(const char *kind, const char *name,
                                const char *id, const char *sha256);
 static int transaction_recover_locked(int state_fd, int store_fd);
 static int recover_at_start(int state_fd);
+static int keyring_open(int state_fd);
 static int autoload_make(int state_fd);
 
 
@@ -408,6 +415,10 @@ store_init(const char *dir, platform_t *p) {
   // It runs before the default list is made, which must not replace a list a
   // committed change still names.
   if(!rc && recover_at_start(state_fd)) {
+    rc = -1;
+  }
+
+  if(!rc && keyring_open(state_fd)) {
     rc = -1;
   }
 
@@ -1147,7 +1158,7 @@ store_approval_request(const approval_facts_t *facts,
   snprintf(slot->challenge.console, sizeof(slot->challenge.console), "%s",
            console);
   slot->challenge.action_len = (size_t)len;
-  slot->challenge.generation = 0;
+  slot->challenge.generation = keyring_generation;
   slot->challenge.issued_ms = now;
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
 
@@ -1912,6 +1923,96 @@ text_read(int dirfd, const char *name, char *buf, size_t size) {
   close(fd);
   buf[total] = '\0';
   return (int)total;
+}
+
+
+/**
+ * Write a generation 0 keyring through a temporary file and an atomic rename.
+ * The file is on disk when this returns 0.
+ **/
+static int
+keyring_write(int state_fd, const char *primary, const char *recovery,
+              const char *anchor) {
+  char text[KEYRING_MAX];
+  int fd;
+  int rc;
+
+  snprintf(text, sizeof(text),
+           "generation 0\nprimary %s\nrecovery %s\nanchor %s\n",
+           primary, recovery, anchor);
+
+  if((fd=open_entry(state_fd, KEYRING_TMP, O_WRONLY | O_CREAT | O_TRUNC)) < 0) {
+    return -1;
+  }
+
+  rc = (write_all(fd, text, strlen(text)) || fsync(fd)) ? -1 : 0;
+  if(close(fd)) {
+    rc = -1;
+  }
+
+  if(!rc && renameat(state_fd, KEYRING_TMP, state_fd, KEYRING_FILE)) {
+    rc = -1;
+  }
+
+  if(!rc && fsync(state_fd)) {
+    rc = -1;
+  }
+
+  if(rc) {
+    unlinkat(state_fd, KEYRING_TMP, 0);
+  }
+  return rc;
+}
+
+
+/**
+ * Load the keyring at start, or make it at generation 0 from the build's
+ * anchor when none exists. A keyring made from another anchor is refused.
+ * A build that pins no anchor keeps no keyring, so every grant is refused.
+ **/
+static int
+keyring_open(int state_fd) {
+  unsigned char primary[APPROVAL_PUBKEY_LEN];
+  unsigned char recovery[APPROVAL_PUBKEY_LEN];
+  char primary_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char recovery_hex[2 * APPROVAL_PUBKEY_LEN + 1];
+  char keys[4 * APPROVAL_PUBKEY_LEN + 1];
+  char anchor[SHA256_HEX_LEN + 1];
+  char text[KEYRING_MAX];
+  char want[KEYRING_MAX];
+  unsigned long generation;
+  struct stat st;
+
+  keyring_generation = 0;
+  if(platform->anchor(platform, primary, recovery)) {
+    return 0;
+  }
+
+  approval_hex_encode(primary, APPROVAL_PUBKEY_LEN, primary_hex);
+  approval_hex_encode(recovery, APPROVAL_PUBKEY_LEN, recovery_hex);
+  snprintf(keys, sizeof(keys), "%s%s", primary_hex, recovery_hex);
+  text_hash(keys, 4 * APPROVAL_PUBKEY_LEN, anchor);
+
+  if(fstatat(state_fd, KEYRING_FILE, &st, AT_SYMLINK_NOFOLLOW)) {
+    if(errno != ENOENT) {
+      return -1;
+    }
+    return keyring_write(state_fd, primary_hex, recovery_hex, anchor);
+  }
+
+  if(text_read(state_fd, KEYRING_FILE, text, sizeof(text)) < 0 ||
+     sscanf(text, "generation %lu\n", &generation) != 1 ||
+     generation > UINT32_MAX) {
+    return -1;
+  }
+
+  snprintf(want, sizeof(want), "\nanchor %s\n", anchor);
+  if(!strstr(text, want)) {
+    return -1;
+  }
+
+  keyring_generation = (uint32_t)generation;
+  return 0;
 }
 
 
