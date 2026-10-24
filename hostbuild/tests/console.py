@@ -302,6 +302,19 @@ def check_run_refusals(session, context):
         "protected", "exit 87"], "a run of Ariel's token must answer protected"
 
 
+def check_tar_refusals_without_asking(session, context):
+    del context
+    for command, answer in (
+            ("tar -t", ["bad_argument", "exit 1"]),
+            ("tar -t relative.tar", ["relative_path", "exit 1"]),
+            ("tar -t /system/ariel-tar-tar", ["protected", "exit 87"]),
+            ("tar -x /system/ariel-tar-tar /data/ariel-tar-out",
+             ["protected", "exit 87"]),
+            ("tar -t /data/ariel-no-such-tar", ["no_such_file", "exit 1"])):
+        assert session.link.exchange(command) == answer, (
+            "%s must answer %s without asking" % (command, answer[0]))
+
+
 def run_gated_file_command(session, command):
     """Ask for command, show the owner the challenge, grant it; return the approval ID."""
     lines = session.until_not_busy(lambda: session.link.exchange(command))
@@ -816,6 +829,8 @@ CHECKS = [
      "unknown_command", check_unknown_command),
     ("on the console, writes outside /data, /user and /mnt/usb* answer "
      "protected and exit 87 without asking", check_protected_without_asking),
+    ("tar refuses a relative, protected or missing archive on the console "
+     "without asking", check_tar_refusals_without_asking),
     ("mkdir and rmdir run only after the owner signs, once each, on the console",
      check_file_command_runs_after_approval),
     ("a truncated upload answers upload_mismatch and exit 81",

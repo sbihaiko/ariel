@@ -26,6 +26,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -1165,6 +1166,13 @@ CLOCK_SCENARIOS = {
     "an autoload edit refused as busy answers approval_busy and is audited",
     "an autoload edit whose audit line fails after the rename answers "
     "audit_failed and stays applied",
+    "tar -x answers 75 with a challenge naming its facts, extracts after the "
+    "grant, and never overwrites",
+    "an archive replaced after the owner signs answers approval_stale and "
+    "writes nothing",
+    "an archive swapped for a link to Ariel's token after the owner signs "
+    "runs nothing",
+    "tar listings, runs and refusals reach audit tail under their paths",
 }
 
 # The scenarios that act on a process only the host build starts, or on
@@ -1229,6 +1237,12 @@ HOST_ROOT_SCENARIOS = {
     "a run of a file over 64 MiB answers too_large and exit 1 without asking",
     "a run never follows a symbolic link, by path or on the PATH, and answers "
     "symbolic_link",
+    "tar -t lists every member name in archive order at once, and a non-tar "
+    "answers not_a_tar",
+    "a member or link that escapes the destination is refused at once, and "
+    "nothing is written",
+    "tar refuses Ariel's own objects, and a member that names one, through "
+    "any alias, without asking",
 }
 
 
@@ -5050,7 +5064,7 @@ def scenario_audit_tail_drops_long_lines(server):
     fresh = Server(server.binary)
     try:
         with open(audit_log_path(fresh), "ab") as handle:
-            handle.write(b"x" * 300 + b"\n")
+            handle.write(b"x" * 400 + b"\n")
         approve_push(fresh, "longline", b"long line bytes\n")
 
         lines = audit_tail(fresh)
@@ -5659,6 +5673,220 @@ def scenario_env_export_exec_refusals(server):
         "each refusal must reach audit tail, got %r" % sorted(kinds))
 
 
+TAR_GOOD = [
+    ("hello.txt", "file", b"hi\n"),
+    ("sub", "dir", None),
+    ("sub/a.txt", "file", b"a\n"),
+]
+
+# Each archive puts a good member first, so a naive extraction would write it
+# before reaching the member that escapes.
+TAR_ESCAPES = (
+    ("parent", [("ok.txt", "file", b"ok\n"), ("../t-escape.txt", "file", b"x\n")]),
+    ("absolute", [("ok.txt", "file", b"ok\n"), ("/t-escape.txt", "file", b"x\n")]),
+    ("nested", [("ok.txt", "file", b"ok\n"),
+                ("sub/../../t-escape.txt", "file", b"x\n")]),
+    ("link-up", [("ok.txt", "file", b"ok\n"), ("up", "link", "../t-escape")]),
+    ("link-absolute", [("ok.txt", "file", b"ok\n"), ("abs", "link", "/etc")]),
+    ("link-nested", [("ok.txt", "file", b"ok\n"),
+                     ("sub/deep/up", "link", "../../../t-escape")]),
+    ("link-then-write", [("ok.txt", "file", b"ok\n"), ("jump", "link", "..")]),
+    ("hard-up", [("ok.txt", "file", b"ok\n"), ("up", "hard", "../t-escape")]),
+)
+
+# A link that stays under the destination is not extracted in this slice.
+TAR_LINKS_INSIDE = (
+    ("link-inside", [("ok.txt", "file", b"ok\n"), ("alias", "link", "ok.txt")]),
+    ("hard-inside", [("ok.txt", "file", b"ok\n"), ("alias", "hard", "ok.txt")]),
+)
+
+
+def make_tar_archive(server, name, members):
+    """A ustar archive in the host test root's data directory.
+
+    Each member is (name, kind, payload): kind is file, dir, link or hard;
+    a link's payload is its target, and a file's payload is its bytes.
+    """
+    path = os.path.join(server.root, "data", name)
+    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as tar:
+        for member_name, kind, payload in members:
+            info = tarfile.TarInfo(member_name)
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            elif kind in ("link", "hard"):
+                info.type = tarfile.SYMTYPE if kind == "link" else tarfile.LNKTYPE
+                info.linkname = payload
+                tar.addfile(info)
+            else:
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+    return path
+
+
+def make_dest(server, name):
+    path = os.path.join(server.root, "data", name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def scenario_tar_refusals_need_no_approval(server):
+    """tar with a bad shape, a relative or protected path, or a missing archive answers at once and asks nothing."""
+    for line, answer in (
+            ("tar", ["bad_argument", "exit 1"]),
+            ("tar -t", ["bad_argument", "exit 1"]),
+            ("tar -x /data/t-a-tar", ["bad_argument", "exit 1"]),
+            ("tar -t relative.tar", ["relative_path", "exit 1"]),
+            ("tar -x /data/t-a-tar relative", ["relative_path", "exit 1"]),
+            ("tar -t /system/t-a-tar", ["protected", "exit 87"]),
+            ("tar -x /system/t-a-tar /data/t-out", ["protected", "exit 87"]),
+            ("tar -x /data/t-a-tar /system/t-out", ["protected", "exit 87"]),
+            ("tar -t " + os.path.join(server.root, "data", "t-no-such-tar"),
+             ["no_such_file", "exit 1"])):
+        assert run_command(server, line) == answer, (
+            "%s must answer %s" % (line, answer[0]))
+
+
+def scenario_tar_lists_members_at_once(server):
+    """tar -t lists every member name in archive order at once, and a non-tar answers not_a_tar."""
+    archive = make_tar_archive(server, "t-list-tar", TAR_GOOD)
+    assert run_command(server, "tar -t " + archive) == [
+        "hello.txt", "sub", "sub/a.txt", "exit 0"], (
+        "tar -t must list the members at once and exit 0")
+    notes = os.path.join(server.root, "data", "t-notes-tar")
+    with open(notes, "wb") as handle:
+        handle.write(b"not a tar archive\n" * 8)
+    assert run_command(server, "tar -t " + notes) == ["not_a_tar", "exit 1"], (
+        "a file that is not a tar archive must answer not_a_tar")
+
+
+def scenario_tar_extract_needs_the_owner(server):
+    """tar -x answers 75 with a challenge naming its facts, extracts after the grant, and never overwrites."""
+    archive = make_tar_archive(server, "t-good-tar", TAR_GOOD)
+    dest = make_dest(server, "t-good-out")
+    line = "tar -x %s %s" % (archive, dest)
+    approval, challenge = gate_request(server, line)
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\ncommand=tar\n"), action
+    assert "\ntarget=%s\n" % archive in action, action
+    assert "\ndestination=%s\n" % dest in action, action
+    digest = hashlib.sha256(read_bytes(archive)).hexdigest()
+    assert "\nsha256=%s\n" % digest in action, action
+
+    assert os.listdir(dest) == [], "an unsigned tar must not extract"
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], "a signed tar must extract"
+    assert read_bytes(os.path.join(dest, "hello.txt")) == b"hi\n"
+    assert read_bytes(os.path.join(dest, "sub", "a.txt")) == b"a\n"
+    assert run_command(server, line) == ["exists", "exit 1"], (
+        "extracting over existing members must answer exists without asking")
+
+
+def scenario_tar_refuses_escaping_members(server):
+    """A member or link that escapes the destination is refused at once, and nothing is written."""
+    for index, (label, members) in enumerate(TAR_ESCAPES + TAR_LINKS_INSIDE):
+        archive = make_tar_archive(server, "t-e%d-tar" % index, members)
+        dest = make_dest(server, "t-e%d-out" % index)
+        word = "escaping_member" if (label, members) in TAR_ESCAPES else "bad_member"
+        lines = run_command(server, "tar -x %s %s" % (archive, dest))
+        assert lines == [word, "exit 1"], (
+            "%s must answer %s, got %r" % (label, word, lines))
+        assert os.listdir(dest) == [], (
+            "a refused tar (%s) must write nothing" % label)
+    for escaped in (os.path.join(server.root, "data", "t-escape.txt"),
+                    os.path.join(server.root, "t-escape.txt")):
+        assert not os.path.lexists(escaped), (
+            "a member that escapes must never be written, found %s" % escaped)
+
+
+def scenario_tar_archive_changed_after_grant_answers_78(server):
+    """An archive replaced after the owner signs answers approval_stale and writes nothing."""
+    archive = make_tar_archive(server, "t-swap-tar", TAR_GOOD)
+    dest = make_dest(server, "t-swap-out")
+    line = "tar -x %s %s" % (archive, dest)
+    approval, challenge = gate_request(server, line)
+    sign_and_grant(server, approval, challenge)
+
+    make_tar_archive(server, "t-swap-tar", TAR_ESCAPES[0][1])
+    assert run_command(server, line) == ["approval_stale", "exit 78"], (
+        "an archive changed after approval must answer approval_stale")
+    assert os.listdir(dest) == [], "a changed archive must write nothing"
+
+
+def scenario_tar_protected_objects_answer_87(server):
+    """tar refuses Ariel's own objects, and a member that names one, through any alias, without asking."""
+    token = secret_path(server, "token")
+    state = os.path.dirname(token)
+    good = make_tar_archive(server, "t-prot-tar", TAR_GOOD)
+    dest = make_dest(server, "t-prot-out")
+    hard = os.path.join(server.root, "data", "t-prot-hard-tar")
+    soft = os.path.join(server.root, "data", "t-prot-soft-tar")
+    make_link(hard, token, hard=True)
+    make_link(soft, token, hard=False)
+
+    for archive in (token, hard, soft):
+        assert_protected(server, "tar -t " + archive)
+        assert_protected(server, "tar -x %s %s" % (archive, dest))
+    assert_protected(server, "tar -x %s %s" % (good, state))
+    assert os.listdir(dest) == [], "a protected tar must write nothing"
+
+    before = read_bytes(token)
+    clash = make_tar_archive(server, "t-clash-tar", [("clash", "file", b"x\n")])
+    make_link(os.path.join(dest, "clash"), token, hard=True)
+    assert_protected(server, "tar -x %s %s" % (clash, dest))
+    assert read_bytes(token) == before, "a protected token must not change"
+
+
+def scenario_tar_protected_after_grant_answers_87(server):
+    """An archive swapped for a link to Ariel's token after the owner signs runs nothing."""
+    token = secret_path(server, "token")
+    archive = make_tar_archive(server, "t-alias-tar", TAR_GOOD)
+    dest = make_dest(server, "t-alias-out")
+    line = "tar -x %s %s" % (archive, dest)
+    approval, challenge = gate_request(server, line)
+    sign_and_grant(server, approval, challenge)
+
+    os.unlink(archive)
+    os.link(token, archive)
+    assert run_command(server, line) == ["protected", "exit 87"], (
+        "an approved tar of an archive that became the token must answer protected")
+    assert os.listdir(dest) == [], "a protected archive must write nothing"
+
+
+def scenario_tar_actions_are_audited(server):
+    """tar listings, runs and refusals reach audit tail under their paths."""
+    archive = make_tar_archive(server, "t-audit-tar", TAR_GOOD)
+    dest = make_dest(server, "t-audit-out")
+    line = "tar -x %s %s" % (archive, dest)
+    approval, challenge = gate_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"]
+    assert run_command(server, "tar -t " + archive)[-1] == "exit 0"
+
+    bad = make_tar_archive(server, "t-bad-tar", TAR_ESCAPES[0][1])
+    bad_dest = make_dest(server, "t-bad-out")
+    assert run_command(server, "tar -x %s %s" % (bad, bad_dest)) == [
+        "escaping_member", "exit 1"]
+    token = secret_path(server, "token")
+    assert_protected(server, "tar -t " + token)
+
+    events = set()
+    for line_text in run_exit_zero(server, "audit tail 64"):
+        fields = line_text.split()
+        if len(fields) == 5:
+            events.add((fields[1], fields[2]))
+    expected = (
+        ("tar.request", "%s>%s" % (archive, dest)),
+        ("tar.done", "%s>%s" % (archive, dest)),
+        ("tar.list", archive),
+        ("tar.refused", "%s>%s" % (bad, bad_dest)),
+        ("tar.protected", token),
+    )
+    for event in expected:
+        assert event in events, (
+            "audit tail must show %r, got %r" % (event, sorted(events)))
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -6070,6 +6298,27 @@ SCENARIOS = [
     ("an autoload edit whose audit line fails after the rename answers "
      "audit_failed and stays applied",
      scenario_autoload_audit_failure_after_rename_stays_applied, CLOCK_REASON),
+    ("tar with a bad shape, a relative or protected path, or a missing archive "
+     "answers at once and asks nothing", scenario_tar_refusals_need_no_approval,
+     None),
+    ("tar -t lists every member name in archive order at once, and a non-tar "
+     "answers not_a_tar", scenario_tar_lists_members_at_once, HOST_ROOT_REASON),
+    ("tar -x answers 75 with a challenge naming its facts, extracts after the "
+     "grant, and never overwrites", scenario_tar_extract_needs_the_owner,
+     CLOCK_REASON),
+    ("a member or link that escapes the destination is refused at once, and "
+     "nothing is written", scenario_tar_refuses_escaping_members,
+     HOST_ROOT_REASON),
+    ("an archive replaced after the owner signs answers approval_stale and "
+     "writes nothing", scenario_tar_archive_changed_after_grant_answers_78,
+     CLOCK_REASON),
+    ("tar refuses Ariel's own objects, and a member that names one, through "
+     "any alias, without asking", scenario_tar_protected_objects_answer_87,
+     HOST_ROOT_REASON),
+    ("an archive swapped for a link to Ariel's token after the owner signs "
+     "runs nothing", scenario_tar_protected_after_grant_answers_87, CLOCK_REASON),
+    ("tar listings, runs and refusals reach audit tail under their paths",
+     scenario_tar_actions_are_audited, CLOCK_REASON),
 ]
 
 

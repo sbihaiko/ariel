@@ -680,6 +680,64 @@ transfer_source(const char *kind) {
 }
 
 
+/**
+ * Open the entry at path for reading: a regular file, or a directory when dir
+ * is set. A symbolic link answers protected when the object it leads to is one.
+ **/
+static int
+entry_open(const char *root, const char *path, int dir, int *fd) {
+  approval_facts_t facts;
+  char leaf[PATH_MAX];
+  struct stat st;
+  int dirfd;
+  int rc;
+
+  memset(&facts, 0, sizeof(facts));
+  // tar reads and extracts only below a writable root, as before reads were split.
+  rc = inspect(root, path, &facts, &dirfd, leaf, sizeof(leaf), 1);
+  if(rc) {
+    return rc;
+  }
+
+  if(!strcmp(facts.kind, "link") && !fstatat(dirfd, leaf, &st, 0) &&
+     protected_stat(&st)) {
+    close(dirfd);
+    return FILEOPS_PROTECTED;
+  }
+
+  if(!dir) {
+    rc = transfer_source(facts.kind);
+  } else if(!strcmp(facts.kind, "absent")) {
+    rc = FILEOPS_NO_FILE;
+  } else if(!strcmp(facts.kind, "link")) {
+    rc = FILEOPS_LINK;
+  } else {
+    rc = strcmp(facts.kind, "dir") ? FILEOPS_NOT_DIR : FILEOPS_OK;
+  }
+  if(rc) {
+    close(dirfd);
+    return rc;
+  }
+
+  *fd = openat(dirfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC |
+                            (dir ? O_DIRECTORY : 0));
+  close(dirfd);
+  return *fd < 0 ? FILEOPS_FAILED : FILEOPS_OK;
+}
+
+
+int
+fileops_read_open(const char *root, const char *path, int *fd) {
+  return entry_open(root, path, 0, fd);
+}
+
+
+int
+fileops_dir_open(const char *root, const char *path, int *fd) {
+  return entry_open(root, path, 1, fd);
+}
+
+
 static int
 write_full(int fd, const char *buf, size_t n) {
   while(n) {
@@ -1553,6 +1611,12 @@ fileops_word(int rc) {
     return "bad_archive";
   case FILEOPS_NOT_EXEC:
     return "not_executable";
+  case FILEOPS_NOT_TAR:
+    return "not_a_tar";
+  case FILEOPS_ESCAPE:
+    return "escaping_member";
+  case FILEOPS_BAD_MEMBER:
+    return "bad_member";
   default:
     return "ok";
   }

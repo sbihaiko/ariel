@@ -42,6 +42,9 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_BAD_ARCHIVE   18
 #define FILEOPS_NOT_EXEC  19
 #define FILEOPS_NOT_RUNNABLE 20
+#define FILEOPS_NOT_TAR   21
+#define FILEOPS_ESCAPE    22
+#define FILEOPS_BAD_MEMBER 23
 
 /** The largest executable a run reads into memory. **/
 #define FILEOPS_RUN_MAX (64UL * 1024 * 1024)
@@ -92,6 +95,15 @@ int fileops_transfer_check(const char *root, const char *source,
 int fileops_transfer_act(const char *root, const char *command,
                          const char *source, const char *destination,
                          const approval_facts_t *expected);
+
+/**
+ * Open the regular file at path for reading, without following a link, after
+ * the same checks as fileops_check. The descriptor is returned in fd.
+ **/
+int fileops_read_open(const char *root, const char *path, int *fd);
+
+/** Open the directory at path for reading, under the same checks. **/
+int fileops_dir_open(const char *root, const char *path, int *fd);
 
 /**
  * Parse one system command's arguments into facts: its command, target and

@@ -265,7 +265,7 @@ void store_object_free(store_object_t *object);
 int store_log_open(const char *name, int create);
 
 /** One audit line is at most this long; a tail shows at most AUDIT_TAIL_MAX. **/
-#define AUDIT_LINE_MAX 256
+#define AUDIT_LINE_MAX 320
 #define AUDIT_TAIL_MAX 64
 
 /**

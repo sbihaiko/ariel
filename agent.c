@@ -35,6 +35,7 @@ along with this program; see the file COPYING. If not, see
 #include "runs.h"
 #include "sha256.h"
 #include "store.h"
+#include "tar.h"
 #include "token.h"
 
 /**
@@ -690,10 +691,11 @@ file_outcome(int fd, const char *command, const char *target, const char *id,
  * Otherwise the answer is written here and 0 is returned.
  **/
 static int
-gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
-          approval_challenge_t *challenge) {
+gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
+               approval_challenge_t *challenge, int (*vet)(void *), void *ctx) {
   char subject[TRANSFER_SUBJECT_MAX + 1];
   const char *target = subject_of(facts->target, facts->dest, subject);
+  int rc;
 
   switch(store_gate_check(facts, challenge)) {
   case STORE_GATE_GO:
@@ -716,6 +718,14 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
     break;
   }
 
+  if(vet) {
+    rc = vet(ctx);
+    if(rc) {
+      file_outcome(fd, facts->command, target, "-", rc);
+      return 0;
+    }
+  }
+
   if(agent->platform->approval_request(agent->platform, facts, challenge)) {
     reply(fd, approval_busy);
     return 0;
@@ -729,6 +739,13 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
 
   challenge_reply(fd, challenge);
   return 0;
+}
+
+
+static int
+gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
+          approval_challenge_t *challenge) {
+  return gate_pass_with(agent, fd, facts, challenge, NULL, NULL);
 }
 
 
@@ -823,6 +840,65 @@ unzip_list(agent_t *agent, int fd, const char *archive) {
 }
 
 
+/** The member names a listing collects, so an archive that is not one answers alone. **/
+#define TAR_LIST_MAX 8192
+
+struct tar_list {
+  char text[TAR_LIST_MAX];
+  size_t len;
+};
+
+
+static int
+list_member(void *ctx, const tar_member_t *member) {
+  struct tar_list *list = ctx;
+  size_t room = sizeof(list->text) - list->len;
+  int n = snprintf(list->text + list->len, room, "%s\n", member->name);
+
+  if(n < 0 || (size_t)n >= room) {
+    return FILEOPS_FAILED;
+  }
+  list->len += (size_t)n;
+  return FILEOPS_OK;
+}
+
+
+/** tar -t ARCHIVE: every member name at once, in archive order. **/
+static void
+tar_list_command(agent_t *agent, int fd, const char *path) {
+  struct tar_list list;
+  int archive;
+  int rc;
+
+  rc = fileops_read_open(agent->platform->fs_root, path, &archive);
+  if(rc) {
+    file_outcome(fd, "tar", path, "-", rc);
+    return;
+  }
+
+  list.len = 0;
+  rc = tar_walk(archive, list_member, &list);
+  close(archive);
+  if(rc) {
+    file_outcome(fd, "tar", path, "-", rc);
+    return;
+  }
+
+  if(audit_line("tar", "list", path, "-")) {
+    reply(fd, audit_failed);
+    return;
+  }
+  write_all(fd, list.text, list.len);
+  reply(fd, "exit 0\n");
+}
+
+
+static int
+tar_vet_job(void *ctx) {
+  return tar_vet(ctx);
+}
+
+
 /**
  * unzip ARCHIVE DEST: extract a stored archive under DEST, after the owner signs
  * its hash and DEST. Every member is checked before the first one is written.
@@ -859,6 +935,63 @@ unzip_command(agent_t *agent, int fd, const char *archive,
   rc = fileops_unzip_act(root, archive, destination, &facts);
   file_outcome(fd, "unzip", subject_of(archive, destination, subject),
                challenge.id, rc);
+}
+
+
+/**
+ * tar -x ARCHIVE DEST: extracts after the owner signs the archive's hash and
+ * the destination. A member that escapes the destination is refused before
+ * the owner is asked, and an approved archive is extracted only if it is
+ * still the object that was signed.
+ **/
+static void
+tar_extract_command(agent_t *agent, int fd, const char *archive,
+                    const char *dest) {
+  const char *root = agent->platform->fs_root;
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  tar_job_t job;
+  int go;
+  int rc;
+
+  if(strlen(archive) + strlen(dest) + 1 > TRANSFER_SUBJECT_MAX) {
+    file_outcome(fd, "tar", "-", "-", FILEOPS_BAD_PATH);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = tar_open(root, archive, dest, &job, &facts);
+  if(rc) {
+    file_outcome(fd, "tar", subject_of(archive, dest, subject), "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "tar");
+  snprintf(facts.target, sizeof(facts.target), "%s", archive);
+  snprintf(facts.dest, sizeof(facts.dest), "%s", dest);
+  go = gate_pass_with(agent, fd, &facts, &challenge, tar_vet_job, &job);
+  tar_close(&job);
+  if(!go) {
+    return;
+  }
+
+  rc = tar_extract(root, archive, dest, &facts);
+  file_outcome(fd, "tar", subject_of(archive, dest, subject), challenge.id, rc);
+}
+
+
+static void
+tar_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  if(argc == 3 && !strcmp(argv[1], "-t")) {
+    tar_list_command(agent, fd, argv[2]);
+    return;
+  }
+  if(argc == 4 && !strcmp(argv[1], "-x")) {
+    tar_extract_command(agent, fd, argv[2], argv[3]);
+    return;
+  }
+  file_outcome(fd, "tar", "-", "-", FILEOPS_BAD_ARG);
 }
 
 
@@ -2408,6 +2541,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc == 3 && (!strcmp(argv[0], "cp") || !strcmp(argv[0], "mv") ||
                    !strcmp(argv[0], "ln"))) {
     transfer_command(agent, fd, argv[0], argv[1], argv[2]);
+    return;
+  }
+
+  if(argc >= 1 && !strcmp(argv[0], "tar")) {
+    tar_command(agent, fd, argc, argv);
     return;
   }
 
