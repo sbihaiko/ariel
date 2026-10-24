@@ -95,7 +95,7 @@ New commands in this stage (see [Command coverage](#command-coverage)):
 
 ### Stage 3: an interface agents can rely on
 
-Once the agent can operate the console safely, make the shell easy for it to use correctly:
+Once the agent can operate the console safely, make the shell easy for it to use correctly. The grammar every command shares — quoting, the escaped canonical action, one frame for bytes, one output cap and one deadline — is [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md); this stage is where it is implemented.
 
 - Proper argument parsing with quotes.
 - Exit status and a separate error channel for every command, extending the Stage 1 grammar to all of them.
