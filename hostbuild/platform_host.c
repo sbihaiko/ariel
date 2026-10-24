@@ -196,6 +196,11 @@ host_wake_idle(platform_t *self, int wake, int fd, int idle) {
  **/
 static unsigned char host_pubkey[APPROVAL_PUBKEY_LEN];
 
+/** The host build's recovery test key; its private half is hostbuild/tests/host-recovery-testkey. **/
+#define HOST_RECOVERY_PUBKEY_HEX \
+  "b7ca23da46f215a71b7dde34148d594e973f82e874f6dc18d208a8a5d3a0c77a"
+static unsigned char host_recovery_pubkey[APPROVAL_PUBKEY_LEN];
+
 /**
  * A scenario can make the nonce stream repeat from a restart by giving
  * ARIEL_HOST_NONCE_SEED. Without it the nonces come from the system's
@@ -272,11 +277,23 @@ host_console_id(platform_t *self) {
 
 
 static int
-host_verify(platform_t *self, const unsigned char *msg, size_t len,
+host_verify(platform_t *self, const unsigned char key[APPROVAL_PUBKEY_LEN],
+            const unsigned char *msg, size_t len,
             const unsigned char *signature) {
   (void)self;
 
-  return approval_verify(host_pubkey, msg, len, signature);
+  return approval_verify(key, msg, len, signature);
+}
+
+
+static int
+host_anchor(platform_t *self, unsigned char primary[APPROVAL_PUBKEY_LEN],
+            unsigned char recovery[APPROVAL_PUBKEY_LEN]) {
+  (void)self;
+
+  memcpy(primary, host_pubkey, APPROVAL_PUBKEY_LEN);
+  memcpy(recovery, host_recovery_pubkey, APPROVAL_PUBKEY_LEN);
+  return 0;
 }
 
 
@@ -808,6 +825,7 @@ static platform_t host_platform = {
   .random = host_random,
   .console_id = host_console_id,
   .verify = host_verify,
+  .anchor = host_anchor,
   .approval_request = host_approval_request,
   .approval_grant = host_approval_grant,
   .spawn = host_spawn,
@@ -874,8 +892,10 @@ platform_host(const char *dir, const char *fs_root, const char *exe) {
   }
 
   if(approval_pubkey_parse(APPROVAL_TEST_PUBKEY_HEX, host_pubkey) ||
-     approval_pin(host_pubkey)) {
-    fprintf(stderr, "the host build cannot pin its test key\n");
+     approval_pin(host_pubkey) ||
+     approval_pubkey_parse(HOST_RECOVERY_PUBKEY_HEX, host_recovery_pubkey) ||
+     approval_pin(host_recovery_pubkey)) {
+    fprintf(stderr, "the host build cannot pin its test keys\n");
     exit(EXIT_FAILURE);
   }
 

@@ -167,11 +167,20 @@ struct platform {
 
   /**
    * Verify an Ed25519 signature of APPROVAL_SIG_LEN bytes over msg against
-   * the public key pinned in this build. Returns 0 only for a valid one;
-   * with no key pinned, nothing is valid.
+   * key. Returns 0 only for a valid one; with the build's anchor not pinned,
+   * nothing is valid.
    **/
-  int (*verify)(platform_t *self, const unsigned char *msg, size_t len,
+  int (*verify)(platform_t *self, const unsigned char key[APPROVAL_PUBKEY_LEN],
+                const unsigned char *msg, size_t len,
                 const unsigned char *signature);
+
+  /**
+   * The anchor pinned in this build: the primary and recovery public keys
+   * that make generation 0. Returns 0 when both are pinned and distinct, and
+   * -1 when this build pins no usable anchor.
+   **/
+  int (*anchor)(platform_t *self, unsigned char primary[APPROVAL_PUBKEY_LEN],
+                unsigned char recovery[APPROVAL_PUBKEY_LEN]);
 
   /**
    * Ask the owner to approve the facts' action and show the prompt on the

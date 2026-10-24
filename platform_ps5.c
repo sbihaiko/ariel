@@ -72,6 +72,10 @@ along with this program; see the file COPYING. If not, see
 #define ARIEL_PUBKEY_HEX ""
 #endif
 
+#ifndef ARIEL_RECOVERY_PUBKEY_HEX
+#define ARIEL_RECOVERY_PUBKEY_HEX ""
+#endif
+
 #ifndef ARIEL_CONSOLE_ID
 #define ARIEL_CONSOLE_ID "ps5"
 #endif
@@ -79,8 +83,9 @@ along with this program; see the file COPYING. If not, see
 /** The agent access token, shown with every approval prompt. **/
 static const char *agent_token;
 
-/** The pinned approval key, and whether the build accepted one. **/
+/** The pinned anchor: the primary and recovery keys, and whether the build accepted both. **/
 static unsigned char pubkey[APPROVAL_PUBKEY_LEN];
+static unsigned char recovery_pubkey[APPROVAL_PUBKEY_LEN];
 static int pinned;
 
 /**
@@ -178,16 +183,32 @@ ps5_console_id(platform_t *self) {
 
 
 static int
-ps5_verify(platform_t *self, const unsigned char *msg, size_t len,
+ps5_verify(platform_t *self, const unsigned char key[APPROVAL_PUBKEY_LEN],
+           const unsigned char *msg, size_t len,
            const unsigned char *signature) {
   (void)self;
 
-  // With no key pinned, or one the build refuses, no signature is valid.
+  // With no anchor pinned, or one the build refuses, no signature is valid.
   if(!pinned) {
     return -1;
   }
 
-  return approval_verify(pubkey, msg, len, signature);
+  return approval_verify(key, msg, len, signature);
+}
+
+
+static int
+ps5_anchor(platform_t *self, unsigned char primary[APPROVAL_PUBKEY_LEN],
+           unsigned char recovery[APPROVAL_PUBKEY_LEN]) {
+  (void)self;
+
+  if(!pinned) {
+    return -1;
+  }
+
+  memcpy(primary, pubkey, APPROVAL_PUBKEY_LEN);
+  memcpy(recovery, recovery_pubkey, APPROVAL_PUBKEY_LEN);
+  return 0;
 }
 
 
@@ -569,6 +590,7 @@ static platform_t ps5_platform = {
   .random = ps5_random,
   .console_id = ps5_console_id,
   .verify = ps5_verify,
+  .anchor = ps5_anchor,
   .approval_request = ps5_approval_request,
   .approval_grant = ps5_approval_grant,
   .spawn = ps5_spawn,
@@ -590,12 +612,16 @@ platform_t *
 platform_ps5(const char *token) {
   agent_token = token;
 
-  // The owner's public key is pinned at build time. A key that does not
-  // parse, or one the build refuses such as the host test key, leaves
-  // nothing pinned, and then every grant is refused.
+  // The anchor is pinned at build time: the primary and the recovery key,
+  // which must differ. A key that does not parse, or one the build refuses
+  // such as the host test key, leaves nothing pinned, and then every grant
+  // is refused.
   if(approval_pubkey_parse(ARIEL_PUBKEY_HEX, pubkey) ||
-     approval_pin(pubkey)) {
-    klog_printf("no approval key pinned: every grant will be refused\n");
+     approval_pin(pubkey) ||
+     approval_pubkey_parse(ARIEL_RECOVERY_PUBKEY_HEX, recovery_pubkey) ||
+     approval_pin(recovery_pubkey) ||
+     !memcmp(pubkey, recovery_pubkey, APPROVAL_PUBKEY_LEN)) {
+    klog_printf("no approval anchor pinned: every grant will be refused\n");
   } else {
     pinned = 1;
   }

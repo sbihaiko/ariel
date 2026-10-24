@@ -21,11 +21,22 @@ PS5_PORT ?= 9021
 # The host build's test key, whose private half is in the repository, must
 # never be pinned: this stops the build before the SDK is even read.
 ARIEL_PUBKEY ?=
+ARIEL_RECOVERY_PUBKEY ?=
 ARIEL_CONSOLE_ID ?= ps5
 ARIEL_TEST_PUBKEY := 299e18435f88e321120e74f83f1b3f3f530ca0d51cad39f3ed45b86b8007f922
 
 ifeq ($(ARIEL_PUBKEY),$(ARIEL_TEST_PUBKEY))
     $(error ARIEL_PUBKEY is the host test key; the PS5 build never pins it)
+endif
+
+ifeq ($(ARIEL_RECOVERY_PUBKEY),$(ARIEL_TEST_PUBKEY))
+    $(error ARIEL_RECOVERY_PUBKEY is the host test key; the PS5 build never pins it)
+endif
+
+ifneq ($(ARIEL_RECOVERY_PUBKEY),)
+ifeq ($(ARIEL_RECOVERY_PUBKEY),$(ARIEL_PUBKEY))
+    $(error ARIEL_RECOVERY_PUBKEY must differ from ARIEL_PUBKEY)
+endif
 endif
 
 ifdef PS5_PAYLOAD_SDK
@@ -65,6 +76,7 @@ tweetnacl.o: CFLAGS += -w
 
 # The key and the console name are pinned into the platform and nowhere else.
 platform_ps5.o: CFLAGS += -DARIEL_PUBKEY_HEX=\"$(ARIEL_PUBKEY)\" \
+                          -DARIEL_RECOVERY_PUBKEY_HEX=\"$(ARIEL_RECOVERY_PUBKEY)\" \
                           -DARIEL_CONSOLE_ID=\"$(ARIEL_CONSOLE_ID)\"
 
 shsrv-ps5.elf: shsrv.o platform_ps5.o readers_ps5.o $(ARIEL_OBJS) elfldr.o \

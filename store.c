@@ -1310,6 +1310,8 @@ store_gate_check(const approval_facts_t *facts,
 int
 store_approval_grant(const char *id, const unsigned char *signature,
                      const char *console, const char *action_sha256) {
+  unsigned char primary[APPROVAL_PUBKEY_LEN];
+  unsigned char recovery[APPROVAL_PUBKEY_LEN];
   unsigned char message[APPROVAL_MESSAGE_MAX];
   unsigned char digest[SHA256_DIGEST_LEN];
   char digest_hex[SHA256_HEX_LEN + 1];
@@ -1353,10 +1355,10 @@ store_approval_grant(const char *id, const unsigned char *signature,
                            request->challenge.expires_ms,
                            message, sizeof(message));
 
-    // The platform checks the signature against the key pinned in the
-    // build, over the exact bytes of this approval's challenge.
-    if(len < 0 || platform->verify(platform, message, (size_t)len,
-                                   signature)) {
+    // The platform checks the signature against the primary of the anchor
+    // pinned in the build, over the exact bytes of this approval's challenge.
+    if(len < 0 || platform->anchor(platform, primary, recovery) ||
+       platform->verify(platform, primary, message, (size_t)len, signature)) {
       rc = STORE_GRANT_INVALID;
     } else if(nonce_consume(request->challenge.nonce)) {
       // Not recorded on disk: the action must not be allowed to run.
