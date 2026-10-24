@@ -153,6 +153,14 @@ static const char log_failed[] =
   "log_failed\n"
   "exit 1\n";
 
+static const char no_previous_version[] =
+  "no_previous_version\n"
+  "exit 1\n";
+
+static const char rollback_failed[] =
+  "rollback_failed\n"
+  "exit 1\n";
+
 static int
 write_all(int fd, const char *buf, size_t len) {
   while(len > 0) {
@@ -1192,6 +1200,78 @@ refuse(int fd, const char *name, const char *word, const char *answer) {
 }
 
 
+static void
+payload_rollback(agent_t *agent, int fd, const char *name) {
+  platform_t *platform = agent->platform;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  store_install_t install;
+  char approval_id[APPROVAL_ID_MAX];
+  char answer[256];
+  int outcome;
+
+  if(!store_name_valid(name)) {
+    reply(fd, bad_name);
+    return;
+  }
+
+  switch(store_rollback_target(name, &facts)) {
+  case STORE_ROLLBACK_UNKNOWN:
+    refuse(fd, name, "unknown_payload", unknown_payload);
+    return;
+  case STORE_ROLLBACK_NO_PREVIOUS:
+    refuse(fd, name, "no_previous_version", no_previous_version);
+    return;
+  }
+
+  approval_id[0] = '\0';
+  memset(&install, 0, sizeof(install));
+  outcome = store_rollback(name, approval_id, sizeof(approval_id), &install);
+
+  switch(outcome) {
+  case STORE_APPROVAL_NEW:
+    if(platform->approval_request(platform, &facts, &challenge)) {
+      refuse(fd, name, "approval_busy", approval_busy);
+      return;
+    }
+    if(store_audit_append("request", name, challenge.id, facts.sha256)) {
+      store_approval_deny(challenge.id);
+      reply(fd, audit_failed);
+      return;
+    }
+    challenge_reply(fd, &challenge);
+    return;
+  case STORE_APPROVAL_REQUIRED:
+    snprintf(answer, sizeof(answer), "approval_required %s\nexit 75\n",
+             approval_id);
+    reply(fd, answer);
+    return;
+  case STORE_APPROVAL_DENIED:
+    refuse(fd, name, "approval_denied", approval_denied);
+    return;
+  case STORE_APPROVAL_EXPIRED:
+    refuse(fd, name, "approval_expired", approval_expired);
+    return;
+  case STORE_APPROVAL_STALE:
+    refuse(fd, name, "approval_stale", approval_stale);
+    return;
+  case STORE_INSTALLED:
+    if(store_audit_append("rollback", install.name, approval_id,
+                          install.sha256)) {
+      reply(fd, audit_failed);
+      return;
+    }
+    snprintf(answer, sizeof(answer), "rolled_back %s %s\nexit 0\n",
+             install.name, install.sha256);
+    reply(fd, answer);
+    return;
+  default:
+    refuse(fd, name, "rollback_failed", rollback_failed);
+    return;
+  }
+}
+
+
 /** 1 when name is an installed payload, 0 when not, -1 when unreadable. **/
 static int
 payload_installed(const char *name) {
@@ -1514,6 +1594,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "list")) {
     payload_list(fd);
+    return;
+  }
+
+  if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "rollback")) {
+    payload_rollback(agent, fd, argv[2]);
     return;
   }
 

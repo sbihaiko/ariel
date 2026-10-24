@@ -845,7 +845,8 @@ value_key(const char *command) {
  * entry's kind and identity, or with the argument count of a command nothing
  * implements, and with the requested value of chmod, chown or chgrp. A kill
  * is an action on its pid, with the hash of its pid and start, its signal and
- * start. text holds the numbers the options point at.
+ * start. A rollback is an action on its name, with the build it replaces.
+ * text holds the numbers the options point at.
  **/
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
@@ -902,6 +903,14 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[action->noptions].value = facts->value;
       action->noptions++;
     }
+  } else if(!strcmp(facts->command, "payload.rollback")) {
+    options[0].key = "replaces";
+    options[0].value = facts->replaces;
+    action->command = facts->command;
+    action->target = facts->name;
+    action->destination = NULL;
+    action->sha256 = facts->sha256;
+    action->noptions = 1;
   } else {
     decimal(facts->size, text[0], sizeof(text[0]));
     options[0].key = "size";
@@ -930,8 +939,11 @@ store_approval_request(const approval_facts_t *facts,
   struct approval *slot;
   const char *console;
   uint64_t now;
+  int rollback;
   int tries;
   int len;
+
+  rollback = !strcmp(facts->command, "payload.rollback");
 
   // The approval is of this one action. What the owner reads and signs is
   // the output of the one encoder, and a build whose facts it refuses can
@@ -997,7 +1009,11 @@ store_approval_request(const approval_facts_t *facts,
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
   slot->facts = *facts;
 
-  if(slot->gated && !strcmp(facts->command, "kill")) {
+  if(rollback) {
+    snprintf(prompt, promptlen,
+             "payload %s rolls back to %s, replacing %s",
+             facts->name, facts->sha256, facts->replaces);
+  } else if(slot->gated && !strcmp(facts->command, "kill")) {
     snprintf(prompt, promptlen, "kill %s with %s (start %s) will run",
              facts->target, facts->signal, facts->start);
   } else if(slot->gated) {
@@ -1987,6 +2003,196 @@ store_commit(const char *staging_id, store_install_t *install,
     outcome = STORE_APPROVAL_DENIED;
   } else {
     outcome = staged_install(entry, request, install);
+  }
+
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
+int
+store_rollback_target(const char *name, approval_facts_t *facts) {
+  char current[SHA256_HEX_LEN + 1];
+  char previous[SHA256_HEX_LEN + 1];
+  int state_fd = -1;
+  int store_fd = -1;
+  int current_fd = -1;
+  int rc = STORE_ROLLBACK_UNKNOWN;
+
+  if((state_fd=root_open()) < 0 ||
+     (store_fd=dir_open(state_fd, "store")) < 0 ||
+     (current_fd=dir_open(store_fd, "current")) < 0 ||
+     current_read(current_fd, name, current) ||
+     state_previous(name, previous, sizeof(previous))) {
+    goto out;
+  }
+
+  if(!strcmp(previous, "-")) {
+    rc = STORE_ROLLBACK_NO_PREVIOUS;
+    goto out;
+  }
+
+  memset(facts, 0, sizeof(*facts));
+  snprintf(facts->command, sizeof(facts->command), "%s", "payload.rollback");
+  snprintf(facts->name, sizeof(facts->name), "%s", name);
+  snprintf(facts->sha256, sizeof(facts->sha256), "%s", previous);
+  snprintf(facts->replaces, sizeof(facts->replaces), "%s", current);
+  rc = STORE_ROLLBACK_OK;
+
+out:
+  if(current_fd >= 0) {
+    close(current_fd);
+  }
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  return rc;
+}
+
+
+/** The newest rollback approval of name that is neither spent nor released. **/
+static struct approval *
+rollback_open_find(const char *name) {
+  int i;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    struct approval *request = &approvals[i];
+
+    if(request->used && !request->consumed && !request->released &&
+       !strcmp(request->facts.command, "payload.rollback") &&
+       !strcmp(request->facts.name, name)) {
+      return request;
+    }
+  }
+  return NULL;
+}
+
+
+/**
+ * The owner approved a rollback: check that the store still holds the facts
+ * approved, then change it through the journal, as an install does. The build
+ * restored becomes current and the one it replaces becomes previous; nothing
+ * is dropped. A rollback whose facts moved on is stale, and its approval is
+ * spent. The caller holds the lock.
+ **/
+static int
+rollback_apply_locked(struct approval *request, store_install_t *install) {
+  const char *name = request->facts.name;
+  approval_facts_t live;
+  struct journal j;
+  char current_text[SHA256_HEX_LEN + 2];
+  char tmp_current[PAYLOAD_NAME_MAX + 8];
+  int state_fd = -1;
+  int store_fd = -1;
+  int objects_fd = -1;
+  int current_fd = -1;
+  int rc = STORE_ROLLBACK_FAILED;
+
+  if((state_fd=root_open()) < 0 ||
+     (store_fd=dir_open(state_fd, "store")) < 0 ||
+     (objects_fd=dir_open(store_fd, "objects")) < 0 ||
+     (current_fd=dir_open(store_fd, "current")) < 0) {
+    goto out;
+  }
+
+  // A change an earlier step left in the journal finishes before this one.
+  if(transaction_recover_locked(store_fd)) {
+    goto out;
+  }
+
+  if(store_rollback_target(name, &live) != STORE_ROLLBACK_OK ||
+     strcmp(live.sha256, request->facts.sha256) ||
+     strcmp(live.replaces, request->facts.replaces) ||
+     !object_present(objects_fd, live.sha256)) {
+    request->consumed = 1;
+    rc = STORE_APPROVAL_STALE;
+    goto out;
+  }
+
+  snprintf(current_text, sizeof(current_text), "%s\n", live.sha256);
+  snprintf(tmp_current, sizeof(tmp_current), "%s.tmp", name);
+  if(tmp_write(current_fd, tmp_current, current_text, SHA256_HEX_LEN + 1)) {
+    goto out;
+  }
+
+  memset(&j, 0, sizeof(j));
+  snprintf(j.name, sizeof(j.name), "%s", name);
+  snprintf(j.hash, sizeof(j.hash), "%s", live.sha256);
+  snprintf(j.previous, sizeof(j.previous), "%s", live.replaces);
+  snprintf(j.drop, sizeof(j.drop), "-");
+
+  snprintf(j.phase, sizeof(j.phase), "prepared");
+  if(journal_write(store_fd, &j)) {
+    transaction_rollback_locked(store_fd, name, live.sha256);
+    goto out;
+  }
+  fault_at("prepared");
+
+  snprintf(j.phase, sizeof(j.phase), "committed");
+  if(journal_write(store_fd, &j)) {
+    goto out;
+  }
+  fault_at("committed");
+
+  if(transaction_roll_forward_locked(store_fd, &j)) {
+    goto out;
+  }
+
+  journal_clear(store_fd);
+
+  snprintf(install->name, sizeof(install->name), "%s", name);
+  snprintf(install->sha256, sizeof(install->sha256), "%s", live.sha256);
+  object_path(live.sha256, install->path, sizeof(install->path));
+  request->consumed = 1;
+
+  rc = STORE_INSTALLED;
+
+out:
+  if(current_fd >= 0) {
+    close(current_fd);
+  }
+  if(objects_fd >= 0) {
+    close(objects_fd);
+  }
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  return rc;
+}
+
+
+int
+store_rollback(const char *name, char *approval_id, size_t idlen,
+               store_install_t *install) {
+  struct approval *request;
+  int outcome;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+  request = rollback_open_find(name);
+
+  if(!request) {
+    outcome = STORE_APPROVAL_NEW;
+  } else {
+    snprintf(approval_id, idlen, "%s", request->id);
+
+    if(request->expired) {
+      request->released = 1;
+      outcome = STORE_APPROVAL_EXPIRED;
+    } else if(!request->decided) {
+      outcome = STORE_APPROVAL_REQUIRED;
+    } else if(!request->approved) {
+      request->released = 1;
+      outcome = STORE_APPROVAL_DENIED;
+    } else {
+      outcome = rollback_apply_locked(request, install);
+    }
   }
 
   pthread_mutex_unlock(&lock);

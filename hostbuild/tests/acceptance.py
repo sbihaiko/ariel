@@ -1052,6 +1052,10 @@ FAULT_SCENARIOS = {
     "audited, and the state file is left as it was",
     "a recovery killed after its renames, then a clean start, leaves the "
     "listing, state file and audit of one crash",
+    "a crash in prepared during a rollback leaves the newer build current "
+    "after restart",
+    "a crash in committed during a rollback leaves the previous build current "
+    "after restart",
 }
 
 # The scenarios that rewrite or remove the state file on the host's disk,
@@ -1727,13 +1731,12 @@ def journal_events(server):
     return events
 
 
-def commit_until_crash(server, staging):
-    """Send a commit that the injected fault ends, and wait for Ariel to die."""
+def command_until_crash(server, command):
+    """Send a command that the injected fault ends, and wait for Ariel to die."""
     sock = server.connect()
     try:
         sock.sendall(
-            ("auth %s\npayload commit %s\n" % (server.token, staging))
-            .encode("ascii")
+            ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
         )
         reply = reply_lines(read_reply(sock))
     except OSError:
@@ -1742,6 +1745,10 @@ def commit_until_crash(server, staging):
         sock.close()
     assert server.proc.wait(timeout=5.0) != 0, "the fault must end Ariel"
     return reply
+
+
+def commit_until_crash(server, staging):
+    return command_until_crash(server, "payload commit %s" % staging)
 
 
 def crash_commit(server, step):
@@ -1907,6 +1914,178 @@ def scenario_previous_version_is_kept_then_dropped(server):
             "a build two replacements old must be dropped, it holds %r" % objects)
     finally:
         history.stop()
+
+
+def rollback_request(server, name):
+    """Ask for a rollback, spaced from the notification of the last request."""
+    server.advance(10_000)
+    return send_command(server, "payload rollback %s" % name)
+
+
+def scenario_rollback_restores_the_previous_version(server):
+    """A rollback answers 75 with its challenge; after a grant the previous build is current."""
+    previous = install_payload(server, "rollb", b"rollback build a\n")
+    current = install_payload(server, "rollb", b"rollback build b\n")
+
+    lines = rollback_request(server, "rollb")
+    assert len(lines) == 3 and APPROVAL_LINE.match(lines[0]) and (
+        lines[2] == "exit 75"), (
+        "a rollback without a grant must answer approval_required, its "
+        "challenge and exit 75, got %r" % lines)
+    approval = APPROVAL_LINE.match(lines[0]).group(1)
+
+    action = challenge_action(challenge_of(lines)).splitlines()
+    for fact in ("command=payload.rollback", "target=rollb",
+                 "sha256=%s" % previous, "option.replaces=%s" % current):
+        assert fact in action, (
+            "the signed action must name %s, got %r" % (fact, action))
+
+    prompt = server.next_line()
+    assert prompt and prompt.startswith(
+        "prompt %s payload rollb rolls back to %s, replacing %s"
+        % (approval, previous, current)), (
+        "the owner must be shown the rollback, got %r" % prompt)
+
+    assert send_command(server, "payload rollback rollb") == [
+        "approval_required %s" % approval, "exit 75"], (
+        "a rollback repeated before the decision must wait for it")
+
+    sign_and_grant(server, approval, challenge_of(lines))
+    assert send_command(server, "payload rollback rollb") == [
+        "rolled_back rollb %s" % previous, "exit 0"], (
+        "a granted rollback must restore the previous build")
+    assert listed(payload_list(server), "rollb") == expected_listing(
+        "rollb", previous, current), (
+        "after the rollback the previous build must be listed as current")
+
+    events = audit_events(server)
+    assert ("request", "rollb", approval, previous) in events, (
+        "the request must be audited, the log holds %r" % events)
+    assert ("rollback", "rollb", approval, previous) in events, (
+        "the rollback must be audited, the log holds %r" % events)
+
+
+def scenario_rollback_without_previous_version_answers_error(server):
+    """No previous version, or no such payload: an error, with no prompt."""
+    install_payload(server, "rollfirst", b"first build only\n")
+
+    assert send_command(server, "payload rollback rollfirst") == [
+        "no_previous_version", "exit 1"], (
+        "a payload with no previous version must answer no_previous_version")
+    assert send_command(server, "payload rollback rollnone") == [
+        "unknown_payload", "exit 1"], (
+        "a rollback of an unknown payload must answer unknown_payload")
+    server.assert_no_line()
+
+    events = audit_events(server)
+    assert ("refuse", "rollfirst", "no_previous_version", "-") in events, (
+        "the refusal must be audited, the log holds %r" % events)
+    assert ("refuse", "rollnone", "unknown_payload", "-") in events, (
+        "the refusal must be audited, the log holds %r" % events)
+
+
+def scenario_rollback_refused_when_the_store_moved_on(server):
+    """A grant for a rollback the store no longer matches answers approval_stale."""
+    install_payload(server, "rollmoved", b"moved build a\n")
+    current = install_payload(server, "rollmoved", b"moved build b\n")
+
+    lines = rollback_request(server, "rollmoved")
+    approval = APPROVAL_LINE.match(lines[0]).group(1)
+    server.next_line()
+    sign_and_grant(server, approval, challenge_of(lines))
+
+    newest = install_payload(server, "rollmoved", b"moved build c\n")
+    assert send_command(server, "payload rollback rollmoved") == [
+        "approval_stale", "exit 78"], (
+        "a rollback whose facts changed after the grant must answer "
+        "approval_stale")
+    assert listed(payload_list(server), "rollmoved") == expected_listing(
+        "rollmoved", newest, current), (
+        "a stale rollback must leave the store as it was")
+    assert ("refuse", "rollmoved", "approval_stale", "-") in audit_events(
+        server), "the stale refusal must be audited"
+
+
+def scenario_rollback_denied_answers_77(server):
+    """A denied rollback answers approval_denied and changes nothing."""
+    previous = install_payload(server, "rolldeny", b"denied build a\n")
+    current = install_payload(server, "rolldeny", b"denied build b\n")
+
+    lines = rollback_request(server, "rolldeny")
+    approval = APPROVAL_LINE.match(lines[0]).group(1)
+    server.next_line()
+    server.controller("deny %s" % approval, "denied %s" % approval)
+
+    assert send_command(server, "payload rollback rolldeny") == [
+        "approval_denied", "exit 77"], (
+        "a denied rollback must answer approval_denied")
+    assert listed(payload_list(server), "rolldeny") == expected_listing(
+        "rolldeny", current, previous), (
+        "a denied rollback must leave the store as it was")
+    assert ("refuse", "rolldeny", "approval_denied", "-") in audit_events(
+        server), "the denial must be audited"
+
+
+ROLLBACK_CRASH_NAME = "rollcrash"
+
+
+def rollback_crash(server, step):
+    """Install two builds, then crash the rollback to the first at step."""
+    install_payload(server, ROLLBACK_CRASH_NAME, FIRST_BUILD)
+    install_payload(server, ROLLBACK_CRASH_NAME, SECOND_BUILD)
+    server.env = {FAULT_ENV: step}
+    server.restart()
+
+    lines = rollback_request(server, ROLLBACK_CRASH_NAME)
+    approval = APPROVAL_LINE.match(lines[0]).group(1)
+    sign_and_grant(server, approval, challenge_of(lines))
+    assert command_until_crash(
+        server, "payload rollback %s" % ROLLBACK_CRASH_NAME) == [], (
+        "a rollback that crashes must answer nothing")
+
+
+def scenario_crash_in_prepared_rolls_back_the_rollback(server):
+    """A crash after the prepared mark leaves the newer build current on restart."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+        rollback_crash(crashed, "prepared")
+        crashed.env = None
+        crashed.restart()
+
+        assert listed(payload_list(crashed), ROLLBACK_CRASH_NAME) == (
+            expected_listing(ROLLBACK_CRASH_NAME, second_hash, first_hash)), (
+            "a crash in prepared must leave the newer build current")
+        assert ("rollback", ROLLBACK_CRASH_NAME, first_hash) in journal_events(
+            crashed), (
+            "the recovered rollback must be audited, the log holds %r"
+            % journal_events(crashed))
+    finally:
+        crashed.stop()
+
+
+def scenario_crash_in_committed_rolls_forward_the_rollback(server):
+    """A crash after the committed mark leaves the previous build current on restart."""
+    del server  # each crash needs an Ariel started with the fault injector
+    crashed = Server(SERVER_BINARY)
+    try:
+        first_hash = hashlib.sha256(FIRST_BUILD).hexdigest()
+        second_hash = hashlib.sha256(SECOND_BUILD).hexdigest()
+        rollback_crash(crashed, "committed")
+        crashed.env = None
+        crashed.restart()
+
+        assert listed(payload_list(crashed), ROLLBACK_CRASH_NAME) == (
+            expected_listing(ROLLBACK_CRASH_NAME, first_hash, second_hash)), (
+            "a crash in committed must leave the previous build current")
+        assert ("rollforward", ROLLBACK_CRASH_NAME, first_hash) in (
+            journal_events(crashed)), (
+            "the recovered rollback must be audited, the log holds %r"
+            % journal_events(crashed))
+    finally:
+        crashed.stop()
 
 
 def starts(log):
@@ -4540,6 +4719,23 @@ SCENARIOS = [
      scenario_recovery_crash_matches_one_crash, FAULT_REASON),
     ("the previous version is kept and listed, and the one before it is dropped",
      scenario_previous_version_is_kept_then_dropped, None),
+    ("payload rollback answers 75 with its challenge, then restores the "
+     "previous version after a grant",
+     scenario_rollback_restores_the_previous_version, None),
+    ("payload rollback with no previous version answers no_previous_version, "
+     "an unknown name unknown_payload, both with exit 1 and no prompt",
+     scenario_rollback_without_previous_version_answers_error, None),
+    ("a rollback whose store moved on after the grant answers approval_stale "
+     "and exit 78",
+     scenario_rollback_refused_when_the_store_moved_on, None),
+    ("a denied rollback answers approval_denied and exit 77 and changes nothing",
+     scenario_rollback_denied_answers_77, None),
+    ("a crash in prepared during a rollback leaves the newer build current "
+     "after restart",
+     scenario_crash_in_prepared_rolls_back_the_rollback, FAULT_REASON),
+    ("a crash in committed during a rollback leaves the previous build current "
+     "after restart",
+     scenario_crash_in_committed_rolls_forward_the_rollback, FAULT_REASON),
     ("a payload the record marks running is not started again on restart",
      scenario_running_mark_does_not_restart_payload, None),
 ]

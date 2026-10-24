@@ -42,6 +42,15 @@ along with this program; see the file COPYING. If not, see
 #define STORE_APPROVAL_STALE    3
 #define STORE_APPROVAL_EXPIRED  4
 
+/** What one rollback request ended in; STORE_INSTALLED is a rollback done. **/
+#define STORE_APPROVAL_NEW      5
+#define STORE_ROLLBACK_FAILED   6
+
+/** What a rollback target was: the build it restores, or why there is none. **/
+#define STORE_ROLLBACK_OK          0
+#define STORE_ROLLBACK_UNKNOWN     1
+#define STORE_ROLLBACK_NO_PREVIOUS 2
+
 /** What a successful commit installed. **/
 typedef struct {
   char name[PAYLOAD_NAME_MAX + 1];
@@ -188,6 +197,26 @@ void store_stage(const char *staging_id, const approval_facts_t *facts,
  **/
 int store_commit(const char *staging_id, store_install_t *install,
                  char *approval_id, size_t idlen);
+
+/**
+ * Work out the rollback of a payload name: the previous build becomes
+ * current and the current one becomes previous. Fills facts with the
+ * rollback's action, which is what an approval of it is bound to. Returns
+ * one of STORE_ROLLBACK_*.
+ **/
+int store_rollback_target(const char *name, approval_facts_t *facts);
+
+/**
+ * Roll back a payload name under its open approval, the newest one that is
+ * neither spent nor released. Returns STORE_APPROVAL_NEW when there is none
+ * (the caller asks for one), STORE_APPROVAL_REQUIRED with approval_id set
+ * while it waits, STORE_APPROVAL_DENIED or STORE_APPROVAL_EXPIRED once it
+ * has ended, STORE_APPROVAL_STALE when the store no longer holds the facts
+ * the owner approved, STORE_INSTALLED when the rollback is done, or
+ * STORE_ROLLBACK_FAILED. approval_id is set whenever an approval is found.
+ **/
+int store_rollback(const char *name, char *approval_id, size_t idlen,
+                   store_install_t *install);
 
 /**
  * Read the current object of a payload name into memory once, hash those

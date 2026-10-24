@@ -71,6 +71,7 @@ typedef struct {
   char type[2];  /** mknod: b or c. **/
   uint64_t major;
   uint64_t minor;
+  char replaces[65];  /** The build a rollback replaces; empty otherwise. **/
 } approval_facts_t;
 
 /**

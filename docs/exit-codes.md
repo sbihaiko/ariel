@@ -25,7 +25,7 @@ The system commands `mount -t <fstype> <from> <dir>`, `umount <dir>`, `chroot <d
 | Exit | Word | Meaning | What the agent does |
 |---|---|---|---|
 | 0 | | Success | |
-| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `bad_argument`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, others | Any other error | Read the word; do not retry as is |
+| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `no_previous_version`, `rollback_failed`, `bad_argument`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, others | Any other error | Read the word; do not retry as is |
 | 70 | | Missing or wrong token; the connection is closed | Fix the token |
 | 75 | `approval_required` | The action waits for the owner's signature; the reply carries the challenge | Have the owner sign, send `approval grant`, then repeat the command |
 | 76 | `approval_busy` | Too many pending approvals, or a notification shown less than 10 s ago | Wait and push again |
