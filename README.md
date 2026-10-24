@@ -6,7 +6,7 @@ Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/sh
 
 > **Status:** Stages 1 and 2 are done and validated on a real PS5. Stage 2 closed on 2026-10-24 with the console suite at 36/36 and the whole key hierarchy exercised on the console. Stages 3 to 6 have not started. See [Progress](#progress).
 >
-> **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have.
+> **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have. The decision is [ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md).
 
 ---
 
