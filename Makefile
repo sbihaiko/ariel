@@ -50,7 +50,7 @@ $(SUBDIRS):
 
 .NOTPARALLEL:
 
-all: shsrv-ps5.elf sh.elf controller-spike.elf
+all: shsrv-ps5.elf sh.elf controller-spike.elf primitives-probe.elf
 
 # The agent protocol, the store and the token are shared with the host
 # build, which compiles the same sources from hostbuild/.
@@ -86,6 +86,12 @@ sh.elf.inc: sh.elf
 controller-spike.elf: controller_spike.o notify.o pt.o
 	$(CC) -lkernel_sys -lScePad -lSceUserService -lSceSystemService \
 	      -lSceRegMgr -o $@ $^
+
+# The primitives probe is a separate payload. It is never linked into
+# shsrv-ps5.elf; the operator sends it to elfldr on its own. ps5_at.h is a
+# header, so the probe needs no extra object.
+primitives-probe.elf: primitives_probe.o
+	$(CC) -lkernel_sys -o $@ $^
 
 clean:
 	rm -f *.o *.elf

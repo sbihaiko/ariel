@@ -128,6 +128,37 @@ The safe call is a `syscall` instruction whose carry flag is checked: carry set 
 - **The kernel `openat` symbol.** The link keeps `libc.a(syscalls.o)`. `dlsym(RTLD_DEFAULT, "openat")` was null. `dlopen` of `libkernel_sys.sprx`, `libkernel.sprx`, `libkernel_web.sprx` and `libSceLibcInternal.sprx` was null.
 - **Absolute `open` in place of `openat`.** A missing absolute path returns -1 with `errno` 2. It does not take a directory fd or `O_NOFOLLOW`, which is what the store uses.
 
+## Issue #18 probe: openat, renameat, unlinkat, fsync
+
+`primitives-probe.elf` is a separate payload. It is not linked into `shsrv-ps5.elf`. It calls `openat`, `renameat`, `unlinkat` and `fsync` the way the store does, and prints each call, its `rc` and `errno`, and a `PASS` or `FAIL` line for whether the POSIX behavior held.
+
+`renameat` is probed as an atomic replace of a file that already exists: the destination must hold the new content, and the temporary name must be gone. `fsync` is probed twice, once on a file descriptor and once on a directory descriptor. `fsync` is the libkernel symbol, which already returns -1 and sets `errno`, so `ps5_at.h` does not wrap it. The other three go through `ps5_at.h`.
+
+Nothing in this section was measured. The probe has not been sent to a console.
+
+### Run procedure
+
+1. Build with the PS5 SDK set, as in the [quick start](quick-start.md). `make clean all` writes `primitives-probe.elf`. To build only the probe, run `make primitives-probe.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console.
+2. Send the probe to the ELF loader. The loader copies the payload's standard output back over this connection, so leave it open:
+
+```console
+$ export PS5_HOST=192.168.0.10
+$ $PS5_PAYLOAD_SDK/bin/prospero-deploy -h $PS5_HOST -p 9021 primitives-probe.elf
+```
+
+3. The payload works under `/data/ariel/probe18` and exits on its own. Each primitive prints three lines: `call <what was called>`, `rc <n> errno <n>`, and `PASS` or `FAIL` with the reason. The last line is `primitives probe: done, failures <n>`.
+4. Copy those lines into the table below, one row per primitive, with the firmware and the model of the console that ran it. A `FAIL` is reported on issue #2 before the journal ticket starts.
+
+### Results
+
+| firmware | model | primitive | rc | errno | verdict |
+| --- | --- | --- | --- | --- | --- |
+| not yet run on a console | not yet run on a console | openat | not yet run on a console | not yet run on a console | not yet run on a console |
+| not yet run on a console | not yet run on a console | renameat (atomic replace of an existing file) | not yet run on a console | not yet run on a console | not yet run on a console |
+| not yet run on a console | not yet run on a console | unlinkat | not yet run on a console | not yet run on a console | not yet run on a console |
+| not yet run on a console | not yet run on a console | fsync of a file | not yet run on a console | not yet run on a console | not yet run on a console |
+| not yet run on a console | not yet run on a console | fsync of a directory | not yet run on a console | not yet run on a console | not yet run on a console |
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.
