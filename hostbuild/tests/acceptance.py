@@ -3464,10 +3464,10 @@ def split_read(reply):
     head, sep, rest = reply.partition(b"\n")
     assert sep, "read must answer a header line, got %r" % reply[:80]
     fields = head.decode("ascii").split(" ")
-    assert len(fields) == 4 and fields[0] == "bytes", (
-        "read's header must be 'bytes <size> <sha256> <length>', got %r" % head)
-    size, digest, length = int(fields[1]), fields[2], int(fields[3])
-    return size, digest, rest[:length], rest[length:]
+    assert len(fields) == 3 and fields[0] == "bytes", (
+        "read's header must be 'bytes <size> <sha256>', got %r" % head)
+    size, digest = int(fields[1]), fields[2]
+    return size, digest, rest[:size], rest[size:]
 
 
 def openssl_sha256(path):
@@ -3496,8 +3496,9 @@ def scenario_read_ranges_over_the_cap(server):
     digest = openssl_sha256(path)
 
     size, got, body, tail = split_read(read_raw(server, "read " + path))
-    assert (size, got) == (len(data), digest), (
-        "a whole read must report the whole file's size and hash")
+    assert (size, got) == (READ_CAP, digest), (
+        "a whole read over the cap must name the cap in its header and the "
+        "whole file's hash")
     assert body == data[:READ_CAP], "a read over the cap must return the cap"
     assert tail == ("truncated %d of %d\nexit 0\n" % (READ_CAP, len(data))
                     ).encode("ascii"), "a cut read must say so, got %r" % tail
@@ -3507,8 +3508,10 @@ def scenario_read_ranges_over_the_cap(server):
         offset = len(assembled)
         command = "read %s --offset %d --limit %d" % (path, offset, READ_CAP)
         size, got, body, tail = split_read(read_raw(server, command))
-        assert (size, got) == (len(data), digest), (
-            "every range must report the whole file's size and hash")
+        assert size == len(body), (
+            "a range's header must name the bytes that follow, got %d for %d"
+            % (size, len(body)))
+        assert got == digest, "every range must report the whole file's hash"
         assert 0 < len(body) <= READ_CAP, (
             "a range must return at most the cap, got %d bytes" % len(body))
         assert tail == b"exit 0\n", "a range must end with exit 0, got %r" % tail
@@ -3525,7 +3528,8 @@ def scenario_read_cut_at_an_offset(server):
     offset = 100000
     size, got, body, tail = split_read(
         read_raw(server, "read %s --offset %d" % (path, offset)))
-    assert size == len(data), "a cut read must report the whole file's size"
+    assert size == len(body) == READ_CAP, (
+        "a cut read must name the bytes it sends")
     assert body == data[offset:offset + READ_CAP], (
         "a cut read from an offset must return the cap from that offset")
     assert tail == ("truncated %d of %d\nexit 0\n"
@@ -3540,7 +3544,7 @@ def scenario_read_bad_range(server):
         "bad_range", "exit 1"], "an offset past the end must answer bad_range"
     size, digest, body, tail = split_read(
         read_raw(server, "read %s --offset 10" % path))
-    assert (size, body, tail) == (10, b"", b"exit 0\n"), (
+    assert (size, body, tail) == (0, b"", b"exit 0\n"), (
         "an offset at the end must read nothing, got %r" % body)
     assert run_command(server, "read %s --offset ten" % path) == [
         "bad_option", "exit 1"], "a non-numeric offset must answer bad_option"

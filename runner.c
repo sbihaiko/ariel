@@ -985,8 +985,10 @@ run_read(int argc, char *const argv[], int outfd, int errfd) {
     return 1;
   }
 
-  snprintf(header, sizeof(header), "bytes %llu %s %llu\n",
-           (unsigned long long)size, hex, (unsigned long long)shown);
+  // Decision 5's one frame: the size is the number of bytes that follow,
+  // which is the file's size for a whole read and the range's for a cut one.
+  snprintf(header, sizeof(header), "bytes %llu %s\n",
+           (unsigned long long)shown, hex);
   say(outfd, header);
   put(outfd, body, (size_t)shown);
   free(body);
