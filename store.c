@@ -747,6 +747,7 @@ store_approval_request(const approval_facts_t *facts,
                        approval_challenge_t *challenge, char *prompt,
                        size_t promptlen) {
   char size_text[24];
+  char id[APPROVAL_ID_MAX] = {0};
   approval_option_t options[2];
   approval_action_t action;
   struct approval *slot;
@@ -815,8 +816,11 @@ store_approval_request(const approval_facts_t *facts,
 
   slot->used = 1;
   slot->created_ms = now;
-  snprintf(slot->id, sizeof(slot->id), "a-%lx", ++approval_count);
-  snprintf(slot->challenge.id, sizeof(slot->challenge.id), "%s", slot->id);
+  // Built once outside the table: GCC's -Wrestrict reads a copy from
+  // slot->id into slot->challenge.id as an overlap in `approvals`.
+  snprintf(id, sizeof(id), "a-%lx", ++approval_count);
+  memcpy(slot->id, id, sizeof(slot->id));
+  memcpy(slot->challenge.id, id, sizeof(slot->challenge.id));
   snprintf(slot->challenge.console, sizeof(slot->challenge.console), "%s",
            console);
   slot->challenge.action_len = (size_t)len;
