@@ -252,19 +252,20 @@ Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014). The spike is
 | `sceKernelLoadStartModule` after `/system/common/lib/libSceIpmi.sprx` and `/system/common/lib/libSceSysUtil.sprx` | loaded (handle 35), all 13 exports resolved, calls survive |
 | `sceKernelDlsym(handle, nid, &fn)` for each export | `0x80020003` for every one, plain and `#E#A`-decorated; `kernel_dynlib_resolve(getpid(), handle, nid)` answers instead |
 | `SetParam("Ariel capture spike", …, "issue #55")` | `0`, twice |
-| `Capture(mode 0, buf, cancel at 15 s, …)`, first run | `0x80020023` until the cancel fired, then `0x80BE000A`; buffer empty |
-| `Capture(mode 0, buf, cancel at 20 s, …)`, second run | `0x80020003` at once; buffer empty |
-| `Capture(mode 1, buf, cancel at 20 s, …)` | `0x80020003` at once; buffer empty |
-| `IsDisabled(&flag)` | `0x80BE0001`, flag untouched: the export does not take a `int *` |
+| `Capture(mode 0, buf, cancel at 15 s, …)` | `0x80020023` until the cancel fired, then `0x80BE000A`; buffer empty |
+| `Capture(mode 0, buf, cancel at 20 s, …)`, a fresh payload | the same: `0x80020023` for 20 s, then `0x80BE000A`; buffer empty |
+| `Capture(mode 1, buf, cancel at 20 s, …)`, a fresh payload | the same for both modes |
+| `Capture`, after the two flag calls below answered errors | `0x80020003` at once, both modes: the client is wedged by the calls before it, not by the capture |
+| `IsDisabled(&flag)` | `0x80BE0001`, flag untouched: the export does not take an `int *` |
 | `IsVshScreenCaptureDisabled(&flag)` | `0x80020003`, flag untouched |
 | `SetOverlayImage("/data/shot-spike2.jpg", 1280, 720, 0)` | `0x80BE0003` (the export takes a path and two coordinates; no image either way) |
 
 Four things this run settled:
 
 - **The library loads in a payload only after its imports are present.** Loaded alone, it resolves and then dies on the first call that crosses a PLT entry into `libSceIpmi`/`libSceSysUtil`; loaded after those two, it answers. A payload has no `dlopen` at all, so `sceKernelLoadStartModule` with the full path is the only door, and `kernel_dynlib_resolve` with the kernel's own symbol table is the only lookup.
-- **A payload is not refused by the capture service, and not served either.** `SetParam` answers success. `Capture` is accepted (`0x80020023` is "still working", not an error) and never leaves that state — 15 s, no game running, the system UI on screen — and on the next payload it answers `0x80020003` at once, for both modes. No image was produced in either run. Whether a running title or the VSH's own identity changes that is not measured.
+- **A payload is not refused by the capture service, and not served either.** `SetParam` answers success. `Capture` is accepted — `0x80020023` is "still working", not an error — and never leaves that state: 20 s in both modes on a fresh payload, with the system UI on screen and no title running. No image was produced. Whether a running title or the VSH's own identity changes that is not measured. The one run where `Capture` answered `0x80020003` at once had called `IsDisabled`/`IsVshScreenCaptureDisabled` with a wrong signature just before it, and that is the likelier cause of the wedge than the capture itself.
 - **Where the image goes is the system's choice.** The caller's buffer says where it went; it is not an argument.
-- **The console going dark after the second run was not the capture.** The second run finished and logged `capture spike end` at 20:51:35; the console stopped answering ping and every port a couple of minutes later and came back on its own, which is the rest/power behaviour already recorded above, not a crash in the payload. The spike logs its last step before taking it, and the log names the run's end.
+- **Every payload that called `Capture` was followed by the console dropping off the network.** Three payloads called it; each logged its own end (`capture spike end`) and each console stopped answering ping and every port — 2323, 2324, 9021, 2121 — a few minutes later, with no wake from a magic packet, and came back on its own tens of minutes after. The payload that called `SetParam` and `SetOverlayImage` but never `Capture` was not followed by one. The cause is not proven — the console also rests on its own, and no payload survives that — but the correlation is three for three, so **no further capture attempt runs on this console without the owner present**.
 
 **Not measured.** The time and memory a capture costs, the size and format of the file (the system's PNG/JPEG setting), what a protected scene answers (no game or video app was run), and whether a capture works while a title is in the foreground. Each needs a console that completes a capture first.
 

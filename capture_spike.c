@@ -248,8 +248,22 @@ main(void) {
   }
   log_line("survived SetParam");
 
-  // Whether the system says capture is off at all: two flags, each written
-  // through a pointer the function insists on.
+  // The capture: a mode, a 1024-byte buffer the system fills with the path
+  // it wrote, a cancel callback and its argument.
+  fn = resolve_logged(handle, "JuMLLmmvRgk");
+  for(i=0; i<2 && fn; i++) {
+    memset(shot_path, 0, sizeof(shot_path));
+    deadline = time(0) + SPIKE_CAPTURE_SECONDS;
+    log_line("call Capture(mode %d, buf, cancel, deadline +%ds)", i,
+             SPIKE_CAPTURE_SECONDS);
+    rc = ((int (*)(int, char*, int (*)(void*), void*))fn)(i, shot_path,
+                                                          spy_cancel, &deadline);
+    log_line("Capture(mode %d) -> %d (%#x) path \"%s\"", i, rc, rc, shot_path);
+    notify("Capture spike: mode %d answered %#x", i, rc);
+    log_line("survived Capture(mode %d)", i);
+  }
+
+  // After the captures, so a bad call cannot wedge the client first.
   fn = resolve_logged(handle, "-SV-oTNGFQk");
   if(fn) {
     int disabled = -1;
@@ -266,21 +280,6 @@ main(void) {
              rc, rc, vsh_disabled);
   }
   log_line("survived the flag queries");
-
-  // The capture: a mode, a 1024-byte buffer the system fills with the path
-  // it wrote, a cancel callback and its argument.
-  fn = resolve_logged(handle, "JuMLLmmvRgk");
-  for(i=0; i<2 && fn; i++) {
-    memset(shot_path, 0, sizeof(shot_path));
-    deadline = time(0) + SPIKE_CAPTURE_SECONDS;
-    log_line("call Capture(mode %d, buf, cancel, deadline +%ds)", i,
-             SPIKE_CAPTURE_SECONDS);
-    rc = ((int (*)(int, char*, int (*)(void*), void*))fn)(i, shot_path,
-                                                          spy_cancel, &deadline);
-    log_line("Capture(mode %d) -> %d (%#x) path \"%s\"", i, rc, rc, shot_path);
-    notify("Capture spike: mode %d answered %#x", i, rc);
-    log_line("survived Capture(mode %d)", i);
-  }
 
   log_line("capture spike end");
   close(logfd);
