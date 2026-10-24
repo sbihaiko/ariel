@@ -133,6 +133,17 @@ int approval_pubkey_parse(const char *hex,
  **/
 int approval_pin(const unsigned char key[APPROVAL_PUBKEY_LEN]);
 
+/**
+ * Whether key may become the active primary: it passes approval_pin, and it is
+ * neither the recovery key, nor the active primary, nor one of the revoked
+ * keys. Returns 0 or -1.
+ **/
+int approval_key_admissible(const unsigned char key[APPROVAL_PUBKEY_LEN],
+                            const unsigned char primary[APPROVAL_PUBKEY_LEN],
+                            const unsigned char recovery[APPROVAL_PUBKEY_LEN],
+                            unsigned char (*revoked)[APPROVAL_PUBKEY_LEN],
+                            size_t revoked_count);
+
 /** Verify sig over msg with key. Returns 0 only for a valid signature. **/
 int approval_verify(const unsigned char key[APPROVAL_PUBKEY_LEN],
                     const unsigned char *msg, size_t len,

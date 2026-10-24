@@ -443,6 +443,28 @@ approval_pin(const unsigned char key[APPROVAL_PUBKEY_LEN]) {
 
 
 int
+approval_key_admissible(const unsigned char key[APPROVAL_PUBKEY_LEN],
+                        const unsigned char primary[APPROVAL_PUBKEY_LEN],
+                        const unsigned char recovery[APPROVAL_PUBKEY_LEN],
+                        unsigned char (*revoked)[APPROVAL_PUBKEY_LEN],
+                        size_t revoked_count) {
+  size_t i;
+
+  if(approval_pin(key) || !memcmp(key, primary, APPROVAL_PUBKEY_LEN) ||
+     !memcmp(key, recovery, APPROVAL_PUBKEY_LEN)) {
+    return -1;
+  }
+
+  for(i = 0; i < revoked_count; i++) {
+    if(!memcmp(key, revoked[i], APPROVAL_PUBKEY_LEN)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+
+int
 approval_verify(const unsigned char key[APPROVAL_PUBKEY_LEN],
                 const unsigned char *msg, size_t len,
                 const unsigned char sig[APPROVAL_SIG_LEN]) {
