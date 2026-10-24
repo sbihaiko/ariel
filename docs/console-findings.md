@@ -134,7 +134,7 @@ The safe call is a `syscall` instruction whose carry flag is checked: carry set 
 
 `renameat` is probed as an atomic replace of a file that already exists: the destination must hold the new content, and the temporary name must be gone. `fsync` is probed twice, once on a file descriptor and once on a directory descriptor. `fsync` is the libkernel symbol, which already returns -1 and sets `errno`, so `ps5_at.h` does not wrap it. The other three go through `ps5_at.h`.
 
-Nothing in this section was measured. The probe has not been sent to a console.
+Measured on 2026-10-24 on a CFI-2014 on firmware 11.200.005: every primitive held, `failures 0`. The probe was sent with `nc 192.168.68.77 9021 < primitives-probe.elf`, since `prospero-deploy` needs `socat`.
 
 ### Run procedure
 
@@ -153,11 +153,11 @@ $ $PS5_PAYLOAD_SDK/bin/prospero-deploy -h $PS5_HOST -p 9021 primitives-probe.elf
 
 | firmware | model | primitive | rc | errno | verdict |
 | --- | --- | --- | --- | --- | --- |
-| not yet run on a console | not yet run on a console | openat | not yet run on a console | not yet run on a console | not yet run on a console |
-| not yet run on a console | not yet run on a console | renameat (atomic replace of an existing file) | not yet run on a console | not yet run on a console | not yet run on a console |
-| not yet run on a console | not yet run on a console | unlinkat | not yet run on a console | not yet run on a console | not yet run on a console |
-| not yet run on a console | not yet run on a console | fsync of a file | not yet run on a console | not yet run on a console | not yet run on a console |
-| not yet run on a console | not yet run on a console | fsync of a directory | not yet run on a console | not yet run on a console | not yet run on a console |
+| 11.200.005 | CFI-2014 | openat | 8 | 0 | PASS |
+| 11.200.005 | CFI-2014 | renameat (atomic replace of an existing file) | 0 | 0 | PASS |
+| 11.200.005 | CFI-2014 | unlinkat | 0 (a second call: -1) | 0 (a second call: 2, ENOENT) | PASS |
+| 11.200.005 | CFI-2014 | fsync of a file | 0 | 0 | PASS |
+| 11.200.005 | CFI-2014 | fsync of a directory | 0 | 0 | PASS |
 
 ## What other projects say
 
