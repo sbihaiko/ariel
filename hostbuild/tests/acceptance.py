@@ -9520,7 +9520,9 @@ def assert_grants_active(server, names, when):
 
 def scenario_revoke_lineage_suspends_every_grant(server):
     del server  # each revocation needs an Ariel of its own
-    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-lineage"})
+    # No nonce seed: a seeded sequence starts over at the reboot's exec and
+    # offers only nonces already consumed.
+    keys = Server(SERVER_BINARY)
     try:
         with tempfile.TemporaryDirectory() as scratch:
             p0, p1 = test_key(), SECOND_PRIMARY_KEY

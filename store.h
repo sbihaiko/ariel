@@ -46,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #define STORE_APPROVAL_NEW      5
 #define STORE_ROLLBACK_FAILED   6
 #define STORE_APPROVAL_FROZEN   7
+#define STORE_APPROVAL_SUSPENDED 8
 
 /** What a rollback target was: the build it restores, or why there is none. **/
 #define STORE_ROLLBACK_OK          0
@@ -61,6 +62,7 @@ typedef struct {
   char tag[65];
   uint64_t release;
   uint64_t asset;
+  int64_t generation;   /** The key generation that approved it, or -1: none. **/
 } store_install_t;
 
 /** How reading a payload back for a run ended. **/
@@ -68,6 +70,7 @@ typedef struct {
 #define STORE_RUN_UNKNOWN 1
 #define STORE_RUN_STALE   2
 #define STORE_RUN_FROZEN  3
+#define STORE_RUN_SUSPENDED 4
 
 /** The verified bytes of one payload, held in memory until they are freed. **/
 typedef struct {
@@ -212,6 +215,7 @@ int store_approval_facts(const char *id, approval_facts_t *facts);
 #define STORE_KEY_UNRECORDED 3
 #define STORE_KEY_ADOPTED    4
 #define STORE_KEY_REFUSED    5
+#define STORE_KEY_REVOKED    6
 
 /** The keyring role a rotation replaces. **/
 #define STORE_KEY_ROLE_PRIMARY  0
@@ -237,6 +241,31 @@ int store_key_check(const char *hex);
  **/
 int store_key_rotate(const approval_challenge_t *challenge, const char *hex,
                      int role, uint32_t *generation);
+
+/**
+ * Whether key revoke --since since with hex as the new primary can be asked:
+ * the keyring is ready, since is a generation it has reached, and hex passes
+ * store_key_check. Returns 0 or -1.
+ **/
+int store_revoke_check(uint32_t since, const char *hex);
+
+/**
+ * Revoke the lineage from generation since on, for the granted recovery-signed
+ * challenge: hex becomes the primary at the next generation, the old primary is
+ * retired, and every grant the ledger holds from a generation in since..current
+ * is suspended. A suspended autoload entry leaves the autoload file. The
+ * keyring, the ledger and the autoload file change in one journal transaction.
+ * Returns STORE_KEY_REVOKED, STORE_KEY_STALE, STORE_KEY_REFUSED,
+ * STORE_KEY_UNRECORDED or STORE_KEY_FAILED; generation is the new one.
+ **/
+int store_key_revoke(const approval_challenge_t *challenge, uint32_t since,
+                     const char *hex, uint32_t *generation);
+
+/**
+ * Whether the pin of name to sha256 is a grant the ledger holds suspended.
+ * Returns 1 when it is, 0 when it is active or was set in advance.
+ **/
+int store_pin_suspended(const char *name, const char *sha256);
 
 /** Whether the owner's freeze is in force. A freeze file not yet recorded is recorded now. **/
 int store_frozen(void);
@@ -314,13 +343,19 @@ int store_commit_pinned(const char *staging_id, store_install_t *install);
 int store_allowlist_read(char *text, size_t size);
 
 /**
- * Pin sha256 to name in the allowlist. Returns 0 when the pin is written or
- * already holds sha256, and -1 otherwise.
+ * Pin sha256 to name in the allowlist, as a grant of generation, or of no key
+ * when generation is -1. Returns 0 when the pin is written or already holds
+ * sha256, 1 when generation is one a revocation suspended, and -1 otherwise.
  **/
-int store_allowlist_pin(const char *name, const char *sha256);
+int store_allowlist_pin(const char *name, const char *sha256,
+                        int64_t generation);
 
-/** Add name to the autoload list. Returns 0, or -1. **/
-int store_autoload_join(const char *name);
+/**
+ * Add name to the autoload list, as a grant of generation, or of no key when
+ * generation is -1. Returns 0, 1 when generation is one a revocation
+ * suspended, or -1.
+ **/
+int store_autoload_join(const char *name, int64_t generation);
 
 /** Bind a staged object to the approval that names it. **/
 void store_stage(const char *staging_id, const approval_facts_t *facts,

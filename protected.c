@@ -27,7 +27,8 @@ along with this program; see the file COPYING. If not, see
 #endif
 
 static const char *const protected_names[] = {
-  "token", "approvals", "nonces", "audit.log", "state", "allowlist", "keyring"
+  "token", "approvals", "nonces", "audit.log", "state", "allowlist", "keyring",
+  "grants"
 };
 static char state_dir[PATH_MAX];
 

@@ -120,6 +120,9 @@ static const char key_failed[] =
 static const char frozen_reply[] =
   "frozen\n"
   "exit 89\n";
+static const char suspended_reply[] =
+  "suspended\n"
+  "exit 90\n";
 
 /** The answer to an approval that could not be requested: a frozen console says so. **/
 static const char *
@@ -1433,6 +1436,69 @@ key_adopt_command(agent_t *agent, int fd) {
 }
 
 
+/**
+ * key revoke --since N <primary>: the recovery key declares every primary from
+ * generation N on compromised. Their grants are suspended and primary becomes
+ * the next generation's primary. It passes while frozen.
+ **/
+static void
+key_revoke_command(agent_t *agent, int fd, const char *since_text,
+                   const char *hex) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  const char *command = "key.revoke";
+  unsigned long long since = 0;
+  char answer[32];
+  uint32_t generation = 0;
+  size_t i;
+
+  for(i=0; since_text[i]; i++) {
+    if(i == 10 || since_text[i] < '0' || since_text[i] > '9') {
+      break;
+    }
+    since = since * 10 + (unsigned)(since_text[i] - '0');
+  }
+  if(!i || since_text[i] || since > UINT32_MAX) {
+    reply(fd, bad_argument);
+    return;
+  }
+
+  if(store_revoke_check((uint32_t)since, hex)) {
+    audit_reply(fd, command, "refused", "keyring", "-", key_refused);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", command);
+  snprintf(facts.target, sizeof(facts.target), "%s", "keyring");
+  snprintf(facts.arg[0], sizeof(facts.arg[0]), "%llu", since);
+  snprintf(facts.arg[1], sizeof(facts.arg[1]), "%s", hex);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  switch(store_key_revoke(&challenge, (uint32_t)since, hex, &generation)) {
+  case STORE_KEY_REVOKED:
+    snprintf(answer, sizeof(answer), "key_revoked %u\nexit 0\n",
+             (unsigned)generation);
+    reply(fd, answer);
+    return;
+  case STORE_KEY_STALE:
+    audit_reply(fd, command, "stale", "keyring", challenge.id, approval_stale);
+    return;
+  case STORE_KEY_REFUSED:
+    audit_reply(fd, command, "refused", "keyring", challenge.id, key_refused);
+    return;
+  case STORE_KEY_UNRECORDED:
+    reply(fd, audit_failed);
+    return;
+  default:
+    audit_reply(fd, command, "failed", "keyring", challenge.id, key_failed);
+    return;
+  }
+}
+
+
 /** key unfreeze: lifts the owner's freeze, signed by the recovery key. **/
 static void
 key_unfreeze_command(agent_t *agent, int fd) {
@@ -1729,8 +1795,21 @@ activation_healthy(agent_t *agent, int fd, const char *name,
   int run;
   int outcome;
 
-  if(state_health_get(name, &timeout, &flagged) ||
-     store_run_load(name, &object) != STORE_RUN_OK) {
+  if(state_health_get(name, &timeout, &flagged)) {
+    outcome = STORE_RUN_STALE;
+  } else {
+    outcome = store_run_load(name, &object);
+  }
+  if(outcome == STORE_RUN_SUSPENDED) {
+    // The build is current but a revoked key approved it: it never runs.
+    if(store_audit_append("health.suspended", name, "-", sha256)) {
+      reply(fd, audit_failed);
+      return 0;
+    }
+    reply(fd, suspended_reply);
+    return 0;
+  }
+  if(outcome != STORE_RUN_OK) {
     if(store_audit_append("health.skipped", name, "-", sha256)) {
       reply(fd, audit_failed);
       return 0;
@@ -1975,12 +2054,27 @@ install_settle(agent_t *agent, int fd, const store_install_t *install) {
     return;
   }
 
-  if(store_autoload_join(install->name)) {
+  switch(store_autoload_join(install->name, install->generation)) {
+  case 0:
+    break;
+  case 1:
+    audit_reply(fd, "payload", "install.refused", install->name, "suspended",
+                suspended_reply);
+    return;
+  default:
     install_refuse(fd, install->name, "install_failed");
     return;
   }
 
-  if(store_allowlist_pin(install->name, install->sha256)) {
+  switch(store_allowlist_pin(install->name, install->sha256,
+                             install->generation)) {
+  case 0:
+    break;
+  case 1:
+    audit_reply(fd, "payload", "install.refused", install->name, "suspended",
+                suspended_reply);
+    return;
+  default:
     install_refuse(fd, install->name, "pin_failed");
     return;
   }
@@ -2128,6 +2222,12 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
     goto out;
   }
 
+  // A pin a revoked key approved admits nothing until the owner approves the
+  // build again; that approval restores the pin.
+  if(pinned && store_pin_suspended(name, pinned)) {
+    pinned = NULL;
+  }
+
   memset(&facts, 0, sizeof(facts));
   snprintf(facts.command, sizeof(facts.command), "%s", "payload.install");
   snprintf(facts.name, sizeof(facts.name), "%s", name);
@@ -2148,6 +2248,12 @@ payload_install(agent_t *agent, int fd, const char *name, const char *repo,
     if(pinned_outcome == STORE_APPROVAL_FROZEN) {
       audit_reply(fd, "payload", "install.refused", name, "frozen",
                   frozen_reply);
+      goto out;
+    }
+    if(pinned_outcome == STORE_APPROVAL_SUSPENDED) {
+      store_staging_discard(staging_id);
+      audit_reply(fd, "payload", "install.refused", name, "suspended",
+                  suspended_reply);
       goto out;
     }
     if(pinned_outcome != STORE_INSTALLED) {
@@ -2434,6 +2540,11 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
     return;
   }
 
+  if(outcome == STORE_RUN_SUSPENDED) {
+    reply(fd, suspended_reply);
+    return;
+  }
+
   if(outcome == STORE_RUN_UNKNOWN) {
     reply(fd, unknown_payload);
     return;
@@ -2668,6 +2779,11 @@ payload_start(agent_t *agent, int fd, const char *name) {
 
   if(outcome == STORE_RUN_FROZEN) {
     refuse(fd, name, "frozen", frozen_reply);
+    return;
+  }
+
+  if(outcome == STORE_RUN_SUSPENDED) {
+    refuse(fd, name, "suspended", suspended_reply);
     return;
   }
 
@@ -3621,6 +3737,12 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "key") && !strcmp(argv[1], "unfreeze")) {
     key_unfreeze_command(agent, fd);
+    return;
+  }
+
+  if(argc == 5 && !strcmp(argv[0], "key") && !strcmp(argv[1], "revoke") &&
+     !strcmp(argv[2], "--since")) {
+    key_revoke_command(agent, fd, argv[3], argv[4]);
     return;
   }
 

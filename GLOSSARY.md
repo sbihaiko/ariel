@@ -28,6 +28,9 @@ Domain terms of Ariel. Use these words, in this sense, in code, tests, issues an
 - **Signer**: the owner's tool that shows a challenge's action and signs it (`ariel-sign`).
 - **Nonce**: random, single-use value in each challenge. Persisted as consumed before the action runs, so a replay answers `approval_replayed` (84).
 - **Console identity**: the name the console signs under (`ARIEL_CONSOLE_ID`, default `ps5`).
+- **Grant ledger**: the protected file `grants` that records each persistent grant a key made (an install, a pin, an autoload entry) with the keyring generation that approved it, and the generation ranges `key revoke` declared compromised.
+- **Suspended grant**: a grant whose generation a revocation declared compromised. Its build stays in the store but does not run, install or autoload, until an active key approves it again. Exit 90 (`suspended`).
+- **Revocation by lineage**: `key revoke --since N`, signed by the recovery key: every primary from generation N to the current one is treated as compromised, and all their grants are suspended at once, because a leaked primary could have rotated to keys of its own.
 
 ## Store
 

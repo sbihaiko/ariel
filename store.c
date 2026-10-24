@@ -138,6 +138,18 @@ static char anchor_hash[SHA256_HEX_LEN + 1];
 #define ALLOWLIST_FILE "allowlist"
 #define ALLOWLIST_TMP "allowlist.tmp"
 
+/**
+ * The grant ledger: every persistent grant a key approved (an install, a pin,
+ * an autoload entry) with the generation that approved it, whether a
+ * revocation suspended it, and the generation ranges revocations declared
+ * compromised. A grant with no line was approved by no key.
+ **/
+#define GRANTS_FILE "grants"
+#define GRANTS_TMP "grants.tmp"
+#define GRANTS_MAX 192
+#define GRANTS_RANGES_MAX 16
+#define GRANTS_TEXT_MAX (GRANTS_MAX * 128 + GRANTS_RANGES_MAX * 40)
+
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -962,6 +974,16 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
                                                            : "recovery";
     options[0].value = facts->arg[0];
     action->noptions = 1;
+  } else if(!strcmp(facts->command, "key.revoke")) {
+    action->command = facts->command;
+    action->target = facts->target;
+    action->destination = NULL;
+    action->sha256 = APPROVAL_NO_HASH;
+    options[0].key = "since";
+    options[0].value = facts->arg[0];
+    options[1].key = "primary";
+    options[1].value = facts->arg[1];
+    action->noptions = 2;
   } else if(!strcmp(facts->command, "key.adopt-anchor")) {
     action->command = facts->command;
     action->target = facts->target;
@@ -1124,10 +1146,13 @@ run_prompt(char *prompt, size_t promptlen, const approval_facts_t *facts) {
 }
 
 
-/** The one command a freeze lets through: the recovery-signed key unfreeze. **/
+/**
+ * The commands a freeze lets through, both recovery-signed: key unfreeze, and
+ * key revoke, which must reach a compromise the freeze was set against.
+ **/
 static int
 freeze_exempt(const char *command) {
-  return !strcmp(command, "key.unfreeze");
+  return !strcmp(command, "key.unfreeze") || !strcmp(command, "key.revoke");
 }
 
 
@@ -1240,6 +1265,8 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen, "key adopt-anchor will run");
   } else if(!strcmp(facts->command, "key.unfreeze")) {
     snprintf(prompt, promptlen, "key unfreeze will run");
+  } else if(!strcmp(facts->command, "key.revoke")) {
+    snprintf(prompt, promptlen, "key revoke will run");
   } else if(rollback) {
     snprintf(prompt, promptlen,
              "payload %s rolls back to %s, replacing %s",
@@ -1358,7 +1385,7 @@ grant_key(const char *command) {
     return anchor_recovery;
   }
   if(!strcmp(command, "key.rotate-recovery") ||
-     !strcmp(command, "key.unfreeze")) {
+     !strcmp(command, "key.unfreeze") || !strcmp(command, "key.revoke")) {
     return keyring_recovery;
   }
   return keyring_primary;
@@ -1879,7 +1906,7 @@ journal_read(int store_fd, struct journal *j) {
   }
 
   if((strcmp(j->kind, "payload") && strcmp(j->kind, "autoload") &&
-      strcmp(j->kind, "keyring")) ||
+      strcmp(j->kind, "keyring") && strcmp(j->kind, "revoke")) ||
      (strcmp(j->phase, "prepared") && strcmp(j->phase, "committed")) ||
      !store_name_valid(j->name) || !hash_text(j->hash) ||
      (strcmp(j->previous, "-") && !hash_text(j->previous)) ||
@@ -2335,6 +2362,366 @@ file_recover_locked(int state_fd, int store_fd, const struct journal *j,
 }
 
 
+/** One grant of the ledger. **/
+struct grant {
+  char kind[12];
+  char name[PAYLOAD_NAME_MAX + 1];
+  char sha256[SHA256_HEX_LEN + 1];
+  uint32_t generation;
+  int suspended;
+};
+
+
+/** The grant ledger, as the grants file holds it. **/
+struct ledger {
+  struct grant rows[GRANTS_MAX];
+  size_t count;
+  uint32_t since[GRANTS_RANGES_MAX];
+  uint32_t until[GRANTS_RANGES_MAX];
+  size_t ranges;
+};
+
+
+static int
+grant_kind_valid(const char *kind) {
+  return !strcmp(kind, "install") || !strcmp(kind, "pin") ||
+         !strcmp(kind, "autoload");
+}
+
+
+/** Read a ledger text. Returns 0, or -1 for any line Ariel does not write. **/
+static int
+ledger_parse(const char *text, struct ledger *ledger) {
+  const char *cursor = text;
+  char line[256];
+  char state[16];
+  unsigned long since;
+  unsigned long until;
+  unsigned long generation;
+  struct grant *row;
+  size_t len;
+
+  memset(ledger, 0, sizeof(*ledger));
+  while(*cursor) {
+    const char *end = strchr(cursor, '\n');
+
+    if(!end || (len=(size_t)(end - cursor)) >= sizeof(line)) {
+      return -1;
+    }
+    memcpy(line, cursor, len);
+    line[len] = '\0';
+    cursor = end + 1;
+
+    if(!strncmp(line, "revoked ", 8)) {
+      if(ledger->ranges == GRANTS_RANGES_MAX ||
+         sscanf(line, "revoked %lu %lu", &since, &until) != 2 ||
+         since > until || until > UINT32_MAX) {
+        return -1;
+      }
+      ledger->since[ledger->ranges] = (uint32_t)since;
+      ledger->until[ledger->ranges++] = (uint32_t)until;
+      continue;
+    }
+
+    if(ledger->count == GRANTS_MAX) {
+      return -1;
+    }
+    row = &ledger->rows[ledger->count];
+    if(sscanf(line, "grant %11s %32s %64s %lu %15s", row->kind, row->name,
+              row->sha256, &generation, state) != 5 ||
+       !grant_kind_valid(row->kind) || !store_name_valid(row->name) ||
+       (strcmp(row->sha256, "-") && !hash_text(row->sha256)) ||
+       generation > UINT32_MAX ||
+       (strcmp(state, "active") && strcmp(state, "suspended"))) {
+      return -1;
+    }
+    row->generation = (uint32_t)generation;
+    row->suspended = !strcmp(state, "suspended");
+    ledger->count++;
+  }
+  return 0;
+}
+
+
+/** Write the ledger as text. Returns its length, or -1 when it does not fit. **/
+static int
+ledger_render(const struct ledger *ledger, char *text, size_t size) {
+  size_t used = 0;
+  size_t i;
+  int n;
+
+  text[0] = '\0';
+  for(i=0; i<ledger->ranges; i++) {
+    n = snprintf(text + used, size - used, "revoked %lu %lu\n",
+                 (unsigned long)ledger->since[i],
+                 (unsigned long)ledger->until[i]);
+    if(n < 0 || (size_t)n >= size - used) {
+      return -1;
+    }
+    used += (size_t)n;
+  }
+  for(i=0; i<ledger->count; i++) {
+    const struct grant *row = &ledger->rows[i];
+
+    n = snprintf(text + used, size - used, "grant %s %s %s %lu %s\n",
+                 row->kind, row->name, row->sha256,
+                 (unsigned long)row->generation,
+                 row->suspended ? "suspended" : "active");
+    if(n < 0 || (size_t)n >= size - used) {
+      return -1;
+    }
+    used += (size_t)n;
+  }
+  return (int)used;
+}
+
+
+/**
+ * Load the ledger below state_fd; a missing one is empty. text is scratch of
+ * GRANTS_TEXT_MAX bytes. Returns 0, or -1 when it cannot be read or parsed.
+ **/
+static int
+ledger_load(int state_fd, struct ledger *ledger, char *text) {
+  if(text_read(state_fd, GRANTS_FILE, text, GRANTS_TEXT_MAX) < 0) {
+    if(errno != ENOENT) {
+      return -1;
+    }
+    text[0] = '\0';
+  }
+  return ledger_parse(text, ledger);
+}
+
+
+/** Replace the ledger file with ledger. Returns 0, or -1 with the old one kept. **/
+static int
+ledger_save(int state_fd, const struct ledger *ledger, char *text) {
+  int len = ledger_render(ledger, text, GRANTS_TEXT_MAX);
+
+  if(len < 0 || tmp_write(state_fd, GRANTS_TMP, text, (size_t)len) ||
+     renameat(state_fd, GRANTS_TMP, state_fd, GRANTS_FILE) || fsync(state_fd)) {
+    unlinkat(state_fd, GRANTS_TMP, 0);
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * The ledger's line for one grant: an install is one build of a name, a pin and
+ * an autoload entry are one per name. NULL when the ledger holds none.
+ **/
+static struct grant *
+ledger_find(struct ledger *ledger, const char *kind, const char *name,
+            const char *sha256) {
+  size_t i;
+
+  for(i=0; i<ledger->count; i++) {
+    struct grant *row = &ledger->rows[i];
+
+    if(!strcmp(row->kind, kind) && !strcmp(row->name, name) &&
+       (strcmp(kind, "install") || !strcmp(row->sha256, sha256))) {
+      return row;
+    }
+  }
+  return NULL;
+}
+
+
+/** Whether a revocation declared generation compromised. **/
+static int
+ledger_revoked(const struct ledger *ledger, uint32_t generation) {
+  size_t i;
+
+  for(i=0; i<ledger->ranges; i++) {
+    if(generation >= ledger->since[i] && generation <= ledger->until[i]) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+/**
+ * Record one grant of generation as active, replacing the line it had: a grant
+ * approved again by a key that is not revoked is active again. generation -1
+ * is a grant no key made, and records nothing. Returns 0, 1 when generation is
+ * one a revocation declared compromised, or -1. The caller holds the lock.
+ **/
+static int
+ledger_grant_locked(int state_fd, const char *kind, const char *name,
+                    const char *sha256, int64_t generation) {
+  struct ledger *ledger;
+  struct grant *row;
+  char *text;
+  int rc = -1;
+
+  if(generation < 0) {
+    return 0;
+  }
+
+  ledger = calloc(1, sizeof(*ledger));
+  text = calloc(1, GRANTS_TEXT_MAX);
+  if(!ledger || !text || ledger_load(state_fd, ledger, text)) {
+    goto out;
+  }
+
+  if(ledger_revoked(ledger, (uint32_t)generation)) {
+    rc = 1;
+    goto out;
+  }
+
+  row = ledger_find(ledger, kind, name, sha256);
+  if(!row) {
+    if(ledger->count == GRANTS_MAX) {
+      goto out;
+    }
+    row = &ledger->rows[ledger->count++];
+  }
+  snprintf(row->kind, sizeof(row->kind), "%s", kind);
+  snprintf(row->name, sizeof(row->name), "%s", name);
+  snprintf(row->sha256, sizeof(row->sha256), "%s", sha256);
+  row->generation = (uint32_t)generation;
+  row->suspended = 0;
+  rc = ledger_save(state_fd, ledger, text) ? -1 : 0;
+
+out:
+  free(ledger);
+  free(text);
+  return rc;
+}
+
+
+/** Drop the ledger's line for one grant. Returns 0, or -1. The caller holds the lock. **/
+static int
+ledger_drop_locked(int state_fd, const char *kind, const char *name) {
+  struct ledger *ledger;
+  struct grant *row;
+  char *text;
+  int rc = -1;
+
+  ledger = calloc(1, sizeof(*ledger));
+  text = calloc(1, GRANTS_TEXT_MAX);
+  if(ledger && text && !ledger_load(state_fd, ledger, text)) {
+    rc = 0;
+    if((row=ledger_find(ledger, kind, name, "-"))) {
+      *row = ledger->rows[--ledger->count];
+      rc = ledger_save(state_fd, ledger, text);
+    }
+  }
+  free(ledger);
+  free(text);
+  return rc;
+}
+
+
+/**
+ * Whether one grant is suspended. An unreadable ledger counts as suspended, so
+ * a revocation is never undone by damaging its record. The caller holds the
+ * lock.
+ **/
+static int
+ledger_suspended_locked(int state_fd, const char *kind, const char *name,
+                        const char *sha256, int64_t *generation) {
+  struct ledger *ledger;
+  struct grant *row;
+  char *text;
+  int rc = 1;
+
+  if(generation) {
+    *generation = -1;
+  }
+  ledger = calloc(1, sizeof(*ledger));
+  text = calloc(1, GRANTS_TEXT_MAX);
+  if(ledger && text && !ledger_load(state_fd, ledger, text)) {
+    row = ledger_find(ledger, kind, name, sha256);
+    if(row && !strcmp(kind, "pin") && strcmp(row->sha256, sha256)) {
+      row = NULL;
+    }
+    rc = row && row->suspended;
+    if(row && generation) {
+      *generation = row->generation;
+    }
+  }
+  free(ledger);
+  free(text);
+  return rc;
+}
+
+
+/**
+ * Settle one file of a committed revocation: its new text, named by hash, is
+ * put in place from tmp, or is there already. buf holds size bytes. Returns 0,
+ * or -1 when neither holds the text the journal names.
+ **/
+static int
+revoke_settle(int state_fd, const char *file, const char *tmp,
+              const char *hash, char *buf, size_t size) {
+  char hex[SHA256_HEX_LEN + 1];
+  int len;
+
+  len = text_read(state_fd, tmp, buf, size);
+  if(len >= 0) {
+    text_hash(buf, (size_t)len, hex);
+    if(strcmp(hex, hash) || renameat(state_fd, tmp, state_fd, file) ||
+       fsync(state_fd)) {
+      return -1;
+    }
+    return 0;
+  }
+
+  len = text_read(state_fd, file, buf, size);
+  if(len < 0) {
+    return -1;
+  }
+  text_hash(buf, (size_t)len, hex);
+  if(strcmp(hex, hash)) {
+    audit_append_locked("rollforward_refused", file, "-", hash);
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * Finish a revocation the journal names. Its record holds the new keyring's
+ * hash, the new ledger's as previous, and the new autoload list's as drop, or
+ * "-" when the list did not change. A prepared one is dropped; a committed one
+ * puts all three in place. The caller holds the lock.
+ **/
+static int
+revoke_recover_locked(int state_fd, int store_fd, const struct journal *j) {
+  char *buf;
+  int rc = -1;
+
+  if(!strcmp(j->phase, "prepared")) {
+    unlinkat(state_fd, GRANTS_TMP, 0);
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    unlinkat(state_fd, KEYRING_TMP, 0);
+    if(fsync(state_fd) ||
+       audit_append_locked("rollback", KEYRING_FILE, "-", j->hash)) {
+      return -1;
+    }
+    return journal_clear(store_fd);
+  }
+
+  if(!(buf=calloc(1, GRANTS_TEXT_MAX))) {
+    return -1;
+  }
+  if(!revoke_settle(state_fd, GRANTS_FILE, GRANTS_TMP, j->previous, buf,
+                    GRANTS_TEXT_MAX) &&
+     (!strcmp(j->drop, "-") ||
+      !revoke_settle(state_fd, AUTOLOAD_FILE, AUTOLOAD_TMP, j->drop, buf,
+                     GRANTS_TEXT_MAX)) &&
+     !revoke_settle(state_fd, KEYRING_FILE, KEYRING_TMP, j->hash, buf,
+                    GRANTS_TEXT_MAX) &&
+     !audit_append_locked("rollforward", KEYRING_FILE, "-", j->hash)) {
+    rc = journal_clear(store_fd);
+  }
+  free(buf);
+  return rc;
+}
+
+
 /**
  * Finish the change the journal names, if one is in progress: roll back a
  * prepared change, roll forward a committed one, and audit which. Running it
@@ -2362,6 +2749,10 @@ transaction_recover_locked(int state_fd, int store_fd) {
   if(!strcmp(j.kind, KEYRING_FILE)) {
     return file_recover_locked(state_fd, store_fd, &j, KEYRING_FILE,
                                KEYRING_TMP);
+  }
+
+  if(!strcmp(j.kind, "revoke")) {
+    return revoke_recover_locked(state_fd, store_fd, &j);
   }
 
   if(!strcmp(j.phase, "prepared")) {
@@ -2491,6 +2882,7 @@ staged_install(struct staged *entry, struct approval *request,
   char old[SHA256_HEX_LEN + 1];
   char previous[SHA256_HEX_LEN + 1];
   uint64_t total = 0;
+  int64_t generation = -1;
   int state_fd = -1;
   int staging_fd = -1;
   int store_fd = -1;
@@ -2557,6 +2949,21 @@ staged_install(struct staged *entry, struct approval *request,
   }
   dst = -1;
 
+  // The build is a grant of the key that approved it, or of the key that
+  // approved its pin. It is recorded first: a crash after this leaves a grant
+  // of a build that is not there, which admits nothing.
+  if(request) {
+    generation = request->challenge.generation;
+  } else if(ledger_suspended_locked(state_fd, "pin", entry->facts.name,
+                                    entry->facts.sha256, &generation)) {
+    rc = STORE_APPROVAL_SUSPENDED;
+    goto out_temp;
+  }
+  if(ledger_grant_locked(state_fd, "install", entry->facts.name,
+                         entry->facts.sha256, generation)) {
+    goto out_temp;
+  }
+
   snprintf(current_text, sizeof(current_text), "%s\n", entry->facts.sha256);
   if(tmp_write(current_fd, tmp_current, current_text, SHA256_HEX_LEN + 1)) {
     goto out_temp;
@@ -2615,6 +3022,7 @@ staged_install(struct staged *entry, struct approval *request,
   snprintf(install->name, sizeof(install->name), "%s", entry->facts.name);
   snprintf(install->sha256, sizeof(install->sha256), "%s", entry->facts.sha256);
   object_path(entry->facts.sha256, install->path, sizeof(install->path));
+  install->generation = generation;
   staged_consume(entry, request);
 
   rc = STORE_INSTALLED;
@@ -2717,6 +3125,7 @@ install_provenance(const approval_facts_t *facts,
   snprintf(install->tag, sizeof(install->tag), "%s", facts->tag);
   install->release = facts->release;
   install->asset = facts->asset;
+  install->generation = -1;
 }
 
 
@@ -2761,6 +3170,11 @@ store_commit(const char *staging_id, store_install_t *install,
     // approval stays, answered as decided and not approved.
     staged_leave(entry);
     outcome = STORE_APPROVAL_DENIED;
+  } else if(request->challenge.generation != keyring_generation) {
+    // A rotation or revocation since the grant spent it: the generation that
+    // granted it no longer admits anything.
+    staged_leave(entry);
+    outcome = STORE_APPROVAL_STALE;
   } else if(!strcmp(entry->facts.command, "payload.install") &&
             pin_conflicts(pins, entry->facts.name, entry->facts.sha256)) {
     // Another build of this name was pinned after the owner was asked.
@@ -2819,7 +3233,7 @@ store_allowlist_read(char *text, size_t size) {
 
 
 int
-store_allowlist_pin(const char *name, const char *sha256) {
+store_allowlist_pin(const char *name, const char *sha256, int64_t generation) {
   allowlist_t *list;
   char *text;
   char *next;
@@ -2841,10 +3255,17 @@ store_allowlist_pin(const char *name, const char *sha256) {
   }
 
   pinned = allowlist_pin(list, name);
-  if(pinned) {
-    rc = strcmp(pinned, sha256) ? -1 : 0;
+  if(pinned && strcmp(pinned, sha256)) {
     goto out_locked;
   }
+
+  // The pin is a grant of the key that approved the install, recorded before
+  // the allowlist holds it. A pin set in advance keeps the line it had.
+  rc = ledger_grant_locked(state_fd, "pin", name, sha256, generation);
+  if(rc || pinned) {
+    goto out_locked;
+  }
+  rc = -1;
 
   if(allowlist_with_pin(text, name, sha256, next, ALLOWLIST_TEXT_MAX) < 0 ||
      tmp_write(state_fd, ALLOWLIST_TMP, next, strlen(next)) ||
@@ -2870,7 +3291,7 @@ out:
 
 
 int
-store_autoload_join(const char *name) {
+store_autoload_join(const char *name, int64_t generation) {
   char text[AUTOLOAD_TEXT_MAX];
   char next[AUTOLOAD_TEXT_MAX];
   int state_fd;
@@ -2889,6 +3310,12 @@ store_autoload_join(const char *name) {
     }
     text[0] = '\0';
   }
+
+  rc = ledger_grant_locked(state_fd, "autoload", name, "-", generation);
+  if(rc) {
+    goto close_state;
+  }
+  rc = -1;
 
   edit = autoload_edit(text, 1, name, next, sizeof(next));
   if(edit == AUTOLOAD_PRESENT) {
@@ -3110,6 +3537,7 @@ rollback_apply_locked(struct approval *request, store_install_t *install) {
   snprintf(install->name, sizeof(install->name), "%s", name);
   snprintf(install->sha256, sizeof(install->sha256), "%s", live.sha256);
   object_path(live.sha256, install->path, sizeof(install->path));
+  install->generation = -1;
   request->consumed = 1;
   request->released = 1;
 
@@ -3170,9 +3598,20 @@ autoload_apply_locked(struct approval *request) {
     } else {
       text_hash(next, strlen(next), next_hex);
       kind = add ? "autoload_add" : "autoload_remove";
-      applied = file_transaction_locked(state_fd, store_fd, next, hex,
-                                        next_hex, AUTOLOAD_FILE, AUTOLOAD_TMP,
-                                        kind, request->facts.name, request->id);
+      // An entry added is a grant, recorded before the list holds it; an
+      // entry removed drops its grant after it leaves.
+      applied = add && ledger_grant_locked(state_fd, "autoload",
+                                           request->facts.name, "-",
+                                           request->challenge.generation)
+                  ? -1
+                  : file_transaction_locked(state_fd, store_fd, next, hex,
+                                            next_hex, AUTOLOAD_FILE,
+                                            AUTOLOAD_TMP, kind,
+                                            request->facts.name, request->id);
+      if(applied >= 0 && !add &&
+         ledger_drop_locked(state_fd, "autoload", request->facts.name)) {
+        applied = 1;
+      }
       if(applied >= 0) {
         request->consumed = 1;
         request->released = 1;
@@ -3478,6 +3917,245 @@ store_key_adopt(const approval_challenge_t *challenge, uint32_t *generation) {
 
 
 int
+store_revoke_check(uint32_t since, const char *hex) {
+  int rc;
+
+  pthread_mutex_lock(&lock);
+  rc = keyring_state == KEYRING_READY && since <= keyring_generation ? 0 : -1;
+  pthread_mutex_unlock(&lock);
+  return rc || store_key_check(hex) ? -1 : 0;
+}
+
+
+/**
+ * Suspend every grant of a generation in since..until, and take each suspended
+ * autoload entry out of the list text, which holds AUTOLOAD_TEXT_MAX bytes.
+ * names receives the newly suspended rows' indexes. Returns how many there are.
+ **/
+static size_t
+ledger_suspend(struct ledger *ledger, uint32_t since, uint32_t until,
+               char *autoload, size_t *names) {
+  char next[AUTOLOAD_TEXT_MAX];
+  size_t count = 0;
+  size_t i;
+
+  for(i=0; i<ledger->count; i++) {
+    struct grant *row = &ledger->rows[i];
+
+    if(row->generation < since || row->generation > until) {
+      continue;
+    }
+    if(!strcmp(row->kind, "autoload") &&
+       autoload_edit(autoload, 0, row->name, next, sizeof(next)) ==
+         AUTOLOAD_OK) {
+      snprintf(autoload, AUTOLOAD_TEXT_MAX, "%s", next);
+    }
+    if(!row->suspended) {
+      row->suspended = 1;
+      names[count++] = i;
+    }
+  }
+  return count;
+}
+
+
+/**
+ * Write the revocation's three files through one journal record: the ledger,
+ * the autoload list when it changed, and the keyring. A crash before the
+ * committed mark keeps all three old texts; after it, recovery puts all three
+ * in place. Returns -1 when nothing changed, 0 when the revocation stands and
+ * is audited, and 1 when it stands but a record failed. The caller holds the
+ * lock.
+ **/
+static int
+revoke_transaction_locked(int state_fd, int store_fd, const char *grants,
+                          const char *autoload, const char *keyring,
+                          const struct ledger *ledger, const size_t *names,
+                          size_t count, const char *id) {
+  struct journal j;
+  int unrecorded;
+  size_t i;
+
+  memset(&j, 0, sizeof(j));
+  snprintf(j.kind, sizeof(j.kind), "revoke");
+  snprintf(j.phase, sizeof(j.phase), "prepared");
+  snprintf(j.name, sizeof(j.name), "%s", KEYRING_FILE);
+  text_hash(keyring, strlen(keyring), j.hash);
+  text_hash(grants, strlen(grants), j.previous);
+  if(autoload) {
+    text_hash(autoload, strlen(autoload), j.drop);
+  } else {
+    snprintf(j.drop, sizeof(j.drop), "-");
+  }
+
+  if(tmp_write(state_fd, GRANTS_TMP, grants, strlen(grants)) ||
+     (autoload &&
+      tmp_write(state_fd, AUTOLOAD_TMP, autoload, strlen(autoload))) ||
+     tmp_write(state_fd, KEYRING_TMP, keyring, strlen(keyring)) ||
+     journal_write(store_fd, &j)) {
+    goto out_discard;
+  }
+  fault_at("prepared");
+
+  snprintf(j.phase, sizeof(j.phase), "committed");
+  if(journal_write(store_fd, &j)) {
+    journal_clear(store_fd);
+    goto out_discard;
+  }
+  fault_at("committed");
+
+  // From here the journal names the change, so a failure leaves it committed
+  // for the next start to finish, and the revocation stands.
+  if(renameat(state_fd, GRANTS_TMP, state_fd, GRANTS_FILE)) {
+    return 1;
+  }
+  fault_at("suspended");
+  if(autoload && renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE)) {
+    return 1;
+  }
+  fault_at("autoload");
+  if(renameat(state_fd, KEYRING_TMP, state_fd, KEYRING_FILE)) {
+    return 1;
+  }
+  fault_at("renamed");
+  if(fsync(state_fd)) {
+    return 1;
+  }
+
+  unrecorded = audit_append_locked("key_revoke", KEYRING_FILE, id, j.hash) != 0;
+  for(i=0; i<count; i++) {
+    const struct grant *row = &ledger->rows[names[i]];
+
+    if(audit_append_locked("grant_suspended", row->name, row->kind,
+                           strcmp(row->sha256, "-") ? row->sha256 : "none")) {
+      unrecorded = 1;
+    }
+  }
+  fault_at("audited");
+  if(journal_clear(store_fd)) {
+    unrecorded = 1;
+  }
+  return unrecorded;
+
+out_discard:
+  unlinkat(state_fd, GRANTS_TMP, 0);
+  unlinkat(state_fd, AUTOLOAD_TMP, 0);
+  unlinkat(state_fd, KEYRING_TMP, 0);
+  return -1;
+}
+
+
+int
+store_key_revoke(const approval_challenge_t *challenge, uint32_t since,
+                 const char *hex, uint32_t *generation) {
+  unsigned char next[APPROVAL_PUBKEY_LEN];
+  unsigned char revoked[KEYRING_REVOKED_MAX][APPROVAL_PUBKEY_LEN];
+  char keyring[KEYRING_MAX];
+  char autoload[AUTOLOAD_TEXT_MAX];
+  char before[AUTOLOAD_TEXT_MAX];
+  size_t names[GRANTS_MAX];
+  struct ledger *ledger = NULL;
+  char *grants = NULL;
+  size_t count;
+  int has_autoload;
+  int state_fd = -1;
+  int store_fd = -1;
+  int applied;
+  int outcome = STORE_KEY_FAILED;
+
+  if(store_key_check(hex) || approval_pubkey_parse(hex, next)) {
+    return STORE_KEY_FAILED;
+  }
+
+  pthread_mutex_lock(&lock);
+  if(keyring_state != KEYRING_READY ||
+     challenge->generation != keyring_generation) {
+    outcome = STORE_KEY_STALE;
+    goto out;
+  }
+  if(since > keyring_generation) {
+    outcome = STORE_KEY_REFUSED;
+    goto out;
+  }
+
+  ledger = calloc(1, sizeof(*ledger));
+  grants = calloc(1, GRANTS_TEXT_MAX);
+  if(!ledger || !grants || keyring_revoked_count == KEYRING_REVOKED_MAX ||
+     (state_fd=root_open()) < 0 || (store_fd=dir_open(state_fd, "store")) < 0 ||
+     transaction_recover_locked(state_fd, store_fd) ||
+     ledger_load(state_fd, ledger, grants) ||
+     ledger->ranges == GRANTS_RANGES_MAX) {
+    goto out;
+  }
+
+  has_autoload = text_read(state_fd, AUTOLOAD_FILE, autoload,
+                           sizeof(autoload)) >= 0;
+  if(!has_autoload) {
+    if(errno != ENOENT) {
+      goto out;
+    }
+    autoload[0] = '\0';
+  }
+  snprintf(before, sizeof(before), "%s", autoload);
+
+  count = ledger_suspend(ledger, since, keyring_generation, autoload, names);
+  ledger->since[ledger->ranges] = since;
+  ledger->until[ledger->ranges++] = keyring_generation;
+
+  memcpy(revoked, keyring_revoked, sizeof(revoked));
+  memcpy(revoked[keyring_revoked_count], keyring_primary, APPROVAL_PUBKEY_LEN);
+  if(ledger_render(ledger, grants, GRANTS_TEXT_MAX) < 0 ||
+     keyring_render(keyring, sizeof(keyring), keyring_generation + 1, next,
+                    keyring_recovery, revoked, keyring_revoked_count + 1,
+                    keyring_anchor, keyring_frozen)) {
+    goto out;
+  }
+
+  applied = revoke_transaction_locked(state_fd, store_fd, grants,
+                                      has_autoload && strcmp(before, autoload)
+                                        ? autoload : NULL,
+                                      keyring, ledger, names, count,
+                                      challenge->id);
+  if(applied >= 0) {
+    keyring_generation++;
+    memcpy(keyring_primary, next, sizeof(keyring_primary));
+    memcpy(keyring_revoked, revoked, sizeof(revoked));
+    keyring_revoked_count++;
+    *generation = keyring_generation;
+    outcome = applied || state_key_generation_set(keyring_generation)
+                ? STORE_KEY_UNRECORDED : STORE_KEY_REVOKED;
+  }
+
+out:
+  if(store_fd >= 0) {
+    close(store_fd);
+  }
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  pthread_mutex_unlock(&lock);
+  free(ledger);
+  free(grants);
+  return outcome;
+}
+
+
+int
+store_pin_suspended(const char *name, const char *sha256) {
+  int state_fd;
+  int rc = 1;
+
+  pthread_mutex_lock(&lock);
+  if((state_fd=root_open()) >= 0) {
+    rc = ledger_suspended_locked(state_fd, "pin", name, sha256, NULL);
+    close(state_fd);
+  }
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
 store_rollback(const char *name, char *approval_id, size_t idlen,
                store_install_t *install) {
   struct approval *request;
@@ -3497,6 +4175,10 @@ store_rollback(const char *name, char *approval_id, size_t idlen,
     } else if(!request->approved) {
       request->released = 1;
       outcome = STORE_APPROVAL_DENIED;
+    } else if(request->challenge.generation != keyring_generation) {
+      request->consumed = 1;
+      request->released = 1;
+      outcome = STORE_APPROVAL_STALE;
     } else {
       outcome = rollback_apply_locked(request, install);
     }
@@ -3704,7 +4386,8 @@ store_autoload_apply(const char *id, const char *command, const char *name,
   } else if(!request->approved) {
     outcome = STORE_AUTOLOAD_DENIED;
   } else if(strcmp(request->facts.command, command) ||
-            strcmp(request->facts.name, name)) {
+            strcmp(request->facts.name, name) ||
+            request->challenge.generation != keyring_generation) {
     outcome = STORE_AUTOLOAD_STALE;
   } else {
     outcome = autoload_apply_locked(request);
@@ -3818,6 +4501,50 @@ store_autoload_safe_boot(const char *id, const char *sha256) {
 }
 
 
+/**
+ * Take every suspended autoload entry out of the snapshot a safe boot set
+ * aside, so restoring it brings none back. A missing snapshot is left alone.
+ * Returns 0, or -1. The caller holds the lock.
+ **/
+static int
+snapshot_suspend_locked(int state_fd) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char next[AUTOLOAD_TEXT_MAX];
+  struct ledger *ledger;
+  char *grants;
+  size_t i;
+  int changed = 0;
+  int rc = -1;
+
+  if(text_read(state_fd, AUTOLOAD_SNAPSHOT, text, sizeof(text)) < 0) {
+    return errno == ENOENT ? 0 : -1;
+  }
+
+  ledger = calloc(1, sizeof(*ledger));
+  grants = calloc(1, GRANTS_TEXT_MAX);
+  if(ledger && grants && !ledger_load(state_fd, ledger, grants)) {
+    for(i=0; i<ledger->count; i++) {
+      if(ledger->rows[i].suspended && !strcmp(ledger->rows[i].kind, "autoload") &&
+         autoload_edit(text, 0, ledger->rows[i].name, next, sizeof(next)) ==
+           AUTOLOAD_OK) {
+        snprintf(text, sizeof(text), "%s", next);
+        changed = 1;
+      }
+    }
+    rc = 0;
+    if(changed &&
+       (tmp_write(state_fd, AUTOLOAD_SNAPSHOT_TMP, text, strlen(text)) ||
+        renameat(state_fd, AUTOLOAD_SNAPSHOT_TMP, state_fd, AUTOLOAD_SNAPSHOT))) {
+      unlinkat(state_fd, AUTOLOAD_SNAPSHOT_TMP, 0);
+      rc = -1;
+    }
+  }
+  free(ledger);
+  free(grants);
+  return rc;
+}
+
+
 int
 store_autoload_restore(void) {
   char text[AUTOLOAD_TEXT_MAX];
@@ -3833,7 +4560,9 @@ store_autoload_restore(void) {
     return -1;
   }
 
-  if(renameat(state_fd, AUTOLOAD_SNAPSHOT, state_fd, AUTOLOAD_FILE)) {
+  if(snapshot_suspend_locked(state_fd)) {
+    rc = -1;
+  } else if(renameat(state_fd, AUTOLOAD_SNAPSHOT, state_fd, AUTOLOAD_FILE)) {
     rc = errno == ENOENT ? 0 : -1;
   } else {
     len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
@@ -3965,6 +4694,13 @@ store_run_load(const char *name, store_object_t *object) {
   if(strcmp(computed, expected)) {
     // The object changed behind Ariel's back: it never runs.
     store_object_free(object);
+    goto out;
+  }
+
+  // A build a revoked key approved stays on disk but never runs.
+  if(ledger_suspended_locked(state_fd, "install", name, computed, NULL)) {
+    store_object_free(object);
+    rc = STORE_RUN_SUSPENDED;
     goto out;
   }
 

@@ -22,14 +22,22 @@ This page says what Ariel does when the owner's keys are rotated, leaked or lost
 
 A leaked key can sign the actions it is used for until it is retired, so rotate it from a trusted console as soon as the leak is known.
 
-- **Leaked primary.** `key rotate` needs the primary's signature, so the owner rotates before the attacker does. If the attacker has already rotated to a key of their own, the recovery key cannot replace the primary (see below). The owner then rebuilds with a new anchor and runs `key adopt-anchor`, signed by the new recovery key.
+- **Leaked primary.** `key rotate` needs the primary's signature, so the owner rotates before the attacker does. If the attacker has already rotated to a key of their own, revoke the lineage from the generation of the leak (below).
 - **Leaked recovery key.** Rotate it with `key rotate-recovery` before the attacker does. If the attacker has already rotated it, use the same rebuild and `key adopt-anchor` path as above.
+
+### Revocation by lineage
+
+A primary that leaked at generation N may have signed rotations to keys the attacker holds, so every primary from N on is suspect. `key revoke --since N <new-primary>`, signed by the current recovery key, takes the console back without a rebuild:
+
+- `<new-primary>` becomes the primary at the next generation, and the current primary is retired.
+- Every grant the grant ledger (`grants`) holds from generations N to the current one is suspended: an installed build, a pin approved with an install, an autoload entry. A suspended build stays in the store but answers `suspended` (exit 90) instead of running, a suspended autoload entry leaves the autoload file in the same journal transaction, and a suspended pin asks the owner again.
+- Grants from before N stay active, including those of a key retired by a planned `key rotate`. Pins the allowlist set in advance were approved by no key and stay active.
+- It passes while frozen and with every approval slot in use, and does not lift the freeze. Re-approving a build with the new primary restores its grant.
+- The audit kinds are `key_revoke` and `grant_suspended`. See `docs/exit-codes.md` for the replies.
 
 ## Loss of the primary
 
-The recovery key cannot replace the primary today. No command takes a recovery-signed primary rotation: `key rotate` is signed only by the primary, and `key rotate-recovery` only replaces the recovery key. ADR-0009 leaves the replacement procedure for later, so the replacement without a rebuild described in the ADR is not yet available.
-
-Until it is, losing the primary means the rebuild path below.
+The recovery key replaces a lost primary with `key revoke --since <current generation> <new-primary>`. It also suspends the grants of the current generation; re-approve the ones still wanted with the new primary. `key rotate` stays signed only by the primary, and `key rotate-recovery` only replaces the recovery key.
 
 ## Loss of the recovery key
 
