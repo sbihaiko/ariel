@@ -55,6 +55,25 @@ int fileops_check(const char *root, const char *command, const char *path,
 int fileops_act(const char *root, const char *command, const char *path,
                 const char *operand, const approval_facts_t *expected);
 
+/**
+ * Check one transfer, cp, mv or ln, from source to destination without acting.
+ * Both paths are checked as fileops_check checks one. The source must be a
+ * regular file and the destination must not exist. The source's kind, device
+ * and inode go into facts. Returns FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_transfer_check(const char *root, const char *source,
+                           const char *destination, approval_facts_t *facts);
+
+/**
+ * Perform one transfer after checking that the source is still the object
+ * expected names and that the destination still does not exist. The
+ * destination is never replaced. Returns FILEOPS_OK, FILEOPS_CHANGED,
+ * FILEOPS_EXISTS or the refusal that stops it.
+ **/
+int fileops_transfer_act(const char *root, const char *command,
+                         const char *source, const char *destination,
+                         const approval_facts_t *expected);
+
 /** The protocol word of a refusal, and its exit status. **/
 const char *fileops_word(int rc);
 int fileops_status(int rc);

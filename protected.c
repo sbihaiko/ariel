@@ -44,6 +44,11 @@ protected_stat(const struct stat *file) {
   char path[PATH_MAX];
   size_t i;
 
+  if(!stat(state_dir, &guard) &&
+     guard.st_dev == file->st_dev && guard.st_ino == file->st_ino) {
+    return 1;
+  }
+
   for(i=0; i<sizeof(protected_names)/sizeof(protected_names[0]); i++) {
     if(snprintf(path, sizeof(path), "%s/%s", state_dir, protected_names[i])
        >= (int)sizeof(path)) {

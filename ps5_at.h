@@ -1,7 +1,7 @@
 /* PS5 libc's *at() stubs return the errno in rax and leave errno unchanged.
-   The host libc returns -1 and sets errno. store.c keeps calling openat,
-   mkdirat, unlinkat, renameat and fstatat; this header is what makes those
-   calls POSIX on the PS5 build. */
+   The host libc returns -1 and sets errno. store.c and fileops.c keep calling
+   openat, mkdirat, unlinkat, renameat, fstatat and linkat; this header is what
+   makes those calls POSIX on the PS5 build. */
 #ifndef PS5_AT_H
 #define PS5_AT_H
 
@@ -58,6 +58,25 @@ ariel_fstatat(int fd, const char *path, struct stat *st, int flag) {
   return (int)ariel_syscall(SYS_fstatat, fd, (long)path, (long)st, flag);
 }
 
+static inline int
+ariel_linkat(int oldfd, const char *old, int newfd, const char *new, int flag) {
+  long ret;
+  unsigned char carry;
+  register long r10 __asm__("r10") = (long)new;
+  register long r8 __asm__("r8") = flag;
+
+  __asm__ volatile("syscall"
+                   : "=a"(ret), "=@ccc"(carry)
+                   : "a"(SYS_linkat), "D"((long)oldfd), "S"(old),
+                     "d"((long)newfd), "r"(r10), "r"(r8)
+                   : "rcx", "r11", "memory");
+  if(carry) {
+    errno = (int)ret;
+    return -1;
+  }
+  return (int)ret;
+}
+
 #define ARIEL_OPENAT_DISP(_1, _2, _3, _4, NAME, ...) NAME
 #define openat(...) \
   ARIEL_OPENAT_DISP(__VA_ARGS__, ariel_openat4, ariel_openat3)(__VA_ARGS__)
@@ -67,6 +86,8 @@ ariel_fstatat(int fd, const char *path, struct stat *st, int flag) {
   ariel_renameat((oldfd), (old), (newfd), (new))
 #define fstatat(fd, path, st, flag) \
   ariel_fstatat((fd), (path), (st), (flag))
+#define linkat(oldfd, old, newfd, new, flag) \
+  ariel_linkat((oldfd), (old), (newfd), (new), (flag))
 
 #endif /* !ARIEL_HOST_BUILD */
 

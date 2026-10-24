@@ -478,6 +478,241 @@ fileops_act(const char *root, const char *command, const char *path,
 }
 
 
+/**
+ * What the entry at path is, for a transfer. Its parent directory must not be
+ * a protected object, and a symbolic link must not lead to one. The parent
+ * stays open in dirfd for the caller to close.
+ **/
+static int
+transfer_inspect(const char *root, const char *path, approval_facts_t *facts,
+                 int *dirfd, char *leaf, size_t size) {
+  struct stat dir;
+  struct stat target;
+  int rc;
+
+  rc = inspect(root, path, facts, dirfd, leaf, size);
+  if(rc) {
+    return rc;
+  }
+
+  if(fstat(*dirfd, &dir)) {
+    close(*dirfd);
+    return FILEOPS_FAILED;
+  }
+  if(protected_stat(&dir)) {
+    close(*dirfd);
+    return FILEOPS_PROTECTED;
+  }
+
+  if(!strcmp(facts->kind, "link") &&
+     !fstatat(*dirfd, leaf, &target, 0) && protected_stat(&target)) {
+    close(*dirfd);
+    return FILEOPS_PROTECTED;
+  }
+
+  return FILEOPS_OK;
+}
+
+
+/** Whether the source's kind lets a transfer run: a regular file only. **/
+static int
+transfer_source(const char *kind) {
+  if(!strcmp(kind, "absent")) {
+    return FILEOPS_NO_FILE;
+  }
+  if(!strcmp(kind, "link")) {
+    return FILEOPS_LINK;
+  }
+  if(!strcmp(kind, "dir")) {
+    return FILEOPS_IS_DIR;
+  }
+  return strcmp(kind, "file") ? FILEOPS_NOT_FILE : FILEOPS_OK;
+}
+
+
+static int
+write_full(int fd, const char *buf, size_t n) {
+  while(n) {
+    ssize_t written = write(fd, buf, n);
+
+    if(written <= 0) {
+      return -1;
+    }
+    buf += written;
+    n -= (size_t)written;
+  }
+  return 0;
+}
+
+
+/**
+ * Copy the regular file sleaf in sdir to a new file dleaf in ddir. The source
+ * is opened first and must still be the expected object. The destination is
+ * made exclusively, and removed again when the copy fails.
+ **/
+static int
+copy_entry(int sdir, const char *sleaf, const approval_facts_t *expected,
+           int ddir, const char *dleaf) {
+  char buf[8192];
+  struct stat st;
+  ssize_t got;
+  int in;
+  int out;
+  int rc = FILEOPS_OK;
+
+  in = openat(sdir, sleaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if(in < 0) {
+    return errno == ELOOP || errno == ENOENT ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+  if(fstat(in, &st)) {
+    close(in);
+    return FILEOPS_FAILED;
+  }
+  if(!S_ISREG(st.st_mode) || (uint64_t)st.st_dev != expected->dev ||
+     (uint64_t)st.st_ino != expected->ino) {
+    close(in);
+    return FILEOPS_CHANGED;
+  }
+
+  out = openat(ddir, dleaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                            O_CLOEXEC, 0644);
+  if(out < 0) {
+    close(in);
+    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+
+  while(rc == FILEOPS_OK && (got = read(in, buf, sizeof(buf))) != 0) {
+    if(got < 0 || write_full(out, buf, (size_t)got)) {
+      rc = FILEOPS_FAILED;
+    }
+  }
+  if(rc == FILEOPS_OK && fsync(out)) {
+    rc = FILEOPS_FAILED;
+  }
+  if(close(out) && rc == FILEOPS_OK) {
+    rc = FILEOPS_FAILED;
+  }
+  close(in);
+
+  if(rc) {
+    unlinkat(ddir, dleaf, 0);
+  }
+  return rc;
+}
+
+
+/**
+ * Give the source's file a second name, then take the first one away. A
+ * link never replaces an existing name, so an existing destination is kept.
+ * The source is checked again before its name goes; a different object there
+ * is taken back out of the destination.
+ **/
+static int
+move_entry(int sdir, const char *sleaf, const approval_facts_t *expected,
+           int ddir, const char *dleaf) {
+  struct stat st;
+  int rc = FILEOPS_OK;
+
+  if(linkat(sdir, sleaf, ddir, dleaf, 0)) {
+    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+
+  if(fstatat(sdir, sleaf, &st, AT_SYMLINK_NOFOLLOW) ||
+     (uint64_t)st.st_dev != expected->dev ||
+     (uint64_t)st.st_ino != expected->ino) {
+    rc = FILEOPS_CHANGED;
+  } else if(unlinkat(sdir, sleaf, 0)) {
+    rc = FILEOPS_FAILED;
+  }
+
+  if(rc) {
+    unlinkat(ddir, dleaf, 0);
+  }
+  return rc;
+}
+
+
+int
+fileops_transfer_check(const char *root, const char *source,
+                       const char *destination, approval_facts_t *facts) {
+  approval_facts_t into;
+  char sleaf[PATH_MAX];
+  char dleaf[PATH_MAX];
+  int sdir;
+  int ddir;
+  int rc;
+
+  rc = transfer_inspect(root, source, facts, &sdir, sleaf, sizeof(sleaf));
+  if(rc) {
+    return rc;
+  }
+
+  memset(&into, 0, sizeof(into));
+  rc = transfer_inspect(root, destination, &into, &ddir, dleaf, sizeof(dleaf));
+  if(rc) {
+    close(sdir);
+    return rc;
+  }
+
+  close(sdir);
+  close(ddir);
+
+  rc = transfer_source(facts->kind);
+  if(rc) {
+    return rc;
+  }
+  return strcmp(into.kind, "absent") ? FILEOPS_EXISTS : FILEOPS_OK;
+}
+
+
+int
+fileops_transfer_act(const char *root, const char *command,
+                     const char *source, const char *destination,
+                     const approval_facts_t *expected) {
+  approval_facts_t now;
+  approval_facts_t into;
+  char sleaf[PATH_MAX];
+  char dleaf[PATH_MAX];
+  int sdir;
+  int ddir;
+  int rc;
+
+  memset(&now, 0, sizeof(now));
+  rc = transfer_inspect(root, source, &now, &sdir, sleaf, sizeof(sleaf));
+  if(rc) {
+    return rc;
+  }
+
+  if(strcmp(now.kind, expected->kind) || now.dev != expected->dev ||
+     now.ino != expected->ino) {
+    close(sdir);
+    return FILEOPS_CHANGED;
+  }
+
+  memset(&into, 0, sizeof(into));
+  rc = transfer_inspect(root, destination, &into, &ddir, dleaf, sizeof(dleaf));
+  if(rc) {
+    close(sdir);
+    return rc;
+  }
+
+  if(strcmp(into.kind, "absent")) {
+    rc = FILEOPS_EXISTS;
+  } else if(!strcmp(command, "cp")) {
+    rc = copy_entry(sdir, sleaf, expected, ddir, dleaf);
+  } else if(!strcmp(command, "mv")) {
+    rc = move_entry(sdir, sleaf, expected, ddir, dleaf);
+  } else {
+    rc = linkat(sdir, sleaf, ddir, dleaf, 0) ?
+         (errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED) : FILEOPS_OK;
+  }
+
+  close(sdir);
+  close(ddir);
+  return rc;
+}
+
+
 const char *
 fileops_word(int rc) {
   switch(rc) {

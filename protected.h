@@ -35,7 +35,8 @@ int protected_object(int fd);
 
 /**
  * Whether the object with the identity in file is a protected one, by the
- * same device and inode test as protected_object. Returns 1 or 0.
+ * same device and inode test as protected_object: the state directory itself
+ * and the objects named below it. Returns 1 or 0.
  **/
 int protected_stat(const struct stat *file);
 

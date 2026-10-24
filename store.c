@@ -854,6 +854,7 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
   if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
+    action->destination = facts->dest[0] ? facts->dest : NULL;
     action->sha256 = APPROVAL_NO_HASH;
     if(!strcmp(facts->command, "kill")) {
       action->sha256 = facts->sha256;
@@ -891,6 +892,7 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     options[1].value = "1";
     action->command = facts->command;
     action->target = facts->name;
+    action->destination = NULL;
     action->sha256 = facts->sha256;
     action->noptions = facts->run ? 2 : 1;
   }
@@ -981,8 +983,8 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen, "kill %s with %s (start %s) will run",
              facts->target, facts->signal, facts->start);
   } else if(slot->gated) {
-    snprintf(prompt, promptlen, "%s %s will run", facts->command,
-             facts->target);
+    snprintf(prompt, promptlen, "%s %s%s%s will run", facts->command,
+             facts->target, facts->dest[0] ? " " : "", facts->dest);
   } else {
     snprintf(prompt, promptlen,
              "payload %s (%llu bytes, sha256 %s) will run",
@@ -1012,8 +1014,9 @@ same_identity(const approval_facts_t *a, const approval_facts_t *b) {
 
 /**
  * The gate for a gated command, one check per attempt. An open row (not
- * consumed, expired or released) for the same command and target is the
- * only one that can answer; there is at most one. The caller holds the lock.
+ * consumed, expired or released) for the same command, target and destination
+ * is the only one that can answer; there is at most one. The caller holds the
+ * lock.
  **/
 static struct approval *
 gate_row(const approval_facts_t *facts) {
@@ -1024,7 +1027,8 @@ gate_row(const approval_facts_t *facts) {
 
     if(row->used && row->gated && !row->consumed && !row->expired &&
        !row->released && !strcmp(row->facts.command, facts->command) &&
-       !strcmp(row->facts.target, facts->target)) {
+       !strcmp(row->facts.target, facts->target) &&
+       !strcmp(row->facts.dest, facts->dest)) {
       return row;
     }
   }

@@ -48,6 +48,7 @@ along with this program; see the file COPYING. If not, see
  * For kill, name is the target pid, and signal and start are its signal and
  * start identity; for anything else they are empty.
  * chmod, chown and chgrp also fill value with the requested mode or owner.
+ * A transfer, cp, mv or ln, also fills dest with its destination path.
  **/
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
@@ -57,6 +58,7 @@ typedef struct {
   char staging_id[APPROVAL_ID_MAX];
   int run;  /** The approved build will be executed. **/
   char target[APPROVAL_TARGET_MAX + 1];
+  char dest[APPROVAL_TARGET_MAX + 1];
   char kind[8];  /** file, dir, link, other or absent. **/
   uint64_t dev;
   uint64_t ino;

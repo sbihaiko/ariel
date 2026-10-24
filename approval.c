@@ -219,7 +219,8 @@ approval_canonical(const approval_action_t *action, char *out, size_t size) {
   }
 
   if(!command_ok(action->command) || !target_ok(action->target) ||
-     !hash_ok(action->sha256)) {
+     !hash_ok(action->sha256) ||
+     (action->destination && !target_ok(action->destination))) {
     return -1;
   }
 
@@ -249,7 +250,12 @@ approval_canonical(const approval_action_t *action, char *out, size_t size) {
      put(out, size, &pos, action->command) ||
      put(out, size, &pos, "\ntarget=") ||
      put(out, size, &pos, action->target) ||
-     put(out, size, &pos, "\nsha256=") ||
+     put(out, size, &pos, "\n") ||
+     (action->destination &&
+      (put(out, size, &pos, "destination=") ||
+       put(out, size, &pos, action->destination) ||
+       put(out, size, &pos, "\n"))) ||
+     put(out, size, &pos, "sha256=") ||
      put(out, size, &pos, action->sha256) ||
      put(out, size, &pos, "\n")) {
     return -1;

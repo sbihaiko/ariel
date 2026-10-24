@@ -552,14 +552,61 @@ outcome_event(int rc) {
 
 
 /**
- * Append one line for command's event: "<command>.<event> <target> <id> none".
- * An invalid target is logged as "-", so no argument can reshape the line.
+ * The longest audit subject of a transfer, source and destination with '>'
+ * between them. Two paths that would not fit one audit line are refused.
+ **/
+#define TRANSFER_SUBJECT_MAX 180
+
+
+/**
+ * Whether subject is one path, or a source and a destination joined by '>'.
+ **/
+static int
+subject_ok(const char *subject) {
+  const char *gt = strchr(subject, '>');
+  char source[APPROVAL_TARGET_MAX + 1];
+  size_t n;
+
+  if(!gt) {
+    return approval_target_valid(subject);
+  }
+
+  n = (size_t)(gt - subject);
+  if(n > APPROVAL_TARGET_MAX) {
+    return 0;
+  }
+  memcpy(source, subject, n);
+  source[n] = '\0';
+  return approval_target_valid(source) && approval_target_valid(gt + 1);
+}
+
+
+/**
+ * The subject an action is audited under: its target alone, or its target and
+ * destination. Paths that are not valid targets are logged as "-".
+ **/
+static const char *
+subject_of(const char *target, const char *destination, char *out) {
+  if(!destination[0]) {
+    return target;
+  }
+  if(!approval_target_valid(target) || !approval_target_valid(destination)) {
+    return "-";
+  }
+  snprintf(out, TRANSFER_SUBJECT_MAX + 1, "%s>%s", target, destination);
+  return out;
+}
+
+
+/**
+ * Append one line for command's event: "<command>.<event> <subject> <id> none".
+ * An invalid subject is logged as "-", so no argument can reshape the line.
  **/
 static int
 audit_line(const char *command, const char *event, const char *target,
            const char *id) {
   char kind[64];
-  const char *name = approval_target_valid(target) ? target : "-";
+  const char *name = subject_ok(target) ? target : "-";
 
   snprintf(kind, sizeof(kind), "%s.%s", command, event);
   return store_audit_append(kind, name, id, APPROVAL_NO_HASH);
@@ -599,6 +646,9 @@ file_outcome(int fd, const char *command, const char *target, const char *id,
 static int
 gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
           approval_challenge_t *challenge) {
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  const char *target = subject_of(facts->target, facts->dest, subject);
+
   switch(store_gate_check(facts, challenge)) {
   case STORE_GATE_GO:
     return 1;
@@ -606,15 +656,15 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
     challenge_reply(fd, challenge);
     return 0;
   case STORE_GATE_STALE:
-    audit_reply(fd, facts->command, "stale", facts->target, challenge->id,
+    audit_reply(fd, facts->command, "stale", target, challenge->id,
                 approval_stale);
     return 0;
   case STORE_GATE_DENIED:
-    audit_reply(fd, facts->command, "denied", facts->target, challenge->id,
+    audit_reply(fd, facts->command, "denied", target, challenge->id,
                 approval_denied);
     return 0;
   case STORE_GATE_REFUSED:
-    audit_reply(fd, facts->command, "refused", facts->target, "-", unknown);
+    audit_reply(fd, facts->command, "refused", target, "-", unknown);
     return 0;
   default:
     break;
@@ -625,7 +675,7 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
     return 0;
   }
 
-  if(audit_line(facts->command, "request", facts->target, challenge->id)) {
+  if(audit_line(facts->command, "request", target, challenge->id)) {
     store_approval_deny(challenge->id);
     reply(fd, audit_failed);
     return 0;
@@ -663,6 +713,42 @@ file_command(agent_t *agent, int fd, const char *command, const char *path,
 
   rc = fileops_act(root, command, path, operand, &facts);
   file_outcome(fd, command, path, challenge.id, rc);
+}
+
+
+/** One transfer, cp, mv or ln, from source to destination: two absolute paths. **/
+static void
+transfer_command(agent_t *agent, int fd, const char *command,
+                 const char *source, const char *destination) {
+  const char *root = agent->platform->fs_root;
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int rc;
+
+  if(strlen(source) + strlen(destination) + 1 > TRANSFER_SUBJECT_MAX) {
+    file_outcome(fd, command, "-", "-", FILEOPS_BAD_PATH);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_transfer_check(root, source, destination, &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, command, subject_of(source, destination, subject), "-",
+                 rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", command);
+  snprintf(facts.target, sizeof(facts.target), "%s", source);
+  snprintf(facts.dest, sizeof(facts.dest), "%s", destination);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_transfer_act(root, command, source, destination, &facts);
+  file_outcome(fd, command, subject_of(source, destination, subject),
+               challenge.id, rc);
 }
 
 
@@ -948,6 +1034,7 @@ approval_grant(agent_t *agent, int fd, const char *id,
   unsigned char signature[APPROVAL_SIG_LEN];
   unsigned char digest[SHA256_DIGEST_LEN];
   approval_facts_t facts;
+  char subject[TRANSFER_SUBJECT_MAX + 1];
   char answer[APPROVAL_ID_MAX + 32];
 
   if(approval_hex_decode(signature_text, signature, sizeof(signature)) ||
@@ -964,7 +1051,9 @@ approval_grant(agent_t *agent, int fd, const char *id,
     // The grant stands once recorded, so a grant the log cannot record is
     // reported as such and is not undone.
     if(store_approval_facts(id, &facts) ||
-       store_audit_append("grant", facts.target[0] ? facts.target : facts.name,
+       store_audit_append("grant",
+                          facts.target[0] ? subject_of(facts.target, facts.dest,
+                                                       subject) : facts.name,
                           id, facts.sha256[0] ? facts.sha256 : APPROVAL_NO_HASH)) {
       reply(fd, audit_failed);
       return;
@@ -1437,6 +1526,12 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc >= 1 && (!strcmp(argv[0], "chmod") || !strcmp(argv[0], "chown") ||
                    !strcmp(argv[0], "chgrp"))) {
     attribute_command(agent, fd, argc, argv);
+    return;
+  }
+
+  if(argc == 3 && (!strcmp(argv[0], "cp") || !strcmp(argv[0], "mv") ||
+                   !strcmp(argv[0], "ln"))) {
+    transfer_command(agent, fd, argv[0], argv[1], argv[2]);
     return;
   }
 

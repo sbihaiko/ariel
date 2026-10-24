@@ -16,6 +16,8 @@ The file commands `mkdir`, `rmdir`, `touch` and `rm` take one absolute path. Eac
 
 `chmod MODE PATH`, `chown ID PATH` and `chgrp ID PATH` are gated the same way. The mode is octal up to `07777`; the owner and group are decimal ids below 4294967295. The challenge also binds the requested mode, owner or group, so a different one answers `approval_stale`. A bad operand answers `bad_mode`, `bad_owner` or `bad_group` with exit 1 before anything is asked; a missing one answers `missing_operand`. A symbolic link to a protected object answers `protected` (87), and the link is never followed to change its target.
 
+The transfers `cp`, `mv` and `ln` take a source and a destination, both absolute. The source must be a regular file (a directory answers `is_a_directory`, a symbolic link `symbolic_link`, a file that is not regular `not_a_file`), and the destination must not exist (`exists`, exit 1); nothing is ever replaced. Each one answers 75 with a challenge that binds both paths, sha256 `none`, and the source's identity, and runs only after the owner signs it. `cp` copies the bytes and leaves the source; `mv` moves the name and removes the source; `ln` makes a hard link. A source that changed after the signature answers `approval_stale` (78), and nothing moves. Every path involved is checked for protection: the source and destination, the directories above them, and the target of a symbolic link, so a link to the token answers `protected` (87) even when approved. A pair of paths whose audit subject would be longer than 180 characters answers `bad_path` before anything is asked.
+
 ## Assigned
 
 | Exit | Word | Meaning | What the agent does |
@@ -26,7 +28,7 @@ The file commands `mkdir`, `rmdir`, `touch` and `rm` take one absolute path. Eac
 | 75 | `approval_required` | The action waits for the owner's signature; the reply carries the challenge | Have the owner sign, send `approval grant`, then repeat the command |
 | 76 | `approval_busy` | Too many pending approvals, or a notification shown less than 10 s ago | Wait and push again |
 | 77 | `approval_denied` | The owner refused. Only the host build's virtual source can refuse; the PS5 has no refusal, an unsigned approval expires | Do not retry |
-| 78 | `approval_stale` | The approved target changed, or the approval is gone. A file command answers it when the entry at its path is no longer the one the owner signed (replaced, or removed and created again), or when a chmod, chown or chgrp asks for another mode, owner or group than the one signed; the approval is spent | Request a new challenge |
+| 78 | `approval_stale` | The approved target changed, or the approval is gone. A file command or a transfer answers it when the entry at its source or path is no longer the one the owner signed (replaced, or removed and created again), or when a chmod, chown or chgrp asks for another mode, owner or group than the one signed; the approval is spent | Request a new challenge |
 | 79 | `signature_invalid` | The signature does not verify against the pinned key | Do not retry with the same signature |
 | 80 | `staging_full` | Staging is over its count or size limit | Wait for the TTL or commit pending objects |
 | 81 | `upload_mismatch` | The upload ended early, ran past its size, or its hash differs | Push again |
@@ -35,7 +37,7 @@ The file commands `mkdir`, `rmdir`, `touch` and `rm` take one absolute path. Eac
 | 84 | `approval_replayed` | The signature's nonce was already consumed | Push again for a fresh challenge |
 | 85 | `signature_action_mismatch` | The signer signed a different action than this approval | Sign this approval's challenge |
 | 86 | `signature_console_mismatch` | The signer signed for another console | Sign with this console's identity |
-| 87 | `protected` | The command reads or writes one of Ariel's protected objects: the token, the approval state, the consumed nonces, the audit log or the state file, directly, through a symbolic link or through a hard link. A file command that writes outside `/data`, `/user` and `/mnt/usb*` is also refused here. Refused even with an approval | Do not retry; these files are Ariel's own |
+| 87 | `protected` | The command reads or writes one of Ariel's protected objects: the token, the approval state, the consumed nonces, the audit log, the state file or the state directory itself, directly, through a symbolic link or through a hard link. A file command that writes outside `/data`, `/user` and `/mnt/usb*` is also refused here. Refused even with an approval | Do not retry; these files are Ariel's own |
 | 88 | `approval_expired` | The approval passed its expiry before it was granted or used | Push again |
 
 Free from 89. The `status <n>` line is outside this registry.

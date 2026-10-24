@@ -66,7 +66,8 @@ main(void) {
   static const approval_option_t bad_key[] = {{"Run", "1"}};
   static const approval_option_t no_value[] = {{"run", ""}};
   static const approval_option_t unicode[] = {{"run", "caf\xc3\xa9"}};
-  approval_action_t action = {"payload.commit", "helloworld", HASH, two, 2};
+  approval_action_t action = {"payload.commit", "helloworld", HASH, two, 2,
+                              NULL};
   approval_action_t other;
   char out[APPROVAL_ACTION_MAX];
   char again[APPROVAL_ACTION_MAX];
@@ -191,6 +192,25 @@ main(void) {
   other.noptions = 0;
   expect(encode(&other, out, sizeof(out)) > 0 &&
          !strstr(out, "option."), "an action with no options encodes");
+
+  // A transfer names its destination on a line of its own, and that path is
+  // held to the same grammar as the target.
+  other = action;
+  other.command = "cp";
+  other.destination = "/data/ariel/xfer-dst";
+  expect(encode(&other, out, sizeof(out)) > 0 && !strcmp(out,
+         "ariel-action-v1\n"
+         "command=cp\n"
+         "target=helloworld\n"
+         "destination=/data/ariel/xfer-dst\n"
+         "sha256=" HASH "\n"
+         "option.run=1\n"
+         "option.size=12\n"),
+         "a destination encodes as its own line after the target");
+  other.destination = "/data/../etc";
+  refused(&other, "a '..' in a destination is refused");
+  other.destination = "/data/xfer.dst";
+  refused(&other, "a '.' in a destination is refused");
 
   printf(failures ? "\n%d check(s) failed\n" : "\nall checks passed\n",
          failures);

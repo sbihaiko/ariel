@@ -63,13 +63,17 @@ typedef struct {
   const char *value;
 } approval_option_t;
 
-/** What the owner approves. Nothing else is signed. **/
+/**
+ * What the owner approves. Nothing else is signed. destination is NULL for an
+ * action with one path; a transfer names its destination too.
+ **/
 typedef struct {
   const char *command;
   const char *target;
   const char *sha256;
   const approval_option_t *options;
   size_t noptions;
+  const char *destination;
 } approval_action_t;
 
 /**

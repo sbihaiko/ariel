@@ -1137,6 +1137,18 @@ HOST_ROOT_SCENARIOS = {
     "its mode",
     "chmod, chown and chgrp answer protected through hard and symbolic links "
     "to a protected object, even when approved",
+    "cp, mv and ln ask the owner first, run once after the signature, and "
+    "ask again",
+    "a source swapped after approval answers approval_stale and exit 78 for "
+    "cp, mv and ln",
+    "cp, mv and ln refuse an existing destination with exists, without asking",
+    "cp, mv and ln refuse the token, approval state, nonces and the state "
+    "directory through any alias with protected and exit 87",
+    "a source swapped after approval for a link to the token answers "
+    "protected and exit 87, even when approved",
+    "cp, mv and ln audit each action and refusal, and audit tail shows them",
+    "the challenge of cp names both paths, sha256 none and the source's "
+    "identity",
 }
 
 
@@ -2525,7 +2537,9 @@ def scenario_no_system_change_on_agent_port(server):
             lines = reply_lines(read_reply(sock))
         finally:
             sock.close()
-        if command.startswith(("rm ", "mkdir ", "touch ", "chmod ")):
+        # mv is a gated command of its own now. Its paths are outside the host
+        # test root, so it answers protected before it asks the owner.
+        if command.startswith(("rm ", "mkdir ", "touch ", "chmod ", "mv ")):
             assert lines == ["protected", "exit 87"], (
                 "%s must answer protected, got %r" % (command, lines))
         else:
@@ -2942,6 +2956,204 @@ def scenario_attribute_operands_are_checked_first(server):
             kinds.add(fields[1])
     assert "chmod.refused" in kinds, (
         "a refused chmod must reach audit tail, got %r" % sorted(kinds))
+
+
+TRANSFERS = ("cp", "mv", "ln")
+TRANSFER_BYTES = b"transfer bytes\n"
+
+
+def make_transfer_file(server, name, data=TRANSFER_BYTES):
+    """A regular file in the host test root's data directory, made directly."""
+    path = os.path.join(server.root, "data", name)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def read_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def transfer_line(command, source, destination):
+    return "%s %s %s" % (command, source, destination)
+
+
+def transfer_request(server, line):
+    """gate_request after the earlier pending approvals expire.
+
+    The store holds at most three pending approvals, so the requests left
+    behind by one transfer would answer approval_busy for the next.
+    """
+    server.advance(120_000)
+    return gate_request(server, line)
+
+
+def scenario_transfer_commands_need_the_owner(server):
+    """cp, mv and ln ask first, run once after the owner signs, and ask again."""
+    for command in TRANSFERS:
+        source = make_transfer_file(server, "xsrc-" + command)
+        destination = os.path.join(server.root, "data", "xdst-" + command)
+        line = transfer_line(command, source, destination)
+
+        approval, challenge = transfer_request(server, line)
+        assert not os.path.lexists(destination), (
+            "an unsigned %s must not run" % command)
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, line) == ["exit 0"], (
+            "a signed %s must run" % command)
+        assert read_bytes(destination) == TRANSFER_BYTES, (
+            "%s must give the destination the source's bytes" % command)
+
+        if command == "cp":
+            assert os.path.exists(source), "cp must leave the source"
+            os.unlink(destination)
+            spent, _ = transfer_request(server, line)
+            assert spent != approval, "a spent cp approval must not be asked again"
+        elif command == "mv":
+            assert not os.path.lexists(source), "mv must remove the source"
+        else:
+            assert os.path.samefile(source, destination), (
+                "ln must make the destination a link to the source")
+
+
+def scenario_transfer_source_swapped_answers_78(server):
+    """A source replaced after the owner signs answers approval_stale and moves nothing."""
+    for command in TRANSFERS:
+        source = make_transfer_file(server, "xswap-" + command)
+        destination = os.path.join(server.root, "data", "xswap-dst-" + command)
+        line = transfer_line(command, source, destination)
+        approval, challenge = transfer_request(server, line)
+        sign_and_grant(server, approval, challenge)
+
+        replacement = source + "-new"
+        with open(replacement, "wb") as handle:
+            handle.write(b"swapped in\n")
+        os.replace(replacement, source)
+
+        assert run_command(server, line) == ["approval_stale", "exit 78"], (
+            "a source swapped after approval must answer approval_stale for %s"
+            % command)
+        assert not os.path.lexists(destination), (
+            "a swapped source must not be transferred by %s" % command)
+
+
+def scenario_transfer_refuses_existing_destination(server):
+    """An existing destination answers exists without asking, and is left alone."""
+    source = make_transfer_file(server, "xkeep-src", b"source\n")
+    destination = make_transfer_file(server, "xkeep-dst", b"keep me\n")
+    for command in TRANSFERS:
+        line = transfer_line(command, source, destination)
+        assert run_command(server, line) == ["exists", "exit 1"], (
+            "%s onto an existing destination must answer exists" % command)
+    assert read_bytes(destination) == b"keep me\n", (
+        "an existing destination must be left as it was")
+    assert read_bytes(source) == b"source\n", "a refused transfer must not move the source"
+
+
+def scenario_transfer_outside_writable_roots_answers_87(server):
+    """cp, mv and ln refuse a path outside /data, /user and /mnt/usb* without asking."""
+    for line in (
+        "cp /system/xfer-src /data/xfer-dst",
+        "mv /data/xfer-src /etc/xfer-dst",
+        "ln /system/xfer-src /data/xfer-dst",
+        "cp /data/xfer-src /mnt/xfer-dst",
+    ):
+        assert run_command(server, line) == ["protected", "exit 87"], (
+            "%s must answer protected and exit 87" % line)
+
+
+def scenario_transfer_protected_objects_answer_87(server):
+    """cp, mv and ln refuse Ariel's own objects through any alias, without asking."""
+    token = secret_path(server, "token")
+    before = read_bytes(token)
+    state = os.path.dirname(token)
+    source = make_transfer_file(server, "xprot-src")
+    destination = os.path.join(server.root, "data", "xprot-dst")
+    hard = os.path.join(server.root, "data", "xprot-hard")
+    soft = os.path.join(server.root, "data", "xprot-soft")
+    make_link(hard, token, hard=True)
+    make_link(soft, token, hard=False)
+
+    for command in TRANSFERS:
+        for source_path in (token, hard, soft):
+            line = transfer_line(command, source_path, destination)
+            assert run_command(server, line) == ["protected", "exit 87"], (
+                "%s must answer protected for %s" % (command, source_path))
+        for target in (token, os.path.join(state, "xprot-new")):
+            line = transfer_line(command, source, target)
+            assert run_command(server, line) == ["protected", "exit 87"], (
+                "%s onto %s must answer protected" % (command, target))
+
+    moved = os.path.join(server.root, "data", "xprot-moved")
+    assert run_command(server, "mv %s %s" % (state, moved)) == [
+        "protected", "exit 87"], "moving the state directory must answer protected"
+    assert read_bytes(token) == before, "a protected token must not change"
+    assert os.path.isdir(state) and os.path.exists(source), (
+        "a refused transfer must leave the state directory and its source")
+
+
+def scenario_transfer_protected_after_approval_answers_87(server):
+    """A source swapped for a link to Ariel's token after the owner signs runs nothing."""
+    token = secret_path(server, "token")
+    source = make_transfer_file(server, "xalias-src")
+    destination = os.path.join(server.root, "data", "xalias-dst")
+    line = transfer_line("cp", source, destination)
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+
+    os.unlink(source)
+    os.link(token, source)
+
+    assert run_command(server, line) == ["protected", "exit 87"], (
+        "an approved cp of a source that became the token must answer protected")
+    assert not os.path.lexists(destination), (
+        "a protected source must not be copied even when approved")
+
+
+def scenario_transfer_actions_are_audited(server):
+    """cp, mv and ln requests, runs and refusals reach audit tail under both paths."""
+    source = make_transfer_file(server, "xaudit-src")
+    destination = os.path.join(server.root, "data", "xaudit-dst")
+    line = transfer_line("cp", source, destination)
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"]
+    assert run_command(server, transfer_line("mv", source, destination)) == [
+        "exists", "exit 1"]
+    token = secret_path(server, "token")
+    assert run_command(server, transfer_line("ln", token, destination)) == [
+        "protected", "exit 87"]
+
+    events = set()
+    for line_text in run_exit_zero(server, "audit tail 64"):
+        fields = line_text.split()
+        if len(fields) == 5:
+            events.add((fields[1], fields[2]))
+    subject = "%s>%s" % (source, destination)
+    expected = (
+        ("cp.request", subject),
+        ("cp.done", subject),
+        ("mv.refused", subject),
+        ("ln.protected", "%s>%s" % (token, destination)),
+    )
+    for event in expected:
+        assert event in events, (
+            "audit tail must show %r, got %r" % (event, sorted(events)))
+
+
+def scenario_transfer_action_names_its_facts(server):
+    """The challenge of cp names both paths, the source's identity and sha256 none."""
+    source = make_transfer_file(server, "xfacts-src")
+    destination = os.path.join(server.root, "data", "xfacts-dst")
+    _, challenge = transfer_request(server, transfer_line("cp", source, destination))
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\ncommand=cp\n"), action
+    assert "\ntarget=%s\n" % source in action, action
+    assert "\ndestination=%s\n" % destination in action, action
+    assert "\nsha256=none\n" in action, action
+    assert "\noption.kind=file\n" in action, action
+    assert "\noption.dev=" in action and "\noption.ino=" in action, action
 
 
 def scenario_two_connections(server):
@@ -3946,6 +4158,26 @@ SCENARIOS = [
      "and are audited", scenario_attribute_operands_are_checked_first, None),
     ("the challenge of a file command names its path, sha256 none and identity",
      scenario_file_action_names_its_facts, True),
+    ("cp, mv and ln ask the owner first, run once after the signature, and "
+     "ask again", scenario_transfer_commands_need_the_owner, HOST_ROOT_REASON),
+    ("a source swapped after approval answers approval_stale and exit 78 for "
+     "cp, mv and ln", scenario_transfer_source_swapped_answers_78,
+     HOST_ROOT_REASON),
+    ("cp, mv and ln refuse an existing destination with exists, without asking",
+     scenario_transfer_refuses_existing_destination, HOST_ROOT_REASON),
+    ("cp, mv and ln refuse paths outside /data, /user and /mnt/usb* with "
+     "protected and exit 87 without asking",
+     scenario_transfer_outside_writable_roots_answers_87, None),
+    ("cp, mv and ln refuse the token, approval state, nonces and the state "
+     "directory through any alias with protected and exit 87",
+     scenario_transfer_protected_objects_answer_87, HOST_ROOT_REASON),
+    ("a source swapped after approval for a link to the token answers "
+     "protected and exit 87, even when approved",
+     scenario_transfer_protected_after_approval_answers_87, HOST_ROOT_REASON),
+    ("cp, mv and ln audit each action and refusal, and audit tail shows them",
+     scenario_transfer_actions_are_audited, HOST_ROOT_REASON),
+    ("the challenge of cp names both paths, sha256 none and the source's "
+     "identity", scenario_transfer_action_names_its_facts, HOST_ROOT_REASON),
     ("pwd and ls <absolute path> run through the agent port",
      scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",
