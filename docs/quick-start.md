@@ -101,9 +101,9 @@ Hello, world from Ariel!
 
 ## After Stage 1
 
-Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-hello-world-end-to-end) lands: no FTP server and no `chmod`. Stage 1 adds an agent port (2324) next to the telnet shell: raw TCP, one command per connection after `auth`, and every reply ends with an `exit <status>` line. Every connection starts with `auth <token>`, using the access token Ariel shows on the console at first start. Status `75` means a human must approve the action on the console with the controller.
+Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-hello-world-end-to-end) lands: no FTP server and no `chmod`. Stage 1 adds an agent port (2324) next to the telnet shell: raw TCP, one command per connection after `auth`, and every reply ends with an `exit <status>` line. Every connection starts with `auth <token>`, using the access token Ariel shows on the console at first start. Status `75` means the owner must approve the action with the key they hold.
 
-The headless acceptance test runs this section: it substitutes the token, the host and the staging ID, approves on a virtual controller where a human would, and treats IDs and hashes as placeholders. It builds `helloworld.elf` for the machine under test: with the host compiler for the headless suite, with `prospero-clang` (step 3) for a console.
+The headless acceptance test runs this section: it substitutes the token, the host and the staging ID, signs with a test key where the owner would, and treats IDs and hashes as placeholders. It builds `helloworld.elf` for the machine under test: with the host compiler for the headless suite, with `prospero-clang` (step 3) for a console.
 
 With `PS5_HOST` set, the same harness runs against a real console instead of starting the host build: it reads the access token from you, builds `helloworld.elf` with `prospero-clang`, prints the notification the console shows at every approval step and waits for you to decide on the controller. It runs only the scenarios that need no test clock, and names the ones it skips. That run is manual: it is not part of CI and not part of the Stage 1 gate.
 
@@ -122,7 +122,7 @@ approval_required a-81d0e3
 exit 75
 ```
 
-Approve it on the console. The notification names the payload, its hash, and that it will be executed. Then commit the staged upload:
+Approve it. The signer names the payload, its hash, and that it will be executed. Then commit the staged upload:
 
 ```console
 $ printf 'auth %s\npayload commit s-4f2a9c\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324

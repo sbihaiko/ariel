@@ -2,15 +2,15 @@
 
 ## Why this exists
 
-Ariel asks the owner to approve an action with the controller. The open question in [#3](https://github.com/sbihaiko/ariel/issues/3) is whether a payload can read the controller while another app is in the foreground.
+Ariel asks the owner to approve an action. The first version of that asked for the controller, and the open question in [#3](https://github.com/sbihaiko/ariel/issues/3) was whether a payload can read it while another app is in the foreground.
 
 `controller-spike.elf` answers that question on a real console. It is a separate payload. It is not part of Ariel.
 
 ## The decision it settles
 
-The approval source on a console is the controller ([ADR-0006](adr/0006-the-controller-is-the-approval-source.md)). Ariel builds the PS5 platform port with the controller as that source, behind the platform port, and this spike is how the choice is validated on a real console.
+The first version of [ADR-0006](adr/0006-the-controller-is-the-approval-source.md) made the controller the approval source on a console. This spike was how that choice was validated on a real console.
 
-If the run shows that another app in the foreground stops the payload from reading the pad, the source changes behind the platform port, to a fallback the agent cannot reach from the network, and ADR-0006 is rewritten with the result.
+The run showed that the payload cannot read the pad, and that borrowing the read from the foreground title freezes the game. The source changed behind the platform port, and ADR-0006 now names a signature by a key the owner holds. The result is recorded in [console-findings.md](console-findings.md) and, with the transcripts, in [controller-spike-notes.md](controller-spike-notes.md).
 
 ## What the payload does
 

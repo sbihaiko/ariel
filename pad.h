@@ -22,6 +22,10 @@ along with this program; see the file COPYING. If not, see
 
 /** The standard controller. **/
 #define PAD_PORT_TYPE_STANDARD 0
+#define PAD_PORT_TYPE_SPECIAL  2
+#define PAD_PORT_TYPE_COUNT    3
+#define PAD_LOGIN_USERS        4
+#define PAD_USER_INVALID       (-1)
 
 /** The system consumed this input before it reached the pad reader. **/
 #define PAD_BUTTON_INTERCEPTED 0x80000000u
@@ -64,16 +68,14 @@ int sceUserServiceInitialize(void* init_params);
 int sceUserServiceTerminate(void);
 int sceUserServiceGetInitialUser(int* user_id);
 int sceUserServiceGetForegroundUser(int* user_id);
+int sceUserServiceGetLoginUserIdList(int* user_ids);
+int sceUserServiceGetUserName(int user_id, char* name, size_t size);
 
-#define USER_LOGIN_MAX 4
-
-typedef struct {
-  int user_id[USER_LOGIN_MAX]; // -1 marks an empty slot
-} user_login_list_t;
-
-int sceUserServiceGetLoginUserIdList(user_login_list_t* list);
+int sceRegMgrGetInt(int entity, int* value);
 int scePadInit(void);
 int scePadOpen(int user_id, int type, int index, void* param);
+int scePadGetHandle(int user_id, int type, int index);
+int scePadSetProcessPrivilege(int privilege);
 int scePadReadState(int handle, pad_data_t* data);
 int scePadClose(int handle);
 
