@@ -65,6 +65,7 @@ static const struct {
   {"file", "print the kind of an absolute path"},
   {"find", "list an absolute tree"},
   {"grep", "print the lines of an absolute file that match"},
+  {"head", "print the first lines of an absolute file"},
   {"help", "list the commands"},
   {"hexdump", "print an absolute file in hex"},
   {"id", "print the user and group ids"},
@@ -80,6 +81,8 @@ static const struct {
   {"sum", "print the BSD checksum of an absolute file"},
   {"sync", "write cached data to disk"},
   {"sysctl", "print a kernel parameter"},
+  {"tail", "print the last lines of an absolute file"},
+  {"wc", "count the lines, words and bytes of an absolute file"},
 };
 
 
@@ -189,6 +192,138 @@ fill(int fd, char *buf, size_t cap) {
 }
 
 
+#define MARKER_RESERVE 64
+#define CONTENT_CAP (OUTPUT_CAP - MARKER_RESERVE)
+
+typedef struct {
+  int fd;
+  size_t limit;
+  size_t shown;
+  size_t total;
+  size_t bytes;
+  int full;
+} answer_t;
+
+
+static void
+say_cut(int fd, size_t shown, size_t total) {
+  char line[64];
+
+  snprintf(line, sizeof(line), "truncated %zu of %zu\n", shown, total);
+  say(fd, line);
+}
+
+
+static void
+answer_init(answer_t *answer, int fd, size_t limit) {
+  answer->fd = fd;
+  answer->limit = limit;
+  answer->shown = 0;
+  answer->total = 0;
+  answer->bytes = 0;
+  answer->full = 0;
+}
+
+
+// A line that does not fit stops the answer, so the lines shown are a prefix.
+static void
+answer_line(answer_t *answer, const char *text, size_t len) {
+  answer->total++;
+  if(answer->full) {
+    return;
+  }
+  if(answer->shown >= answer->limit || len + 1 > CONTENT_CAP - answer->bytes) {
+    answer->full = 1;
+    return;
+  }
+  put(answer->fd, text, len);
+  say(answer->fd, "\n");
+  answer->shown++;
+  answer->bytes += len + 1;
+}
+
+
+static void
+answer_done(answer_t *answer) {
+  if(answer->shown < answer->total) {
+    say_cut(answer->fd, answer->shown, answer->total);
+  }
+}
+
+
+// A JSON object of one string member, bounded like every other answer line.
+static void
+answer_json(answer_t *answer, const char *key, const char *value) {
+  char line[OUT_LINE_CAP];
+  size_t n;
+
+  n = (size_t)snprintf(line, sizeof(line), "{\"%s\":", key);
+  if(n < sizeof(line)) {
+    n += json_format_string(line + n, sizeof(line) - n, value);
+  }
+  if(n >= sizeof(line)) {
+    answer->total++;
+    answer->full = 1;
+    return;
+  }
+  line[n++] = '}';
+  answer_line(answer, line, n);
+}
+
+
+// say_path, bounded: the same object, cut like any other answer line.
+static void
+answer_path(answer_t *answer, int json, const char *path) {
+  if(json) {
+    answer_json(answer, "path", path);
+  } else {
+    answer_line(answer, path, strlen(path));
+  }
+}
+
+
+static int
+parse_count(const char *text, size_t *value) {
+  size_t n = 0;
+
+  if(!*text) {
+    return -1;
+  }
+  for(; *text; text++) {
+    size_t digit;
+
+    if(*text < '0' || *text > '9') {
+      return -1;
+    }
+    digit = (size_t)(*text - '0');
+    if(n > (SIZE_MAX - digit) / 10) {
+      return -1;
+    }
+    n = n * 10 + digit;
+  }
+  *value = n;
+  return 0;
+}
+
+
+// --limit N is the only option a reader takes, and it comes first.
+static int
+parse_limit(int argc, char *const argv[], int errfd, size_t *limit, int *skip) {
+  *limit = SIZE_MAX;
+  *skip = 0;
+
+  if(argc < 2 || strncmp(argv[1], "--", 2)) {
+    return 0;
+  }
+  if(!strcmp(argv[1], "--limit") && argc >= 3 && !parse_count(argv[2], limit)) {
+    *skip = 2;
+    return 0;
+  }
+  say(errfd, "bad_option\n");
+  return 1;
+}
+
+
 static int
 name_cmp(const void *a, const void *b) {
   return strcmp(*(char *const *)a, *(char *const *)b);
@@ -201,9 +336,18 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
   size_t count = 0;
   size_t cap = 0;
   struct dirent *ent;
+  answer_t answer;
+  size_t limit;
   DIR *dir;
   size_t i;
+  int skip;
   int rc = 0;
+
+  if(parse_limit(argc, argv, errfd, &limit, &skip)) {
+    return 1;
+  }
+  argc -= skip;
+  argv += skip;
 
   if(argc != 2 || argv[1][0] != '/') {
     say(errfd, "relative_path\n");
@@ -243,16 +387,15 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
     say(errfd, "operation_failed\n");
   } else {
     qsort(names, count, sizeof(*names), name_cmp);
+    answer_init(&answer, outfd, limit);
     for(i=0; i<count; i++) {
       if(json) {
-        say(outfd, "{\"name\":");
-        json_say_string(outfd, names[i]);
-        say(outfd, "}\n");
+        answer_json(&answer, "name", names[i]);
       } else {
-        say(outfd, names[i]);
-        say(outfd, "\n");
+        answer_line(&answer, names[i], strlen(names[i]));
       }
     }
+    answer_done(&answer);
   }
 
   for(i=0; i<count; i++) {
@@ -292,6 +435,30 @@ open_target(const char *cmd, const char *path, int errfd, int *fd) {
   }
   report(cmd, path, errfd, err);
   return 1;
+}
+
+
+static int
+open_regular(const char *cmd, const char *path, int errfd, int *fd) {
+  struct stat st;
+  int rc;
+  int err;
+
+  if((rc=open_target(cmd, path, errfd, fd))) {
+    return rc;
+  }
+  if(fstat(*fd, &st)) {
+    err = errno;
+    close(*fd);
+    report(cmd, path, errfd, err);
+    return 1;
+  }
+  if(!S_ISREG(st.st_mode)) {
+    close(*fd);
+    say(errfd, "not_a_file\n");
+    return 1;
+  }
+  return 0;
 }
 
 
@@ -388,9 +555,20 @@ static int
 run_cat(int argc, char *const argv[], int outfd, int errfd) {
   char buf[IO_CHUNK];
   char last = '\n';
+  size_t shown = 0;
+  size_t total = 0;
+  size_t cap;
+  size_t limit;
   ssize_t n;
+  int skip;
   int fd;
   int rc;
+
+  if(parse_limit(argc, argv, errfd, &limit, &skip)) {
+    return 1;
+  }
+  argc -= skip;
+  argv += skip;
 
   if(argc != 2) {
     return bad_arguments("cat", errfd);
@@ -399,6 +577,7 @@ run_cat(int argc, char *const argv[], int outfd, int errfd) {
     return rc;
   }
 
+  cap = limit < CONTENT_CAP ? limit : CONTENT_CAP;
   for(;;) {
     n = read(fd, buf, sizeof(buf));
     if(n < 0 && errno == EINTR) {
@@ -407,8 +586,17 @@ run_cat(int argc, char *const argv[], int outfd, int errfd) {
     if(n <= 0) {
       break;
     }
-    put(outfd, buf, (size_t)n);
-    last = buf[n - 1];
+    total += (size_t)n;
+    if(shown < cap) {
+      size_t take = cap - shown;
+
+      if((size_t)n < take) {
+        take = (size_t)n;
+      }
+      put(outfd, buf, take);
+      shown += take;
+      last = buf[take - 1];
+    }
   }
 
   if(n < 0) {
@@ -423,6 +611,9 @@ run_cat(int argc, char *const argv[], int outfd, int errfd) {
   // A reply is one line per result, so the exit line never follows text.
   if(last != '\n') {
     say(outfd, "\n");
+  }
+  if(shown < total) {
+    say_cut(outfd, shown, total);
   }
   return 0;
 }
@@ -463,13 +654,22 @@ static int
 run_grep(int argc, char *const argv[], int outfd, int errfd) {
   char *line = NULL;
   size_t cap = 0;
+  answer_t answer;
+  size_t limit;
   regex_t re;
   ssize_t len;
   int matched = 0;
   int failed;
+  int skip;
   int fd;
   int rc;
   FILE *file;
+
+  if(parse_limit(argc, argv, errfd, &limit, &skip)) {
+    return 1;
+  }
+  argc -= skip;
+  argv += skip;
 
   if(argc != 3) {
     return bad_arguments("grep", errfd);
@@ -489,6 +689,7 @@ run_grep(int argc, char *const argv[], int outfd, int errfd) {
     return 1;
   }
 
+  answer_init(&answer, outfd, limit);
   while((len=next_line(file, &line, &cap)) >= 0) {
     size_t text = (size_t)len;
 
@@ -497,8 +698,7 @@ run_grep(int argc, char *const argv[], int outfd, int errfd) {
     }
     if(regexec(&re, line, 0, NULL, 0) == 0) {
       matched = 1;
-      put(outfd, line, text);
-      say(outfd, "\n");
+      answer_line(&answer, line, text);
     }
   }
 
@@ -511,7 +711,241 @@ run_grep(int argc, char *const argv[], int outfd, int errfd) {
     say(errfd, "operation_failed\n");
     return 1;
   }
+  answer_done(&answer);
   return matched ? 0 : 1;
+}
+
+
+static int
+run_head(int argc, char *const argv[], int outfd, int errfd) {
+  char *line = NULL;
+  size_t cap = 0;
+  answer_t answer;
+  size_t count = 10;
+  ssize_t len;
+  int failed;
+  int fd;
+  int rc;
+  FILE *file;
+
+  if(argc == 3) {
+    if(parse_count(argv[1], &count)) {
+      return bad_arguments("head", errfd);
+    }
+    argc--;
+    argv++;
+  }
+  if(argc != 2) {
+    return bad_arguments("head", errfd);
+  }
+  if((rc=open_regular("head", argv[1], errfd, &fd))) {
+    return rc;
+  }
+  if(!(file=fdopen(fd, "r"))) {
+    close(fd);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  answer_init(&answer, outfd, count);
+  while((len=next_line(file, &line, &cap)) >= 0) {
+    size_t text = (size_t)len;
+
+    if(line[text - 1] == '\n') {
+      line[--text] = '\0';
+    }
+    answer_line(&answer, line, text);
+  }
+
+  failed = len == -2 || ferror(file);
+  fclose(file);
+  free(line);
+
+  if(failed) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  answer_done(&answer);
+  return 0;
+}
+
+
+typedef struct tail_line {
+  struct tail_line *next;
+  size_t len;
+  char text[];
+} tail_line_t;
+
+
+static void
+tail_drop(tail_line_t **first, tail_line_t **last, size_t *count,
+          size_t *bytes) {
+  tail_line_t *old = *first;
+
+  *first = old->next;
+  if(!*first) {
+    *last = NULL;
+  }
+  *bytes -= old->len + 1;
+  (*count)--;
+  free(old);
+}
+
+
+static void
+tail_free(tail_line_t *first) {
+  while(first) {
+    tail_line_t *next = first->next;
+
+    free(first);
+    first = next;
+  }
+}
+
+
+static int
+run_tail(int argc, char *const argv[], int outfd, int errfd) {
+  tail_line_t *first = NULL;
+  tail_line_t *last = NULL;
+  tail_line_t *node;
+  char *line = NULL;
+  size_t cap = 0;
+  size_t count = 0;
+  size_t bytes = 0;
+  size_t total = 0;
+  size_t limit = 10;
+  ssize_t len;
+  int failed;
+  int oom = 0;
+  int fd;
+  int rc;
+  FILE *file;
+
+  if(argc == 3) {
+    if(parse_count(argv[1], &limit)) {
+      return bad_arguments("tail", errfd);
+    }
+    argc--;
+    argv++;
+  }
+  if(argc != 2) {
+    return bad_arguments("tail", errfd);
+  }
+  if((rc=open_regular("tail", argv[1], errfd, &fd))) {
+    return rc;
+  }
+  if(!(file=fdopen(fd, "r"))) {
+    close(fd);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  while((len=next_line(file, &line, &cap)) >= 0) {
+    size_t text = (size_t)len;
+
+    if(line[text - 1] == '\n') {
+      text--;
+    }
+    total++;
+    if(!(node=malloc(sizeof(*node) + text + 1))) {
+      oom = 1;
+      break;
+    }
+    node->next = NULL;
+    node->len = text;
+    memcpy(node->text, line, text);
+    node->text[text] = '\0';
+    if(last) {
+      last->next = node;
+    } else {
+      first = node;
+    }
+    last = node;
+    count++;
+    bytes += text + 1;
+    while(first && (count > limit || bytes > CONTENT_CAP)) {
+      tail_drop(&first, &last, &count, &bytes);
+    }
+  }
+
+  failed = oom || len == -2 || ferror(file);
+  fclose(file);
+  free(line);
+
+  if(failed) {
+    tail_free(first);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  for(node=first; node; node=node->next) {
+    put(outfd, node->text, node->len);
+    say(outfd, "\n");
+  }
+  if(count < total) {
+    say_cut(outfd, count, total);
+  }
+  tail_free(first);
+  return 0;
+}
+
+
+static int
+run_wc(int argc, char *const argv[], int outfd, int errfd) {
+  unsigned long long lines = 0;
+  unsigned long long words = 0;
+  unsigned long long bytes = 0;
+  char buf[IO_CHUNK];
+  char line[OUT_LINE_CAP];
+  int inword = 0;
+  ssize_t n;
+  size_t i;
+  int fd;
+  int rc;
+
+  if(argc != 2) {
+    return bad_arguments("wc", errfd);
+  }
+  if((rc=open_regular("wc", argv[1], errfd, &fd))) {
+    return rc;
+  }
+
+  for(;;) {
+    n = read(fd, buf, sizeof(buf));
+    if(n < 0 && errno == EINTR) {
+      continue;
+    }
+    if(n <= 0) {
+      break;
+    }
+    for(i=0; i<(size_t)n; i++) {
+      bytes++;
+      if(buf[i] == '\n') {
+        lines++;
+      }
+      if(isspace((unsigned char)buf[i])) {
+        inword = 0;
+      } else if(!inword) {
+        inword = 1;
+        words++;
+      }
+    }
+  }
+
+  if(n < 0) {
+    int err = errno;
+
+    close(fd);
+    report("wc", argv[1], errfd, err);
+    return 1;
+  }
+  close(fd);
+
+  snprintf(line, sizeof(line), "%llu %llu %llu ", lines, words, bytes);
+  say(outfd, line);
+  say(outfd, argv[1]);
+  say(outfd, "\n");
+  return 0;
 }
 
 
@@ -713,19 +1147,6 @@ push_path(char ***stack, size_t *count, size_t *cap, char *path) {
 }
 
 
-static void
-say_path(int json, int fd, const char *path) {
-  if(json) {
-    say(fd, "{\"path\":");
-    json_say_string(fd, path);
-    say(fd, "}\n");
-  } else {
-    say(fd, path);
-    say(fd, "\n");
-  }
-}
-
-
 static int
 run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   char **todo = NULL;
@@ -733,11 +1154,20 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   size_t cap = 0;
   struct stat st;
   struct dirent *ent;
+  answer_t answer;
+  size_t limit;
   DIR *dir;
   char *root;
   int failed = 0;
   int oom = 0;
+  int skip;
   size_t i;
+
+  if(parse_limit(argc, argv, errfd, &limit, &skip)) {
+    return 1;
+  }
+  argc -= skip;
+  argv += skip;
 
   if(argc != 2) {
     return bad_arguments("find", errfd);
@@ -750,8 +1180,10 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
     return 1;
   }
 
-  say_path(json, outfd, argv[1]);
+  answer_init(&answer, outfd, limit);
+  answer_path(&answer, json, argv[1]);
   if(!S_ISDIR(st.st_mode)) {
+    answer_done(&answer);
     return 0;
   }
 
@@ -790,7 +1222,7 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
         free(child);
         continue;
       }
-      say_path(json, outfd, child);
+      answer_path(&answer, json, child);
 
       if(S_ISDIR(child_st.st_mode)) {
         if(push_path(&todo, &count, &cap, child)) {
@@ -815,6 +1247,7 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
     say(errfd, "operation_failed\n");
     return 1;
   }
+  answer_done(&answer);
   return failed;
 }
 
@@ -1283,6 +1716,9 @@ static const struct {
   {"hexdump", run_hexdump},
   {"sha256sum", run_sha256sum},
   {"read", run_read},
+  {"head", run_head},
+  {"tail", run_tail},
+  {"wc", run_wc},
 };
 
 

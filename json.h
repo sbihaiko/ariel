@@ -23,4 +23,12 @@ along with this program; see the file COPYING. If not, see
  **/
 void json_say_string(int fd, const char *text);
 
+/**
+ * Format text into out as a JSON string, quotes included, the way
+ * json_say_string writes it. The result is truncated at cap bytes, and the
+ * return value is the length the whole string needs, as snprintf answers:
+ * a caller that sees a return at or above cap has no whole string.
+ **/
+size_t json_format_string(char *out, size_t cap, const char *text);
+
 #endif /* ARIEL_JSON_H */

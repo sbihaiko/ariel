@@ -17,7 +17,8 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_RUNNER_H
 #define ARIEL_RUNNER_H
 
-/** The most bytes of output one answer carries. A reader cuts past it. **/
+/** The most bytes of output one answer carries, the cut marker included
+    (ADR-0012). A reader cuts past it. **/
 #define OUTPUT_CAP (64UL * 1024)
 
 /**
