@@ -65,6 +65,55 @@ A second `eboot.bin` in the list, pid 66, is the system title `NPXS40039`. It is
 
 Do not attach to the foreground title to sample the pad. That is the run that froze the console.
 
+## The *at() calls on this SDK
+
+Measured on firmware 11.200.005, console `192.168.68.77`, under `/data/ariel`. The link of a payload built with `prospero-clang -lkernel_sys` (`-Wl,--trace-symbol`) is:
+
+| Symbol | Definition the link uses |
+| --- | --- |
+| `open` | `libkernel_stub_weak.so` (shared) |
+| `fstat` | `libkernel_stub_weak.so` (shared) |
+| `openat`, `mkdirat`, `unlinkat`, `renameat`, `fstatat`, `fchmodat`, `linkat`, `readlinkat`, `syscall` | `libc.a(syscalls.o)` |
+
+`libc.a(syscalls.o)` for each of those is `mov $SYS_*, %rax; mov %rcx, %r10; syscall; ret`. Runtime addresses of the libc copies were `0x200009ae0`–`0x20000a6f0`. `open` was `0x80000ecb0` and `fstat` was `0x800001090`.
+
+| Call | Case | rc | errno |
+| --- | --- | --- | --- |
+| `open` absolute | `/data/ariel/token` | 9 | 0 |
+| `open` absolute | missing `nonces` | -1 | 2 `ENOENT` |
+| `openat` | `token` | 10 | 0 |
+| `openat` | missing `nonces` | 2 | 0 |
+| `syscall(SYS_openat)` | missing `nonces` | 2 | 0 |
+| carry-checking `SYS_openat` | missing `nonces` | -1 | 2 `ENOENT` |
+| carry-checking `SYS_openat` | `token` | 10 | 0 |
+| `mkdirat` | `store` exists | 17 | 0 |
+| `syscall(SYS_mkdirat)` | `store` exists | 17 | 0 |
+| carry-checking `SYS_mkdirat` | `store` exists | -1 | 17 `EEXIST` |
+| `unlinkat` | missing name | 2 | 0 |
+| `unlinkat` | existing file | 0 | 0 |
+| `syscall(SYS_unlinkat)` | missing name | 2 | 0 |
+| carry-checking `SYS_unlinkat` | missing name | -1 | 2 `ENOENT` |
+| `renameat` | existing file | 0 | 0 |
+| `renameat` | missing name | 2 | 0 |
+| `syscall(SYS_renameat)` | missing name | 2 | 0 |
+| carry-checking `SYS_renameat` | missing name | -1 | 2 `ENOENT` |
+| `fstatat` | `token` | 0 | 0 |
+| `fstatat` | missing name | 2 | 0 |
+| `syscall(SYS_fstatat)` | missing name | 2 | 0 |
+| carry-checking `SYS_fstatat` | missing name | -1 | 2 `ENOENT` |
+| `fstat` | open token fd | 0 | 0 |
+| `fstat` | fd -1 | -1 | 9 `EBADF` |
+| `fchmodat` | `token` mode 0600 | 0 | 0 |
+| `fchmodat` | missing name | 2 | 0 |
+| `linkat` | `token` to a new name | 45 | 0 |
+| `linkat` | missing name | 2 | 0 |
+| `readlinkat` | `token` | 78 | 0 |
+| `readlinkat` | missing name | 78 | 0 |
+
+45 is `EOPNOTSUPP`. 78 is `ENOSYS`. The `linkat` of `token` did not create the destination (`unlinkat` of that name then returned 2). `dlsym(RTLD_DEFAULT, "openat")` returned null. `dlopen` of `libkernel_sys.sprx`, `libkernel.sprx`, `libkernel_web.sprx` and `libSceLibcInternal.sprx` returned null.
+
+The safe call is a `syscall` instruction whose carry flag is checked: carry set means `errno = rax` and the result is -1. Carry clear means `rax` is the result. That is what `ps5_at.h` does for the five calls `store.c` makes. `open` and `fstat` already do it inside libkernel.
+
 ## Ruled out
 
 - **Credentials alone.** The user service answers; the pad does not open.
@@ -75,6 +124,9 @@ Do not attach to the foreground title to sample the pad. That is the run that fr
 - **User ids.** Inside the title, user id `1` is still `DEVICE_NO_HANDLE`; only the real account id resolves.
 - **The shell.** `SceShellCore` on the home screen has no pad open, because nothing is in the foreground.
 - **Untested, therefore not results.** Port type 3, pad indexes other than 0, the PoorDS4 context setters (`scePadSetLoginUserNumber`, `scePadSetUserNumber`, `scePadSetProcessFocus`) and `scePadVirtualDeviceAddDevice` were never run. A virtual device would create input, not read the owner's.
+- **`*at()` via `libc` `syscall()`.** `syscall(SYS_openat)` on a missing file returned 2 and left `errno` at 0. Same for `SYS_mkdirat` (17), `SYS_unlinkat` (2), `SYS_renameat` (2) and `SYS_fstatat` (2).
+- **The kernel `openat` symbol.** The link keeps `libc.a(syscalls.o)`. `dlsym(RTLD_DEFAULT, "openat")` was null. `dlopen` of `libkernel_sys.sprx`, `libkernel.sprx`, `libkernel_web.sprx` and `libSceLibcInternal.sprx` was null.
+- **Absolute `open` in place of `openat`.** A missing absolute path returns -1 with `errno` 2. It does not take a directory fd or `O_NOFOLLOW`, which is what the store uses.
 
 ## What other projects say
 

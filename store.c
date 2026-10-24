@@ -35,6 +35,7 @@ along with this program; see the file COPYING. If not, see
 #include "approval.h"
 #include "sha256.h"
 #include "store.h"
+#include "ps5_at.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
