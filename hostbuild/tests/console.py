@@ -43,6 +43,7 @@ SECRET_READS = (
     "grep . {p}",
     "hexdump {p}",
     "sha256sum {p}",
+    "read {p}",
     "cmp {p} {p}",
 )
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")

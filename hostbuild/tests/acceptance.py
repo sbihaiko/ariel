@@ -1357,6 +1357,7 @@ HOST_ROOT_SCENARIOS = {
     "read answers the file's size and SHA-256, its raw bytes, then exit 0",
     "read of a file over the cap returns ranges that reassemble and verify "
     "by the whole file's hash",
+    "a cut read from an offset marks the range's length in truncated",
     "read past the end answers bad_range and exit 1, and a bad option "
     "answers bad_option",
     "the token, approval state and nonces answer protected and exit 87 when "
@@ -3515,6 +3516,21 @@ def scenario_read_ranges_over_the_cap(server):
     assert assembled == data, "the ranges must reassemble the file"
     assert hashlib.sha256(assembled).hexdigest() == digest, (
         "the reassembled bytes must verify against the whole file's hash")
+
+
+def scenario_read_cut_at_an_offset(server):
+    """A cut read from an offset marks the length of its range, not the file's size."""
+    data = bytes((i * 17 + 3) % 256 for i in range(300 * 1024))
+    path = write_scratch(server, "cut.bin", data)
+    offset = 100000
+    size, got, body, tail = split_read(
+        read_raw(server, "read %s --offset %d" % (path, offset)))
+    assert size == len(data), "a cut read must report the whole file's size"
+    assert body == data[offset:offset + READ_CAP], (
+        "a cut read from an offset must return the cap from that offset")
+    assert tail == ("truncated %d of %d\nexit 0\n"
+                    % (READ_CAP, len(data) - offset)).encode("ascii"), (
+        "the truncated marker must name the range's length, got %r" % tail)
 
 
 def scenario_read_bad_range(server):
@@ -8471,6 +8487,8 @@ SCENARIOS = [
     ("read of a file over the cap returns ranges that reassemble and verify "
      "by the whole file's hash", scenario_read_ranges_over_the_cap,
      HOST_ROOT_REASON),
+    ("a cut read from an offset marks the range's length in truncated",
+     scenario_read_cut_at_an_offset, HOST_ROOT_REASON),
     ("read past the end answers bad_range and exit 1, and a bad option "
      "answers bad_option", scenario_read_bad_range, HOST_ROOT_REASON),
     ("the token, approval state and nonces answer protected and exit 87 when "
