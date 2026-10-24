@@ -131,6 +131,10 @@ static const char autoload_full[] =
 static const char autoload_failed[] =
   "autoload_failed\n"
   "exit 1\n";
+
+static const char safe_boot_pending[] =
+  "safe_boot_pending\n"
+  "exit 1\n";
 static const char unknown_approval[] =
   "unknown_approval\n"
   "exit 1\n";
@@ -2333,6 +2337,67 @@ reboot_command(agent_t *agent, int fd) {
 
 
 /**
+ * autoload safe-boot: the owner signs the boot list it leaves aside. Only Ariel
+ * runs on the next boot, and the list comes back at the start after it.
+ **/
+static void
+safe_boot_command(agent_t *agent, int fd) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  approval_facts_t facts;
+  approval_challenge_t challenge;
+  sha256_t hash;
+
+  if(store_autoload_skip_pending() == 1) {
+    audit_reply(fd, "autoload.safe-boot", "refused", "autoload", "-",
+                safe_boot_pending);
+    return;
+  }
+
+  if(store_autoload_show(text, sizeof(text)) < 0) {
+    reply(fd, list_failed);
+    return;
+  }
+
+  sha256_init(&hash);
+  sha256_update(&hash, text, strlen(text));
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "autoload.safe-boot");
+  snprintf(facts.target, sizeof(facts.target), "%s", "autoload");
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  switch(store_autoload_safe_boot(challenge.id, hex)) {
+  case STORE_SAFE_BOOT_OK:
+    reply(fd, "autoload safe-boot\nexit 0\n");
+    return;
+  case STORE_SAFE_BOOT_PENDING:
+    audit_reply(fd, "autoload.safe-boot", "refused", "autoload", challenge.id,
+                safe_boot_pending);
+    return;
+  case STORE_SAFE_BOOT_STALE:
+    audit_reply(fd, "autoload.safe-boot", "stale", "autoload", challenge.id,
+                approval_stale);
+    return;
+  case STORE_SAFE_BOOT_UNRECORDED:
+    reply(fd, audit_failed);
+    return;
+  default:
+    audit_reply(fd, "autoload.safe-boot", "failed", "autoload", challenge.id,
+                autoload_failed);
+    return;
+  }
+}
+
+
+/**
  * audit tail [n]: the newest n lines of the audit log, at most AUDIT_TAIL_MAX.
  * Reading the log writes nothing to it.
  **/
@@ -2687,6 +2752,12 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "autoload") && !strcmp(argv[1], "show")) {
     autoload_show(fd);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "autoload") &&
+     !strcmp(argv[1], "safe-boot")) {
+    safe_boot_command(agent, fd);
     return;
   }
 

@@ -173,6 +173,13 @@ main(int argc, char **argv) {
     run_autoload(platform);
   }
 
+  // A boot list set aside by autoload safe-boot comes back only after the boot
+  // that skipped it, so the next boot runs it again.
+  if(store_autoload_restore()) {
+    fprintf(stderr, "cannot restore the boot list in %s\n", state_dir);
+    return EXIT_FAILURE;
+  }
+
   // The harness reads the token from standard output. Print it only once
   // the listener is ready, so the line also announces that the port is up.
   printf("token %s\n", agent_token);

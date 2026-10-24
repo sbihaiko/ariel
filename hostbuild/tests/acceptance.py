@@ -1236,6 +1236,9 @@ HOST_RESTART_SCENARIOS = {
     "a crash restart runs no autoload entry and restarts nothing that was "
     "running",
     "a granted reboot is audited as its request, grant and done",
+    "a granted autoload safe-boot skips autoload on the next boot only",
+    "a second autoload safe-boot while one is pending answers "
+    "safe_boot_pending, exit 1, and asks nothing",
 }
 
 # The scenarios that need the host test root: they write scratch files or
@@ -6408,6 +6411,114 @@ def scenario_failed_rollback_restores_the_build_it_replaced(server):
         server), "the replacement must be audited"
 
 
+def safe_boot_approve(server):
+    """Ask for autoload safe-boot, sign the challenge and grant it."""
+    approval, challenge = gate_request(server, "autoload safe-boot")
+    sign_and_grant(server, approval, challenge)
+    return approval
+
+
+def scenario_safe_boot_asks_the_owner(server):
+    """autoload safe-boot answers 75 with a challenge that names the boot list it skips."""
+    listing = autoload_listing(server)
+    approval, challenge = gate_request(server, "autoload safe-boot")
+    action = reboot_action(challenge)
+    assert "command=autoload.safe-boot" in action and (
+        "sha256=%s" % autoload_list_sha(listing)) in action, (
+        "the challenge must name safe-boot and the boot list, got %r" % action)
+    server.controller("deny %s" % approval, "denied %s" % approval)
+    assert send_command(server, "autoload safe-boot") == [
+        "approval_denied", "exit 77"], "a denied safe-boot must answer 77"
+    assert autoload_listing(server) == listing, (
+        "a denied safe-boot must leave the boot list as it was")
+
+
+def scenario_safe_boot_skips_autoload_for_one_boot(server):
+    """A granted safe-boot skips autoload on the next boot, and autoload is back after it."""
+    install_hanging(server, "safe_keep",
+                    compile_payload(HANG_SOURCE, "safe_keep"))
+    install_hanging(server, "safe_boot",
+                    compile_payload(HANG_SOURCE, "safe_boot"))
+    approval = autoload_approve(server, "add", "safe_boot")
+    assert autoload_apply(server, "add", "safe_boot", approval) == [
+        "autoload add safe_boot", "exit 0"], "the boot entry must be added"
+
+    approval = safe_boot_approve(server)
+    assert send_command(server, "autoload safe-boot") == [
+        "autoload safe-boot", "exit 0"], "a granted safe-boot must apply"
+    assert autoload_listing(server) == ["autoload ariel", "exit 0"], (
+        "safe-boot must leave only Ariel in the boot list")
+
+    reboot_approve(server)
+    reboot_and_wait(server)
+    assert running_flag(server, "safe_boot") == "no", (
+        "safe-boot must skip the autoload entry on the next boot")
+    assert running_flag(server, "safe_keep") == "no", (
+        "safe-boot must skip every autoload entry on the next boot")
+    assert "autoload safe_boot" in autoload_listing(server), (
+        "the next start must restore the boot list the skip left aside")
+
+    reboot_approve(server)
+    reboot_and_wait(server)
+    assert running_flag(server, "safe_boot") == "yes", (
+        "autoload must be back on the boot after the skipped one")
+
+    events = [line.split() for line in audit_tail(server)
+              if line.split()[3:4] == [approval]]
+    assert [event[1] for event in events] == [
+        "autoload.safe-boot.request", "grant", "autoload_safe_boot"], (
+        "safe-boot must be audited as its request, grant and change, got %r"
+        % events)
+    assert "autoload_restore" in [event[0] for event in audit_events(server)], (
+        "the restore at the next start must be audited")
+
+
+def scenario_safe_boot_stale_answers_78(server):
+    """A safe-boot granted for a boot list that has since changed answers 78 and changes nothing."""
+    install_payload(server, "safe_stale",
+                    compile_payload(HELLO_SOURCE, "safe_stale"))
+    approval, challenge = gate_request(server, "autoload safe-boot")
+
+    other = autoload_approve(server, "add", "safe_stale")
+    assert autoload_apply(server, "add", "safe_stale", other) == [
+        "autoload add safe_stale", "exit 0"], "the other edit must apply"
+
+    sign_and_grant(server, approval, challenge)
+    assert send_command(server, "autoload safe-boot") == [
+        "approval_stale", "exit 78"], (
+        "a safe-boot granted for an older boot list is stale")
+    assert "autoload safe_stale" in autoload_listing(server), (
+        "a stale safe-boot must leave the boot list as it was")
+    assert "autoload.safe-boot.stale" in [
+        line.split()[1] for line in audit_tail(server)
+        if line.split()[3:4] == [approval]], (
+        "the stale safe-boot must be audited")
+
+
+def scenario_safe_boot_refused_while_pending(server):
+    """A second safe-boot while one is pending answers safe_boot_pending and asks nothing."""
+    listing = autoload_listing(server)
+    safe_boot_approve_and_apply(server)
+    assert send_command(server, "autoload safe-boot") == [
+        "safe_boot_pending", "exit 1"], (
+        "a second safe-boot must not replace the boot list it left aside")
+    server.assert_no_line()
+    assert "autoload.safe-boot.refused" in [
+        line.split()[1] for line in audit_tail(server)], (
+        "the refused safe-boot must be audited")
+    reboot_approve(server)
+    reboot_and_wait(server)
+    assert autoload_listing(server) == listing, (
+        "the next start must restore the boot list the first safe-boot left aside")
+
+
+def safe_boot_approve_and_apply(server):
+    """Approve and apply one safe-boot, leaving the boot list only Ariel's."""
+    safe_boot_approve(server)
+    assert send_command(server, "autoload safe-boot") == [
+        "autoload safe-boot", "exit 0"], "a granted safe-boot must apply"
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -6883,6 +6994,17 @@ SCENARIOS = [
     ("a rollback whose restored build fails its health check is replaced by "
      "the build it rolled back from",
      scenario_failed_rollback_restores_the_build_it_replaced, CLOCK_REASON),
+    ("autoload safe-boot answers 75 with a challenge that names the boot list "
+     "it skips, and a denial answers 77",
+     scenario_safe_boot_asks_the_owner, None),
+    ("a granted autoload safe-boot skips autoload on the next boot only",
+     scenario_safe_boot_skips_autoload_for_one_boot, HOST_RESTART_REASON),
+    ("autoload safe-boot granted for a changed boot list answers "
+     "approval_stale, 78, and changes nothing",
+     scenario_safe_boot_stale_answers_78, None),
+    ("a second autoload safe-boot while one is pending answers "
+     "safe_boot_pending, exit 1, and asks nothing",
+     scenario_safe_boot_refused_while_pending, HOST_RESTART_REASON),
 ]
 
 

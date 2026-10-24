@@ -105,6 +105,8 @@ struct staged {
 #define JOURNAL_MARKER_V1 "ariel-journal-v1"
 #define AUTOLOAD_FILE "autoload"
 #define AUTOLOAD_TMP "autoload.tmp"
+#define AUTOLOAD_SNAPSHOT "autoload.snapshot"
+#define AUTOLOAD_SNAPSHOT_TMP "autoload.snapshot.tmp"
 
 /** One member of the approval table. **/
 struct approval {
@@ -1110,7 +1112,11 @@ store_approval_request(const approval_facts_t *facts,
   slot->challenge.issued_ms = now;
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
 
-  if(!strncmp(facts->command, "autoload.", 9)) {
+  if(!strcmp(facts->command, "autoload.safe-boot")) {
+    snprintf(prompt, promptlen,
+             "autoload safe-boot skips autoload on the next boot "
+             "(list sha256 %s)", facts->sha256);
+  } else if(!strncmp(facts->command, "autoload.", 9)) {
     snprintf(prompt, promptlen, "%s %s (list sha256 %s) will change autoload",
              facts->command, facts->name, facts->sha256);
   } else if(rollback) {
@@ -2830,6 +2836,143 @@ store_autoload_apply(const char *id, const char *command, const char *name,
 
   pthread_mutex_unlock(&lock);
   return outcome;
+}
+
+
+int
+store_autoload_skip_pending(void) {
+  int state_fd;
+  int fd;
+  int rc = 0;
+
+  pthread_mutex_lock(&lock);
+  if((state_fd=root_open()) < 0) {
+    rc = -1;
+  } else {
+    if((fd=open_entry(state_fd, AUTOLOAD_SNAPSHOT, O_RDONLY)) >= 0) {
+      close(fd);
+      rc = 1;
+    } else if(errno != ENOENT) {
+      rc = -1;
+    }
+    close(state_fd);
+  }
+  pthread_mutex_unlock(&lock);
+
+  return rc;
+}
+
+
+/**
+ * Set the boot list aside as the snapshot, then write the list that only
+ * Ariel is in. The snapshot is written first, so a list that changes has its
+ * old text kept. The caller holds the lock.
+ **/
+static int
+autoload_set_aside_locked(int state_fd, int store_fd, const char *id,
+                          const char *hex, const char *text, size_t len) {
+  char next_hex[SHA256_HEX_LEN + 1];
+  int applied;
+
+  if(tmp_write(state_fd, AUTOLOAD_SNAPSHOT_TMP, text, len)) {
+    return -1;
+  }
+  if(renameat(state_fd, AUTOLOAD_SNAPSHOT_TMP, state_fd, AUTOLOAD_SNAPSHOT)) {
+    unlinkat(state_fd, AUTOLOAD_SNAPSHOT_TMP, 0);
+    return -1;
+  }
+
+  text_hash(AUTOLOAD_DEFAULT, strlen(AUTOLOAD_DEFAULT), next_hex);
+  applied = autoload_transaction_locked(state_fd, store_fd, AUTOLOAD_DEFAULT,
+                                        hex, next_hex, "autoload_safe_boot",
+                                        "autoload", id);
+  if(applied < 0) {
+    unlinkat(state_fd, AUTOLOAD_SNAPSHOT, 0);
+  }
+  return applied;
+}
+
+
+int
+store_autoload_safe_boot(const char *id, const char *sha256) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  int state_fd;
+  int store_fd;
+  int fd;
+  int len;
+  int applied;
+  int outcome = STORE_SAFE_BOOT_FAILED;
+
+  pthread_mutex_lock(&lock);
+
+  if((state_fd=root_open()) < 0) {
+    pthread_mutex_unlock(&lock);
+    return STORE_SAFE_BOOT_FAILED;
+  }
+  if((store_fd=dir_open(state_fd, "store")) < 0) {
+    close(state_fd);
+    pthread_mutex_unlock(&lock);
+    return STORE_SAFE_BOOT_FAILED;
+  }
+
+  if((fd=open_entry(state_fd, AUTOLOAD_SNAPSHOT, O_RDONLY)) >= 0) {
+    close(fd);
+    outcome = STORE_SAFE_BOOT_PENDING;
+  } else {
+    len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
+    if(len >= 0) {
+      text_hash(text, (size_t)len, hex);
+      if(strcmp(hex, sha256)) {
+        outcome = STORE_SAFE_BOOT_STALE;
+      } else {
+        applied = autoload_set_aside_locked(state_fd, store_fd, id, hex,
+                                            text, (size_t)len);
+        if(applied >= 0) {
+          outcome = applied ? STORE_SAFE_BOOT_UNRECORDED : STORE_SAFE_BOOT_OK;
+        }
+      }
+    }
+  }
+
+  close(store_fd);
+  close(state_fd);
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
+int
+store_autoload_restore(void) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  int state_fd;
+  int len;
+  int rc = 0;
+
+  pthread_mutex_lock(&lock);
+
+  if((state_fd=root_open()) < 0) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
+  if(renameat(state_fd, AUTOLOAD_SNAPSHOT, state_fd, AUTOLOAD_FILE)) {
+    rc = errno == ENOENT ? 0 : -1;
+  } else {
+    len = text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text));
+    if(len < 0 || fsync(state_fd)) {
+      rc = -1;
+    } else {
+      text_hash(text, (size_t)len, hex);
+      rc = audit_append_locked("autoload_restore", "autoload", "-", hex)
+           ? -1 : 0;
+    }
+  }
+
+  close(state_fd);
+  pthread_mutex_unlock(&lock);
+  return rc;
 }
 
 

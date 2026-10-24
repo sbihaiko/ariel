@@ -211,6 +211,34 @@ int store_autoload_show(char *buf, size_t size);
 int store_autoload_apply(const char *id, const char *command, const char *name,
                          approval_challenge_t *challenge);
 
+/** What one autoload safe-boot ended in. **/
+#define STORE_SAFE_BOOT_OK         0
+#define STORE_SAFE_BOOT_STALE      1
+#define STORE_SAFE_BOOT_PENDING    2
+#define STORE_SAFE_BOOT_FAILED     3
+#define STORE_SAFE_BOOT_UNRECORDED 4
+
+/**
+ * Whether a safe-boot's skip is still owed: its list is set aside and the next
+ * start restores it. Returns 1 or 0, or -1 when the state cannot be read.
+ **/
+int store_autoload_skip_pending(void);
+
+/**
+ * Apply a granted autoload safe-boot whose approval is id, for the boot list
+ * whose sha256 is sha256. The list must still be that one, or the answer is
+ * STORE_SAFE_BOOT_STALE. The list is copied aside and reduced to Ariel, so the
+ * next start restores the copy. Returns one of STORE_SAFE_BOOT_*.
+ **/
+int store_autoload_safe_boot(const char *id, const char *sha256);
+
+/**
+ * Restore the boot list a safe-boot set aside, at a start. Call it once the
+ * boot's autoload entries are decided, so the skipped boot runs none of them.
+ * Returns 0 when there is nothing to restore or it is restored, -1 on error.
+ **/
+int store_autoload_restore(void);
+
 /** Bind a staged object to the approval that names it. **/
 void store_stage(const char *staging_id, const approval_facts_t *facts,
                  const char *approval_id);
