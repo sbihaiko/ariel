@@ -1379,6 +1379,39 @@ def scenario_unknown_command(server):
             sock.close()
 
 
+def scenario_no_system_change_on_agent_port(server):
+    """Telnet is out of scope; the agent port opens no way past the gate.
+
+    The telnet shell has the ungated commands (docs/telnet-boundary.md). This
+    checks the other half of the boundary: every command that changes the
+    system on the telnet shell is refused here, and the only way to put code
+    on the console is a push, which waits for an approval.
+    """
+    for command in (
+        "rm /data/ariel/token",
+        "kill 1",
+        "mount -t nullfs / /mnt",
+        "mkdir /data/x",
+        "touch /data/x",
+        "mv /data/a /data/b",
+        "chmod 777 /data",
+        "exec /data/payload",
+        "reboot",
+        "/data/payload",
+    ):
+        sock = server.connect()
+        try:
+            sock.sendall(
+                ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
+            )
+            assert_unknown(read_reply(sock))
+        finally:
+            sock.close()
+    # A push is the one way in. It names an approval and shows the owner a
+    # prompt; the scenario denies it so nothing stays staged.
+    decide_push(server, "boundary", b"\x7fELF telnet boundary", "deny")
+
+
 def scenario_two_connections(server):
     first = server.connect(timeout=3.0)
     try:
@@ -1567,6 +1600,9 @@ SCENARIOS = [
     ("wrong token closes with exit 70", scenario_wrong_token, False),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, False),
+    ("the agent port opens no system change outside the gate and the "
+     "telnet shell stays out of scope",
+     scenario_no_system_change_on_agent_port, False),
     ("two connections are served at the same time",
      scenario_two_connections, False),
     ("a fifth concurrent connection answers busy and exit 82",
