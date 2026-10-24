@@ -90,6 +90,35 @@ struct staged {
 /** The file in Ariel's directory that holds the consumed nonces. **/
 #define NONCES_FILE "nonces"
 
+/**
+ * The state file: the single record of installed payloads. It lives beside
+ * the store and replaces Stage 1's per-name current records.
+ **/
+#define STATE_FILE "state"
+
+/** The state file's marker, so a later reader can tell this text apart. **/
+#define STATE_MARKER "ariel-state-v1"
+
+/** At most this many payloads fit in the state file. **/
+#define STATE_PAYLOADS_MAX 64
+
+/** One installed payload, as the state file holds it between starts. **/
+struct state_payload {
+  int used;
+  char name[PAYLOAD_NAME_MAX + 1];
+  char source[16];
+  char version[64];
+  uint64_t release;
+  uint64_t asset;
+  char sha256[SHA256_HEX_LEN + 1];
+  char path[256];
+  int running;
+};
+
+/** The record in memory. state_loaded is 1 once this start has read it. **/
+static struct state_payload state_payloads[STATE_PAYLOADS_MAX];
+static int state_loaded;
+
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -128,6 +157,8 @@ static void staging_clear(void);
 static void expire_locked(uint64_t now);
 static void *expiry_run(void *arg);
 static int nonces_load(void);
+static int state_load(void);
+static int state_save_locked(void);
 static int write_all(int fd, const char *buf, size_t len);
 
 
@@ -293,6 +324,8 @@ store_init(const char *dir, platform_t *p) {
   memset(staged, 0, sizeof(staged));
   memset(approvals, 0, sizeof(approvals));
   nonce_count = 0;
+  state_loaded = 0;
+  memset(state_payloads, 0, sizeof(state_payloads));
   pthread_mutex_unlock(&lock);
 
   // No approval survives the process, so no staging object may either.
@@ -319,6 +352,13 @@ store_init(const char *dir, platform_t *p) {
       rc = 0;
     }
     close(store_fd);
+  }
+
+  // The first start of Stage 2 builds the state file from Stage 1's current
+  // records, which live under the store just made; every later start reads
+  // the file and leaves those records alone.
+  if(!rc && state_load()) {
+    rc = -1;
   }
 
   close(state_fd);
@@ -998,6 +1038,22 @@ entry_regular(int fd) {
 }
 
 
+/** Whether text is exactly one lowercase hex SHA-256 and nothing else. **/
+static int
+hash_text(const char *text) {
+  size_t i;
+
+  for(i=0; i<SHA256_HEX_LEN; i++) {
+    if(!((text[i] >= '0' && text[i] <= '9') ||
+         (text[i] >= 'a' && text[i] <= 'f'))) {
+      return 0;
+    }
+  }
+
+  return text[SHA256_HEX_LEN] == '\0';
+}
+
+
 /**
  * Read the current record of one payload name: the hash of the object it
  * points at. A record that is missing, not a regular file or not a hash
@@ -1044,6 +1100,13 @@ current_read(int dirfd, const char *name, char hash[SHA256_HEX_LEN + 1]) {
   hash[SHA256_HEX_LEN] = '\0';
 
   return 0;
+}
+
+
+/** The path the state file records for one hash-addressed object. **/
+static void
+object_path(const char *hash, char *out, size_t size) {
+  snprintf(out, size, "/data/ariel/store/objects/%s", hash);
 }
 
 

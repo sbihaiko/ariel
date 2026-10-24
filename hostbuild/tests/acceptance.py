@@ -1192,6 +1192,48 @@ def approve_push(server, name, data):
     return staging, approval
 
 
+def payload_list(server):
+    """Ask the agent port for the record of installed payloads."""
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\npayload list\n" % server.token).encode("ascii"))
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def listed(lines, name):
+    """The payload list line for one name, or None when the name is absent."""
+    matches = [line for line in lines if line.startswith("payload %s " % name)]
+    assert len(matches) <= 1, "payload list names %s more than once: %r" % (
+        name, lines)
+    return matches[0] if matches else None
+
+
+def scenario_list_after_commit(server):
+    """After a commit, payload list shows the payload with every field.
+
+    Stage 1 records only a name and a hash. A push has no release, so its
+    version identifiers and source say so, and nothing is running: the commit
+    approved running the build, it did not start it.
+    """
+    data = b"listed bytes\n"
+    hash_hex = hashlib.sha256(data).hexdigest()
+    staging, _ = approve_push(server, "listed", data)
+    assert commit(server, staging) == [
+        "installed listed %s" % hash_hex, "exit 0"], (
+        "the build must be committed before it can be listed")
+
+    lines = payload_list(server)
+    entry = listed(lines, "listed")
+    assert entry == (
+        "payload listed source=push version=- release=- asset=- "
+        "sha256=%s path=/data/ariel/store/objects/%s running=no" % (
+            hash_hex, hash_hex)), (
+        "payload list must show the name, source, version identifiers, hash, "
+        "path and whether it is running, got %r" % lines)
+
+
 def scenario_commit_installed(server):
     data = b"committed bytes\n"
     staging, _ = approve_push(server, "committed", data)
@@ -2153,6 +2195,8 @@ SCENARIOS = [
      scenario_commit_before_decision, False),
     ("an approved commit answers installed <name> <hash> and exit 0",
      scenario_commit_installed, False),
+    ("after a commit, payload list shows the payload with every field",
+     scenario_list_after_commit, False),
     ("a second commit of the same name replaces the first build",
      scenario_commit_replaces, False),
     ("an approval does not survive a restart of Ariel",
