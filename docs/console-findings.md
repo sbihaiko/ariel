@@ -178,6 +178,29 @@ Deviations from the probe:
 - The probe checked return values and the file contents it read back. It did not cut power. The host crash scenarios end the process with `abort`, so they test the order of the steps, not what survives a power loss. Durability after a power cut rests on POSIX `fsync` semantics and is not measured here.
 - `openat`, `renameat`, `unlinkat` and `fstatat` go through the carry-checking wrappers in `ps5_at.h`, the form the table above measured. `fsync` is the libkernel symbol, which the probe called directly.
 
+## Issue #48: keys on the console
+
+Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014), with the `dev` build at 366c677. The build's anchor was the owner's primary and recovery keys, and the keyring started at generation 0. Each approval was asked on the agent port, signed offline with `ariel-sign` and granted. The freeze file was written and removed through the telnet shell. Ariel was restarted by sending the ELF to the loader again; the console itself was not rebooted.
+
+| Step | Command and signer | Console reply |
+| --- | --- | --- |
+| Rotate the primary | `key rotate <P2>`, signed by the primary P1 | `key_rotated 1` |
+| Old primary after rotation | a `mkdir` approval signed by P1 | `signature_invalid`, exit 79 |
+| New primary after rotation | the same approval signed by P2 | `approval_granted`, and the `mkdir` ran |
+| Freeze | `/data/ariel/freeze` written; `mkdir`, `payload run helloworld`, `key rotate-recovery` | `frozen`, exit 89, for each |
+| Revoke while frozen | `key revoke --since 1 <P3>`, signed by the recovery key | `key_revoked 2` |
+| Freeze after revoke | a `mkdir` approval; then the freeze file deleted and the same approval asked again | `frozen`, exit 89, both times |
+| Unfreeze | `key unfreeze` signed by P3, then by the recovery key | `signature_invalid` for P3; `key_unfrozen 2` for the recovery key |
+| Revoked lineage | an approval signed by P2 | `signature_invalid`, exit 79 |
+| Active primary | the same approval signed by P3 | `approval_granted`, and the `mkdir` ran |
+| Grant from before generation 1 | `payload run helloworld`, installed at generation 0 | `pid <n>`, exit 0: not suspended |
+| Start with the keyring removed | keyring copied aside and deleted, Ariel restarted; a `mkdir`, `key rotate` and `key unfreeze` | `key_refused`, exit 1, for each. No keyring was made from the build's anchor. |
+| Keyring restored | the copy put back, Ariel restarted; an approval signed by P1 (the anchor's primary), then by P3 | `signature_invalid` for P1; `approval_granted` for P3 |
+
+The audit log recorded `key_revoke` and `key_unfreeze` with their approval IDs, and `<command>.refused` for each refusal. No `grant_suspended` line was written: no install, pin or autoload entry had been approved at generation 1, so the revocation suspended nothing. The host scenarios cover suspension.
+
+The keyring copy and the test folders were removed from `/data` after the run. The console's primary is now P3.
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.
