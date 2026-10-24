@@ -6150,7 +6150,13 @@ def scenario_audit_tail_order(server):
             "expected '<ms> <kind> <name> <id> <sha256>', got %r" % event)
 
     # Other scenarios share this server's log: only this build's events count.
-    ours = [event for event in events if event.split()[3] in (staging, approval)]
+    # Ids restart with Ariel, so on a console an older line can carry the same
+    # id: count only from this build's push on.
+    pushes = [i for i, event in enumerate(events)
+              if event.split()[1:4] == ["push", "audited", staging]]
+    assert pushes, "audit tail must show the push, got %r" % events
+    ours = [event for event in events[pushes[-1]:]
+            if event.split()[3] in (staging, approval)]
     kinds = [event.split()[1] for event in ours]
     assert kinds == ["push", "grant", "commit"], (
         "audit tail must show the push, then the grant, then the commit, "
