@@ -9406,6 +9406,516 @@ HOST_RESTART_SCENARIOS.add(FREEZE_RESTART_TITLE)
 SCENARIOS.extend(FREEZE_SCENARIOS)
 
 
+# ---------------------------------------------------------------------------
+# Revocation by lineage (SPEC 2, #52): `key revoke --since <generation>
+# <primary>`, signed by the current recovery key, declares every key from that
+# generation on compromised, installs a new primary and suspends every
+# persistent grant those keys approved: installs, pins and autoload entries. A
+# suspended install answers suspended and exit 90; a suspended autoload entry
+# leaves the autoload file in the revocation's own journal transaction; a
+# suspended pin installs nothing without a new approval. Re-approving with the
+# new primary restores a grant. A pin the allowlist set in advance was approved
+# by no key, so no revocation suspends it.
+# ---------------------------------------------------------------------------
+
+SUSPENDED_REPLY = ["suspended", "exit 90"]
+REVOKE_PROMPT = "key revoke will run"
+REVOKE_STEPS = ("prepared", "committed", "suspended", "autoload", "renamed",
+                "audited")
+
+REVOKE_LINEAGE_TITLE = ("a P0 -> P1 -> P2 compromise: after key revoke --since "
+                        "0 every grant of P0, P1 and P2 stays suspended across "
+                        "a reboot and a payload rollback")
+REVOKE_EARLIER_TITLE = ("key revoke keeps the grants made before the "
+                        "compromise point, and the grants of a key retired by "
+                        "key rotate, active")
+REVOKE_SIGNER_TITLE = ("key revoke is refused unless signed by the current "
+                       "recovery key, and refuses a generation it has not "
+                       "reached before asking")
+REVOKE_FROZEN_TITLE = ("key revoke passes while frozen with the approval table "
+                       "full, and its autoload entries are gone before the "
+                       "freeze lifts")
+REVOKE_REAPPROVE_TITLE = ("a grant re-approved with the new primary is active "
+                          "again, and the grant ledger is protected")
+REVOKE_PIN_TITLE = ("a revoked pin installs nothing without a new approval, "
+                    "and a pin set in advance stays active")
+REVOKE_RACE_TITLE = ("a rotate or revoke racing a grant, a commit and a run "
+                     "admits nothing after the cutoff")
+REVOKE_CRASH_TITLE = ("a crash at each durable step of key revoke leaves no "
+                      "grant active that the revocation suspended")
+REVOKE_DOC_TITLE = ("the exit-code registry names suspended (90) and key "
+                    "revoke, and the glossary names the grant ledger")
+
+
+def revoke_action(since, new_pub):
+    return ["command=key.revoke", "target=keyring", "sha256=none",
+            "option.primary=" + new_pub, "option.since=%d" % since]
+
+
+def revoke_command(since, new_pub):
+    return "key revoke --since %d %s" % (since, new_pub)
+
+
+def request_revoke(server, since, new_pub):
+    return gated_request(server, revoke_command(since, new_pub),
+                         revoke_action(since, new_pub), REVOKE_PROMPT,
+                         wait_ms=10_000)
+
+
+def revoke(server, since, new_pub, generation):
+    """Request, sign with the recovery key, grant and perform one revocation."""
+    approval, challenge = request_revoke(server, since, new_pub)
+    sign_and_grant_with(server, approval, challenge, RECOVERY_KEY)
+    assert run_command(server, revoke_command(since, new_pub)) == [
+        "key_revoked %d" % generation, "exit 0"], (
+        "a recovery-signed revocation must answer key_revoked %d" % generation)
+
+
+def install_with(server, name, data, key):
+    """Push, sign with key, grant and commit one build; return its hash."""
+    server.advance(10_000)
+    lines = push(server, name, data)
+    staging, approval = assert_staged(server, lines, name, data)
+    sign_and_grant_with(server, approval, challenge_of(lines), key)
+    digest = hashlib.sha256(data).hexdigest()
+    assert commit(server, staging) == [
+        "installed %s %s" % (name, digest), "exit 0"], (
+        "a commit signed by the active primary must install the build")
+    return digest
+
+
+def autoload_add_with(server, name, key):
+    approval, challenge = autoload_ask(server, "add", name)
+    sign_and_grant_with(server, approval, challenge, key)
+    assert autoload_apply(server, "add", name, approval) == [
+        "autoload add %s" % name, "exit 0"], "a granted autoload add must apply"
+
+
+def autoload_file_names(server):
+    with open(autoload_path(server)) as handle:
+        return handle.read().splitlines()
+
+
+def assert_grants_suspended(server, names, when):
+    for name in names:
+        assert run_payload(server, name) == SUSPENDED_REPLY, (
+            "%s, a payload approved by a revoked key must answer suspended "
+            "and exit 90" % when)
+        assert "autoload %s" % name not in autoload_listing(server), (
+            "%s, a suspended autoload entry must not be listed" % when)
+        assert name not in autoload_file_names(server), (
+            "%s, a suspended autoload entry must be gone from the loader's "
+            "file" % when)
+
+
+def assert_grants_active(server, names, when):
+    for name in names:
+        assert run_payload(server, name)[-2:] == RUN_OK, (
+            "%s, a payload approved before the compromise must still run"
+            % when)
+        assert name in autoload_file_names(server), (
+            "%s, an autoload entry approved before the compromise must stay"
+            % when)
+
+
+def scenario_revoke_lineage_suspends_every_grant(server):
+    del server  # each revocation needs an Ariel of its own
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-lineage"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            p0, p1 = test_key(), SECOND_PRIMARY_KEY
+            p2 = make_key(scratch, "p2.key")
+            p3 = make_key(scratch, "p3.key")
+            install_with(keys, "linzero", healthy_build("linzero"), p0)
+            autoload_add_with(keys, "linzero", p0)
+            rotate_primary(keys, public_key(keys, p1), 1, p0)
+            first = install_with(keys, "linone", healthy_build("linone-a"), p1)
+            autoload_add_with(keys, "linone", p1)
+            rotate_primary(keys, public_key(keys, p2), 2, p1)
+            install_with(keys, "linone", healthy_build("linone-b"), p2)
+            install_with(keys, "lintwo", healthy_build("lintwo"), p2)
+            autoload_add_with(keys, "lintwo", p2)
+
+            revoke(keys, 0, public_key(keys, p3), 3)
+            names = ("linzero", "linone", "lintwo")
+            assert_grants_suspended(keys, names, "after the revocation")
+
+            approval, challenge = gate_request(keys, "reboot")
+            sign_and_grant_with(keys, approval, challenge, p3)
+            reboot_and_wait(keys)
+            assert_grants_suspended(keys, names, "after a reboot")
+
+            lines = rollback_request(keys, "linone")
+            approval = APPROVAL_LINE.match(lines[0]).group(1)
+            sign_and_grant_with(keys, approval, challenge_of(lines), p3)
+            # The rollback happens, but the build it restores was approved by
+            # a revoked key: it is current, suspended, and not health-checked.
+            assert send_command(keys, "payload rollback linone") == (
+                SUSPENDED_REPLY), (
+                "a rollback to a suspended build must answer suspended")
+            assert "sha256=%s " % first in listed(payload_list(keys), "linone"), (
+                "the new primary's rollback must make the previous build "
+                "current")
+            assert_grants_suspended(keys, names, "after a payload rollback")
+            events = [kind for kind, _name, _id, _sha in audit_events(keys)]
+            assert "key_revoke" in events and "grant_suspended" in events, (
+                "the revocation and each suspension must be audited, got %r"
+                % events)
+    finally:
+        keys.stop()
+
+
+def scenario_revoke_keeps_earlier_grants_active(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-earlier"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            p0, p1 = test_key(), SECOND_PRIMARY_KEY
+            p2 = make_key(scratch, "p2.key")
+            p3 = make_key(scratch, "p3.key")
+            install_with(keys, "honest", healthy_build("honest"), p0)
+            autoload_add_with(keys, "honest", p0)
+            # A planned rotation retires P0; P1 then leaks.
+            rotate_primary(keys, public_key(keys, p1), 1, p0)
+            install_with(keys, "leaked", healthy_build("leaked"), p1)
+            autoload_add_with(keys, "leaked", p1)
+            rotate_primary(keys, public_key(keys, p2), 2, p1)
+            install_with(keys, "hostile", healthy_build("hostile"), p2)
+
+            revoke(keys, 1, public_key(keys, p3), 3)
+            assert_grants_active(keys, ("honest",), "after key revoke --since 1")
+            assert_grants_suspended(keys, ("leaked", "hostile"),
+                                    "after key revoke --since 1")
+            keys.restart()
+            assert_grants_active(keys, ("honest",), "after a restart")
+            assert_grants_suspended(keys, ("leaked", "hostile"),
+                                    "after a restart")
+    finally:
+        keys.stop()
+
+
+def scenario_revoke_needs_current_recovery(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-signer"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            second = public_key(keys, SECOND_PRIMARY_KEY)
+            assert run_command(keys, revoke_command(1, second)) == [
+                "key_refused", "exit 1"], (
+                "a revocation from a generation not reached yet must be "
+                "refused before the owner is asked")
+            assert run_command(keys, "key revoke --since x " + second) == [
+                "bad_argument", "exit 1"], (
+                "a generation that is not a number must be refused")
+            assert run_command(keys, revoke_command(
+                0, public_key(keys, RECOVERY_KEY))) == ["key_refused", "exit 1"], (
+                "the recovery key must not become the primary")
+
+            approval, challenge = request_revoke(keys, 0, second)
+            for what, key in [("the primary", test_key()),
+                              ("the key being installed", SECOND_PRIMARY_KEY)]:
+                assert grant(keys, approval, sign_challenge(
+                    keys, challenge, key=key)) == ["signature_invalid",
+                                                   "exit 79"], (
+                    "a revocation signed by %s must be refused" % what)
+            sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+            assert run_command(keys, revoke_command(0, second)) == [
+                "key_revoked 1", "exit 0"]
+
+            fourth_key = make_key(scratch, "fourth.key")
+            rotate_recovery(keys, public_key(keys, fourth_key), 2, RECOVERY_KEY)
+            third = public_key(keys, make_key(scratch, "third.key"))
+            approval, challenge = request_revoke(keys, 2, third)
+            assert grant(keys, approval, sign_challenge(
+                keys, challenge, key=RECOVERY_KEY)) == ["signature_invalid",
+                                                        "exit 79"], (
+                "a retired recovery key must not sign a revocation")
+            sign_and_grant_with(keys, approval, challenge, fourth_key)
+            assert run_command(keys, revoke_command(2, third)) == [
+                "key_revoked 3", "exit 0"]
+    finally:
+        keys.stop()
+
+
+def scenario_revoke_while_frozen_with_slots_full(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-frozen"})
+    try:
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+        install_with(keys, "frozenrev", healthy_build("frozenrev"), test_key())
+        autoload_add_with(keys, "frozenrev", test_key())
+        for index in range(APPROVALS_TABLE_SIZE):
+            push_for_challenge(keys, "fill%d" % index, b"fill %d" % index)
+        set_freeze(keys)
+        assert run_payload(keys, "frozenrev") == FROZEN_REPLY
+        keys.advance(10_000)
+        approval, challenge = pending_challenge(keys, revoke_command(0, second))
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, revoke_command(0, second)) == [
+            "key_revoked 1", "exit 0"], (
+            "a recovery-signed revocation must pass while frozen with the "
+            "approval table full")
+        assert run_payload(keys, "frozenrev") == FROZEN_REPLY, (
+            "a revocation must not lift the freeze")
+        assert "frozenrev" not in autoload_file_names(keys), (
+            "the suspended autoload entry must leave the loader's file before "
+            "the freeze lifts")
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, "key unfreeze") == ["key_unfrozen 1", "exit 0"]
+        assert_grants_suspended(keys, ("frozenrev",), "after the unfreeze")
+    finally:
+        keys.stop()
+
+
+def scenario_revoke_reapproval_restores_grants(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-again"})
+    try:
+        data = healthy_build("again")
+        install_with(keys, "again", data, test_key())
+        autoload_add_with(keys, "again", test_key())
+        revoke(keys, 0, public_key(keys, SECOND_PRIMARY_KEY), 1)
+        assert_grants_suspended(keys, ("again",), "after the revocation")
+        install_with(keys, "again", data, SECOND_PRIMARY_KEY)
+        autoload_add_with(keys, "again", SECOND_PRIMARY_KEY)
+        assert_grants_active(keys, ("again",), "after a re-approval")
+        keys.restart()
+        assert_grants_active(keys, ("again",), "after a restart")
+        path = secret_path(keys, "grants")
+        for template in SECRET_READS:
+            assert_protected(keys, template.format(p=path))
+    finally:
+        keys.stop()
+
+
+def scenario_revoke_suspends_approved_pin(_server):
+    data = healthy_build(INSTALL_NAME)
+    digest = hashlib.sha256(data).hexdigest()
+    installed = ["installed %s %s" % (INSTALL_NAME, digest), "exit 0"]
+
+    def approved(fx):
+        server = fx.server
+        lines = install_request(server, INSTALL_NAME)
+        staging, approval = assert_staged(server, lines, INSTALL_NAME, data)
+        sign_and_grant(server, approval, challenge_of(lines))
+        assert commit(server, staging) == installed
+        revoke(server, 0, public_key(server, SECOND_PRIMARY_KEY), 1)
+        assert_grants_suspended(server, (INSTALL_NAME,), "after the revocation")
+        lines = install_request(server, INSTALL_NAME)
+        assert lines[-1] == "exit 75", (
+            "a revoked pin must not install without a new approval, got %r"
+            % lines)
+        staging, approval = assert_staged(server, lines, INSTALL_NAME, data)
+        sign_and_grant_with(server, approval, challenge_of(lines),
+                            SECOND_PRIMARY_KEY)
+        assert commit(server, staging) == installed
+        assert run_payload(server, INSTALL_NAME)[-2:] == RUN_OK, (
+            "an install re-approved by the new primary must run")
+        assert install_request(server, INSTALL_NAME) == installed, (
+            "a re-approved pin must install again without asking")
+
+    def preset(fx):
+        server = fx.server
+        assert install_request(server, INSTALL_NAME) == installed
+        revoke(server, 0, public_key(server, SECOND_PRIMARY_KEY), 1)
+        assert run_payload(server, INSTALL_NAME)[-2:] == RUN_OK, (
+            "a build installed through a pin set in advance was approved by "
+            "no key, so no revocation suspends it")
+        assert install_request(server, INSTALL_NAME) == installed, (
+            "a pin set in advance must still install without asking")
+
+    with_install(data, approved, allowlist="default")
+    with_install(data, preset, pin=(INSTALL_NAME, digest))
+
+
+def scenario_revoke_racing_admissions(server):
+    del server
+    keys = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "revoke-race"})
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            third = public_key(keys, make_key(scratch, "third.key"))
+        second = public_key(keys, SECOND_PRIMARY_KEY)
+
+        # A rotation is a cutoff too: what generation 0 granted is spent.
+        keys.advance(10_000)
+        staging = approve_push_with(keys, "rotcommit", healthy_build("rotcommit"),
+                                    test_key())
+        keys.advance(10_000)
+        approval, challenge = pending_challenge(keys, "env PATH")
+        signature = signature_of(sign_challenge(keys, challenge))
+        rotate_primary(keys, second, 1, test_key(), wait_ms=10_000)
+        assert commit(keys, staging) == ["approval_stale", "exit 78"], (
+            "a commit granted before a rotation must answer approval_stale")
+        assert grant(keys, approval, signature) == ["signature_invalid",
+                                                    "exit 79"], (
+            "a grant signed before a rotation must be refused after it")
+        assert listed(payload_list(keys), "rotcommit") is None
+
+        install_with(keys, "racerev", healthy_build("racerev"),
+                     SECOND_PRIMARY_KEY)
+        keys.advance(10_000)
+        staging = approve_push_with(keys, "revcommit", healthy_build("revcommit"),
+                                    SECOND_PRIMARY_KEY)
+        keys.advance(10_000)
+        approval, challenge = pending_challenge(keys, "env HOME")
+        signature = signature_of(sign_challenge(keys, challenge,
+                                                key=SECOND_PRIMARY_KEY))
+        revoke_approval, revoke_challenge = request_revoke(keys, 1, third)
+        sign_and_grant_with(keys, revoke_approval, revoke_challenge,
+                            RECOVERY_KEY)
+
+        results = []
+        results_lock = threading.Lock()
+        stop = threading.Event()
+
+        def run_until_stopped():
+            while not stop.is_set():
+                start = time.monotonic_ns()
+                lines = run_payload(keys, "racerev")
+                with results_lock:
+                    results.append((start, lines))
+                time.sleep(0.005)
+
+        workers = [threading.Thread(target=run_until_stopped) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        deadline = time.monotonic() + 30
+        while not results:
+            assert time.monotonic() < deadline, "no run before the revocation"
+            time.sleep(0.005)
+        assert run_command(keys, revoke_command(1, third)) == [
+            "key_revoked 2", "exit 0"]
+        cutoff = time.monotonic_ns()
+        late_results = {}
+
+        def late(kind, attempt):
+            late_results[kind] = attempt()
+
+        late_workers = [
+            threading.Thread(target=late, args=("commit", lambda: commit(keys, staging))),
+            threading.Thread(target=late, args=("grant", lambda: grant(keys, approval, signature))),
+        ]
+        for worker in late_workers:
+            worker.start()
+        deadline = time.monotonic() + 30
+        while True:
+            with results_lock:
+                after = [lines for start, lines in results if start > cutoff]
+            if len(after) >= 2:
+                break
+            assert time.monotonic() < deadline, "no run after the revocation"
+            time.sleep(0.005)
+        stop.set()
+        for worker in workers + late_workers:
+            worker.join(timeout=30)
+
+        with results_lock:
+            after = [lines for start, lines in results if start > cutoff]
+        for lines in after:
+            assert lines == SUSPENDED_REPLY, (
+                "a run started after the revocation must be refused, got %r"
+                % lines)
+        assert late_results["commit"] == ["approval_stale", "exit 78"], (
+            "a commit granted before the revocation must answer approval_stale")
+        assert late_results["grant"] == ["signature_invalid", "exit 79"], (
+            "a grant signed before the revocation must be refused")
+        assert listed(payload_list(keys), "revcommit") is None, (
+            "a refused commit must install nothing")
+    finally:
+        keys.stop()
+
+
+def approve_push_with(server, name, data, key):
+    lines = push(server, name, data)
+    staging, approval = assert_staged(server, lines, name, data)
+    sign_and_grant_with(server, approval, challenge_of(lines), key)
+    return staging
+
+
+def scenario_revoke_crash(server):
+    del server
+    for step in REVOKE_STEPS:
+        keys = Server(SERVER_BINARY, env={
+            "ARIEL_HOST_NONCE_SEED": "revoke-crash-" + step})
+        try:
+            second = public_key(keys, SECOND_PRIMARY_KEY)
+            install_with(keys, "crashrev", healthy_build("crashrev"), test_key())
+            autoload_add_with(keys, "crashrev", test_key())
+            keys.env = {FAULT_ENV: step}
+            keys.restart()
+            approval, challenge = request_revoke(keys, 0, second)
+            sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+            command_until_crash(keys, revoke_command(0, second))
+            keys.env = None
+            keys.restart()
+            if step == "prepared":
+                assert_grants_active(keys, ("crashrev",),
+                                     "after a revocation crashed at prepared")
+                generation = "0"
+            else:
+                assert_grants_suspended(
+                    keys, ("crashrev",),
+                    "after a revocation crashed at %s" % step)
+                generation = "1"
+            _approval, challenge = gated_request(
+                keys, "env HOME", ["command=env", "target=HOME", "sha256=none"],
+                "env HOME will run", wait_ms=10_000)
+            assert generation_of(challenge) == generation, (
+                "a revocation crashed at %s must leave the keyring at "
+                "generation %s" % (step, generation))
+        finally:
+            keys.stop()
+
+
+def scenario_revoke_is_documented(server):
+    del server
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    assert "| 90 | `suspended` |" in registry, (
+        "docs/exit-codes.md must assign exit 90 to suspended")
+    assert "key revoke" in registry, "docs/exit-codes.md must name key revoke"
+    with open(os.path.join(repo_dir(), "GLOSSARY.md")) as handle:
+        glossary = handle.read()
+    for term in ("**Grant ledger**", "**Suspended grant**",
+                 "**Revocation by lineage**"):
+        assert term in glossary, "GLOSSARY.md must define %s" % term
+
+
+REVOKE_SCENARIOS = [
+    (REVOKE_LINEAGE_TITLE, scenario_revoke_lineage_suspends_every_grant,
+     CLOCK_REASON),
+    (REVOKE_EARLIER_TITLE, scenario_revoke_keeps_earlier_grants_active,
+     CLOCK_REASON),
+    (REVOKE_SIGNER_TITLE, scenario_revoke_needs_current_recovery,
+     CLOCK_REASON),
+    (REVOKE_FROZEN_TITLE, scenario_revoke_while_frozen_with_slots_full,
+     CLOCK_REASON),
+    (REVOKE_REAPPROVE_TITLE, scenario_revoke_reapproval_restores_grants,
+     CLOCK_REASON),
+    (REVOKE_PIN_TITLE, scenario_revoke_suspends_approved_pin,
+     RELEASE_FIXTURE_REASON),
+    (REVOKE_RACE_TITLE, scenario_revoke_racing_admissions, CLOCK_REASON),
+    (REVOKE_CRASH_TITLE, scenario_revoke_crash, FAULT_REASON),
+    (REVOKE_DOC_TITLE, scenario_revoke_is_documented, None),
+]
+
+CLOCK_SCENARIOS.update({REVOKE_LINEAGE_TITLE, REVOKE_EARLIER_TITLE,
+                        REVOKE_SIGNER_TITLE, REVOKE_FROZEN_TITLE,
+                        REVOKE_REAPPROVE_TITLE, REVOKE_RACE_TITLE,
+                        REVOKE_CRASH_TITLE})
+HOST_ROOT_SCENARIOS.update({REVOKE_LINEAGE_TITLE, REVOKE_EARLIER_TITLE,
+                            REVOKE_SIGNER_TITLE, REVOKE_FROZEN_TITLE,
+                            REVOKE_REAPPROVE_TITLE, REVOKE_RACE_TITLE,
+                            REVOKE_CRASH_TITLE})
+FAULT_SCENARIOS.add(REVOKE_CRASH_TITLE)
+HOST_RESTART_SCENARIOS.update({REVOKE_LINEAGE_TITLE, REVOKE_EARLIER_TITLE,
+                               REVOKE_REAPPROVE_TITLE})
+RELEASE_SCENARIOS.add(REVOKE_PIN_TITLE)
+
+SCENARIOS.extend(REVOKE_SCENARIOS)
+
+
 def main():
     argv = sys.argv[1:]
 
