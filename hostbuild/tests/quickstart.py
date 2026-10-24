@@ -3,8 +3,8 @@
 
 The fixture reads the section, not a copy of it: every `$` block is sent as
 written after substituting the access token, the host, the port and the
-staging ID captured from an earlier reply. Each 'Approve it on the console'
-step becomes an approval on the virtual controller. Expected output is
+staging ID captured from an earlier reply. Each 'Approve it' step becomes
+an approval on the virtual controller. Expected output is
 matched line by line, with `s-...`/`a-...` IDs and hashes as placeholders.
 
 The blocks share one shell, so the documented `export ARIEL_TOKEN` is what
@@ -41,7 +41,7 @@ ERROR = re.compile(r"(invalid|illegal|unknown) option", re.I)
 
 SECTION = "## After Stage 1"
 DOCUMENTED_PORT = 2324
-APPROVE_STEP = "Approve it on the console"
+APPROVE_STEP = "Approve it"
 TOKEN_PLACEHOLDER = "<token shown on the console>"
 TAIL = [
     "Hello, world from Ariel!",
@@ -366,13 +366,12 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
 
                 if pending is None:
                     raise FixtureError(
-                        "the section approves on the console with nothing "
-                        "pending")
+                        "the section approves with nothing pending")
 
                 if notify is not None:
                     if push_name is None:
                         raise FixtureError(
-                            "the section approves on the console before a push")
+                            "the section approves before a push")
                     notify(pending, push_name, len(elf), elf_hash)
                 else:
                     line = next_line()
