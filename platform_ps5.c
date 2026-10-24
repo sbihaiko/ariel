@@ -53,6 +53,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "approval.h"
 #include "elfldr.h"
+#include "http.h"
 #include "notify.h"
 #include "platform.h"
 #include "platform_ps5.h"
@@ -547,6 +548,14 @@ ps5_system_act(platform_t *self, const approval_facts_t *facts) {
 }
 
 
+static int
+ps5_http_get(platform_t *self, const char *url, size_t max, http_sink_t sink,
+             void *ctx, int *status, char *location, size_t size) {
+  (void)self;
+  return http_fetch(url, max, sink, ctx, status, location, size);
+}
+
+
 static platform_t ps5_platform = {
   // A console has no test clock, so no wait has a wake pipe and every
   // deadline runs on real time.
@@ -566,6 +575,7 @@ static platform_t ps5_platform = {
   .spawn_start = ps5_spawn_start,
   .spawn_poll = ps5_spawn_poll,
   .spawn_kill = ps5_spawn_kill,
+  .http_get = ps5_http_get,
   .run = ps5_run,
   .processes = ps5_processes,
   .process_start = ps5_process_start,

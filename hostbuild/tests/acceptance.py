@@ -15,7 +15,9 @@ their own until payload run arrives.
 
 import contextlib
 import hashlib
+import http.server
 import io
+import json
 import os
 import platform
 import queue
@@ -72,11 +74,13 @@ def free_port():
 class Server:
     """The host build of Ariel, started against a temporary root."""
 
-    def __init__(self, binary, env=None):
+    def __init__(self, binary, env=None, setup=None):
         self.binary = binary
         self.env = env
         self.root = tempfile.mkdtemp(prefix="ariel-host-", dir=os.path.realpath("/tmp"))
         self.token = None
+        if setup is not None:
+            setup(self.root)
         self._start()
 
     def _spawn(self):
@@ -7006,6 +7010,340 @@ SCENARIOS = [
      "safe_boot_pending, exit 1, and asks nothing",
      scenario_safe_boot_refused_while_pending, HOST_RESTART_REASON),
 ]
+
+
+# Payload install from an allowlisted release (SPEC 2, #42). The fake release
+# server stands in for the release API and its CDN; the allowlist it needs is
+# test data, written into the state directory before Ariel starts.
+
+INSTALL_REPO = "owner/app"
+INSTALL_ASSET = "app.elf"
+INSTALL_NAME = "fetched"
+INSTALL_TAG = "v1"
+RELEASE_ID = 7
+ASSET_ID = 11
+CDN_SUFFIX = "localhost"
+
+
+class FakeRelease:
+    """A local release API and CDN. mode picks how the asset download misbehaves.
+
+    ok: the asset redirects once to the CDN host and is served there.
+    off_cdn: the redirect goes to a host outside the CDN suffix.
+    second_hop: the CDN answers with a further redirect.
+    fail: the asset request answers 500.
+    """
+
+    def __init__(self, data, mode="ok", url_id=ASSET_ID, asset_id=ASSET_ID):
+        self.data = data
+        self.mode = mode
+        self.url_id = url_id
+        self.asset_id = asset_id
+        self.requests = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, body=b"", location=None):
+                self.send_response(status)
+                if location is not None:
+                    self.send_header("Location", location)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                fake.requests.append(self.path)
+                cdn = "http://%s:%d" % (CDN_SUFFIX, fake.port)
+                releases = ("/repos/%s/releases/latest" % INSTALL_REPO,
+                            "/repos/%s/releases/tags/%s" % (INSTALL_REPO, INSTALL_TAG))
+                if self.path in releases:
+                    body = json.dumps(fake.release_json()).encode("ascii")
+                    return self.reply(200, body)
+                if self.path == "/assets/%d" % fake.url_id:
+                    if fake.mode == "fail":
+                        return self.reply(500)
+                    if fake.mode == "off_cdn":
+                        return self.reply(302, location="http://127.0.0.1:%d/cdn/%d"
+                                          % (fake.port, fake.url_id))
+                    if fake.mode == "second_hop":
+                        return self.reply(302, location="%s/hop/%d" % (cdn, fake.url_id))
+                    return self.reply(302, location="%s/cdn/%d" % (cdn, fake.url_id))
+                if self.path == "/hop/%d" % fake.url_id:
+                    return self.reply(302, location="%s/cdn/%d" % (cdn, fake.url_id))
+                if self.path == "/cdn/%d" % fake.url_id:
+                    return self.reply(200, fake.data)
+                return self.reply(404)
+
+        self.httpd = http.server.ThreadingHTTPServer((HOST, 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def release_json(self):
+        return {
+            "id": RELEASE_ID,
+            "tag_name": INSTALL_TAG,
+            "assets": [{
+                "id": self.asset_id,
+                "name": INSTALL_ASSET,
+                "size": len(self.data),
+                "url": "http://%s:%d/assets/%d" % (HOST, self.port, self.url_id),
+            }],
+        }
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class InstallFixture:
+    """A fresh Ariel whose allowlist names the fake release server.
+
+    allowlist=None writes no allowlist at all. pin, when given, is a
+    (name, sha256) pair the allowlist pins.
+    """
+
+    def __init__(self, data, mode="ok", url_id=ASSET_ID, asset_id=ASSET_ID,
+                 allowlist="default", pin=None):
+        self.fake = FakeRelease(data, mode=mode, url_id=url_id, asset_id=asset_id)
+        if allowlist == "default":
+            lines = ["host %s:%d" % (HOST, self.fake.port),
+                     "cdn %s" % CDN_SUFFIX,
+                     "repo %s" % INSTALL_REPO]
+            if pin is not None:
+                lines.append("pin %s %s" % pin)
+            allowlist = "\n".join(lines) + "\n"
+        self.allowlist = allowlist
+        self.server = Server(SERVER_BINARY, setup=self._setup)
+
+    def _setup(self, root):
+        state = os.path.join(root, "data", "ariel")
+        os.makedirs(state, exist_ok=True)
+        if self.allowlist is not None:
+            with open(os.path.join(state, "allowlist"), "w") as fh:
+                fh.write(self.allowlist)
+
+    def allowlist_path(self):
+        return os.path.join(self.server.root, "data", "ariel", "allowlist")
+
+    def close(self):
+        self.server.stop()
+        self.fake.stop()
+
+
+def install_request(server, name, repo=INSTALL_REPO, asset=INSTALL_ASSET, tag=None):
+    """Send one payload install and return the lines the server answered."""
+    command = "payload install %s %s %s" % (name, repo, asset)
+    if tag is not None:
+        command += " " + tag
+    server.advance(10_000)
+    return send_command(server, command)
+
+
+def with_install(data, scenario, **kwargs):
+    fixture = InstallFixture(data, **kwargs)
+    try:
+        return scenario(fixture)
+    finally:
+        fixture.close()
+
+
+def scenario_install_refused_outside_the_allowlist_host(_server):
+    """A host the allowlist does not name is refused before anything is fetched."""
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["not_allowlisted", "exit 1"], lines
+        assert fx.fake.requests == [], "no request may leave for a refused host"
+    with_install(healthy_build(INSTALL_NAME), run,
+                 allowlist="cdn %s\nrepo %s\n" % (CDN_SUFFIX, INSTALL_REPO))
+
+
+def scenario_install_refused_without_allowlist(_server):
+    """An install with no allowlist at all is refused."""
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["not_allowlisted", "exit 1"], lines
+    with_install(healthy_build(INSTALL_NAME), run, allowlist=None)
+
+
+def scenario_install_refused_outside_the_allowlist_repository(_server):
+    """A repository the allowlist does not name is refused, even on a listed host."""
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME, repo="owner/other")
+        assert lines == ["not_allowlisted", "exit 1"], lines
+        assert fx.fake.requests == [], "no request may leave for a refused repository"
+    with_install(healthy_build(INSTALL_NAME), run)
+
+
+def scenario_install_failed_download_is_refused(_server):
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["download_failed", "exit 1"], lines
+    with_install(healthy_build(INSTALL_NAME), run, mode="fail")
+
+
+def scenario_install_redirect_off_the_cdn_is_refused(_server):
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["redirect_refused", "exit 1"], lines
+    with_install(healthy_build(INSTALL_NAME), run, mode="off_cdn")
+
+
+def scenario_install_second_redirect_hop_is_refused(_server):
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["second_redirect", "exit 1"], lines
+    with_install(healthy_build(INSTALL_NAME), run, mode="second_hop")
+
+
+def scenario_install_asset_id_mismatch_is_refused(_server):
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["asset_mismatch", "exit 1"], lines
+    with_install(healthy_build(INSTALL_NAME), run, url_id=ASSET_ID + 1)
+
+
+def scenario_install_pinned_hash_installs_and_joins_autoload(_server):
+    data = healthy_build(INSTALL_NAME)
+    digest = hashlib.sha256(data).hexdigest()
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["installed %s %s" % (INSTALL_NAME, digest), "exit 0"], lines
+        listing = listed(payload_list(fx.server), INSTALL_NAME)
+        assert listing == (
+            "payload %s source=release version=%s release=%d asset=%d "
+            "sha256=%s path=/data/ariel/store/objects/%s running=no "
+            "failed=no previous=-" % (INSTALL_NAME, INSTALL_TAG, RELEASE_ID,
+                                      ASSET_ID, digest, digest)), listing
+        assert "autoload %s" % INSTALL_NAME in autoload_listing(fx.server), (
+            "install must join autoload")
+    with_install(data, run, pin=(INSTALL_NAME, digest))
+
+
+def scenario_install_different_hash_is_refused_and_nothing_kept(_server):
+    data = healthy_build(INSTALL_NAME)
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["hash_mismatch", "exit 1"], lines
+        assert listed(payload_list(fx.server), INSTALL_NAME) is None, (
+            "a refused hash must not be recorded")
+        assert "autoload %s" % INSTALL_NAME not in autoload_listing(fx.server), (
+            "a refused hash must not join autoload")
+    with_install(data, run, pin=(INSTALL_NAME, "0" * 64))
+
+
+def scenario_install_runs_the_health_check(_server):
+    data = compile_payload(EXIT_SOURCE.replace("EXIT_CODE", "1"), "broken")
+    digest = hashlib.sha256(data).hexdigest()
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        assert lines == ["health_failed %s %s" % (INSTALL_NAME, digest), "exit 1"], lines
+        listing = listed(payload_list(fx.server), INSTALL_NAME)
+        assert listing is not None and "failed=yes" in listing, listing
+        assert "autoload %s" % INSTALL_NAME not in autoload_listing(fx.server), (
+            "a failed install must leave autoload")
+    with_install(data, run, pin=(INSTALL_NAME, digest))
+
+
+def scenario_ariel_never_installs_itself(_server):
+    def run(fx):
+        lines = install_request(fx.server, "ariel")
+        assert lines == ["protected", "exit 87"], lines
+        assert fx.fake.requests == [], "Ariel's own install must not fetch anything"
+    with_install(healthy_build("ariel"), run)
+
+
+def scenario_unpinned_install_asks_then_commit_pins_and_joins(_server):
+    data = healthy_build(INSTALL_NAME)
+    digest = hashlib.sha256(data).hexdigest()
+
+    def run(fx):
+        lines = install_request(fx.server, INSTALL_NAME)
+        staging, approval = assert_staged(fx.server, lines, INSTALL_NAME, data)
+        sign_and_grant(fx.server, approval, challenge_of(lines))
+        assert commit(fx.server, staging) == [
+            "installed %s %s" % (INSTALL_NAME, digest), "exit 0"], (
+            "an approved install must commit the build")
+        with open(fx.allowlist_path()) as fh:
+            assert "pin %s %s" % (INSTALL_NAME, digest) in fh.read().splitlines(), (
+                "a committed install must pin its hash")
+        assert "autoload %s" % INSTALL_NAME in autoload_listing(fx.server), (
+            "install must join autoload")
+    with_install(data, run, allowlist="default")
+
+
+def scenario_protected_allowlist_answers_87_even_when_asked(_server):
+    def run(fx):
+        path = fx.allowlist_path()
+        spare = os.path.join(fx.server.root, "data", "ariel", "spare")
+        commands = [
+            "cat " + path,
+            "rm " + path,
+            "mv " + path + " " + spare,
+            "cp " + path + " " + spare,
+            "chmod 600 " + path,
+            "ln " + path + " " + spare,
+        ]
+        for command in commands:
+            assert run_command(fx.server, command) == ["protected", "exit 87"], (
+                "%s must answer protected and exit 87" % command)
+        fx.server.assert_no_line()
+        assert os.path.exists(path), "the allowlist must survive"
+    with_install(healthy_build(INSTALL_NAME), run, pin=(INSTALL_NAME, "0" * 64))
+
+
+def scenario_install_actions_reach_audit_tail(_server):
+    data = healthy_build(INSTALL_NAME)
+    digest = hashlib.sha256(data).hexdigest()
+
+    def run(fx):
+        install_request(fx.server, INSTALL_NAME, repo="owner/other")
+        install_request(fx.server, INSTALL_NAME)
+        events = audit_events(fx.server)
+        kinds = [event[0] for event in events]
+        assert "payload.install.refused" in kinds, kinds
+        assert "payload.install.done" in kinds, kinds
+    with_install(data, run, pin=(INSTALL_NAME, digest))
+
+
+INSTALL_SCENARIOS = [
+    ("install refuses a host outside the allowlist",
+     scenario_install_refused_outside_the_allowlist_host, None),
+    ("install refuses without an allowlist",
+     scenario_install_refused_without_allowlist, None),
+    ("install refuses a repository outside the allowlist",
+     scenario_install_refused_outside_the_allowlist_repository, None),
+    ("install refuses a failed download",
+     scenario_install_failed_download_is_refused, None),
+    ("install refuses a redirect off the CDN suffix",
+     scenario_install_redirect_off_the_cdn_is_refused, None),
+    ("install refuses a second redirect hop",
+     scenario_install_second_redirect_hop_is_refused, None),
+    ("install refuses an asset ID mismatch",
+     scenario_install_asset_id_mismatch_is_refused, None),
+    ("a pinned install records release and asset IDs and joins autoload",
+     scenario_install_pinned_hash_installs_and_joins_autoload, None),
+    ("a different hash than the pin is refused and nothing is kept",
+     scenario_install_different_hash_is_refused_and_nothing_kept, None),
+    ("an install runs the health check",
+     scenario_install_runs_the_health_check, None),
+    ("Ariel never installs itself",
+     scenario_ariel_never_installs_itself, None),
+    ("an unpinned install asks, then commit pins the hash and joins autoload",
+     scenario_unpinned_install_asks_then_commit_pins_and_joins, None),
+    ("the allowlist answers protected even when asked",
+     scenario_protected_allowlist_answers_87_even_when_asked, None),
+    ("install refusals and installs reach audit tail",
+     scenario_install_actions_reach_audit_tail, None),
+]
+
+SCENARIOS.extend(INSTALL_SCENARIOS)
 
 
 def main():

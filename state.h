@@ -89,6 +89,13 @@ int state_health_set(const char *name, uint64_t timeout);
  **/
 int state_health_get(const char *name, uint64_t *timeout, int *failed);
 
+/**
+ * Record that name was installed from a release: its source, version tag,
+ * release ID and asset ID. Returns 0, or -1 when name is not installed.
+ **/
+int state_release_set(const char *name, const char *version, uint64_t release,
+                      uint64_t asset);
+
 /** Set the failed flag of name, the current build having failed its check. **/
 int state_failed_set(const char *name, int failed);
 

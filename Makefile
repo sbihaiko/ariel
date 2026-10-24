@@ -55,6 +55,7 @@ all: shsrv-ps5.elf sh.elf controller-spike.elf primitives-probe.elf
 # The agent protocol, the store and the token are shared with the host
 # build, which compiles the same sources from hostbuild/.
 ARIEL_OBJS := agent.o agent_server.o store.o state.o token.o approval.o runner.o \
+              http.o allowlist.o release.o \
               protected.o runs.o fileops.o zip.o tar.o tweetnacl.o autoload.o
 
 shsrv.o: sh.elf.inc

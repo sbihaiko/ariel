@@ -36,6 +36,7 @@ along with this program; see the file COPYING. If not, see
 #include "autoload.h"
 #include "protected.h"
 #include "sha256.h"
+#include "allowlist.h"
 #include "store.h"
 #include "ps5_at.h"
 
@@ -107,6 +108,8 @@ struct staged {
 #define AUTOLOAD_TMP "autoload.tmp"
 #define AUTOLOAD_SNAPSHOT "autoload.snapshot"
 #define AUTOLOAD_SNAPSHOT_TMP "autoload.snapshot.tmp"
+#define ALLOWLIST_FILE "allowlist"
+#define ALLOWLIST_TMP "allowlist.tmp"
 
 /** One member of the approval table. **/
 struct approval {
@@ -889,7 +892,23 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
   };
   uint64_t i;
 
-  if(facts->target[0]) {
+  if(!strcmp(facts->command, "payload.install")) {
+    decimal(facts->release, text[0], sizeof(text[0]));
+    decimal(facts->asset, text[1], sizeof(text[1]));
+    action->command = facts->command;
+    action->target = facts->target;
+    action->destination = NULL;
+    action->sha256 = facts->sha256;
+    options[0].key = "name";
+    options[0].value = facts->name;
+    options[1].key = "tag";
+    options[1].value = facts->tag;
+    options[2].key = "release";
+    options[2].value = text[0];
+    options[3].key = "asset";
+    options[3].value = text[1];
+    action->noptions = 4;
+  } else if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
     action->destination = facts->dest[0] ? facts->dest : NULL;
@@ -1132,7 +1151,7 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen,
              "reboot the console with boot list sha256 %s will run",
              facts->sha256);
-  } else if(slot->gated) {
+  } else if(slot->gated && strcmp(facts->command, "payload.install")) {
     snprintf(prompt, promptlen, "%s %s%s%s will run", facts->command,
              facts->target, facts->dest[0] ? " " : "", facts->dest);
   } else {
@@ -2285,6 +2304,15 @@ out:
   return rc;
 }
 
+static void
+install_provenance(const approval_facts_t *facts,
+                    store_install_t *install) {
+  snprintf(install->tag, sizeof(install->tag), "%s", facts->tag);
+  install->release = facts->release;
+  install->asset = facts->asset;
+}
+
+
 int
 store_commit(const char *staging_id, store_install_t *install,
              char *approval_id, size_t idlen) {
@@ -2319,11 +2347,149 @@ store_commit(const char *staging_id, store_install_t *install,
     staged_leave(entry);
     outcome = STORE_APPROVAL_DENIED;
   } else {
+    install_provenance(&entry->facts, install);
     outcome = staged_install(entry, request, install);
   }
 
   pthread_mutex_unlock(&lock);
   return outcome;
+}
+
+
+int
+store_commit_pinned(const char *staging_id, store_install_t *install) {
+  struct staged *entry;
+  int outcome;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = staged_find(staging_id);
+  if(entry) {
+    install_provenance(&entry->facts, install);
+    outcome = staged_install(entry, NULL, install);
+  } else {
+    outcome = STORE_APPROVAL_STALE;
+  }
+
+  pthread_mutex_unlock(&lock);
+  return outcome;
+}
+
+
+int
+store_allowlist_read(char *text, size_t size) {
+  int state_fd;
+
+  text[0] = '\0';
+  if((state_fd=root_open()) < 0) {
+    return -1;
+  }
+
+  // A missing, unreadable or oversized allowlist is empty, so nothing is allowed.
+  if(text_read(state_fd, ALLOWLIST_FILE, text, size) < 0) {
+    text[0] = '\0';
+  }
+
+  close(state_fd);
+  return 0;
+}
+
+
+int
+store_allowlist_pin(const char *name, const char *sha256) {
+  allowlist_t *list;
+  char *text;
+  char *next;
+  const char *pinned;
+  int state_fd = -1;
+  int rc = -1;
+
+  text = calloc(1, ALLOWLIST_TEXT_MAX);
+  next = calloc(1, ALLOWLIST_TEXT_MAX);
+  list = calloc(1, sizeof(*list));
+  if(!text || !next || !list) {
+    goto out;
+  }
+
+  pthread_mutex_lock(&lock);
+
+  if((state_fd=root_open()) < 0 ||
+     text_read(state_fd, ALLOWLIST_FILE, text, ALLOWLIST_TEXT_MAX) < 0 ||
+     allowlist_parse(text, list)) {
+    goto out_locked;
+  }
+
+  pinned = allowlist_pin(list, name);
+  if(pinned) {
+    rc = strcmp(pinned, sha256) ? -1 : 0;
+    goto out_locked;
+  }
+
+  if(allowlist_with_pin(text, name, sha256, next, ALLOWLIST_TEXT_MAX) < 0 ||
+     tmp_write(state_fd, ALLOWLIST_TMP, next, strlen(next)) ||
+     renameat(state_fd, ALLOWLIST_TMP, state_fd, ALLOWLIST_FILE)) {
+    unlinkat(state_fd, ALLOWLIST_TMP, 0);
+    goto out_locked;
+  }
+
+  rc = 0;
+
+out_locked:
+  if(state_fd >= 0) {
+    close(state_fd);
+  }
+  pthread_mutex_unlock(&lock);
+
+out:
+  free(text);
+  free(next);
+  free(list);
+  return rc;
+}
+
+
+int
+store_autoload_join(const char *name) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char next[AUTOLOAD_TEXT_MAX];
+  int state_fd;
+  int edit;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+
+  if((state_fd=root_open()) < 0) {
+    goto out;
+  }
+
+  if(text_read(state_fd, AUTOLOAD_FILE, text, sizeof(text)) < 0) {
+    if(errno != ENOENT) {
+      goto close_state;
+    }
+    text[0] = '\0';
+  }
+
+  edit = autoload_edit(text, 1, name, next, sizeof(next));
+  if(edit == AUTOLOAD_PRESENT) {
+    rc = 0;
+    goto close_state;
+  }
+
+  if(edit != AUTOLOAD_OK ||
+     tmp_write(state_fd, AUTOLOAD_TMP, next, strlen(next)) ||
+     renameat(state_fd, AUTOLOAD_TMP, state_fd, AUTOLOAD_FILE)) {
+    unlinkat(state_fd, AUTOLOAD_TMP, 0);
+    goto close_state;
+  }
+
+  rc = 0;
+
+close_state:
+  close(state_fd);
+out:
+  pthread_mutex_unlock(&lock);
+  return rc;
 }
 
 

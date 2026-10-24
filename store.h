@@ -57,6 +57,9 @@ typedef struct {
   char name[PAYLOAD_NAME_MAX + 1];
   char sha256[65];
   char path[256];
+  char tag[65];
+  uint64_t release;
+  uint64_t asset;
 } store_install_t;
 
 /** How reading a payload back for a run ended. **/
@@ -238,6 +241,27 @@ int store_autoload_safe_boot(const char *id, const char *sha256);
  * Returns 0 when there is nothing to restore or it is restored, -1 on error.
  **/
 int store_autoload_restore(void);
+
+/**
+ * Commit a staged object whose install needs no approval, because the
+ * allowlist already pins its hash. Returns one of STORE_*.
+ **/
+int store_commit_pinned(const char *staging_id, store_install_t *install);
+
+/**
+ * Copy the allowlist text into text, empty when it is missing, unreadable or
+ * too large. Returns 0, or -1 when the state directory cannot be opened.
+ **/
+int store_allowlist_read(char *text, size_t size);
+
+/**
+ * Pin sha256 to name in the allowlist. Returns 0 when the pin is written or
+ * already holds sha256, and -1 otherwise.
+ **/
+int store_allowlist_pin(const char *name, const char *sha256);
+
+/** Add name to the autoload list. Returns 0, or -1. **/
+int store_autoload_join(const char *name);
 
 /** Bind a staged object to the approval that names it. **/
 void store_stage(const char *staging_id, const approval_facts_t *facts,

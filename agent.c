@@ -28,10 +28,13 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "agent.h"
+#include "allowlist.h"
 #include "approval.h"
 #include "autoload.h"
 #include "builtins.h"
 #include "fileops.h"
+#include "http.h"
+#include "release.h"
 #include "runs.h"
 #include "sha256.h"
 #include "store.h"
@@ -1621,6 +1624,389 @@ activation_healthy(agent_t *agent, int fd, const char *name,
 }
 
 
+/** The longest release document an install reads. **/
+#define RELEASE_JSON_MAX 16384
+
+struct install_work {
+  char text[ALLOWLIST_TEXT_MAX];
+  char json[RELEASE_JSON_MAX];
+  allowlist_t list;
+  release_t release;
+};
+
+struct text_sink {
+  char *buf;
+  size_t size;
+  size_t len;
+  const int *status;
+};
+
+struct asset_sink {
+  int fd;
+  sha256_t hash;
+  uint64_t size;
+  uint64_t total;
+  const int *status;
+};
+
+
+static int
+text_sink(void *ctx, const unsigned char *data, size_t len) {
+  struct text_sink *text = ctx;
+
+  if(*text->status != 200) {
+    return 0;
+  }
+
+  if(len > text->size - 1 - text->len) {
+    return -1;
+  }
+
+  memcpy(text->buf + text->len, data, len);
+  text->len += len;
+  return 0;
+}
+
+
+static int
+asset_sink(void *ctx, const unsigned char *data, size_t len) {
+  struct asset_sink *asset = ctx;
+
+  if(*asset->status != 200) {
+    return 0;
+  }
+
+  if(len > asset->size - asset->total ||
+     write_all(asset->fd, (const char *)data, len)) {
+    return -1;
+  }
+
+  sha256_update(&asset->hash, data, len);
+  asset->total += len;
+  return 0;
+}
+
+
+static int
+fetch_text(platform_t *platform, const char *url, char *buf, size_t size) {
+  struct text_sink text;
+  char location[RELEASE_URL_MAX + 1];
+  int status = 0;
+
+  text.buf = buf;
+  text.size = size;
+  text.len = 0;
+  text.status = &status;
+
+  if(platform->http_get(platform, url, size - 1, text_sink, &text, &status,
+                        location, sizeof(location)) || status != 200) {
+    return -1;
+  }
+
+  buf[text.len] = '\0';
+  return 0;
+}
+
+
+/**
+ * Fetch the asset along its redirects: one hop to the CDN, which may not
+ * redirect again. Returns 0 with the bytes in asset, or -1 with the refusal
+ * word in refusal.
+ **/
+static int
+fetch_asset(platform_t *platform, const allowlist_t *list, const char *url,
+            struct asset_sink *asset, const char **refusal) {
+  char current[RELEASE_URL_MAX + 1];
+  char location[RELEASE_URL_MAX + 1];
+  char authority[ALLOWLIST_TOKEN_MAX];
+  int status = 0;
+  int hop;
+
+  snprintf(current, sizeof(current), "%s", url);
+  asset->status = &status;
+
+  for(hop=0; hop<2; hop++) {
+    status = 0;
+    location[0] = '\0';
+
+    if(platform->http_get(platform, current, asset->size, asset_sink, asset,
+                          &status, location, sizeof(location))) {
+      *refusal = "download_failed";
+      return -1;
+    }
+
+    if(status == 200) {
+      return 0;
+    }
+
+    if(status < 300 || status > 399) {
+      *refusal = "download_failed";
+      return -1;
+    }
+
+    if(hop) {
+      *refusal = "second_redirect";
+      return -1;
+    }
+
+    if(http_url_host(location, authority, sizeof(authority)) ||
+       !allowlist_cdn_host(list, authority)) {
+      *refusal = "redirect_refused";
+      return -1;
+    }
+
+    snprintf(current, sizeof(current), "%s", location);
+  }
+
+  *refusal = "second_redirect";
+  return -1;
+}
+
+
+static int
+asset_url_has_id(const char *url, uint64_t asset_id) {
+  const char *slash = strrchr(url, '/');
+  char expect[24];
+
+  if(!slash) {
+    return 0;
+  }
+
+  snprintf(expect, sizeof(expect), "%llu", (unsigned long long)asset_id);
+  return !strcmp(slash + 1, expect);
+}
+
+
+static void
+install_refuse(int fd, const char *name, const char *word) {
+  char answer[64];
+
+  snprintf(answer, sizeof(answer), "%s\nexit 1\n", word);
+  audit_reply(fd, "payload", "install.refused", name, word, answer);
+}
+
+
+/**
+ * Record an installed release and join it to autoload, after its health
+ * check passed, and pin its hash when the allowlist does not yet.
+ **/
+static void
+install_settle(agent_t *agent, int fd, const store_install_t *install) {
+  char release[24];
+  char answer[256];
+
+  snprintf(release, sizeof(release), "%llu",
+           (unsigned long long)install->release);
+
+  if(state_release_set(install->name, install->tag, install->release,
+                       install->asset)) {
+    install_refuse(fd, install->name, "install_failed");
+    return;
+  }
+
+  if(!activation_healthy(agent, fd, install->name, install->sha256)) {
+    return;
+  }
+
+  if(store_autoload_join(install->name)) {
+    install_refuse(fd, install->name, "install_failed");
+    return;
+  }
+
+  if(store_allowlist_pin(install->name, install->sha256)) {
+    install_refuse(fd, install->name, "pin_failed");
+    return;
+  }
+
+  if(audit_line("payload", "install.done", install->name, release)) {
+    reply(fd, audit_failed);
+    return;
+  }
+
+  snprintf(answer, sizeof(answer), "installed %s %s\nexit 0\n",
+           install->name, install->sha256);
+  reply(fd, answer);
+}
+
+
+static void
+payload_install(agent_t *agent, int fd, const char *name, const char *repo,
+                const char *asset_name, const char *tag) {
+  platform_t *platform = agent->platform;
+  struct install_work *work = NULL;
+  struct asset_sink asset;
+  approval_facts_t facts;
+  store_install_t install;
+  char staging_id[APPROVAL_ID_MAX];
+  char authority[ALLOWLIST_TOKEN_MAX];
+  char url[1024];
+  char computed[SHA256_HEX_LEN + 1];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  const char *api;
+  const char *pinned;
+  const char *refusal = NULL;
+  int outfd;
+  int rc;
+
+  if(!store_name_valid(name)) {
+    reply(fd, bad_name);
+    return;
+  }
+
+  if(!strcmp(name, AUTOLOAD_SELF)) {
+    audit_reply(fd, "payload", "install.refused", name, "protected",
+                protected_process);
+    return;
+  }
+
+  if(tag && !approval_value_valid(tag)) {
+    reply(fd, unknown);
+    return;
+  }
+
+  if(strlen(repo) > APPROVAL_TARGET_MAX) {
+    install_refuse(fd, name, "not_allowlisted");
+    return;
+  }
+
+  work = calloc(1, sizeof(*work));
+  if(!work) {
+    install_refuse(fd, name, "install_failed");
+    return;
+  }
+
+  if(store_allowlist_read(work->text, sizeof(work->text)) ||
+     allowlist_parse(work->text, &work->list) ||
+     !allowlist_has_repo(&work->list, repo)) {
+    install_refuse(fd, name, "not_allowlisted");
+    goto out;
+  }
+
+  api = allowlist_api_host(&work->list);
+  if(!api) {
+    install_refuse(fd, name, "not_allowlisted");
+    goto out;
+  }
+
+  if(tag) {
+    snprintf(url, sizeof(url), "http://%s/repos/%s/releases/tags/%s", api, repo,
+             tag);
+  } else {
+    snprintf(url, sizeof(url), "http://%s/repos/%s/releases/latest", api, repo);
+  }
+
+  if(fetch_text(platform, url, work->json, sizeof(work->json))) {
+    install_refuse(fd, name, "download_failed");
+    goto out;
+  }
+
+  rc = release_parse(work->json, asset_name, &work->release);
+  if(rc == RELEASE_NO_ASSET) {
+    install_refuse(fd, name, "asset_missing");
+    goto out;
+  }
+  if(rc || !work->release.tag[0] || !approval_value_valid(work->release.tag)) {
+    install_refuse(fd, name, "download_failed");
+    goto out;
+  }
+
+  if(http_url_host(work->release.asset_url, authority, sizeof(authority)) ||
+     !allowlist_has_host(&work->list, authority)) {
+    install_refuse(fd, name, "host_refused");
+    goto out;
+  }
+
+  if(!asset_url_has_id(work->release.asset_url, work->release.asset_id)) {
+    install_refuse(fd, name, "asset_mismatch");
+    goto out;
+  }
+
+  store_staging_next_id(staging_id, sizeof(staging_id));
+  if((outfd=store_staging_create(staging_id, work->release.asset_size)) < 0) {
+    install_refuse(fd, name, "staging_full");
+    goto out;
+  }
+
+  asset.fd = outfd;
+  asset.size = work->release.asset_size;
+  asset.total = 0;
+  sha256_init(&asset.hash);
+
+  if(fetch_asset(platform, &work->list, work->release.asset_url, &asset,
+                 &refusal)) {
+    close(outfd);
+    store_staging_discard(staging_id);
+    install_refuse(fd, name, refusal);
+    goto out;
+  }
+
+  if(close(outfd) || asset.total != asset.size) {
+    store_staging_discard(staging_id);
+    install_refuse(fd, name, "download_failed");
+    goto out;
+  }
+
+  sha256_final(&asset.hash, digest);
+  sha256_hex(digest, computed);
+
+  pinned = allowlist_pin(&work->list, name);
+  if(pinned && strcmp(pinned, computed)) {
+    store_staging_discard(staging_id);
+    install_refuse(fd, name, "hash_mismatch");
+    goto out;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "payload.install");
+  snprintf(facts.name, sizeof(facts.name), "%s", name);
+  snprintf(facts.target, sizeof(facts.target), "%s", repo);
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", computed);
+  snprintf(facts.staging_id, sizeof(facts.staging_id), "%s", staging_id);
+  snprintf(facts.tag, sizeof(facts.tag), "%s", work->release.tag);
+  facts.size = work->release.asset_size;
+  facts.release = work->release.id;
+  facts.asset = work->release.asset_id;
+
+  if(pinned) {
+    memset(&install, 0, sizeof(install));
+    store_stage(staging_id, &facts, "");
+    if(store_commit_pinned(staging_id, &install) != STORE_INSTALLED) {
+      install_refuse(fd, name, "install_failed");
+      goto out;
+    }
+    install_settle(agent, fd, &install);
+    goto out;
+  }
+
+  {
+    approval_challenge_t challenge;
+    char answer[64];
+
+    if(platform->approval_request(platform, &facts, &challenge)) {
+      store_staging_discard(staging_id);
+      reply(fd, approval_busy);
+      goto out;
+    }
+
+    store_stage(staging_id, &facts, challenge.id);
+
+    if(store_audit_append("payload.install.staged", name, staging_id, computed)) {
+      store_approval_deny(challenge.id);
+      store_staging_discard(staging_id);
+      reply(fd, audit_failed);
+      goto out;
+    }
+
+    snprintf(answer, sizeof(answer), "staged %s\n", staging_id);
+    reply(fd, answer);
+    challenge_reply(fd, &challenge);
+  }
+
+out:
+  free(work);
+}
+
+
 static void
 payload_commit(agent_t *agent, int fd, const char *staging_id) {
   char approval_id[APPROVAL_ID_MAX];
@@ -1636,6 +2022,10 @@ payload_commit(agent_t *agent, int fd, const char *staging_id) {
 
   switch(outcome) {
   case STORE_INSTALLED:
+    if(install.release) {
+      install_settle(agent, fd, &install);
+      return;
+    }
     // The install already happened, so a commit that cannot be logged still
     // stands; the agent is told it was not recorded.
     if(store_audit_append("commit", install.name, staging_id, install.sha256)) {
@@ -2737,6 +3127,13 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   // Exactly one command per connection.
   if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "push")) {
     payload_push(agent, fd, wake, argv[2], argv[3], argv[4]);
+    return;
+  }
+
+  if((argc == 5 || argc == 6) && !strcmp(argv[0], "payload") &&
+     !strcmp(argv[1], "install")) {
+    payload_install(agent, fd, argv[2], argv[3], argv[4],
+                    argc == 6 ? argv[5] : NULL);
     return;
   }
 

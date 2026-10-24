@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "approval.h"
+#include "http.h"
 #include "platform.h"
 #include "runner.h"
 #include "sha256.h"
@@ -789,6 +790,14 @@ host_reboot(platform_t *self) {
 }
 
 
+static int
+host_http_get(platform_t *self, const char *url, size_t max, http_sink_t sink,
+              void *ctx, int *status, char *location, size_t size) {
+  (void)self;
+  return http_fetch(url, max, sink, ctx, status, location, size);
+}
+
+
 static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
@@ -805,6 +814,7 @@ static platform_t host_platform = {
   .spawn_start = host_spawn_start,
   .spawn_poll = host_spawn_poll,
   .spawn_kill = host_spawn_kill,
+  .http_get = host_http_get,
   .run = host_run,
   .system_act = host_system_act,
   .fault = host_fault,

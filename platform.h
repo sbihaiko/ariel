@@ -85,6 +85,9 @@ typedef struct {
   uint64_t major;
   uint64_t minor;
   char replaces[65];  /** The build a rollback replaces; empty otherwise. **/
+  char tag[65];  /** install: the release tag the asset came from. **/
+  uint64_t release;  /** install: the release ID; 0 for any other action. **/
+  uint64_t asset;  /** install: the asset ID. **/
   char args[ARGS_HASH_MAX + 1];
   char arg[RUN_ARGS_MAX][BUILTIN_ARG_MAX + 1];  /** A built-in's or a run's. **/
 } approval_facts_t;
@@ -111,6 +114,9 @@ typedef struct {
  * widens in Stage 2.
  **/
 typedef struct platform platform_t;
+
+/** Receives the next piece of a fetched body. Returns 0, or -1 to stop. **/
+typedef int (*http_sink_t)(void *ctx, const unsigned char *data, size_t len);
 
 struct platform {
   /**
@@ -266,6 +272,17 @@ struct platform {
    * does not return. Returns -1 when the restart cannot be started.
    **/
   int (*reboot)(platform_t *self);
+
+  /**
+   * Fetch url over plain HTTP without following redirects. The reply status
+   * is set in status and a redirect's Location is copied into location. The
+   * body is passed to sink in order and may not exceed max bytes. Returns 0
+   * when a reply arrived, or -1 for a refused URL, a failed transfer or a
+   * body over max.
+   **/
+  int (*http_get)(platform_t *self, const char *url, size_t max,
+                  http_sink_t sink, void *ctx, int *status, char *location,
+                  size_t size);
 };
 
 /**

@@ -741,6 +741,27 @@ state_health_set(const char *name, uint64_t timeout) {
 
 
 int
+state_release_set(const char *name, const char *version, uint64_t release,
+                  uint64_t asset) {
+  struct state_payload *entry;
+  int rc = -1;
+
+  pthread_mutex_lock(&lock);
+
+  if(loaded && (entry=payload_find(name))) {
+    snprintf(entry->source, sizeof(entry->source), "%s", "release");
+    snprintf(entry->version, sizeof(entry->version), "%s", version);
+    entry->release = release;
+    entry->asset = asset;
+    rc = state_save_locked();
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
 state_failed_set(const char *name, int failed) {
   struct state_payload *entry;
   int rc = -1;
