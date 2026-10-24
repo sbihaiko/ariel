@@ -29,7 +29,7 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 |---|---|---|
 | 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.20: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
 | 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done. 37 sub-issues closed; console suite 36/36 on firmware 11.20, with the key hierarchy exercised on the console ([#46](https://github.com/sbihaiko/ariel/issues/46), [#48](https://github.com/sbihaiko/ariel/issues/48)). |
-| 3. An interface agents can rely on | | Not started. |
+| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | Not started. |
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | Not started. |
 | 5. Sessions (optional) | | Not started. |
 | 6. MCP (optional) | | Not started. |
