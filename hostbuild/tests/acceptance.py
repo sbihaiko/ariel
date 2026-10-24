@@ -17,9 +17,11 @@ import contextlib
 import hashlib
 import io
 import os
+import platform
 import queue
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1936,6 +1938,124 @@ def scenario_no_system_change_on_agent_port(server):
     decide_push(server, "boundary", b"\x7fELF telnet boundary", "deny")
 
 
+INSPECTION_COMMANDS = (
+    "authid", "echo", "help", "id", "procstat", "ps", "sfoinfo", "sleep",
+    "sum", "sync", "sysctl",
+)
+
+# The kernel parameter each host reads for its operating system, and its value.
+OSTYPE = {"Darwin": ("kern.ostype", "Darwin"),
+          "Linux": ("kernel.ostype", "Linux")}
+
+
+def sfo_bytes(title):
+    """A PARAM.SFO with one string entry, laid out as bundles/core/sfo.h says."""
+    key = b"TITLE\0"
+    value = title.encode("ascii") + b"\0"
+    keys_offset = 20 + 16
+    data_offset = keys_offset + len(key)
+    return (struct.pack("<IIIII", 0x46535000, 0x101, keys_offset, data_offset, 1)
+            + struct.pack("<HBBIII", 0, 0, 2, len(value), len(value), 0)
+            + key + value)
+
+
+def rows_of(lines):
+    return [line.split() for line in lines[:-1]]
+
+
+def scenario_inspection_runs_at_once(server):
+    """These commands need no approval, so each answers with its own output."""
+    assert run_command(server, "echo hello from ariel") == [
+        "hello from ariel", "exit 0"]
+    assert run_command(server, "sync") == ["exit 0"]
+    assert run_command(server, "sleep 0") == ["exit 0"]
+    started = time.monotonic()
+    assert run_command(server, "sleep 1") == ["exit 0"]
+    assert time.monotonic() - started >= 0.9, "sleep 1 must pause a second"
+    assert run_command(server, "sleep") == ["missing_operand", "exit 1"]
+    assert run_command(server, "sleep soon") == ["bad_duration", "exit 1"]
+    assert run_command(server, "sleep 61") == ["bad_duration", "exit 1"]
+    lines = run_command(server, "id")
+    assert lines[-1] == "exit 0" and lines[0].startswith("uid="), (
+        "id must print the user and group, got %r" % lines)
+    lines = run_command(server, "help")
+    assert lines[-1] == "exit 0", "help must exit 0, got %r" % lines
+    listed = {line.split(" ")[0] for line in lines[:-1]}
+    missing = sorted(set(INSPECTION_COMMANDS) - listed)
+    assert not missing, "help must list every command, missing %r" % missing
+
+
+def scenario_ps_and_procstat(server):
+    """ps lists Ariel's own process; procstat reads one pid and refuses a bad one."""
+    pid = str(server.proc.pid)
+    lines = run_command(server, "ps")
+    assert lines[-1] == "exit 0", "ps must exit 0, got %r" % lines
+    rows = rows_of(lines)
+    assert rows and rows[0][0] == "PID", "ps must print a header, got %r" % lines
+    assert any(row[0] == pid for row in rows[1:]), (
+        "ps must list Ariel's process %s, got %r" % (pid, lines))
+    lines = run_command(server, "procstat %s" % pid)
+    assert lines[-1] == "exit 0", "procstat must exit 0, got %r" % lines
+    assert any(row[0] == pid for row in rows_of(lines)[1:]), (
+        "procstat must describe %s, got %r" % (pid, lines))
+    assert run_command(server, "procstat") == ["missing_operand", "exit 1"]
+    assert run_command(server, "procstat 99999999") == [
+        "no_such_process", "exit 1"]
+
+
+def scenario_sysctl_reads_and_refuses_writes(server):
+    name, value = OSTYPE[platform.system()]
+    assert run_command(server, "sysctl %s" % name) == [value, "exit 0"]
+    assert run_command(server, "sysctl") == ["missing_operand", "exit 1"]
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\nsysctl %s=Other\n" % (server.token, name)).encode("ascii")
+        )
+        assert_unknown(read_reply(sock))
+    finally:
+        sock.close()
+    assert run_command(server, "sysctl %s" % name) == [value, "exit 0"], (
+        "a refused sysctl write must change nothing")
+
+
+def scenario_sum_and_sfoinfo_read_absolute_paths(server):
+    data = os.path.join(server.root, "abc.bin")
+    with open(data, "wb") as handle:
+        handle.write(b"abc")
+    # The BSD sum of "abc" is 16556, by the algorithm bundles/core/sum.c runs.
+    assert run_command(server, "sum %s" % data) == [
+        "16556 %s" % data, "exit 0"]
+    assert run_command(server, "sum abc.bin") == ["relative_path", "exit 1"]
+    assert run_command(server, "sum") == ["missing_operand", "exit 1"]
+    missing = run_command(server, "sum %s/none" % server.root)
+    assert missing[-1] == "exit 1" and len(missing) == 2, (
+        "sum of a missing file must explain and exit 1, got %r" % missing)
+    sfo = os.path.join(server.root, "PARAM.SFO")
+    with open(sfo, "wb") as handle:
+        handle.write(sfo_bytes("Hello"))
+    assert run_command(server, "sfoinfo %s" % sfo) == [
+        "TITLE('Hello')", "exit 0"]
+    junk = os.path.join(server.root, "junk.sfo")
+    with open(junk, "wb") as handle:
+        handle.write(b"not an sfo file")
+    assert run_command(server, "sfoinfo %s" % junk) == ["not_sfo", "exit 1"]
+
+
+def scenario_authid_is_not_available_on_the_host(server):
+    """authid reads the console's kernel credentials: a PS5-only reader."""
+    assert run_command(server, "authid") == [
+        "not available on this platform", "exit 1"]
+    sock = server.connect()
+    try:
+        sock.sendall(
+            ("auth %s\nauthid 0x4800000000010003\n" % server.token).encode("ascii")
+        )
+        assert_unknown(read_reply(sock))
+    finally:
+        sock.close()
+
+
 def scenario_two_connections(server):
     first = server.connect(timeout=3.0)
     try:
@@ -2758,6 +2878,16 @@ SCENARIOS = [
     ("the token, approval state and nonces answer protected and exit 87 "
      "through a hard link", scenario_secrets_read_through_hard_link,
      HOST_ROOT_REASON),
+    ("echo, sleep, sync, id and help run at once on the agent port",
+     scenario_inspection_runs_at_once, False),
+    ("ps and procstat list Ariel's own process and refuse a missing or "
+     "unknown pid", scenario_ps_and_procstat, False),
+    ("sysctl reads a kernel parameter, and a sysctl write is refused and "
+     "changes nothing", scenario_sysctl_reads_and_refuses_writes, False),
+    ("sum and sfoinfo read absolute paths and refuse relative ones",
+     scenario_sum_and_sfoinfo_read_absolute_paths, False),
+    ("authid answers 'not available on this platform' on the host and "
+     "exit 1", scenario_authid_is_not_available_on_the_host, False),
     ("two connections are served at the same time",
      scenario_two_connections, False),
     ("a fifth concurrent connection answers busy and exit 82",

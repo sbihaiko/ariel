@@ -4,7 +4,9 @@ The registry of every `exit <n>` value the agent port answers. A number is assig
 
 `payload run --wait` reports the payload's own status on a `status <n>` line, then `exit 0`. A payload's status never appears on the `exit` line.
 
-A shell command (`pwd`, `cd`, or a read-only command that takes a path: `ls`, `stat`, `file`, `cat`, `grep`, `find`, `cmp`, `hexdump`, `df`, `sha256sum`) writes its output and its error word to the connection and ends with `exit <n>`, where `n` is the command's own status: 0 for success, 1 for an error such as `relative_path` or `no_working_directory`. `grep` and `cmp` also exit 1 when nothing matches or the files differ. A connection has no working directory, so every path is absolute and `cd` always fails.
+A shell command (`pwd`, `cd`, a read-only command that takes a path: `ls`, `stat`, `file`, `cat`, `grep`, `find`, `cmp`, `hexdump`, `df`, `sha256sum`, or an inspection command: `echo`, `help`, `id`, `sync`, `sleep`, `sum`, `sfoinfo`, `ps`, `procstat`, `sysctl`, `authid`) writes its output and its error word to the connection and ends with `exit <n>`, where `n` is the command's own status: 0 for success, 1 for an error such as `relative_path` or `no_working_directory`. `grep` and `cmp` also exit 1 when nothing matches or the files differ. A connection has no working directory, so every path is absolute and `cd` always fails.
+
+The inspection commands add these error words, all with exit 1: `missing_operand` (an operand is required), `bad_duration` (`sleep` takes whole seconds from 0 to 60), `not_a_pid` (`procstat` takes a decimal pid), `no_such_process` (no process has that pid), and `not_sfo` (the file is not a PARAM.SFO). On the host build, `authid` answers `not available on this platform`, because it reads the console's kernel credentials. A `sysctl` write (`sysctl name=value`) is not a command of the agent port and answers `unknown_command`.
 
 ## Assigned
 

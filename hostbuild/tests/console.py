@@ -460,6 +460,38 @@ def check_audit_tail(session, context):
         "no agent-port command may change the audit log")
 
 
+def check_inspection_commands(session, context):
+    del context
+    link = session.link
+    assert link.exchange("echo hello from ariel") == ["hello from ariel", "exit 0"]
+    assert link.exchange("sync") == ["exit 0"]
+    assert link.exchange("sleep 0") == ["exit 0"]
+    assert link.exchange("sleep") == ["missing_operand", "exit 1"]
+    assert link.exchange("sleep 61") == ["bad_duration", "exit 1"]
+    lines = link.exchange("id")
+    assert lines[-1] == "exit 0" and lines[0].startswith("uid="), (
+        "id must print the user and group, got %r" % lines)
+    lines = link.exchange("ps")
+    assert lines[-1] == "exit 0" and lines[0].split()[0] == "PID", (
+        "ps must print a header and exit 0, got %r" % lines)
+    rows = [line.split() for line in lines[1:-1]]
+    assert rows, "ps must list the console's processes"
+    lines = link.exchange("procstat %s" % rows[0][0])
+    assert lines[-1] == "exit 0", "procstat must exit 0, got %r" % lines
+    assert link.exchange("procstat") == ["missing_operand", "exit 1"]
+    lines = link.exchange("sysctl kern.ostype")
+    assert lines[-1] == "exit 0" and lines[0].startswith("00000000"), (
+        "sysctl must print a hexdump and exit 0, got %r" % lines)
+    assert link.exchange("sum relative") == ["relative_path", "exit 1"]
+    assert link.exchange("sfoinfo relative") == ["relative_path", "exit 1"]
+    lines = link.exchange("authid")
+    assert lines[-1] == "exit 0" and lines[0].startswith("0x"), (
+        "authid must print the console's authid and exit 0, got %r" % lines)
+    lines = link.exchange("sysctl kern.ostype=Other")
+    assert lines[:-1] == ["unknown_command"] and lines[-1] != "exit 0", (
+        "a sysctl write must be refused, got %r" % lines)
+
+
 # Every check console mode runs. Each is a scenario that needs no test clock.
 CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
@@ -490,6 +522,8 @@ CHECKS = [
      "read directly on the console", check_secrets_read_directly),
     ("the quick start's 'After Stage 1' section passes against the console",
      check_quick_start),
+    ("the inspection commands run with no approval and answer their output",
+     check_inspection_commands),
 ]
 
 

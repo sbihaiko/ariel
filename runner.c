@@ -19,15 +19,18 @@ along with this program; see the file COPYING. If not, see
 #include <errno.h>
 #include <fcntl.h>
 #include <regex.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "protected.h"
+#include "readers.h"
 #include "runner.h"
 #include "sha256.h"
 
@@ -35,6 +38,44 @@ along with this program; see the file COPYING. If not, see
 #define OUT_LINE_CAP 1536
 
 #define STATUS_PROTECTED 87
+
+#define SUM_BLOCK 8192
+#define SFO_MAGIC 0x46535000u
+#define SFO_HEADER 20
+#define SFO_ENTRY 16
+#define SFO_TYPE_STR 2
+#define SFO_TYPE_INT 4
+#define SFO_MAX_SIZE (1024 * 1024)
+#define SLEEP_MAX 60
+
+
+static const struct {
+  const char *name;
+  const char *summary;
+} commands[] = {
+  {"authid", "print the authid of this process"},
+  {"cat", "print an absolute file"},
+  {"cmp", "compare two absolute files"},
+  {"df", "print the free space of an absolute path"},
+  {"echo", "print the operands"},
+  {"file", "print the kind of an absolute path"},
+  {"find", "list an absolute tree"},
+  {"grep", "print the lines of an absolute file that match"},
+  {"help", "list the commands"},
+  {"hexdump", "print an absolute file in hex"},
+  {"id", "print the user and group ids"},
+  {"ls", "list the entries of an absolute directory"},
+  {"procstat", "print one process by pid"},
+  {"ps", "list the processes"},
+  {"pwd", "print the working directory"},
+  {"sfoinfo", "print the entries of an absolute PARAM.SFO"},
+  {"sha256sum", "print the SHA-256 of an absolute file"},
+  {"sleep", "pause for up to 60 seconds"},
+  {"stat", "print the size, mode and inode of an absolute path"},
+  {"sum", "print the BSD checksum of an absolute file"},
+  {"sync", "write cached data to disk"},
+  {"sysctl", "print a kernel parameter"},
+};
 
 
 static void
@@ -68,6 +109,18 @@ report(const char *cmd, const char *path, int errfd, int err) {
   say(errfd, ": ");
   say(errfd, strerror(err));
   say(errfd, "\n");
+}
+
+
+static void
+say_bytes(int fd, const void *data, size_t len) {
+  put(fd, data, len);
+}
+
+
+static void
+say_failure(int errfd, const char *command, const char *path, int err) {
+  report(command, path, errfd, err);
 }
 
 
@@ -747,6 +800,273 @@ run_sha256sum(int argc, char *const argv[], int outfd, int errfd) {
 }
 
 
+static int
+run_echo(int argc, char *const argv[], int outfd) {
+  for(int i=1; i<argc; i++) {
+    if(i > 1) {
+      say(outfd, " ");
+    }
+    say(outfd, argv[i]);
+  }
+  say(outfd, "\n");
+  return 0;
+}
+
+
+static int
+run_help(int outfd) {
+  char line[256];
+  size_t i;
+
+  for(i=0; i<sizeof(commands)/sizeof(commands[0]); i++) {
+    snprintf(line, sizeof(line), "%-10s %s\n",
+             commands[i].name, commands[i].summary);
+    say(outfd, line);
+  }
+  return 0;
+}
+
+
+static int
+run_id(int outfd) {
+  char line[128];
+
+  snprintf(line, sizeof(line), "uid=%u gid=%u euid=%u egid=%u\n",
+           (unsigned)getuid(), (unsigned)getgid(),
+           (unsigned)geteuid(), (unsigned)getegid());
+  say(outfd, line);
+  return 0;
+}
+
+
+static int
+run_sleep(int argc, char *const argv[], int errfd) {
+  struct timespec want;
+  struct timespec rest;
+  unsigned long seconds;
+  char *end;
+
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+
+  errno = 0;
+  seconds = strtoul(argv[1], &end, 10);
+  if(!isdigit((unsigned char)argv[1][0]) || *end || errno ||
+     seconds > SLEEP_MAX) {
+    say(errfd, "bad_duration\n");
+    return 1;
+  }
+
+  want.tv_sec = (time_t)seconds;
+  want.tv_nsec = 0;
+  while(nanosleep(&want, &rest) < 0 && errno == EINTR) {
+    want = rest;
+  }
+  return 0;
+}
+
+
+static int
+run_sum(int argc, char *const argv[], int outfd, int errfd) {
+  int rc;
+  unsigned long checksum = 0;
+  unsigned char buf[SUM_BLOCK];
+  char digits[16];
+  ssize_t n;
+  size_t i;
+  int fd;
+
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[1][0] != '/') {
+    say(errfd, "relative_path\n");
+    return 1;
+  }
+
+  if((rc=open_target("sum", argv[1], errfd, &fd))) {
+    return rc;
+  }
+
+  while((n = read(fd, buf, sizeof(buf))) != 0) {
+    if(n < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      say_failure(errfd, "sum", argv[1], errno);
+      close(fd);
+      return 1;
+    }
+    for(i=0; i<(size_t)n; i++) {
+      checksum = (checksum & 1) ? (checksum >> 1) + 0x8000 : checksum >> 1;
+      checksum = (checksum + buf[i]) & 0xffff;
+    }
+  }
+  close(fd);
+
+  snprintf(digits, sizeof(digits), "%05lu ", checksum);
+  say(outfd, digits);
+  say(outfd, argv[1]);
+  say(outfd, "\n");
+  return 0;
+}
+
+
+static uint32_t
+le32(const unsigned char *p) {
+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+         (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+
+static uint16_t
+le16(const unsigned char *p) {
+  return (uint16_t)(p[0] | p[1] << 8);
+}
+
+
+static void
+say_sfo_value(int outfd, const unsigned char *val, uint32_t len, uint32_t type) {
+  char pair[4];
+  uint32_t i;
+
+  if(type == SFO_TYPE_STR) {
+    if(len && val[len-1] == 0) {
+      len--;
+    }
+    say(outfd, "'");
+    say_bytes(outfd, val, len);
+    say(outfd, "'");
+  } else if(type == SFO_TYPE_INT && len >= 4) {
+    char hex[16];
+
+    snprintf(hex, sizeof(hex), "0x%08x", le32(val));
+    say(outfd, hex);
+  } else {
+    char head[32];
+
+    snprintf(head, sizeof(head), "%u, 0x", (unsigned)type);
+    say(outfd, head);
+    for(i=0; i<len; i++) {
+      snprintf(pair, sizeof(pair), "%02x", val[i]);
+      say(outfd, pair);
+    }
+  }
+}
+
+
+static int
+run_sfoinfo(int argc, char *const argv[], int outfd, int errfd) {
+  int rc;
+  unsigned char *buf;
+  struct stat st;
+  uint64_t size;
+  uint32_t count;
+  uint32_t keys;
+  uint32_t data;
+  uint32_t i;
+  size_t got = 0;
+  ssize_t n;
+  int fd;
+
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[1][0] != '/') {
+    say(errfd, "relative_path\n");
+    return 1;
+  }
+
+  if((rc=open_target("sfoinfo", argv[1], errfd, &fd))) {
+    return rc;
+  }
+  if(fstat(fd, &st)) {
+    say_failure(errfd, "sfoinfo", argv[1], errno);
+    close(fd);
+    return 1;
+  }
+  if(st.st_size < SFO_HEADER || st.st_size > SFO_MAX_SIZE) {
+    close(fd);
+    say(errfd, "not_sfo\n");
+    return 1;
+  }
+
+  size = (uint64_t)st.st_size;
+  if(!(buf = malloc(size))) {
+    close(fd);
+    say(errfd, "sfoinfo: out of memory\n");
+    return 1;
+  }
+  while(got < size) {
+    n = read(fd, buf + got, size - got);
+    if(n < 0 && errno == EINTR) {
+      continue;
+    }
+    if(n <= 0) {
+      break;
+    }
+    got += (size_t)n;
+  }
+  close(fd);
+
+  if(got != size || le32(buf) != SFO_MAGIC) {
+    free(buf);
+    say(errfd, "not_sfo\n");
+    return 1;
+  }
+
+  keys = le32(buf + 8);
+  data = le32(buf + 12);
+  count = le32(buf + 16);
+
+  for(i=0; i<count; i++) {
+    uint64_t offset = SFO_HEADER + (uint64_t)i * SFO_ENTRY;
+    const unsigned char *entry;
+    uint64_t key_start;
+    uint64_t val_start;
+    uint32_t val_len;
+    uint32_t type;
+    const unsigned char *nul;
+
+    if(offset + SFO_ENTRY > size) {
+      free(buf);
+      say(errfd, "not_sfo\n");
+      return 1;
+    }
+    entry = buf + offset;
+
+    key_start = (uint64_t)keys + le16(entry);
+    val_len = le32(entry + 4);
+    type = entry[3];
+    val_start = (uint64_t)data + le32(entry + 12);
+
+    if(key_start >= size || val_start + val_len > size) {
+      free(buf);
+      say(errfd, "not_sfo\n");
+      return 1;
+    }
+    nul = memchr(buf + key_start, 0, (size_t)(size - key_start));
+    if(!nul) {
+      free(buf);
+      say(errfd, "not_sfo\n");
+      return 1;
+    }
+
+    say_bytes(outfd, buf + key_start, (size_t)(nul - (buf + key_start)));
+    say(outfd, "(");
+    say_sfo_value(outfd, buf + val_start, val_len, type);
+    say(outfd, ")\n");
+  }
+
+  free(buf);
+  return 0;
+}
+
+
 typedef int (*file_command_fn)(int argc, char *const argv[], int outfd,
                                int errfd);
 
@@ -770,6 +1090,10 @@ int
 runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
   size_t i;
 
+  if(argc < 1) {
+    return -1;
+  }
+
   if(argc == 1 && !strcmp(argv[0], "pwd")) {
     say(outfd, "/\n");
     *status = 0;
@@ -787,6 +1111,42 @@ runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
     return 0;
   }
 
+  if(!strcmp(argv[0], "echo")) {
+    *status = run_echo(argc, argv, outfd);
+    return 0;
+  }
+
+  if(argc == 1 && !strcmp(argv[0], "help")) {
+    *status = run_help(outfd);
+    return 0;
+  }
+
+  if(argc == 1 && !strcmp(argv[0], "id")) {
+    *status = run_id(outfd);
+    return 0;
+  }
+
+  if(argc == 1 && !strcmp(argv[0], "sync")) {
+    sync();
+    *status = 0;
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "sleep")) {
+    *status = run_sleep(argc, argv, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "sum")) {
+    *status = run_sum(argc, argv, outfd, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "sfoinfo")) {
+    *status = run_sfoinfo(argc, argv, outfd, errfd);
+    return 0;
+  }
+
   for(i=0; argc >= 1 && i<sizeof(file_commands)/sizeof(file_commands[0]); i++) {
     if(!strcmp(argv[0], file_commands[i].name)) {
       *status = file_commands[i].run(argc, argv, outfd, errfd);
@@ -794,5 +1154,5 @@ runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
     }
   }
 
-  return -1;
+  return readers_run(argc, argv, outfd, errfd, status);
 }
