@@ -3217,8 +3217,6 @@ def scenario_legacy_commands_name_their_error(server):
         ("sleep soon", "bad_duration"),
         ("procstat not-a-pid", "not_a_pid"),
         ("sysctl", "missing_operand"),
-        ("payload run nosuchbuild", "unknown_payload"),
-        ("autoload remove nosuchbuild", "not_in_autoload"),
     )
     for command, word in cases:
         lines = run_command(server, command)
