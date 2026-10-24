@@ -750,6 +750,17 @@ def check_autoload_edit_asks_before_it_applies(session, context):
         "an edit that was asked for must not be applied before its grant")
 
 
+def check_reboot_asks_the_owner(session, context):
+    """reboot without a grant answers 75 and asks the owner, and restarts nothing."""
+    del context
+    lines = session.link.exchange("reboot")
+    assert lines and lines[-1] == "exit 75" and APPROVAL_LINE.match(lines[0]), (
+        "reboot without a grant must answer approval_required and exit 75, "
+        "got %r" % lines)
+    assert not any(line.startswith("rebooting") for line in lines), (
+        "a reboot without a grant must not restart the console")
+
+
 def check_autoload_edit_applies_after_grant(session, context):
     """A granted autoload add is applied, shown by autoload show and audited."""
     del context
@@ -874,6 +885,8 @@ CHECKS = [
     ("env, export and exec refuse a bad name, a relative or missing path and "
      "the token without asking, and audit each refusal",
      check_env_export_exec_refusals),
+    ("reboot answers 75 with a challenge and restarts nothing without a grant",
+     check_reboot_asks_the_owner),
     ("the read-only commands on the console's root and data directory exit 0",
      check_read_only_on_console),
     ("the token, approval state and nonces answer protected and exit 87 when "

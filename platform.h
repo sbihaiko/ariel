@@ -260,14 +260,22 @@ struct platform {
 
   /** Send signal sig to process pid. Returns 0, or -1 on error. **/
   int (*process_signal)(platform_t *self, int32_t pid, int sig);
+
+  /**
+   * Restart the console once the owner has approved a reboot. On success it
+   * does not return. Returns -1 when the restart cannot be started.
+   **/
+  int (*reboot)(platform_t *self);
 };
 
 /**
  * The implementation for the host operating system. run_dir is a directory
  * only Ariel can read, where the bytes of a run are written before they are
  * executed and removed afterwards. fs_root is the test root that file
- * commands' paths are under.
+ * commands' paths are under. exe is Ariel's own program, which a reboot
+ * starts again.
  **/
-platform_t *platform_host(const char *run_dir, const char *fs_root);
+platform_t *platform_host(const char *run_dir, const char *fs_root,
+                          const char *exe);
 
 #endif /* ARIEL_PLATFORM_H */

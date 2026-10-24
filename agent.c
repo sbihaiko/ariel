@@ -2107,6 +2107,49 @@ kill_command(agent_t *agent, int fd, const char *pid_text,
 
 
 /**
+ * reboot: the owner signs the boot list the restart will run. The answer and
+ * its audit line come before the restart, which replaces this process.
+ **/
+static void
+reboot_command(agent_t *agent, int fd) {
+  char text[AUTOLOAD_TEXT_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  approval_facts_t facts;
+  approval_challenge_t challenge;
+  sha256_t hash;
+
+  if(store_autoload_show(text, sizeof(text)) < 0) {
+    reply(fd, list_failed);
+    return;
+  }
+
+  sha256_init(&hash);
+  sha256_update(&hash, text, strlen(text));
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "reboot");
+  snprintf(facts.target, sizeof(facts.target), "%s", "console");
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  if(audit_line("reboot", "done", "console", challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  reply(fd, "rebooting\nexit 0\n");
+  if(agent->platform->reboot(agent->platform)) {
+    audit_line("reboot", "failed", "console", challenge.id);
+  }
+}
+
+
+/**
  * audit tail [n]: the newest n lines of the audit log, at most AUDIT_TAIL_MAX.
  * Reading the log writes nothing to it.
  **/
@@ -2582,6 +2625,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc >= 1 && builtin_gated(argv[0])) {
     builtin_command(agent, fd, argc, argv);
+    return;
+  }
+
+  if(argc == 1 && !strcmp(argv[0], "reboot")) {
+    reboot_command(agent, fd);
     return;
   }
 

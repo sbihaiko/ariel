@@ -1085,6 +1085,11 @@ HOST_FILE_SCENARIOS = {
 HOST_FIXTURE_REASON = ("needs a process only the host build starts, which "
                        "console mode cannot name")
 
+# A granted reboot restarts Ariel's own process, and a crash restart ends it.
+# On a console the same grant would reboot the console, so these never run there.
+HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console "
+                       "would turn into a reboot")
+
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
@@ -1183,6 +1188,14 @@ HOST_FIXTURE_SCENARIOS = {
     "touches nothing",
 }
 
+HOST_RESTART_SCENARIOS = {
+    "a granted reboot restarts Ariel, keeps payloads listed and runs the "
+    "autoload entries",
+    "a crash restart runs no autoload entry and restarts nothing that was "
+    "running",
+    "a granted reboot is audited as its request, grant and done",
+}
+
 # The read-only scenarios that need the host test root: they write scratch
 # files or links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
@@ -1278,7 +1291,8 @@ def scenario_console_mode_plan(server):
         skipped.append(match.group(1))
 
     expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
-                      | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS)
+                      | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS
+                      | HOST_RESTART_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
         "clock, the host test root, the fault injector or the host's files:"
@@ -5887,6 +5901,151 @@ def scenario_tar_actions_are_audited(server):
             "audit tail must show %r, got %r" % (event, sorted(events)))
 
 
+def reboot_action(challenge):
+    """The canonical action text that a reboot challenge carries."""
+    return bytes.fromhex(challenge.split(" ")[6]).decode("ascii")
+
+
+def reboot_approve(server):
+    """Ask to reboot, sign the challenge and grant it; return the approval ID."""
+    approval, challenge = gate_request(server, "reboot")
+    sign_and_grant(server, approval, challenge)
+    return approval
+
+
+def reboot_and_wait(server):
+    """Send the granted reboot and check the restarted Ariel prints its token again."""
+    assert send_command(server, "reboot") == [
+        "rebooting", "exit 0"], "a granted reboot must answer rebooting"
+    line = server.next_line()
+    assert line == "token %s" % server.token, (
+        "the restarted Ariel must print its token line, got %r" % line)
+
+
+def scenario_reboot_asks_the_owner(server):
+    """reboot answers 75 with a challenge that names the boot list it will run."""
+    listing = autoload_listing(server)
+    _approval, challenge = gate_request(server, "reboot")
+    action = reboot_action(challenge)
+    assert "command=reboot" in action and (
+        "sha256=%s" % autoload_list_sha(listing)) in action, (
+        "the challenge must name reboot and the boot list, got %r" % action)
+
+
+def scenario_reboot_granted_restarts_and_runs_autoload(server):
+    """A granted reboot restarts Ariel: payloads stay listed and autoload runs."""
+    install_payload(server, "reboot_keep",
+                    compile_payload(HANG_SOURCE, "reboot_keep"))
+    install_payload(server, "reboot_boot",
+                    compile_payload(HANG_SOURCE, "reboot_boot"))
+    approval = autoload_approve(server, "add", "reboot_boot")
+    assert autoload_apply(server, "add", "reboot_boot", approval) == [
+        "autoload add reboot_boot", "exit 0"], "the boot entry must be added"
+
+    reboot_approve(server)
+    reboot_and_wait(server)
+
+    assert listed(payload_list(server), "reboot_keep") is not None, (
+        "payload list must show the installed payloads after a reboot")
+    listing = autoload_listing(server)
+    assert listing[0] == "autoload ariel" and (
+        "autoload reboot_boot" in listing), (
+        "autoload show must list the boot entry after a reboot, got %r"
+        % listing)
+    assert running_flag(server, "reboot_boot") == "yes", (
+        "the autoload entry must run after a reboot")
+    assert running_flag(server, "reboot_keep") == "no", (
+        "a payload that is not autoloaded must not run after a reboot")
+
+
+def scenario_crash_restart_runs_no_autoload(server):
+    """A crash restart runs no autoload entry and restarts nothing that was running."""
+    install_payload(server, "crashboot",
+                    compile_payload(HANG_SOURCE, "crashboot"))
+    install_payload(server, "crashrun", compile_payload(HANG_SOURCE, "crashrun"))
+    approval = autoload_approve(server, "add", "crashboot")
+    assert autoload_apply(server, "add", "crashboot", approval) == [
+        "autoload add crashboot", "exit 0"], "the boot entry must be added"
+    reboot_approve(server)
+    reboot_and_wait(server)
+    assert running_flag(server, "crashboot") == "yes", (
+        "the autoload entry must run after a reboot")
+
+    assert background_run(server, "crashrun")[-1] == "exit 0"
+    assert running_flag(server, "crashrun") == "yes"
+
+    server.proc.kill()
+    server.proc.wait()
+    server.restart()
+
+    assert running_flag(server, "crashboot") == "no", (
+        "a crash restart must not run the autoload entries")
+    assert running_flag(server, "crashrun") == "no", (
+        "a payload running before a crash must not be restarted")
+    assert "autoload crashboot" in autoload_listing(server), (
+        "the autoload list must survive a crash")
+
+
+def scenario_reboot_stale_list_answers_78(server):
+    """A reboot granted for a boot list that has since changed is stale and does not restart."""
+    install_payload(server, "stale_add", b"stale add build\n")
+    approval, challenge = gate_request(server, "reboot")
+
+    other = autoload_approve(server, "add", "stale_add")
+    assert autoload_apply(server, "add", "stale_add", other) == [
+        "autoload add stale_add", "exit 0"], "the other edit must apply"
+
+    sign_and_grant(server, approval, challenge)
+    assert send_command(server, "reboot") == [
+        "approval_stale", "exit 78"], (
+        "a reboot granted for an older boot list is stale")
+    server.assert_no_line()
+    assert "reboot.stale" in [
+        line.split()[1] for line in audit_tail(server)
+        if line.split()[3:4] == [approval]], (
+        "the stale reboot must be audited")
+
+
+def scenario_reboot_denied_answers_77(server):
+    """A reboot the owner denies answers approval_denied and does not restart."""
+    approval, _challenge = gate_request(server, "reboot")
+    server.controller("deny %s" % approval, "denied %s" % approval)
+    assert send_command(server, "reboot") == [
+        "approval_denied", "exit 77"], "a denied reboot must answer approval_denied"
+    server.assert_no_line()
+    assert "reboot.denied" in [
+        line.split()[1] for line in audit_tail(server)
+        if line.split()[3:4] == [approval]], (
+        "the denied reboot must be audited")
+
+
+def scenario_reboot_signature_wrong_action(server):
+    """A signature for another action than reboot is refused and does not restart.
+
+    The owner then denies the open request, so the next reboot asks afresh.
+    """
+    approval, challenge = gate_request(server, "reboot")
+    signature = sign_challenge(
+        server, retarget(challenge, "command=reboot", "command=kill"))
+    assert grant(server, approval, signature) == [
+        "signature_action_mismatch", "exit 85"], (
+        "a signature for another command must be refused")
+    server.assert_no_line()
+    server.controller("deny %s" % approval, "denied %s" % approval)
+    assert send_command(server, "reboot") == [
+        "approval_denied", "exit 77"], "the denied request must answer 77"
+
+
+def scenario_reboot_is_audited(server):
+    """A granted reboot is audited as its request, its grant and its done line."""
+    approval = reboot_approve(server)
+    reboot_and_wait(server)
+    ours = [line.split()[1] for line in audit_tail(server)
+            if line.split()[3:4] == [approval]]
+    assert ours == ["reboot.request", "grant", "reboot.done"], (
+        "the reboot must be audited in order, got %r" % ours)
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -6319,6 +6478,22 @@ SCENARIOS = [
      "runs nothing", scenario_tar_protected_after_grant_answers_87, CLOCK_REASON),
     ("tar listings, runs and refusals reach audit tail under their paths",
      scenario_tar_actions_are_audited, CLOCK_REASON),
+    ("reboot answers 75 with a challenge that names the boot list",
+     scenario_reboot_asks_the_owner, None),
+    ("a granted reboot restarts Ariel, keeps payloads listed and runs the "
+     "autoload entries", scenario_reboot_granted_restarts_and_runs_autoload,
+     HOST_RESTART_REASON),
+    ("a crash restart runs no autoload entry and restarts nothing that was "
+     "running", scenario_crash_restart_runs_no_autoload, HOST_RESTART_REASON),
+    ("a reboot granted for a changed boot list answers approval_stale, 78, "
+     "and does not restart", scenario_reboot_stale_list_answers_78, None),
+    ("a reboot the owner denies answers approval_denied, 77, and does not "
+     "restart", scenario_reboot_denied_answers_77, None),
+    ("a signature for another action than reboot answers "
+     "signature_action_mismatch and does not restart",
+     scenario_reboot_signature_wrong_action, None),
+    ("a granted reboot is audited as its request, grant and done",
+     scenario_reboot_is_audited, HOST_RESTART_REASON),
 ]
 
 

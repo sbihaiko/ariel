@@ -24,7 +24,9 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "agent_server.h"
+#include "autoload.h"
 #include "platform.h"
+#include "runs.h"
 #include "store.h"
 #include "token.h"
 
@@ -45,12 +47,43 @@ ensure_dir(const char *path) {
 }
 
 
+/**
+ * Start every autoload entry but Ariel's own, as a boot does. A payload that
+ * fails to start is skipped; the list itself is never changed.
+ **/
+static void
+run_autoload(platform_t *platform) {
+  char text[AUTOLOAD_TEXT_MAX];
+  store_object_t object;
+  pid_t pid;
+  char *p;
+  char *nl;
+
+  if(store_autoload_show(text, sizeof(text)) < 0) {
+    fprintf(stderr, "cannot read the autoload list\n");
+    return;
+  }
+
+  for(p=text; (nl=strchr(p, '\n')); p=nl + 1) {
+    *nl = '\0';
+    if(strcmp(p, "ariel") && store_run_load(p, &object) == STORE_RUN_OK) {
+      runs_start(platform, p, object.sha256, object.bytes, object.size, &pid);
+      store_object_free(&object);
+    }
+    *nl = '\n';
+  }
+}
+
+
 static int
-parse_args(int argc, char **argv, uint16_t *port, const char **root) {
+parse_args(int argc, char **argv, uint16_t *port, const char **root,
+           int *boot) {
   int i;
 
   for(i=1; i<argc; i++) {
-    if(!strcmp(argv[i], "--port") && i + 1 < argc) {
+    if(!strcmp(argv[i], "--boot")) {
+      *boot = 1;
+    } else if(!strcmp(argv[i], "--port") && i + 1 < argc) {
       char *end = NULL;
       long value = strtol(argv[++i], &end, 10);
 
@@ -62,7 +95,8 @@ parse_args(int argc, char **argv, uint16_t *port, const char **root) {
     } else if(!strcmp(argv[i], "--root") && i + 1 < argc) {
       *root = argv[++i];
     } else {
-      fprintf(stderr, "usage: %s [--port PORT] [--root DIR]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--port PORT] [--root DIR] [--boot]\n",
+              argv[0]);
       return -1;
     }
   }
@@ -82,6 +116,7 @@ main(int argc, char **argv) {
   platform_t *platform;
   const char *root;
   uint16_t port = DEFAULT_PORT;
+  int boot = 0;
   int srvfd;
 
   root = getenv("ARIEL_HOST_ROOT");
@@ -89,7 +124,7 @@ main(int argc, char **argv) {
     root = ".";
   }
 
-  if(parse_args(argc, argv, &port, &root)) {
+  if(parse_args(argc, argv, &port, &root, &boot)) {
     return EXIT_FAILURE;
   }
 
@@ -113,7 +148,7 @@ main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  platform = platform_host(run_dir, root);
+  platform = platform_host(run_dir, root, argv[0]);
 
   // The store needs the platform's clock: approvals and staging objects
   // expire against it.
@@ -130,6 +165,12 @@ main(int argc, char **argv) {
 
   if((srvfd=platform->listen(platform, port)) < 0) {
     return EXIT_FAILURE;
+  }
+
+  // A reboot starts the autoload entries before the agent answers. A crash
+  // restart is started without --boot and runs none of them.
+  if(boot) {
+    run_autoload(platform);
   }
 
   // The harness reads the token from standard output. Print it only once

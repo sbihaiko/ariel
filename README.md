@@ -137,7 +137,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `date` | | ❌ | S3 |
 | `dmesg` | | ❌ only through klogsrv | S3 |
 | `mount`, `umount`, `chroot`, `mknod` | | ✅ | S2: gated |
-| `reboot` | | ❌ | S2, gated |
+| `reboot` | | ⚠️ host build simulates it; PS5 path not yet run on a console | S2: gated |
 | `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
 | `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional |

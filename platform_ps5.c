@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 #include <ps5/klog.h>
 #include <ps5/kernel.h>
 #include <sys/mount.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -520,6 +521,14 @@ ps5_process_signal(platform_t *self, int32_t pid, int sig) {
 
 
 static int
+ps5_reboot(platform_t *self) {
+  (void)self;
+
+  return reboot(RB_AUTOBOOT) ? -1 : 0;
+}
+
+
+static int
 ps5_system_act(platform_t *self, const approval_facts_t *facts) {
   int rc;
 
@@ -562,6 +571,7 @@ static platform_t ps5_platform = {
   .process_start = ps5_process_start,
   .process_critical = ps5_process_critical,
   .process_signal = ps5_process_signal,
+  .reboot = ps5_reboot,
   .system_act = ps5_system_act,
 };
 

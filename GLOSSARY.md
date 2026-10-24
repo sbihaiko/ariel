@@ -62,3 +62,5 @@ Domain terms of Ariel. Use these words, in this sense, in code, tests, issues an
 - **Console suite**: the scenarios that need no test clock, run against a real console when `PS5_HOST` is set.
 - **Platform port**: the one interface between Ariel's logic and the OS, with a PS5 and a host implementation.
 - **Test clock**: the host-only clock the suite moves instead of waiting.
+- **Simulated reboot**: on the host build, a granted `reboot` that restarts Ariel's process and runs the autoload entries, as a boot does.
+- **Crash restart**: a restart of Ariel that runs no autoload entry and restarts no payload.

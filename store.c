@@ -1115,6 +1115,10 @@ store_approval_request(const approval_facts_t *facts,
              facts->target, facts->signal, facts->start);
   } else if(slot->gated && !strcmp(facts->command, "run")) {
     run_prompt(prompt, promptlen, facts);
+  } else if(slot->gated && !strcmp(facts->command, "reboot")) {
+    snprintf(prompt, promptlen,
+             "reboot the console with boot list sha256 %s will run",
+             facts->sha256);
   } else if(slot->gated) {
     snprintf(prompt, promptlen, "%s %s%s%s will run", facts->command,
              facts->target, facts->dest[0] ? " " : "", facts->dest);

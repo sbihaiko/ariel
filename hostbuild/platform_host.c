@@ -85,6 +85,9 @@ set_cloexec(int fd) {
 }
 
 
+static uint16_t listen_port;
+static char exe_path[PATH_MAX];
+
 static int
 host_listen(platform_t *self, uint16_t port) {
   struct sockaddr_in addr;
@@ -92,6 +95,7 @@ host_listen(platform_t *self, uint16_t port) {
   int srvfd;
 
   (void)self;
+  listen_port = port;
 
   if((srvfd=socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     perror("socket");
@@ -769,6 +773,22 @@ host_fault(platform_t *self, const char *step) {
 }
 
 
+// execv keeps the pid, stdout and stdin, so the harness reads the new token
+// line from the same pipe; the listener and the agent's sockets are CLOEXEC.
+static int
+host_reboot(platform_t *self) {
+  char port[8];
+  char *args[] = {exe_path, "--port", port, "--root", NULL, "--boot", NULL};
+
+  snprintf(port, sizeof(port), "%u", (unsigned)listen_port);
+  args[4] = (char *)self->fs_root;
+  fflush(stdout);
+  fflush(stderr);
+  execv(exe_path, args);
+  return -1;
+}
+
+
 static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
@@ -792,6 +812,7 @@ static platform_t host_platform = {
   .process_start = host_process_start,
   .process_critical = host_process_critical,
   .process_signal = host_process_signal,
+  .reboot = host_reboot,
 };
 
 
@@ -824,11 +845,12 @@ open_max(void) {
 
 
 platform_t *
-platform_host(const char *dir, const char *fs_root) {
+platform_host(const char *dir, const char *fs_root, const char *exe) {
   long limit;
 
   testclock_init();
   snprintf(run_dir, sizeof(run_dir), "%s", dir);
+  snprintf(exe_path, sizeof(exe_path), "%s", exe);
   host_platform.fs_root = fs_root;
 
   // Read the descriptor bound here, before any connection thread exists:
