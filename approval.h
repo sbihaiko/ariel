@@ -37,6 +37,9 @@ along with this program; see the file COPYING. If not, see
 #define APPROVAL_ACTION_MAX  512
 #define APPROVAL_CONSOLE_MAX 64
 
+/** The longest command name an action can carry. **/
+#define APPROVAL_COMMAND_MAX 32
+
 /** The longest message a signature covers. **/
 #define APPROVAL_MESSAGE_MAX 1024
 

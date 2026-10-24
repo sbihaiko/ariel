@@ -515,6 +515,7 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
   // The approval is bound to an immutable copy of these facts: what the
   // owner sees and approves, and nothing the client can change later.
   memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "payload.commit");
   snprintf(facts.name, sizeof(facts.name), "%s", name);
   facts.size = size;
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", computed);
@@ -673,6 +674,9 @@ approval_status(int fd, const char *id) {
     break;
   case STORE_STATUS_CONSUMED:
     word = "consumed";
+    break;
+  case STORE_STATUS_DENIED:
+    word = "denied";
     break;
   default:
     reply(fd, unknown_approval);

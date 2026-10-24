@@ -35,6 +35,7 @@ along with this program; see the file COPYING. If not, see
  * holds, so a caller cannot change the facts after the request.
  **/
 typedef struct {
+  char command[APPROVAL_COMMAND_MAX + 1];
   char name[PAYLOAD_NAME_MAX + 1];
   uint64_t size;
   char sha256[65];

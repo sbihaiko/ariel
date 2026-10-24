@@ -100,6 +100,7 @@ struct approval {
   int approved;
   int expired;
   int consumed;
+  int released;
   char id[APPROVAL_ID_MAX];
   uint64_t created_ms;
   approval_challenge_t challenge;
@@ -217,10 +218,11 @@ staged_find(const char *id) {
 
 
 /**
- * An empty slot, or NULL when every slot holds an approval that is still
- * pending or granted. A consumed, expired or denied approval has already
- * answered, so the oldest of those gives its slot up when a new approval
- * needs one; until then it stays, so a question can still name it.
+ * An empty slot, or NULL when no row can give one up. A row gives its slot
+ * up only once it has answered (consumed, expired or denied) and no staged
+ * object still names it: the staging TTL outlives the approval's window, so
+ * a row a staged object names must stay for that commit to find. The oldest
+ * such row goes first.
  **/
 static struct approval *
 approval_slot(void) {
@@ -236,8 +238,8 @@ approval_slot(void) {
   for(i=0; i<APPROVALS_MAX; i++) {
     struct approval *slot = &approvals[i];
 
-    if(!slot->consumed && !slot->expired &&
-       !(slot->decided && !slot->approved)) {
+    if(!slot->released || !(slot->consumed || slot->expired ||
+                            (slot->decided && !slot->approved))) {
       continue;
     }
     if(!oldest || slot->created_ms < oldest->created_ms) {
@@ -482,6 +484,24 @@ staging_unlink(const char *staging_id) {
 
 
 /**
+ * Drop a staged entry: its file, its slot and its bytes. The approval it
+ * names is released, so its row may be given up once it has answered. The
+ * caller holds the lock.
+ **/
+static void
+staged_leave(struct staged *entry) {
+  struct approval *request = approval_find(entry->approval_id);
+
+  staging_unlink(entry->id);
+  staged_release(entry);
+
+  if(request) {
+    request->released = 1;
+  }
+}
+
+
+/**
  * Drop what the clock has outlived. An approval stops counting as pending
  * after its expiry, but its row stays, so a later question can still say
  * expired and a late commit can say approval_expired. A staging object
@@ -506,8 +526,7 @@ expire_locked(uint64_t now) {
       continue;
     }
 
-    staging_unlink(entry->id);
-    staged_release(entry);
+    staged_leave(entry);
   }
 }
 
@@ -791,7 +810,7 @@ store_approval_request(const approval_facts_t *facts,
   // The approval is of this one action. What the owner reads and signs is
   // the output of the one encoder, and a build whose facts it refuses can
   // not be approved at all.
-  action.command = "payload.commit";
+  action.command = facts->command;
   action.target = facts->name;
   action.sha256 = facts->sha256;
   action.options = options;
@@ -881,7 +900,8 @@ store_approval_grant(const char *id, const unsigned char *signature,
   expire_locked(now_ms());
   request = approval_find(id);
 
-  if(!request) {
+  if(!request || request->consumed || request->released) {
+    // Spent, or its staged object has left: a signature for it answers stale.
     rc = STORE_GRANT_UNKNOWN;
   } else if(request->expired) {
     rc = STORE_GRANT_EXPIRED;
@@ -992,13 +1012,12 @@ store_approval_status(const char *id) {
     status = STORE_STATUS_CONSUMED;
   } else if(request->expired) {
     status = STORE_STATUS_EXPIRED;
-  } else if(request->decided && request->approved) {
-    status = STORE_STATUS_GRANTED;
   } else if(!request->decided) {
     status = STORE_STATUS_PENDING;
+  } else if(request->approved) {
+    status = STORE_STATUS_GRANTED;
   } else {
-    // A denial is neither of the four states a question reports.
-    status = STORE_STATUS_UNKNOWN;
+    status = STORE_STATUS_DENIED;
   }
 
   pthread_mutex_unlock(&lock);
@@ -1235,8 +1254,7 @@ object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
  **/
 static void
 staged_consume(struct staged *entry, struct approval *request) {
-  staging_unlink(entry->id);
-  staged_release(entry);
+  staged_leave(entry);
 
   if(request) {
     request->consumed = 1;
@@ -1405,8 +1423,7 @@ store_commit(const char *staging_id, store_install_t *install,
     // The owner's window closed: the object leaves the console and the
     // agent pushes the build again. The approval stays, so a later question
     // can still say it expired.
-    staging_unlink(entry->id);
-    staged_release(entry);
+    staged_leave(entry);
     outcome = STORE_APPROVAL_EXPIRED;
   } else if(!request->decided) {
     snprintf(approval_id, idlen, "%s", request->id);
@@ -1414,8 +1431,7 @@ store_commit(const char *staging_id, store_install_t *install,
   } else if(!request->approved) {
     // A denial is terminal: the bytes leave the console for good. The
     // approval stays, answered as decided and not approved.
-    staging_unlink(entry->id);
-    staged_release(entry);
+    staged_leave(entry);
     outcome = STORE_APPROVAL_DENIED;
   } else {
     outcome = staged_install(entry, request, install);

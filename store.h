@@ -111,18 +111,21 @@ int store_approval_request(const approval_facts_t *facts,
 /**
  * What one approval is, as a question sees it. Consumed wins over the
  * others: the action it allowed already ran. Expired wins over granted,
- * because a window that closed is what a later question reports.
+ * because a window that closed is what a later question reports. A denial
+ * is its own state, not an unknown approval.
  **/
 #define STORE_STATUS_UNKNOWN  0
 #define STORE_STATUS_PENDING  1
 #define STORE_STATUS_GRANTED  2
 #define STORE_STATUS_EXPIRED  3
 #define STORE_STATUS_CONSUMED 4
+#define STORE_STATUS_DENIED   5
 
 /**
  * Answer what state an approval is in. The record outlives the action it
- * allowed and the window it was good for, so a consumed or expired approval
- * still answers. Returns one of STORE_STATUS_*.
+ * allowed and the window it was good for, so a consumed, expired or denied
+ * approval still answers, until the table needs its row. Returns one of
+ * STORE_STATUS_*.
  **/
 int store_approval_status(const char *id);
 

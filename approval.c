@@ -23,7 +23,6 @@ along with this program; see the file COPYING. If not, see
 /** The tag that keeps an Ariel approval from verifying as anything else. **/
 #define MESSAGE_TAG "ARIEL-APPROVAL-V1"
 
-#define COMMAND_MAX  32
 #define SEGMENT_MAX  32
 #define TARGET_MAX   128
 #define KEY_MAX      16
@@ -97,7 +96,8 @@ in_set(const char *text, size_t min, size_t max, const char *extra,
 
 static int
 command_ok(const char *command) {
-  return in_set(command, 1, COMMAND_MAX, ".-", 1) && is_lower(command[0]);
+  return in_set(command, 1, APPROVAL_COMMAND_MAX, ".-", 1) &&
+         is_lower(command[0]);
 }
 
 

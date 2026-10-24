@@ -1438,6 +1438,10 @@ def scenario_commit_denied(server):
     assert commit(server, staging) == ["approval_stale", "exit 78"], (
         "a consumed denial must not be replayed"
     )
+    late = signature_of(sign_challenge(server, challenge_of(lines)))
+    assert grant(server, approval, late) == ["approval_stale", "exit 78"], (
+        "a signature for a denied approval whose object left must be stale"
+    )
 
 
 def scenario_commit_before_decision(server):
@@ -2186,6 +2190,8 @@ def scenario_signature_expired(server):
     assert grant(server, approval, signature) == ["approval_expired",
                                                   "exit 88"]
     assert commit(server, staging) == ["approval_expired", "exit 88"]
+    assert grant(server, approval, signature) == ["approval_stale", "exit 78"], (
+        "once the expired object has left, its signature must be stale")
     assert run_payload(server, "latesign") == ["unknown_payload", "exit 1"]
 
 
