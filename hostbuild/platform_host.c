@@ -43,7 +43,10 @@ along with this program; see the file COPYING. If not, see
 #endif
 #include <unistd.h>
 
+#include "approval.h"
 #include "platform.h"
+#include "sha256.h"
+#include "store.h"
 #include "testclock.h"
 #include "vcontroller.h"
 
@@ -177,12 +180,114 @@ host_wake_idle(platform_t *self, int wake, int fd, int idle) {
 }
 
 
+/** The identity every signature checked by the host build names. **/
+#define HOST_CONSOLE_ID "ariel-host-test"
+
+/**
+ * The key the host build pins: the test key, whose private half is in the
+ * repository. approval_pin refuses it in the PS5 build.
+ **/
+static unsigned char host_pubkey[APPROVAL_PUBKEY_LEN];
+
+/**
+ * A scenario can make the nonce stream repeat from a restart by giving
+ * ARIEL_HOST_NONCE_SEED. Without it the nonces come from the system's
+ * random source. The seed exists only in the host build.
+ **/
+static char nonce_seed[64];
+static int nonce_seeded;
+static uint64_t nonce_counter;
+static pthread_mutex_t random_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
 static int
-host_approval_request(platform_t *self, const approval_facts_t *facts,
-                      char *id, size_t idlen) {
+host_random(platform_t *self, unsigned char *buf, size_t len) {
+  size_t total = 0;
+  int fd;
+
   (void)self;
 
-  return vcontroller_request(facts, id, idlen);
+  if(nonce_seeded) {
+    // sha256(seed || counter), one block at a time.
+    while(total < len) {
+      unsigned char digest[SHA256_DIGEST_LEN];
+      unsigned char counter[8];
+      sha256_t hash;
+      size_t n = len - total < sizeof(digest) ? len - total : sizeof(digest);
+      uint64_t value;
+      int i;
+
+      pthread_mutex_lock(&random_lock);
+      value = nonce_counter++;
+      pthread_mutex_unlock(&random_lock);
+
+      for(i=0; i<8; i++) {
+        counter[i] = (unsigned char)(value >> (8 * i));
+      }
+
+      sha256_init(&hash);
+      sha256_update(&hash, nonce_seed, strlen(nonce_seed));
+      sha256_update(&hash, counter, sizeof(counter));
+      sha256_final(&hash, digest);
+      memcpy(buf + total, digest, n);
+      total += n;
+    }
+    return 0;
+  }
+
+  if((fd=open("/dev/urandom", O_RDONLY | O_CLOEXEC)) < 0) {
+    return -1;
+  }
+
+  while(total < len) {
+    ssize_t n = read(fd, buf + total, len - total);
+
+    if(n < 0 && errno == EINTR) {
+      continue;
+    }
+    if(n <= 0) {
+      close(fd);
+      return -1;
+    }
+    total += (size_t)n;
+  }
+
+  return close(fd);
+}
+
+
+static const char *
+host_console_id(platform_t *self) {
+  (void)self;
+
+  return HOST_CONSOLE_ID;
+}
+
+
+static int
+host_verify(platform_t *self, const unsigned char *msg, size_t len,
+            const unsigned char *signature) {
+  (void)self;
+
+  return approval_verify(host_pubkey, msg, len, signature);
+}
+
+
+static int
+host_approval_request(platform_t *self, const approval_facts_t *facts,
+                      approval_challenge_t *challenge) {
+  (void)self;
+
+  return vcontroller_request(facts, challenge);
+}
+
+
+static int
+host_approval_grant(platform_t *self, const char *id,
+                    const unsigned char *signature) {
+  (void)self;
+
+  return store_approval_grant(id, signature);
 }
 
 
@@ -431,7 +536,11 @@ static platform_t host_platform = {
   .wake_new = host_wake_new,
   .wake_close = host_wake_close,
   .wake_idle = host_wake_idle,
+  .random = host_random,
+  .console_id = host_console_id,
+  .verify = host_verify,
   .approval_request = host_approval_request,
+  .approval_grant = host_approval_grant,
   .spawn = host_spawn,
 };
 
@@ -479,6 +588,22 @@ platform_host(const char *dir) {
   limit = open_max();
   if(limit > 2) {
     fd_limit = limit;
+  }
+
+  if(approval_pubkey_parse(APPROVAL_TEST_PUBKEY_HEX, host_pubkey) ||
+     approval_pin(host_pubkey)) {
+    fprintf(stderr, "the host build cannot pin its test key\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Read the seed here too, before any connection thread exists.
+  {
+    const char *seed = getenv("ARIEL_HOST_NONCE_SEED");
+
+    if(seed && *seed && strlen(seed) < sizeof(nonce_seed)) {
+      snprintf(nonce_seed, sizeof(nonce_seed), "%s", seed);
+      nonce_seeded = 1;
+    }
   }
 
   vcontroller_start();

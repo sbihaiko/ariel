@@ -101,11 +101,11 @@ Hello, world from Ariel!
 
 ## After Stage 1
 
-Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-hello-world-end-to-end) lands: no FTP server and no `chmod`. Stage 1 adds an agent port (2324) next to the telnet shell: raw TCP, one command per connection after `auth`, and every reply ends with an `exit <status>` line. Every connection starts with `auth <token>`, using the access token Ariel shows on the console at first start. Status `75` means the owner must approve the action with the key they hold.
+Steps 4 and 5 will shrink to Ariel alone once [Stage 1](../README.md#stage-1-hello-world-end-to-end) lands: no FTP server and no `chmod`. Stage 1 adds an agent port (2324) next to the telnet shell: raw TCP, one command per connection after `auth`, and every reply ends with an `exit <status>` line. Every connection starts with `auth <token>`, using the access token Ariel shows on the console at first start. Status `75` means the owner must approve the action with a signature from the key they hold.
 
 The headless acceptance test runs this section: it substitutes the token, the host and the staging ID, signs with a test key where the owner would, and treats IDs and hashes as placeholders. It builds `helloworld.elf` for the machine under test: with the host compiler for the headless suite, with `prospero-clang` (step 3) for a console.
 
-With `PS5_HOST` set, the same harness runs against a real console instead of starting the host build: it reads the access token from you, builds `helloworld.elf` with `prospero-clang`, prints the notification the console shows at every approval step and waits for you to decide on the controller. It runs only the scenarios that need no test clock, and names the ones it skips. That run is manual: it is not part of CI and not part of the Stage 1 gate.
+With `PS5_HOST` set, the same harness runs against a real console instead of starting the host build: it reads the access token from you, builds `helloworld.elf` with `prospero-clang`, prints the notification the console shows and the challenge at every approval step, and waits for you to sign it offline with `ariel-sign` and paste the signature. It runs only the scenarios that need no test clock, and names the ones it skips. That run is manual: it is not part of CI and not part of the Stage 1 gate.
 
 ```console
 $ export ARIEL_TOKEN=<token shown on the console>
@@ -119,10 +119,18 @@ $ { printf 'auth %s\npayload push helloworld %s %s\n' "$ARIEL_TOKEN" \
       "$(openssl dgst -sha256 -r helloworld.elf | cut -d' ' -f1)"; cat helloworld.elf; } | nc $PS5_HOST 2324
 staged s-4f2a9c
 approval_required a-81d0e3
+challenge a-81d0e3 ps5-living-room 0c5e9d1a7b3f4e62a8d0c1b9e7f35a24 120000 240000 6172...
 exit 75
 ```
 
-Approve it. The signer names the payload, its hash, and that it will be executed. Then commit the staged upload:
+Approve it. The `challenge` line is what the owner signs: the approval ID, the console, a nonce, the window in milliseconds, and the canonical action as hex. Copy it to the owner's signer, which prints the action exactly as it signs it, shows it for confirmation and prints a signature (`ariel-sign sign <keyfile>`). The signer is offline and holds the owner's key; the agent only relays the signature it prints. Submit it on the agent port:
+
+```text
+auth <token>
+approval grant a-81d0e3 <signature>
+```
+
+Ariel answers `approval_granted a-81d0e3` and `exit 0`. A signature that does not verify, was made for another action or console, arrives after the window or a second time is refused, and nothing runs. Then commit the staged upload:
 
 ```console
 $ printf 'auth %s\npayload commit s-4f2a9c\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324

@@ -24,6 +24,7 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 
 #include "agent.h"
+#include "approval.h"
 #include "sha256.h"
 #include "store.h"
 #include "token.h"
@@ -69,6 +70,18 @@ static const char approval_denied[] =
 static const char approval_expired[] =
   "approval_expired\n"
   "exit 77\n";
+static const char signature_invalid[] =
+  "signature_invalid\n"
+  "exit 79\n";
+static const char signature_malformed[] =
+  "signature_malformed\n"
+  "exit 83\n";
+static const char approval_replayed[] =
+  "approval_replayed\n"
+  "exit 84\n";
+static const char grant_failed[] =
+  "grant_failed\n"
+  "exit 1\n";
 static const char approval_stale[] =
   "approval_stale\n"
   "exit 78\n";
@@ -471,22 +484,32 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
   facts.run = 1;
 
   {
-    char approval_id[APPROVAL_ID_MAX];
-    char answer[256];
+    approval_challenge_t challenge;
+    char action_hex[2 * APPROVAL_ACTION_MAX + 1];
+    char nonce_hex[2 * APPROVAL_NONCE_LEN + 1];
+    char answer[2048];
     int len;
 
-    if(platform->approval_request(platform, &facts,
-                                  approval_id, sizeof(approval_id))) {
+    if(platform->approval_request(platform, &facts, &challenge)) {
       store_staging_discard(staging_id);
       reply(fd, approval_busy);
       return;
     }
 
-    store_stage(staging_id, &facts, approval_id);
+    store_stage(staging_id, &facts, challenge.id);
+
+    // The challenge is everything the owner's signer needs: the canonical
+    // action as bytes in hex, so no byte of it can be reshaped on the way.
+    approval_hex_encode((const unsigned char*)challenge.action,
+                        challenge.action_len, action_hex);
+    approval_hex_encode(challenge.nonce, sizeof(challenge.nonce), nonce_hex);
 
     len = snprintf(answer, sizeof(answer),
-                   "staged %s\napproval_required %s\nexit 75\n",
-                   staging_id, approval_id);
+                   "staged %s\napproval_required %s\n"
+                   "challenge %s %s %s %llu %llu %s\nexit 75\n",
+                   staging_id, challenge.id, challenge.id, challenge.console,
+                   nonce_hex, (unsigned long long)challenge.issued_ms,
+                   (unsigned long long)challenge.expires_ms, action_hex);
     write_all(fd, answer, (size_t)len);
   }
 }
@@ -521,6 +544,51 @@ payload_commit(int fd, const char *staging_id) {
     return;
   case STORE_APPROVAL_EXPIRED:
     reply(fd, approval_expired);
+    return;
+  default:
+    // An approval that is gone is not an approval: push the build again.
+    reply(fd, approval_stale);
+    return;
+  }
+}
+
+
+/**
+ * approval grant <id> <signature>: the owner's signature arrives here, on
+ * whatever connection carries it, the agent's included. It cannot be
+ * forged there, so relaying it is fine: the platform verifies it behind
+ * the port, and nothing else makes an approval approved.
+ **/
+static void
+approval_grant(agent_t *agent, int fd, const char *id,
+               const char *signature_text) {
+  unsigned char signature[APPROVAL_SIG_LEN];
+  char answer[APPROVAL_ID_MAX + 32];
+
+  if(approval_hex_decode(signature_text, signature, sizeof(signature))) {
+    reply(fd, signature_malformed);
+    return;
+  }
+
+  switch(agent->platform->approval_grant(agent->platform, id, signature)) {
+  case STORE_GRANT_OK:
+    snprintf(answer, sizeof(answer), "approval_granted %s\nexit 0\n", id);
+    reply(fd, answer);
+    return;
+  case STORE_GRANT_EXPIRED:
+    reply(fd, approval_expired);
+    return;
+  case STORE_GRANT_INVALID:
+    reply(fd, signature_invalid);
+    return;
+  case STORE_GRANT_REPLAYED:
+    reply(fd, approval_replayed);
+    return;
+  case STORE_GRANT_DENIED:
+    reply(fd, approval_denied);
+    return;
+  case STORE_GRANT_ERROR:
+    reply(fd, grant_failed);
     return;
   default:
     // An approval that is gone is not an approval: push the build again.
@@ -591,6 +659,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "commit")) {
     payload_commit(fd, argv[2]);
+    return;
+  }
+
+  if(argc == 4 && !strcmp(argv[0], "approval") && !strcmp(argv[1], "grant")) {
+    approval_grant(agent, fd, argv[2], argv[3]);
     return;
   }
 

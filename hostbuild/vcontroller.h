@@ -22,9 +22,11 @@ along with this program; see the file COPYING. If not, see
 #include "platform.h"
 
 /**
- * The virtual controller is the host build's approval source. It stands in
- * for the owner's controller and exists only in the host build, so no
- * payload sent to a console can approve itself.
+ * The virtual controller is a host-only test aid. It cannot approve: an
+ * approval is the owner's signature, and the host build checks it against
+ * the test key as a console checks the owner's. What it does is show the
+ * prompt and let a test refuse one, which no signature can do. It exists
+ * only in the host build, so no payload sent to a console can use it.
  *
  * It reports each pending prompt on standard output, one line:
  *
@@ -32,7 +34,6 @@ along with this program; see the file COPYING. If not, see
  *
  * It is driven by lines on standard input:
  *
- *   approve <approval-id>   answers approved <approval-id>
  *   deny <approval-id>      answers denied <approval-id>
  *
  * The pending approvals themselves live in the store, next to the staged
@@ -43,6 +44,7 @@ along with this program; see the file COPYING. If not, see
 void vcontroller_start(void);
 
 /** Request approval; see platform_t.approval_request. **/
-int vcontroller_request(const approval_facts_t *facts, char *id, size_t idlen);
+int vcontroller_request(const approval_facts_t *facts,
+                        approval_challenge_t *challenge);
 
 #endif /* ARIEL_VCONTROLLER_H */

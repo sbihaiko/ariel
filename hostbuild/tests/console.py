@@ -5,7 +5,7 @@ With PS5_HOST set, the harness runs against a real console instead of starting
 the host build of Ariel: Ariel already runs there, so nothing is started. The
 harness reads the access token from the owner, builds `helloworld.elf` with
 `prospero-clang`, and at every approval step prints the notification the
-console shows and waits for the owner to decide on the controller.
+console shows and waits for the owner to sign the challenge.
 
 The console has no test clock, so every scenario that moves time is skipped
 and named. Console mode is a manual run: it is not part of CI and not part of
@@ -38,8 +38,6 @@ APPROVAL_LINE = re.compile(r"^approval_required (a-[0-9a-f]+)$")
 # no clock.
 NOTIFICATION_SPACING = 10.0
 BUSY_RETRIES = 6
-DECISION_SPACING = 1.0
-DECISION_RETRIES = 180
 
 
 class ConsoleError(AssertionError):
@@ -96,76 +94,15 @@ class Operator:
             self.say("That is not a token: 32 lowercase hex digits.")
         raise ConsoleError("no valid token was read from the owner")
 
-    def approve(self, name, notification):
-        self._decide("Approve", name, notification)
-
-    def deny(self, name, notification):
-        self._decide("Deny", name, notification)
-
-    def _decide(self, verb, name, notification):
-        """Show the console's notification, then wait for the decision."""
+    def sign(self, name, notification, challenge):
+        """Show the console's notification and the challenge, read the signature."""
         self.say("")
-        self.say("%s %s on the console with the controller." % (verb, name))
+        self.say("Sign %s offline with your key: ariel-sign sign <keyfile>" % name)
         self.say("The console notification should read:")
         self.say("  " + notification)
-        self._read("Press Enter when the console has recorded your decision: ")
-
-
-def read_reply(sock):
-    """Read a reply until the server closes the connection."""
-    data = b""
-    try:
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-    except ConnectionResetError:
-        pass
-    return data.decode("ascii", "replace")
-
-
-def reply_lines(reply):
-    return [line for line in reply.replace("\r\n", "\n").split("\n")
-            if line != ""]
-
-
-class Link:
-    """One connection to a console's agent port."""
-
-    def __init__(self, host, port, token, connect=None, timeout=10.0):
-        self.host = host
-        self.port = port
-        self.token = token
-        self._connect = connect if connect is not None else socket.create_connection
-        self.timeout = timeout
-
-    def open(self, timeout=None):
-        return self._connect((self.host, self.port),
-                             timeout=timeout or self.timeout)
-
-    def exchange(self, command, body=None, token=None):
-        """Send one command after auth and return the lines the console replied."""
-        sock = self.open()
-        try:
-            sock.sendall(("auth %s\n%s\n" % (token or self.token, command))
-                         .encode("ascii"))
-            if body is not None:
-                sock.sendall(body)
-            sock.shutdown(socket.SHUT_WR)
-            return reply_lines(read_reply(sock))
-        finally:
-            sock.close()
-
-    def raw(self, payload):
-        """Send bytes with no auth line and return whatever came back."""
-        sock = self.open()
-        try:
-            sock.sendall(payload)
-            sock.shutdown(socket.SHUT_WR)
-            return read_reply(sock)
-        finally:
-            sock.close()
+        self.say("The challenge to sign:")
+        self.say("  " + challenge)
+        return (self._read("Signature (128 hex digits): ") or "").strip()
 
 
 class Session:
@@ -194,45 +131,32 @@ class Session:
     def commit(self, staging_id):
         return self.link.exchange("payload commit %s" % staging_id)
 
-    def commit_after_decision(self, staging_id):
-        """Retry a commit while the console still has no decision.
+    def grant(self, approval_id, signature):
+        return self.link.exchange("approval grant %s %s"
+                                  % (approval_id, signature))
 
-        The owner is asked to press Enter only once the controller has
-        recorded the decision, so the first commit usually succeeds; a
-        commit before the decision answers `approval_required` and is simply
-        retried, as an agent does until `approval status` exists.
-        """
-        lines = self.commit(staging_id)
-        for attempt in range(DECISION_RETRIES):
-            if lines[-1:] != ["exit 75"]:
-                return lines
-            if attempt == 0:
-                self.operator.say(
-                    "The console has not recorded the decision yet; retrying.")
-            self._sleep(DECISION_SPACING)
-            lines = self.commit(staging_id)
-        return lines
-
-    def request(self, approval_id, name, size, digest, deny=False):
-        """Show the notification the console displays and wait for the decision."""
+    def request(self, approval_id, challenge, name, size, digest):
+        """Show what the console displays, read the owner's signature, grant it."""
         notification = ("prompt %s payload %s (%d bytes, sha256 %s) will run"
                         % (approval_id, name, size, digest))
-        if deny:
-            self.operator.deny(name, notification)
-        else:
-            self.operator.approve(name, notification)
+        signature = self.operator.sign(name, notification, challenge)
+        lines = self.grant(approval_id, signature)
+        assert lines == ["approval_granted %s" % approval_id, "exit 0"], (
+            "the owner's signature must decide the approval, got %r" % lines)
         return notification
 
 
 def assert_staged(lines, name, data):
     """Check a matching push's reply and return its staging and approval IDs."""
-    assert len(lines) == 3, "expected three reply lines, got %r" % lines
+    assert len(lines) == 4, "expected four reply lines, got %r" % lines
     staged = STAGED_LINE.match(lines[0])
     assert staged, "expected 'staged <id>', got %r" % lines[0]
     approval = APPROVAL_LINE.match(lines[1])
     assert approval, "expected 'approval_required <id>', got %r" % lines[1]
-    assert lines[2] == "exit 75", "expected exit 75, got %r" % lines[2]
-    return staged.group(1), approval.group(1)
+    assert lines[2].startswith("challenge %s " % approval.group(1)), (
+        "expected the challenge for the approval, got %r" % lines[2])
+    assert lines[3] == "exit 75", "expected exit 75, got %r" % lines[3]
+    return staged.group(1), approval.group(1), lines[2]
 
 
 def assert_mismatch(lines):
@@ -297,30 +221,32 @@ def check_approval_then_install(session, context):
     data = b"console approval\n"
     digest = hashlib.sha256(data).hexdigest()
     lines = session.push("consoleapprove", data)
-    staging, approval = assert_staged(lines, "consoleapprove", data)
+    staging, approval, challenge = assert_staged(lines, "consoleapprove", data)
 
     lines = session.commit(staging)
     assert lines == ["approval_required %s" % approval, "exit 75"], (
         "a commit before the decision must ask again with the same approval "
         "ID, got %r" % lines)
 
-    session.request(approval, "consoleapprove", len(data), digest)
-    lines = session.commit_after_decision(staging)
+    session.request(approval, challenge, "consoleapprove", len(data), digest)
+    lines = session.commit(staging)
     assert lines == ["installed consoleapprove %s" % digest, "exit 0"], (
         "an approved commit must install the build, got %r" % lines)
 
 
-def check_denied_commit(session, context):
+def check_unsigned_commit(session, context):
     del context
-    data = b"console denial\n"
-    digest = hashlib.sha256(data).hexdigest()
-    lines = session.push("consoledenied", data)
-    staging, approval = assert_staged(lines, "consoledenied", data)
+    data = b"console unsigned\n"
+    lines = session.push("consoleunsigned", data)
+    staging, approval, _challenge = assert_staged(lines, "consoleunsigned", data)
 
-    session.request(approval, "consoledenied", len(data), digest, deny=True)
-    lines = session.commit_after_decision(staging)
-    assert lines == ["approval_denied", "exit 77"], (
-        "a denied commit must answer approval_denied and exit 77, got %r"
+    lines = session.grant(approval, "0" * 128)
+    assert lines == ["signature_invalid", "exit 79"], (
+        "a signature that is not the owner's must answer signature_invalid "
+        "and exit 79, got %r" % lines)
+    lines = session.commit(staging)
+    assert lines == ["approval_required %s" % approval, "exit 75"], (
+        "a commit without the owner's signature must stay refused, got %r"
         % lines)
 
 
@@ -333,8 +259,8 @@ def check_quick_start(session, context):
         token=context.token,
         next_line=None,
         approve=None,
-        notify=lambda approval_id, name, size, digest: session.request(
-            approval_id, name, size, digest),
+        notify=lambda approval_id, challenge, name, size, digest: (
+            session.request(approval_id, challenge, name, size, digest)),
         cc=context.cc,
     )
 
@@ -364,10 +290,10 @@ CHECKS = [
      check_hash_mismatch),
     ("a name outside the grammar answers bad_name", check_bad_name),
     ("a commit before the decision answers approval_required and exit 75, the "
-     "owner approves on the console, and the commit installs the build",
+     "owner signs the challenge, and the commit installs the build",
      check_approval_then_install),
-    ("a deny step asks the owner to deny on the controller, and the commit "
-     "answers approval_denied and exit 77", check_denied_commit),
+    ("a grant that is not the owner's signature answers signature_invalid "
+     "and the commit stays refused", check_unsigned_commit),
     ("the quick start's 'After Stage 1' section passes against the console",
      check_quick_start),
 ]

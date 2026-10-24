@@ -31,7 +31,7 @@ The first milestone is the smallest loop that proves the whole idea: an agent bu
 - **Approval by the owner's key.** A push answers `approval_required <id>`; the owner signs the exact action with a key the agent does not hold. Approving a pushed build also approves running that exact build.
 - **`payload commit <staging-id>`** moves an approved upload into Ariel's store. The bytes are sent once.
 - **`payload run --wait <name>`** runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports the payload's exit status on a `status <n>` line, apart from the protocol's `exit` line.
-- **A host build** of Ariel behind a platform port, with a virtual controller for tests. It never ships in the PS5 build.
+- **A host build** of Ariel behind a platform port, with a test clock and a virtual controller that can only deny, for tests. It never ships in the PS5 build.
 
 The agent port offers only these commands. Everything else, including every command that changes the system, stays on the telnet shell exactly as in upstream shsrv until Stage 2. Until then, approval protects only the agent port: anyone who can reach the telnet shell can still do what they can today.
 

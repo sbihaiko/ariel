@@ -22,8 +22,8 @@ along with this program; see the file COPYING. If not, see
 /**
  * The PS5 implementation of the platform port. token is the agent access
  * token, shown with every approval prompt so the owner always has it at
- * hand. Approvals come from the controller the owner holds. Starts the
- * controller reader and returns the port; the platform lives as long as
+ * hand. Approvals come from the owner's signature, checked against the key
+ * pinned at build time. Returns the port; the platform lives as long as
  * the process.
  **/
 platform_t *platform_ps5(const char *token);

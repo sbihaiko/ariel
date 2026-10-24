@@ -64,8 +64,9 @@ def free_port():
 class Server:
     """The host build of Ariel, started against a temporary root."""
 
-    def __init__(self, binary):
+    def __init__(self, binary, env=None):
         self.binary = binary
+        self.env = env
         self.root = tempfile.mkdtemp(prefix="ariel-host-")
         self.token = None
         self._start()
@@ -74,6 +75,7 @@ class Server:
         self.port = free_port()
         self.proc = subprocess.Popen(
             [self.binary, "--port", str(self.port), "--root", self.root],
+            env=dict(os.environ, **(self.env or {})),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -284,12 +286,14 @@ def assert_mismatch(server, lines):
 
 def assert_staged(server, lines, name, data, timeout=5.0):
     """Check a matching push's reply and the prompt the owner would see."""
-    assert len(lines) == 3, "expected three reply lines, got %r" % lines
+    assert len(lines) == 4, "expected four reply lines, got %r" % lines
     staged = STAGED_LINE.match(lines[0])
     assert staged, "expected 'staged <id>', got %r" % lines[0]
     approval = APPROVAL_LINE.match(lines[1])
     assert approval, "expected 'approval_required <id>', got %r" % lines[1]
-    assert lines[2] == "exit 75", "expected exit 75, got %r" % lines[2]
+    assert CHALLENGE_LINE.match(lines[2]), (
+        "expected a challenge line, got %r" % lines[2])
+    assert lines[3] == "exit 75", "expected exit 75, got %r" % lines[3]
 
     prompt = server.next_line(timeout=timeout)
     match = PROMPT_LINE.match(prompt or "")
@@ -311,12 +315,13 @@ def assert_staged(server, lines, name, data, timeout=5.0):
 
 
 def decide_push(server, name, data, decision, fragments=None):
-    """Push, check the prompt, then answer it on the virtual controller."""
+    """Push, check the prompt, then sign it, or deny it on the controller."""
     lines = push(server, name, data, fragments=fragments)
     _, approval = assert_staged(server, lines, name, data)
-    answer = "approved" if decision == "approve" else "denied"
-    server.controller("%s %s" % (decision, approval),
-                      "%s %s" % (answer, approval))
+    if decision == "approve":
+        sign_and_grant(server, approval, challenge_of(lines))
+    else:
+        server.controller("deny %s" % approval, "denied %s" % approval)
     return approval
 
 
@@ -644,8 +649,8 @@ def run_quick_start(server, doc):
         port=server.port,
         token=server.token,
         next_line=lambda timeout=5.0: server.next_line(timeout=timeout),
-        approve=lambda approval_id: server.controller(
-            "approve %s" % approval_id, "approved %s" % approval_id),
+        approve=lambda approval_id, challenge: sign_and_grant(
+            server, approval_id, challenge),
     )
 
 
@@ -864,6 +869,14 @@ CLOCK_SCENARIOS = {
     "an unanswered staging object disappears after 15 min",
     "a second notification within 10 s answers approval_busy with no prompt",
     "the test clock is host-only and cannot enter the PS5 build",
+    "a valid signature decides the approval and the gated command runs once",
+    "a forged signature answers signature_invalid and runs nothing",
+    "a signature for a different command, target or hash is refused",
+    "a signature for another console is refused",
+    "a signature after the challenge expired is refused",
+    "a malformed signature answers signature_malformed and exit 83",
+    "the same signature twice is refused the second time",
+    "a consumed nonce is refused after Ariel restarts",
 }
 
 
@@ -933,13 +946,13 @@ class ScriptedLink:
         return list(self.replies.pop(0))
 
 
-def scripted_session(replies):
+def scripted_session(replies, answers=()):
     """One console session over a scripted link and a scripted operator."""
     import console
 
     events = []
     shown = []
-    answers = []
+    answers = list(answers)
 
     def read(prompt=""):
         events.append(("wait", prompt))
@@ -954,60 +967,52 @@ def scripted_session(replies):
 
 
 def scenario_console_approval_prompts(server):
-    """An approval step shows the console notification and waits; deny says deny."""
+    """An approval step shows the notification and the challenge, and submits the signature."""
     del server  # the fake link stands in for the agent port
 
-    data = b"deny me"
+    data = b"sign me"
     digest = hashlib.sha256(data).hexdigest()
+    signature = "ab" * 64
+    challenge = "challenge a-4567ef90 ariel-test %s 10000 70000 %s" % (
+        "00" * 16, "61".encode().hex())
     console, link, operator, session, events, shown = scripted_session([
-        ["staged s-0123abcd", "approval_required a-4567ef90", "exit 75"],
-        ["approval_denied", "exit 77"],
-    ])
+        ["staged s-0123abcd", "approval_required a-4567ef90", challenge,
+         "exit 75"],
+        ["approval_granted a-4567ef90", "exit 0"],
+        ["installed consolesigned %s" % digest, "exit 0"],
+    ], answers=[signature])
 
-    lines = session.push("consoledenied", data)
-    staging, approval = console.assert_staged(lines, "consoledenied", data)
-    session.request(approval, "consoledenied", len(data), digest, deny=True)
-    assert session.commit(staging) == ["approval_denied", "exit 77"], (
-        "the scripted commit must answer the denial")
+    lines = session.push("consolesigned", data)
+    staging, approval, shown_challenge = console.assert_staged(
+        lines, "consolesigned", data)
+    assert shown_challenge == challenge, "the challenge line must come through"
+    session.request(approval, challenge, "consolesigned", len(data), digest)
+    assert session.commit(staging) == [
+        "installed consolesigned %s" % digest, "exit 0"], (
+        "the scripted commit must answer the installation")
 
-    notification = ("prompt %s payload consoledenied (%d bytes, sha256 %s) "
+    notification = ("prompt %s payload consolesigned (%d bytes, sha256 %s) "
                     "will run" % (approval, len(data), digest))
-    assert "Deny consoledenied on the console with the controller." in shown, (
-        "a deny step must ask the owner to deny, showed %r" % shown)
     assert "The console notification should read:" in shown, (
         "the owner must be told what the console shows, showed %r" % shown)
     assert "  " + notification in shown, (
         "the step must print the notification the console shows, showed %r"
         % shown)
+    assert "  " + challenge in shown, (
+        "the step must print the challenge to sign, showed %r" % shown)
 
-    sends = [i for i, event in enumerate(events) if event[0] == "send"]
+    sends = [event[1] for event in events if event[0] == "send"]
     waits = [i for i, event in enumerate(events) if event[0] == "wait"]
-    assert sends and waits, "the step must send and wait, events %r" % events
-    assert sends[0] < waits[0] < sends[1], (
-        "the prompt must follow the push and the commit must follow the "
-        "owner's decision, events %r" % events)
-    assert "payload push consoledenied" in events[sends[0]][1], (
+    assert len(sends) == 3 and waits, "events %r" % events
+    assert "payload push consolesigned" in sends[0], (
         "the first exchange must be the push")
-    assert "payload commit" in events[sends[1]][1], (
-        "the commit must wait for the decision")
-
-    # An approve step asks the owner to approve, with the same notification.
-    console, link, operator, session, events, shown = scripted_session([
-        ["staged s-0123abcd", "approval_required a-4567ef90", "exit 75"],
-        ["installed consoleapproved %s" % digest, "exit 0"],
-    ])
-    lines = session.push("consoleapproved", data)
-    staging, approval = console.assert_staged(lines, "consoleapproved", data)
-    session.request(approval, "consoleapproved", len(data), digest)
-    assert session.commit(staging) == [
-        "installed consoleapproved %s" % digest, "exit 0"], (
-        "the scripted commit must answer the installation")
-    assert "Approve consoleapproved on the console with the controller." in shown, (
-        "an approval step must ask the owner to approve, showed %r" % shown)
-    assert "  prompt %s payload consoleapproved" % approval in " ".join(shown), (
-        "the approval step must print the console notification, showed %r"
-        % shown)
-
+    assert sends[1] == "approval grant %s %s" % (approval, signature), (
+        "the owner's signature must be submitted as a grant, sent %r"
+        % sends[1])
+    assert events.index(("send", sends[0])) < waits[0] < events.index(
+        ("send", sends[1])), (
+        "the grant must follow the owner's signature, events %r" % events)
+    assert "payload commit" in sends[2], "the commit must follow the grant"
 
 def scenario_test_clock_host_only(server):
     """The test clock cannot be compiled into the PS5 build."""
@@ -1103,7 +1108,7 @@ def approve_push(server, name, data):
     """Push, check the prompt, approve it and return the staging ID."""
     lines = push(server, name, data)
     staging, approval = assert_staged(server, lines, name, data)
-    server.controller("approve %s" % approval, "approved %s" % approval)
+    sign_and_grant(server, approval, challenge_of(lines))
     return staging, approval
 
 
@@ -1592,6 +1597,367 @@ def scenario_denied_push(server):
 # Every scenario the headless suite runs, in report order. The third field
 # says whether the scenario's behavior is defined by moving the host test
 # clock; console mode reads this table to skip and name exactly those.
+
+# ---------------------------------------------------------------------------
+# The owner's signature is the approval source (ADR-0006).
+# ---------------------------------------------------------------------------
+
+CHALLENGE_LINE = re.compile(
+    r"^challenge (a-[0-9a-f]+) (\S+) ([0-9a-f]{32}) (\d+) (\d+) ([0-9a-f]+)$")
+
+
+def tests_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def repo_dir():
+    return os.path.dirname(os.path.dirname(tests_dir()))
+
+
+def signer_path(server):
+    return os.path.join(os.path.dirname(os.path.abspath(server.binary)),
+                        "ariel-sign")
+
+
+def test_key():
+    return os.path.join(tests_dir(), "testkey")
+
+
+def push_for_challenge(server, name, data):
+    """Push, check the prompt and return (staging, approval, challenge).
+
+    The console shows one notification every 10 s and holds three pending
+    approvals, so the test clock moves past an approval's whole life first;
+    what an earlier scenario left pending has then expired.
+    """
+    server.advance(120000)
+    lines = push(server, name, data)
+    assert len(lines) == 4, "expected four reply lines, got %r" % lines
+    staged = STAGED_LINE.match(lines[0])
+    approval = APPROVAL_LINE.match(lines[1])
+    challenge = CHALLENGE_LINE.match(lines[2])
+    assert staged and approval and challenge, (
+        "expected staged, approval_required and challenge lines, got %r"
+        % lines)
+    assert lines[3] == "exit 75", "expected exit 75, got %r" % lines[3]
+    assert challenge.group(1) == approval.group(1), (
+        "the challenge names %s but the reply names %s"
+        % (challenge.group(1), approval.group(1)))
+    prompt = server.next_line()
+    match = PROMPT_LINE.match(prompt or "")
+    assert match and match.group(1) == approval.group(1), (
+        "expected the approval prompt, got %r" % prompt)
+    return staged.group(1), approval.group(1), lines[2]
+
+
+def challenge_action(challenge):
+    return bytes.fromhex(CHALLENGE_LINE.match(challenge).group(6)).decode(
+        "ascii")
+
+
+def sign_challenge(server, challenge, key=None):
+    """Sign a challenge line with the offline signer; return the hex."""
+    done = subprocess.run(
+        [signer_path(server), "sign", key or test_key(), "--yes"],
+        input=challenge + "\n", capture_output=True, text=True)
+    assert done.returncode == 0, "the signer failed: %r" % done.stderr
+    # The signer shows exactly the action it signs, never a summary.
+    assert challenge_action(challenge) in done.stderr, (
+        "the signer must print the canonical action as signed, got %r"
+        % done.stderr)
+    signature = done.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{128}", signature), (
+        "expected a 128-digit signature, got %r" % signature)
+    return signature
+
+
+def retarget(challenge, old, new):
+    """The challenge with old replaced by new in its canonical action."""
+    parts = challenge.split(" ")
+    action = bytes.fromhex(parts[6]).decode("ascii")
+    assert old in action, "%r is not in the action" % old
+    parts[6] = action.replace(old, new).encode("ascii").hex()
+    return " ".join(parts)
+
+
+def challenge_of(lines):
+    """The challenge line of a push's reply."""
+    found = [line for line in lines if CHALLENGE_LINE.match(line)]
+    assert len(found) == 1, "expected one challenge line, got %r" % lines
+    return found[0]
+
+
+def sign_and_grant(server, approval, challenge):
+    """The owner's step: sign the challenge, submit it, expect the grant."""
+    signature = sign_challenge(server, challenge)
+    assert grant(server, approval, signature) == [
+        "approval_granted %s" % approval, "exit 0"], (
+        "the owner's signature must grant the approval")
+
+
+def grant(server, approval, signature):
+    sock = server.connect()
+    try:
+        sock.sendall(("auth %s\napproval grant %s %s\n"
+                      % (server.token, approval, signature)).encode("ascii"))
+        return reply_lines(read_reply(sock))
+    finally:
+        sock.close()
+
+
+def assert_not_run(server, name, staging, approval):
+    """Nothing ran and nothing installed: the commit still waits."""
+    assert commit(server, staging) == ["approval_required %s" % approval,
+                                       "exit 75"], (
+        "a refused grant must leave the approval pending")
+    assert run_payload(server, name) == ["unknown_payload", "exit 1"], (
+        "a refused grant must install nothing")
+
+
+def scenario_signature_loop(server):
+    """Request, sign with the test key, grant, commit and run once."""
+    data = compile_payload('#include <stdio.h>\nint main(void) {'
+                           ' puts("signed and run"); return 0; }\n',
+                           "signedloop")
+    staging, approval, challenge = push_for_challenge(
+        server, "signedloop", data)
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\n"), action
+    assert "target=signedloop\n" in action, action
+    assert "sha256=%s\n" % hashlib.sha256(data).hexdigest() in action, action
+    parts = CHALLENGE_LINE.match(challenge).groups()
+    assert int(parts[4]) - int(parts[3]) == 120000, (
+        "the challenge expires after the approval expiry: %r" % (parts,))
+    assert commit(server, staging) == ["approval_required %s" % approval,
+                                       "exit 75"], (
+        "a commit before the grant must wait")
+    signature = sign_challenge(server, challenge)
+    assert grant(server, approval, signature) == [
+        "approval_granted %s" % approval, "exit 0"]
+    digest = hashlib.sha256(data).hexdigest()
+    assert commit(server, staging) == ["installed signedloop %s" % digest,
+                                       "exit 0"]
+    assert run_payload(server, "signedloop") == [
+        "signed and run", "status 0", "exit 0"]
+
+
+def scenario_signature_forged(server):
+    data = b"forged approval"
+    staging, approval, challenge = push_for_challenge(
+        server, "forged", data)
+    with tempfile.TemporaryDirectory() as scratch:
+        key = os.path.join(scratch, "other.key")
+        made = subprocess.run([signer_path(server), "keygen", key],
+                              capture_output=True, text=True)
+        assert made.returncode == 0, made.stderr
+        forged = sign_challenge(server, challenge, key=key)
+    assert grant(server, approval, forged) == ["signature_invalid",
+                                               "exit 79"]
+    assert_not_run(server, "forged", staging, approval)
+
+
+def scenario_signature_wrong_action(server):
+    data = b"a swapped action"
+    staging, approval, challenge = push_for_challenge(
+        server, "swapped", data)
+    digest = hashlib.sha256(data).hexdigest()
+    swaps = [
+        ("command", "command=payload.commit", "command=payload.delete"),
+        ("target", "target=swapped", "target=other"),
+        ("hash", "sha256=%s" % digest, "sha256=%s" % ("0" * 64)),
+    ]
+    for what, old, new in swaps:
+        signature = sign_challenge(server, retarget(challenge, old, new))
+        assert grant(server, approval, signature) == [
+            "signature_invalid", "exit 79"], (
+            "a signature for a different %s must be refused" % what)
+    assert_not_run(server, "swapped", staging, approval)
+
+
+def scenario_signature_wrong_console(server):
+    data = b"another console"
+    staging, approval, challenge = push_for_challenge(
+        server, "elsewhere", data)
+    console = CHALLENGE_LINE.match(challenge).group(2)
+    parts = challenge.split(" ")
+    parts[2] = console + "-two"
+    signature = sign_challenge(server, " ".join(parts))
+    assert grant(server, approval, signature) == ["signature_invalid",
+                                                  "exit 79"]
+    assert_not_run(server, "elsewhere", staging, approval)
+
+
+def scenario_signature_expired(server):
+    data = b"too late to sign"
+    staging, approval, challenge = push_for_challenge(
+        server, "latesign", data)
+    signature = sign_challenge(server, challenge)
+    server.advance(120000)
+    assert grant(server, approval, signature) == ["approval_expired",
+                                                  "exit 77"]
+    assert commit(server, staging) == ["approval_expired", "exit 77"]
+    assert run_payload(server, "latesign") == ["unknown_payload", "exit 1"]
+
+
+def scenario_signature_malformed(server):
+    data = b"a bad signature"
+    staging, approval, challenge = push_for_challenge(
+        server, "malformed", data)
+    good = sign_challenge(server, challenge)
+    for what, signature in [("not hex", "zz" * 64),
+                            ("too short", good[:-2]),
+                            ("too long", good + "00"),
+                            ("odd length", good[:-1]),
+                            ("uppercase", good.upper()),
+                            ("empty", "-")]:
+        assert grant(server, approval, signature) == [
+            "signature_malformed", "exit 83"], (
+            "a signature that is %s must be malformed" % what)
+    assert_not_run(server, "malformed", staging, approval)
+
+
+def scenario_signature_twice(server):
+    data = b"one signature, two tries"
+    staging, approval, challenge = push_for_challenge(
+        server, "twice", data)
+    signature = sign_challenge(server, challenge)
+    assert grant(server, approval, signature) == [
+        "approval_granted %s" % approval, "exit 0"]
+    assert grant(server, approval, signature) == ["approval_replayed",
+                                                  "exit 84"]
+    digest = hashlib.sha256(data).hexdigest()
+    assert commit(server, staging) == ["installed twice %s" % digest,
+                                       "exit 0"]
+    # The approval is spent: the same signature gets nothing now.
+    assert grant(server, approval, signature) == ["approval_stale",
+                                                  "exit 78"]
+
+
+def scenario_signature_replay_after_restart(server):
+    """A nonce consumed before a restart is not good again after it."""
+    del server  # this scenario needs a nonce stream it can repeat
+    replay = Server(SERVER_BINARY, env={"ARIEL_HOST_NONCE_SEED": "replay"})
+    try:
+        data = b"replayed after a restart"
+        staging, approval, challenge = push_for_challenge(
+            replay, "replayed", data)
+        signature = sign_challenge(replay, challenge)
+        assert grant(replay, approval, signature) == [
+            "approval_granted %s" % approval, "exit 0"]
+        replay.restart()
+        staging, again, repeated = push_for_challenge(
+            replay, "replayed", data)
+        # Without the persisted nonces the seeded stream would offer the
+        # same challenge again; a different one shows the file was loaded.
+        assert repeated != challenge, (
+            "a nonce consumed before the restart must not be offered again")
+        assert CHALLENGE_LINE.match(repeated).group(3) != (
+            CHALLENGE_LINE.match(challenge).group(3)), (
+            "the new challenge must carry a fresh nonce")
+        assert grant(replay, again, signature) == ["signature_invalid",
+                                                   "exit 79"], (
+            "a signature given before the restart must not decide a new "
+            "approval")
+        assert_not_run(replay, "replayed", staging, again)
+    finally:
+        replay.stop()
+
+
+def compile_probe(scratch, name, defines):
+    root = repo_dir()
+    probe = os.path.join(scratch, name)
+    done = subprocess.run(
+        [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Werror", "-w",
+         "-I" + root, "-o", probe,
+         os.path.join(tests_dir(), "pin_probe.c"),
+         os.path.join(root, "approval.c"), os.path.join(root, "tweetnacl.c")]
+        + defines, capture_output=True, text=True)
+    assert done.returncode == 0, "the probe must build: %r" % done.stderr
+    return probe
+
+
+def scenario_ps5_rejects_test_key(server):
+    """The PS5 configuration of the verifier refuses the host test key."""
+    pub = subprocess.run([signer_path(server), "pubkey", test_key()],
+                         capture_output=True, text=True)
+    assert pub.returncode == 0, pub.stderr
+    test_pub = pub.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as scratch:
+        other = os.path.join(scratch, "other.key")
+        made = subprocess.run([signer_path(server), "keygen", other],
+                              capture_output=True, text=True)
+        assert made.returncode == 0, made.stderr
+        other_pub = made.stdout.strip()
+
+        # The PS5 build never defines ARIEL_HOST_BUILD.
+        ps5 = compile_probe(scratch, "probe-ps5", [])
+        host = compile_probe(scratch, "probe-host",
+                            ["-DARIEL_HOST_BUILD=1"])
+        refused = subprocess.run([ps5, test_pub], capture_output=True,
+                                 text=True)
+        assert refused.returncode == 1, (
+            "the PS5 configuration must refuse the test key: %r"
+            % refused.stdout)
+        accepted = subprocess.run([ps5, other_pub], capture_output=True,
+                                  text=True)
+        assert accepted.returncode == 0, (
+            "the PS5 configuration must accept an owner's key: %r"
+            % accepted.stdout)
+        allowed = subprocess.run([host, test_pub], capture_output=True,
+                                 text=True)
+        assert allowed.returncode == 0, (
+            "the host configuration pins the test key: %r" % allowed.stdout)
+
+    # The PS5 makefile refuses to build with the test key pinned.
+    build = subprocess.run(
+        ["make", "-n", "-f", os.path.join(repo_dir(), "Makefile"),
+         "PS5_PAYLOAD_SDK=/nonexistent", "ARIEL_PUBKEY=" + test_pub],
+        capture_output=True, text=True)
+    assert build.returncode != 0 and "test key" in build.stderr, (
+        "the PS5 makefile must refuse the test key, got %r" % build.stderr)
+
+    # And the PS5 platform goes through that one check.
+    with open(os.path.join(repo_dir(), "platform_ps5.c")) as handle:
+        assert "approval_pin(" in handle.read(), (
+            "platform_ps5.c must pin its key through approval_pin")
+
+
+def scenario_ps5_has_no_pad(server):
+    """Nothing in the PS5 approval path touches the controller."""
+    del server
+    with open(os.path.join(repo_dir(), "platform_ps5.c")) as handle:
+        source = handle.read()
+    for name in ("scePadInit", "scePadOpen", "scePadReadState",
+                 "pad_reader", "pthread_create"):
+        assert name not in source, "platform_ps5.c still uses %s" % name
+
+
+def scenario_one_canonical_function(server):
+    """Exactly one source file builds the canonical action text."""
+    del server
+    owners = []
+    for name in sorted(os.listdir(repo_dir())):
+        if name.endswith(".c"):
+            with open(os.path.join(repo_dir(), name)) as handle:
+                if "ariel-action-v1" in handle.read():
+                    owners.append(name)
+    assert owners == ["approval.c"], (
+        "only approval.c may spell the canonical action: %r" % owners)
+
+
+def scenario_canonical_encoder(server):
+    """The encoder's own tests pass (ambiguous inputs are refused)."""
+    del server
+    binary = os.path.join(os.path.dirname(os.path.abspath(SERVER_BINARY)),
+                          "canonical_test")
+    done = subprocess.run([binary], capture_output=True, text=True)
+    assert done.returncode == 0, "canonical_test failed:\n" + done.stdout
+
+
+SERVER_BINARY = "./ariel-host"
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, False),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -1683,10 +2049,34 @@ SCENARIOS = [
      scenario_test_clock_host_only, True),
     ("the virtual controller is host-only and cannot enter the PS5 build",
      scenario_vcontroller_host_only, False),
+    ("a valid signature decides the approval and the gated command runs "
+     "once", scenario_signature_loop, True),
+    ("a forged signature answers signature_invalid and runs nothing",
+     scenario_signature_forged, True),
+    ("a signature for a different command, target or hash is refused",
+     scenario_signature_wrong_action, True),
+    ("a signature for another console is refused",
+     scenario_signature_wrong_console, True),
+    ("a signature after the challenge expired is refused",
+     scenario_signature_expired, True),
+    ("a malformed signature answers signature_malformed and exit 83",
+     scenario_signature_malformed, True),
+    ("the same signature twice is refused the second time",
+     scenario_signature_twice, True),
+    ("a consumed nonce is refused after Ariel restarts",
+     scenario_signature_replay_after_restart, True),
+    ("the PS5 build rejects the host test key",
+     scenario_ps5_rejects_test_key, False),
+    ("the PS5 platform no longer reads the controller",
+     scenario_ps5_has_no_pad, False),
+    ("one function builds the canonical action text",
+     scenario_one_canonical_function, False),
+    ("the canonical encoder refuses ambiguous inputs",
+     scenario_canonical_encoder, False),
     ("console mode with PS5_HOST set names the console scenarios and every "
      "scenario that needs the test clock", scenario_console_mode_plan, False),
     ("console mode prints what the owner should see on the console and "
-     "waits for the controller decision",
+     "waits for the owner's signature",
      scenario_console_approval_prompts, False),
 ]
 
@@ -1706,6 +2096,8 @@ def main():
         return 2
 
     binary = argv[0] if argv else "./ariel-host"
+    global SERVER_BINARY
+    SERVER_BINARY = binary
     server = Server(binary)
     try:
         for title, scenario, _clock in SCENARIOS:

@@ -25,7 +25,7 @@ along with this program; see the file COPYING. If not, see
  * Ariel's state: the staged objects, the pending approvals and the store
  * live in this process's memory under one mutex, so consuming an approval
  * is atomic and approvals die with the process. Nothing here survives a
- * restart except the store's files.
+ * restart except the store's files and the consumed nonces.
  **/
 
 /**
@@ -84,16 +84,37 @@ int store_staging_create(const char *staging_id, uint64_t size);
 void store_staging_discard(const char *staging_id);
 
 /**
- * Ask the owner to approve facts. On success write the approval ID into
- * id and the text the owner would see into prompt, and take one pending
+ * Ask the owner to approve facts. On success fill challenge with what the
+ * owner signs (the approval ID, the console identity, the canonical action
+ * bytes, a nonce from the platform's CSPRNG, issued-at and expiry) and
+ * write the text the owner would see into prompt, and take one pending
  * slot. Returns 0, or -1 when no approval can be requested now: at most
  * three approvals wait for a decision at once.
  **/
-int store_approval_request(const approval_facts_t *facts, char *id,
-                           size_t idlen, char *prompt, size_t promptlen);
+int store_approval_request(const approval_facts_t *facts,
+                           approval_challenge_t *challenge, char *prompt,
+                           size_t promptlen);
 
-/** Record the owner's decision. Returns 0, or -1 for an unknown ID. **/
-int store_approval_decide(const char *id, int approved);
+/** What one signature submitted for an approval ended in. **/
+#define STORE_GRANT_OK       0
+#define STORE_GRANT_UNKNOWN  1
+#define STORE_GRANT_EXPIRED  2
+#define STORE_GRANT_INVALID  3
+#define STORE_GRANT_REPLAYED 4
+#define STORE_GRANT_DENIED   5
+#define STORE_GRANT_ERROR    6
+
+/**
+ * Grant an approval with the owner's signature. The platform verifies it
+ * over the exact message of this approval's challenge. A valid signature
+ * records the nonce as consumed on disk, then marks the approval decided;
+ * the record is on disk before anything runs. This is the only way an
+ * approval becomes approved. signature is APPROVAL_SIG_LEN bytes.
+ **/
+int store_approval_grant(const char *id, const unsigned char *signature);
+
+/** Record a denial. Returns 0, or -1 for an unknown ID. **/
+int store_approval_deny(const char *id);
 
 /** Bind a staged object to the approval that names it. **/
 void store_stage(const char *staging_id, const approval_facts_t *facts,

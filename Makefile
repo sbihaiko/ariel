@@ -17,6 +17,17 @@
 PS5_HOST ?= ps5
 PS5_PORT ?= 9021
 
+# The owner's public key and this console's name, pinned into the build.
+# The host build's test key, whose private half is in the repository, must
+# never be pinned: this stops the build before the SDK is even read.
+ARIEL_PUBKEY ?=
+ARIEL_CONSOLE_ID ?= ps5
+ARIEL_TEST_PUBKEY := 299e18435f88e321120e74f83f1b3f3f530ca0d51cad39f3ed45b86b8007f922
+
+ifeq ($(ARIEL_PUBKEY),$(ARIEL_TEST_PUBKEY))
+    $(error ARIEL_PUBKEY is the host test key; the PS5 build never pins it)
+endif
+
 ifdef PS5_PAYLOAD_SDK
     include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 else
@@ -43,13 +54,20 @@ all: shsrv-ps5.elf sh.elf controller-spike.elf
 
 # The agent protocol, the store and the token are shared with the host
 # build, which compiles the same sources from hostbuild/.
-ARIEL_OBJS := agent.o agent_server.o store.o token.o
+ARIEL_OBJS := agent.o agent_server.o store.o token.o approval.o tweetnacl.o
 
 shsrv.o: sh.elf.inc
 
+# TweetNaCl is vendored as published, so it is not held to -Wall -Werror.
+tweetnacl.o: CFLAGS += -w
+
+# The key and the console name are pinned into the platform and nowhere else.
+platform_ps5.o: CFLAGS += -DARIEL_PUBKEY_HEX=\"$(ARIEL_PUBKEY)\" \
+                          -DARIEL_CONSOLE_ID=\"$(ARIEL_CONSOLE_ID)\"
+
 shsrv-ps5.elf: shsrv.o platform_ps5.o $(ARIEL_OBJS) elfldr.o pt.o notify.o \
                sha256.o
-	$(CC) -lkernel_sys -lScePad -lSceUserService -o $@ $^
+	$(CC) -lkernel_sys -o $@ $^
 
 sh.elf: sh.o builtin.o elfldr.o pt.o libtelnet.o
 	$(CC) -lkernel_sys -o $@ $^ \

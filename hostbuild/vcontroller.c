@@ -17,8 +17,8 @@ along with this program; see the file COPYING. If not, see
 /*
  * The virtual controller exists only in the host build. A PS5 build never
  * defines ARIEL_HOST_BUILD, so it cannot compile this file in: approvals
- * on a console come from the controller the owner holds, and nothing a
- * payload or the network can drive.
+ * on a console are the owner's signature, and nothing a payload or the
+ * network can drive.
  */
 #ifndef ARIEL_HOST_BUILD
 #error "the virtual controller is host-only"
@@ -60,13 +60,13 @@ print_line(const char *fmt, ...) {
 
 
 static void
-decide(const char *id, int approved) {
-  if(store_approval_decide(id, approved)) {
+deny(const char *id) {
+  if(store_approval_deny(id)) {
     print_line("unknown_approval %s", id);
     return;
   }
 
-  print_line("%s %s", approved ? "approved" : "denied", id);
+  print_line("denied %s", id);
 }
 
 
@@ -82,10 +82,8 @@ handle_line(char *line) {
   // The clock is the host build's other test aid: it shares this input.
   if(testclock_handle_line(line, clock_reply, sizeof(clock_reply))) {
     print_line("%s", clock_reply);
-  } else if(!strncmp(line, "approve ", 8)) {
-    decide(line + 8, 1);
   } else if(!strncmp(line, "deny ", 5)) {
-    decide(line + 5, 0);
+    deny(line + 5);
   } else if(len > 0) {
     print_line("unknown_command");
   }
@@ -127,16 +125,17 @@ vcontroller_start(void) {
 
 
 int
-vcontroller_request(const approval_facts_t *facts, char *id, size_t idlen) {
+vcontroller_request(const approval_facts_t *facts,
+                    approval_challenge_t *challenge) {
   char prompt[PROMPT_MAX];
 
-  if(store_approval_request(facts, id, idlen, prompt, sizeof(prompt))) {
+  if(store_approval_request(facts, challenge, prompt, sizeof(prompt))) {
     return -1;
   }
 
   // Show the prompt the owner would see, and only then let the decision
-  // arrive, so a test never approves an ID it could not have seen.
-  print_line("prompt %s %s", id, prompt);
+  // arrive, so a test never answers an ID it could not have seen.
+  print_line("prompt %s %s", challenge->id, prompt);
 
   return 0;
 }

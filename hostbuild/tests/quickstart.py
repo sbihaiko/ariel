@@ -33,6 +33,9 @@ APPROVAL_ID = re.compile(r"(?<![0-9a-z])a-[0-9a-f]+(?![0-9a-z])")
 ANY_ID = re.compile(r"(?<![0-9a-z])[sa]-[0-9a-f]+(?![0-9a-z])")
 HASH = re.compile(r"(?<![0-9a-f])[0-9a-f]{6,}(?:\.\.\.)?(?![0-9a-f])")
 APPROVAL_REPLY = re.compile(r"^approval_required (a-[0-9a-f]+)$")
+CHALLENGE = re.compile(
+    r"^challenge (a-[0-9a-f]+) (\S+) ([0-9a-f]{32}) (\d+) (\d+) ([0-9a-f]+)$")
+CHALLENGE_SHAPE = re.compile(r"^challenge \S+ \S+ \S+ \S+ \S+ \S+$")
 PROMPT = re.compile(
     r"^prompt (a-[0-9a-f]+) payload (\S+) \((\d+) bytes, sha256 ([0-9a-f]{64})\)"
     r" will run$"
@@ -132,6 +135,10 @@ def parse_command(block):
 
 def normalize(line):
     """Replace IDs and hashes with placeholders so only behavior is compared."""
+    # A challenge line is one record whose every field after the word is
+    # specific to the console and the moment: only its shape is compared.
+    if CHALLENGE_SHAPE.match(line):
+        return "challenge <id> <console> <nonce> <ms> <ms> <action>"
     line = ANY_ID.sub("<id>", line)
     return HASH.sub("<hash>", line)
 
@@ -328,10 +335,13 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
                     notify=None, cc=None):
     """Drive the section against one server. Raises FixtureError on a mismatch.
 
+    The owner's step is a signature over the push's challenge line: approve
+    receives the approval ID and that line, signs it and submits the grant.
     With `notify`, the owner approves on a real console instead: the callback
-    receives the approval ID, the payload name, its size and its hash, shows
-    the notification the console displays, and waits for the owner's decision.
-    The prompt is then not read from a server's standard output.
+    receives the approval ID, the challenge line, the payload name, its size
+    and its hash, shows the notification the console displays, and waits for
+    the owner's signature. The prompt is then not read from a server's
+    standard output.
     """
     with open(doc_path) as handle:
         text = handle.read()
@@ -353,6 +363,7 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
     shell = Shell(workdir, env)
     ids = {}
     pending = None
+    challenge = None
     push_name = None
     run_output = None
     approvals = 0
@@ -367,12 +378,15 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
                 if pending is None:
                     raise FixtureError(
                         "the section approves with nothing pending")
+                if challenge is None:
+                    raise FixtureError(
+                        "the push answered no challenge to sign")
 
                 if notify is not None:
                     if push_name is None:
                         raise FixtureError(
                             "the section approves before a push")
-                    notify(pending, push_name, len(elf), elf_hash)
+                    notify(pending, challenge, push_name, len(elf), elf_hash)
                 else:
                     line = next_line()
                     match = PROMPT.match(line or "")
@@ -394,9 +408,10 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
                     if match.group(4) != elf_hash:
                         raise FixtureError("the prompt shows the wrong hash")
 
-                    approve(pending)
+                    approve(pending, challenge)
                 approvals += 1
                 pending = None
+                challenge = None
                 continue
 
             command, expected = parse_command(body)
@@ -419,6 +434,8 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
                 match = APPROVAL_REPLY.match(line)
                 if match:
                     pending = match.group(1)
+                if CHALLENGE.match(line):
+                    challenge = line
 
             if "payload run --wait" in command:
                 runs += 1

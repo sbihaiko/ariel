@@ -8,3 +8,5 @@ hostbuild/ariel-host
 
 __pycache__/
 *.pyc
+hostbuild/ariel-sign
+hostbuild/canonical_test

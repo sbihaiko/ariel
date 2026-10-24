@@ -21,6 +21,8 @@ along with this program; see the file COPYING. If not, see
 #include <stdint.h>
 #include <time.h>
 
+#include "approval.h"
+
 /** The longest payload name the agent port accepts. **/
 #define PAYLOAD_NAME_MAX 32
 
@@ -39,6 +41,21 @@ typedef struct {
   char staging_id[APPROVAL_ID_MAX];
   int run;  /** The approved build will be executed. **/
 } approval_facts_t;
+
+/**
+ * What the owner signs to approve one action: the approval ID, the console
+ * it is for, the canonical action bytes, a nonce and the window it is good
+ * for. issued_ms and expires_ms are on the platform clock.
+ **/
+typedef struct {
+  char id[APPROVAL_ID_MAX];
+  char console[APPROVAL_CONSOLE_MAX + 1];
+  char action[APPROVAL_ACTION_MAX + 1];
+  size_t action_len;
+  unsigned char nonce[APPROVAL_NONCE_LEN];
+  uint64_t issued_ms;
+  uint64_t expires_ms;
+} approval_challenge_t;
 
 /**
  * The platform port: everything the agent port needs from the system it
@@ -79,12 +96,37 @@ struct platform {
   void (*wake_idle)(platform_t *self, int wake, int fd, int idle);
 
   /**
+   * Fill buf with len bytes from the system's cryptographic random source.
+   * Returns 0, or -1 when it cannot.
+   **/
+  int (*random)(platform_t *self, unsigned char *buf, size_t len);
+
+  /** The identity of this console: the text every signature names. **/
+  const char *(*console_id)(platform_t *self);
+
+  /**
+   * Verify an Ed25519 signature of APPROVAL_SIG_LEN bytes over msg against
+   * the public key pinned in this build. Returns 0 only for a valid one;
+   * with no key pinned, nothing is valid.
+   **/
+  int (*verify)(platform_t *self, const unsigned char *msg, size_t len,
+                const unsigned char *signature);
+
+  /**
    * Ask the owner to approve the facts' action and show the prompt on the
-   * console. On success write the approval ID into id and return 0; return
-   * -1 when no approval can be requested now.
+   * console. On success fill challenge, what the owner signs, and return
+   * 0; return -1 when no approval can be requested now.
    **/
   int (*approval_request)(platform_t *self, const approval_facts_t *facts,
-                          char *id, size_t idlen);
+                          approval_challenge_t *challenge);
+
+  /**
+   * Take the owner's signature for an approval: verify it behind the port
+   * and, when it holds, mark the approval decided with its nonce recorded
+   * as consumed. Returns one of the STORE_GRANT_* outcomes.
+   **/
+  int (*approval_grant)(platform_t *self, const char *id,
+                        const unsigned char *signature);
 
   /**
    * Run a payload in the foreground from its verified bytes: put the bytes

@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "approval.h"
 #include "sha256.h"
 #include "store.h"
 
@@ -77,6 +78,17 @@ struct staged {
   uint64_t created_ms;
 };
 
+/**
+ * At most this many consumed nonces are remembered, newest last. A nonce
+ * is only good for one approval window, and no approval outlives the
+ * process, so the oldest can go: what a restart must never allow is the
+ * nonce of a signature the owner gave a moment ago.
+ **/
+#define NONCES_MAX 1024
+
+/** The file in Ariel's directory that holds the consumed nonces. **/
+#define NONCES_FILE "nonces"
+
 /** One member of the approval table. **/
 struct approval {
   int used;
@@ -85,6 +97,7 @@ struct approval {
   int expired;
   char id[APPROVAL_ID_MAX];
   uint64_t created_ms;
+  approval_challenge_t challenge;
 };
 
 /**
@@ -96,6 +109,8 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct staged staged[STAGING_MAX];
 static struct approval approvals[APPROVALS_MAX];
+static unsigned char nonces[NONCES_MAX][APPROVAL_NONCE_LEN];
+static size_t nonce_count;
 static unsigned long staging_count;
 static unsigned long approval_count;
 static uint64_t staging_bytes;
@@ -111,6 +126,8 @@ static int dir_make(int dirfd, const char *name);
 static void staging_clear(void);
 static void expire_locked(uint64_t now);
 static void *expiry_run(void *arg);
+static int nonces_load(void);
+static int write_all(int fd, const char *buf, size_t len);
 
 
 /** Give a staging entry back: its slot and the bytes it reserved. The
@@ -274,12 +291,20 @@ store_init(const char *dir, platform_t *p) {
   last_notification_ms = 0;
   memset(staged, 0, sizeof(staged));
   memset(approvals, 0, sizeof(approvals));
+  nonce_count = 0;
   pthread_mutex_unlock(&lock);
 
   // No approval survives the process, so no staging object may either.
   staging_clear();
 
   if((state_fd=state_open()) < 0) {
+    return -1;
+  }
+
+  // A nonce consumed before this start must stay consumed: an unreadable
+  // record is an error, never an empty one.
+  if(nonces_load()) {
+    close(state_fd);
     return -1;
   }
 
@@ -549,11 +574,195 @@ store_staging_discard(const char *staging_id) {
 }
 
 
+/** Whether a nonce was consumed. The caller holds the lock. **/
+static int
+nonce_consumed(const unsigned char *nonce) {
+  size_t i;
+
+  for(i=0; i<nonce_count; i++) {
+    if(!memcmp(nonces[i], nonce, APPROVAL_NONCE_LEN)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+/**
+ * Write the nonces to the state directory through a temporary file and an
+ * atomic rename, so a reader never sees a partial record and a crash keeps
+ * the old one whole. The file is on disk when this returns 0.
+ **/
+static int
+nonces_write(const unsigned char list[][APPROVAL_NONCE_LEN], size_t count) {
+  char tmp[64];
+  char line[2 * APPROVAL_NONCE_LEN + 2];
+  size_t i;
+  int dirfd;
+  int fd;
+
+  if((dirfd=state_open()) < 0) {
+    return -1;
+  }
+
+  snprintf(tmp, sizeof(tmp), NONCES_FILE ".tmp.%ld", (long)getpid());
+
+  if((fd=open_entry(dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC)) < 0) {
+    close(dirfd);
+    return -1;
+  }
+
+  for(i=0; i<count; i++) {
+    approval_hex_encode(list[i], APPROVAL_NONCE_LEN, line);
+    line[2 * APPROVAL_NONCE_LEN] = '\n';
+    if(write_all(fd, line, sizeof(line) - 1)) {
+      goto fail;
+    }
+  }
+
+  if(fsync(fd) || close(fd)) {
+    fd = -1;
+    goto fail;
+  }
+
+  if(renameat(dirfd, tmp, dirfd, NONCES_FILE)) {
+    fd = -1;
+    goto fail;
+  }
+
+  // The rename is only durable once the directory is.
+  if(fsync(dirfd)) {
+    close(dirfd);
+    return -1;
+  }
+
+  close(dirfd);
+  return 0;
+
+fail:
+  if(fd >= 0) {
+    close(fd);
+  }
+  unlinkat(dirfd, tmp, 0);
+  close(dirfd);
+  return -1;
+}
+
+
+/** Read the consumed nonces back at start. A missing file is no nonces. **/
+static int
+nonces_load(void) {
+  char line[2 * APPROVAL_NONCE_LEN + 2];
+  FILE *file;
+  int dirfd;
+  int fd;
+  int rc = 0;
+
+  if((dirfd=state_open()) < 0) {
+    return -1;
+  }
+
+  fd = open_entry(dirfd, NONCES_FILE, O_RDONLY);
+  close(dirfd);
+
+  if(fd < 0) {
+    return errno == ENOENT ? 0 : -1;
+  }
+
+  if(!(file=fdopen(fd, "r"))) {
+    close(fd);
+    return -1;
+  }
+
+  pthread_mutex_lock(&lock);
+  while(fgets(line, sizeof(line), file)) {
+    size_t len = strlen(line);
+
+    if(len != sizeof(line) - 1 || line[len - 1] != '\n') {
+      rc = -1;
+      break;
+    }
+    line[len - 1] = '\0';
+
+    if(nonce_count >= NONCES_MAX ||
+       approval_hex_decode(line, nonces[nonce_count], APPROVAL_NONCE_LEN)) {
+      rc = -1;
+      break;
+    }
+    nonce_count++;
+  }
+  if(ferror(file)) {
+    rc = -1;
+  }
+  if(rc) {
+    nonce_count = 0;
+  }
+  pthread_mutex_unlock(&lock);
+
+  fclose(file);
+  return rc;
+}
+
+
+/**
+ * Record a nonce as consumed on disk, and then in memory. The record is
+ * written before the approval is marked decided, so the action it allows
+ * never runs on a nonce the disk has not seen. The caller holds the lock.
+ **/
+static int
+nonce_consume(const unsigned char *nonce) {
+  static unsigned char next[NONCES_MAX][APPROVAL_NONCE_LEN];
+  size_t keep = nonce_count < NONCES_MAX ? nonce_count : NONCES_MAX - 1;
+  size_t drop = nonce_count - keep;
+
+  memcpy(next, nonces[drop], keep * APPROVAL_NONCE_LEN);
+  memcpy(next[keep], nonce, APPROVAL_NONCE_LEN);
+
+  if(nonces_write((const unsigned char (*)[APPROVAL_NONCE_LEN])next,
+                  keep + 1)) {
+    return -1;
+  }
+
+  memcpy(nonces, next, (keep + 1) * APPROVAL_NONCE_LEN);
+  nonce_count = keep + 1;
+  return 0;
+}
+
+
+/** Write the decimal digits of value. **/
+static void
+decimal(uint64_t value, char *out, size_t size) {
+  snprintf(out, size, "%llu", (unsigned long long)value);
+}
+
+
 int
-store_approval_request(const approval_facts_t *facts, char *id,
-                       size_t idlen, char *prompt, size_t promptlen) {
+store_approval_request(const approval_facts_t *facts,
+                       approval_challenge_t *challenge, char *prompt,
+                       size_t promptlen) {
+  char size_text[24];
+  approval_option_t options[2];
+  approval_action_t action;
   struct approval *slot;
+  const char *console;
   uint64_t now;
+  int tries;
+  int len;
+
+  decimal(facts->size, size_text, sizeof(size_text));
+  options[0].key = "size";
+  options[0].value = size_text;
+  options[1].key = "run";
+  options[1].value = "1";
+
+  // The approval is of this one action. What the owner reads and signs is
+  // the output of the one encoder, and a build whose facts it refuses can
+  // not be approved at all.
+  action.command = "payload.commit";
+  action.target = facts->name;
+  action.sha256 = facts->sha256;
+  action.options = options;
+  action.noptions = facts->run ? 2 : 1;
 
   pthread_mutex_lock(&lock);
   now = now_ms();
@@ -574,20 +783,45 @@ store_approval_request(const approval_facts_t *facts, char *id,
   }
 
   memset(slot, 0, sizeof(*slot));
+  console = platform->console_id(platform);
+
+  // The nonce comes from the platform's CSPRNG. One that was already
+  // consumed is never offered again.
+  for(tries=0; tries<4; tries++) {
+    if(platform->random(platform, slot->challenge.nonce,
+                        sizeof(slot->challenge.nonce))) {
+      pthread_mutex_unlock(&lock);
+      return -1;
+    }
+    if(!nonce_consumed(slot->challenge.nonce)) {
+      break;
+    }
+  }
+
+  len = approval_canonical(&action, slot->challenge.action,
+                           sizeof(slot->challenge.action));
+  if(tries == 4 || len < 0 || !console ||
+     strlen(console) > APPROVAL_CONSOLE_MAX) {
+    memset(slot, 0, sizeof(*slot));
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
   slot->used = 1;
   slot->created_ms = now;
   snprintf(slot->id, sizeof(slot->id), "a-%lx", ++approval_count);
+  snprintf(slot->challenge.id, sizeof(slot->challenge.id), "%s", slot->id);
+  snprintf(slot->challenge.console, sizeof(slot->challenge.console), "%s",
+           console);
+  slot->challenge.action_len = (size_t)len;
+  slot->challenge.issued_ms = now;
+  slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
 
   snprintf(prompt, promptlen,
            "payload %s (%llu bytes, sha256 %s) will run",
            facts->name, (unsigned long long)facts->size, facts->sha256);
 
-  if(snprintf(id, idlen, "%s", slot->id) >= (int)idlen) {
-    slot->used = 0;
-    pthread_mutex_unlock(&lock);
-    return -1;
-  }
-
+  *challenge = slot->challenge;
   notified = 1;
   last_notification_ms = now;
 
@@ -597,7 +831,57 @@ store_approval_request(const approval_facts_t *facts, char *id,
 
 
 int
-store_approval_decide(const char *id, int approved) {
+store_approval_grant(const char *id, const unsigned char *signature) {
+  unsigned char message[APPROVAL_MESSAGE_MAX];
+  struct approval *request;
+  int len;
+  int rc;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+  request = approval_find(id);
+
+  if(!request) {
+    rc = STORE_GRANT_UNKNOWN;
+  } else if(request->expired) {
+    rc = STORE_GRANT_EXPIRED;
+  } else if(nonce_consumed(request->challenge.nonce) ||
+            (request->decided && request->approved)) {
+    // A signature is good once. Whatever it was, this one is spent.
+    rc = STORE_GRANT_REPLAYED;
+  } else if(request->decided) {
+    rc = STORE_GRANT_DENIED;
+  } else {
+    len = approval_message(request->challenge.console,
+                           request->challenge.action,
+                           request->challenge.action_len,
+                           request->challenge.nonce,
+                           request->challenge.issued_ms,
+                           request->challenge.expires_ms,
+                           message, sizeof(message));
+
+    // The platform checks the signature against the key pinned in the
+    // build, over the exact bytes of this approval's challenge.
+    if(len < 0 || platform->verify(platform, message, (size_t)len,
+                                   signature)) {
+      rc = STORE_GRANT_INVALID;
+    } else if(nonce_consume(request->challenge.nonce)) {
+      // Not recorded on disk: the action must not be allowed to run.
+      rc = STORE_GRANT_ERROR;
+    } else {
+      request->decided = 1;
+      request->approved = 1;
+      rc = STORE_GRANT_OK;
+    }
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
+}
+
+
+int
+store_approval_deny(const char *id) {
   struct approval *request;
 
   pthread_mutex_lock(&lock);
@@ -610,7 +894,7 @@ store_approval_decide(const char *id, int approved) {
   }
 
   request->decided = 1;
-  request->approved = approved;
+  request->approved = 0;
   pthread_mutex_unlock(&lock);
 
   return 0;
