@@ -47,6 +47,7 @@ along with this program; see the file COPYING. If not, see
  * instead, with its entry's kind, device and inode, or its argument count.
  * For kill, name is the target pid, and signal and start are its signal and
  * start identity; for anything else they are empty.
+ * chmod, chown and chgrp also fill value with the requested mode or owner.
  **/
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
@@ -62,6 +63,7 @@ typedef struct {
   uint64_t argc;
   char signal[SIGNAL_NAME_MAX + 1];
   char start[PROCESS_START_MAX + 1];
+  char value[16];  /** The requested mode or owner or group, canonical. **/
 } approval_facts_t;
 
 /**

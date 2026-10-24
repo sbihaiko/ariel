@@ -14,17 +14,19 @@ The file commands `mkdir`, `rmdir`, `touch` and `rm` take one absolute path. Eac
 
 `kill <pid> <SIGNAL>` is gated like a payload commit: it answers `approval_required` with exit 75 until the owner signs its challenge, which binds the pid, the signal and the process's start identity. After a grant, the same command runs once and answers `killed <pid> <SIGNAL>` with exit 0. Its error words are `bad_signal` (the signal is not TERM, KILL, INT or HUP), `no_such_process` and `kill_failed`, all exit 1; a pid that is not a decimal number answers `unknown_command`, and a kill with another argument count is an unlisted command, gated like any other. The audit log records `kill.request`, `kill.done`, `kill.stale`, `kill.failed` and `kill.protected`, like the file commands. Exit 87 (`protected`) covers a kill of a critical process and of Ariel's own process; those are refused whether or not an approval exists. A process that was restarted under the same pid answers `approval_stale` with exit 78, and its approval is spent.
 
+`chmod MODE PATH`, `chown ID PATH` and `chgrp ID PATH` are gated the same way. The mode is octal up to `07777`; the owner and group are decimal ids below 4294967295. The challenge also binds the requested mode, owner or group, so a different one answers `approval_stale`. A bad operand answers `bad_mode`, `bad_owner` or `bad_group` with exit 1 before anything is asked; a missing one answers `missing_operand`. A symbolic link to a protected object answers `protected` (87), and the link is never followed to change its target.
+
 ## Assigned
 
 | Exit | Word | Meaning | What the agent does |
 |---|---|---|---|
 | 0 | | Success | |
-| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, others | Any other error | Read the word; do not retry as is |
+| 1 | `unknown_command`, `bad_name`, `unknown_payload`, `grant_failed`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, others | Any other error | Read the word; do not retry as is |
 | 70 | | Missing or wrong token; the connection is closed | Fix the token |
 | 75 | `approval_required` | The action waits for the owner's signature; the reply carries the challenge | Have the owner sign, send `approval grant`, then repeat the command |
 | 76 | `approval_busy` | Too many pending approvals, or a notification shown less than 10 s ago | Wait and push again |
 | 77 | `approval_denied` | The owner refused. Only the host build's virtual source can refuse; the PS5 has no refusal, an unsigned approval expires | Do not retry |
-| 78 | `approval_stale` | The approved target changed, or the approval is gone. A file command answers it when the entry at its path is no longer the one the owner signed (replaced, or removed and created again); the approval is spent | Request a new challenge |
+| 78 | `approval_stale` | The approved target changed, or the approval is gone. A file command answers it when the entry at its path is no longer the one the owner signed (replaced, or removed and created again), or when a chmod, chown or chgrp asks for another mode, owner or group than the one signed; the approval is spent | Request a new challenge |
 | 79 | `signature_invalid` | The signature does not verify against the pinned key | Do not retry with the same signature |
 | 80 | `staging_full` | Staging is over its count or size limit | Wait for the TTL or commit pending objects |
 | 81 | `upload_mismatch` | The upload ended early, ran past its size, or its hash differs | Push again |

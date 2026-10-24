@@ -24,6 +24,7 @@ along with this program; see the file COPYING. If not, see
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -221,6 +222,77 @@ inspect(const char *root, const char *path, approval_facts_t *facts,
 }
 
 
+/** Whether the command sets attributes: chmod, chown or chgrp. **/
+static int
+attribute(const char *command) {
+  return !strcmp(command, "chmod") || !strcmp(command, "chown") ||
+         !strcmp(command, "chgrp");
+}
+
+
+/**
+ * Parse the operand of an attribute command into its canonical text: a mode
+ * in octal up to 07777, or an owner or group in decimal below 2^32 - 1, which
+ * is the one id chown reads as "unchanged". Other commands have no operand.
+ **/
+static int
+operand_value(const char *command, const char *operand, char *value,
+              size_t size) {
+  int octal = !strcmp(command, "chmod");
+  uint64_t base = octal ? 8 : 10;
+  uint64_t limit = octal ? 07777 : 4294967294ULL;
+  uint64_t n = 0;
+  const char *p;
+
+  value[0] = '\0';
+  if(!attribute(command)) {
+    return FILEOPS_OK;
+  }
+
+  if(!*operand) {
+    return octal ? FILEOPS_BAD_MODE :
+           !strcmp(command, "chown") ? FILEOPS_BAD_OWNER : FILEOPS_BAD_GROUP;
+  }
+  for(p = operand; *p; p++) {
+    if(*p < '0' || (uint64_t)(*p - '0') >= base) {
+      break;
+    }
+    n = n * base + (uint64_t)(*p - '0');
+    if(n > limit) {
+      break;
+    }
+  }
+  if(*p) {
+    return octal ? FILEOPS_BAD_MODE :
+           !strcmp(command, "chown") ? FILEOPS_BAD_OWNER : FILEOPS_BAD_GROUP;
+  }
+
+  if(octal) {
+    snprintf(value, size, "%04llo", (unsigned long long)n);
+  } else {
+    snprintf(value, size, "%llu", (unsigned long long)n);
+  }
+  return FILEOPS_OK;
+}
+
+
+/**
+ * The refusal of a symbolic link. An attribute command on a link to a
+ * protected object answers protected: the link is not followed, only looked
+ * at, so no change reaches the object.
+ **/
+static int
+link_refusal(const char *command, int dirfd, const char *leaf) {
+  struct stat st;
+
+  if(attribute(command) && !fstatat(dirfd, leaf, &st, 0) &&
+     protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
+  }
+  return FILEOPS_LINK;
+}
+
+
 /** Whether the entry's kind lets the command run. **/
 static int
 precondition(const char *command, const char *kind) {
@@ -228,6 +300,13 @@ precondition(const char *command, const char *kind) {
   int file = !strcmp(kind, "file");
   int dir = !strcmp(kind, "dir");
   int link = !strcmp(kind, "link");
+
+  if(attribute(command)) {
+    if(absent) {
+      return FILEOPS_NO_FILE;
+    }
+    return link ? FILEOPS_LINK : FILEOPS_OK;
+  }
 
   if(!strcmp(command, "mkdir")) {
     return absent ? FILEOPS_OK : FILEOPS_EXISTS;
@@ -265,10 +344,50 @@ precondition(const char *command, const char *kind) {
 }
 
 
+/**
+ * Set the mode, owner or group of the entry leaf in dirfd. The entry is opened
+ * without following a link and must still be the one now describes, so the
+ * change lands on the object that was checked.
+ **/
+static int
+set_attributes(const char *command, const approval_facts_t *now, int dirfd,
+               const char *leaf) {
+  struct stat st;
+  int fd;
+  int rc;
+
+  fd = openat(dirfd, leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if(fd < 0) {
+    return FILEOPS_FAILED;
+  }
+  if(fstat(fd, &st) || (uint64_t)st.st_dev != now->dev ||
+     (uint64_t)st.st_ino != now->ino) {
+    close(fd);
+    return FILEOPS_CHANGED;
+  }
+
+  if(!strcmp(command, "chmod")) {
+    rc = fchmod(fd, (mode_t)strtoul(now->value, NULL, 8));
+  } else if(!strcmp(command, "chown")) {
+    rc = fchown(fd, (uid_t)strtoul(now->value, NULL, 10), (gid_t)-1);
+  } else {
+    rc = fchown(fd, (uid_t)-1, (gid_t)strtoul(now->value, NULL, 10));
+  }
+  close(fd);
+  return rc ? FILEOPS_FAILED : FILEOPS_OK;
+}
+
+
 /** Run a command whose precondition holds, on the entry leaf in dirfd. **/
 static int
-perform(const char *command, const char *kind, int dirfd, const char *leaf) {
+perform(const char *command, const approval_facts_t *now, int dirfd,
+        const char *leaf) {
+  const char *kind = now->kind;
   int fd;
+
+  if(attribute(command)) {
+    return set_attributes(command, now, dirfd, leaf);
+  }
 
   if(!strcmp(command, "mkdir")) {
     return mkdirat(dirfd, leaf, 0755) ? FILEOPS_FAILED : FILEOPS_OK;
@@ -295,10 +414,15 @@ perform(const char *command, const char *kind, int dirfd, const char *leaf) {
 
 int
 fileops_check(const char *root, const char *command, const char *path,
-              approval_facts_t *facts) {
+              const char *operand, approval_facts_t *facts) {
   char leaf[PATH_MAX];
   int dirfd;
   int rc;
+
+  rc = operand_value(command, operand, facts->value, sizeof(facts->value));
+  if(rc) {
+    return rc;
+  }
 
   rc = inspect(root, path, facts, &dirfd, leaf, sizeof(leaf));
   if(rc) {
@@ -306,6 +430,9 @@ fileops_check(const char *root, const char *command, const char *path,
   }
 
   rc = precondition(command, facts->kind);
+  if(rc == FILEOPS_LINK) {
+    rc = link_refusal(command, dirfd, leaf);
+  }
   close(dirfd);
   return rc;
 }
@@ -313,28 +440,37 @@ fileops_check(const char *root, const char *command, const char *path,
 
 int
 fileops_act(const char *root, const char *command, const char *path,
-            const approval_facts_t *expected) {
+            const char *operand, const approval_facts_t *expected) {
   approval_facts_t now;
   char leaf[PATH_MAX];
   int dirfd;
   int rc;
 
   memset(&now, 0, sizeof(now));
+  rc = operand_value(command, operand, now.value, sizeof(now.value));
+  if(rc) {
+    return rc;
+  }
+
   rc = inspect(root, path, &now, &dirfd, leaf, sizeof(leaf));
   if(rc) {
     return rc;
   }
 
-  // The entry is checked again: it must be the one the owner signed for.
+  // The entry and the operand are checked again: both must be the ones the
+  // owner signed for.
   if(strcmp(now.kind, expected->kind) || now.dev != expected->dev ||
-     now.ino != expected->ino) {
+     now.ino != expected->ino || strcmp(now.value, expected->value)) {
     close(dirfd);
     return FILEOPS_CHANGED;
   }
 
   rc = precondition(command, now.kind);
+  if(rc == FILEOPS_LINK) {
+    rc = link_refusal(command, dirfd, leaf);
+  }
   if(!rc) {
-    rc = perform(command, now.kind, dirfd, leaf);
+    rc = perform(command, &now, dirfd, leaf);
   }
 
   close(dirfd);
@@ -367,6 +503,12 @@ fileops_word(int rc) {
     return "approval_stale";
   case FILEOPS_FAILED:
     return "operation_failed";
+  case FILEOPS_BAD_MODE:
+    return "bad_mode";
+  case FILEOPS_BAD_OWNER:
+    return "bad_owner";
+  case FILEOPS_BAD_GROUP:
+    return "bad_group";
   default:
     return "ok";
   }

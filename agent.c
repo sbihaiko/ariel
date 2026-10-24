@@ -59,6 +59,9 @@ static const char bad_name[] =
 static const char unknown[] =
   "unknown_command\n"
   "exit 1\n";
+static const char missing_operand[] =
+  "missing_operand\n"
+  "exit 1\n";
 static const char list_failed[] =
   "list_failed\n"
   "exit 1\n";
@@ -633,16 +636,20 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
 }
 
 
-/** One file command, mkdir, rmdir, touch or rm, on one absolute path. **/
+/**
+ * One file command on one absolute path: mkdir, rmdir, touch, rm, or chmod,
+ * chown or chgrp with its operand. operand is NULL for the first four.
+ **/
 static void
-file_command(agent_t *agent, int fd, const char *command, const char *path) {
+file_command(agent_t *agent, int fd, const char *command, const char *path,
+             const char *operand) {
   const char *root = agent->platform->fs_root;
   approval_challenge_t challenge;
   approval_facts_t facts;
   int rc;
 
   memset(&facts, 0, sizeof(facts));
-  rc = fileops_check(root, command, path, &facts);
+  rc = fileops_check(root, command, path, operand, &facts);
   if(rc != FILEOPS_OK) {
     file_outcome(fd, command, path, "-", rc);
     return;
@@ -654,7 +661,7 @@ file_command(agent_t *agent, int fd, const char *command, const char *path) {
     return;
   }
 
-  rc = fileops_act(root, command, path, &facts);
+  rc = fileops_act(root, command, path, operand, &facts);
   file_outcome(fd, command, path, challenge.id, rc);
 }
 
@@ -681,6 +688,24 @@ unlisted_command(agent_t *agent, int fd, int argc, char *argv[]) {
   if(gate_pass(agent, fd, &facts, &challenge)) {
     audit_reply(fd, "unlisted", "refused", argv[0], challenge.id, unknown);
   }
+}
+
+
+/**
+ * chmod MODE PATH, chown ID PATH and chgrp ID PATH, gated like the other file
+ * commands. More than one path is not one of them, so it is unlisted.
+ **/
+static void
+attribute_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  if(argc < 3) {
+    audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+    return;
+  }
+  if(argc > 3) {
+    unlisted_command(agent, fd, argc, argv);
+    return;
+  }
+  file_command(agent, fd, argv[0], argv[2], argv[1]);
 }
 
 
@@ -1405,7 +1430,13 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && (!strcmp(argv[0], "mkdir") || !strcmp(argv[0], "rmdir") ||
                    !strcmp(argv[0], "touch") || !strcmp(argv[0], "rm"))) {
-    file_command(agent, fd, argv[0], argv[1]);
+    file_command(agent, fd, argv[0], argv[1], NULL);
+    return;
+  }
+
+  if(argc >= 1 && (!strcmp(argv[0], "chmod") || !strcmp(argv[0], "chown") ||
+                   !strcmp(argv[0], "chgrp"))) {
+    attribute_command(agent, fd, argc, argv);
     return;
   }
 

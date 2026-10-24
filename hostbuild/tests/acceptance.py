@@ -1107,6 +1107,10 @@ CLOCK_SCENARIOS = {
     "78 and is not signalled",
     "a kill signal or start changed in the challenge answers "
     "signature_action_mismatch, and the real grant still runs it",
+    "chmod, chown and chgrp run only after the owner signs, once each, and "
+    "are audited",
+    "a chmod approved for one mode answers approval_stale for another, and "
+    "the signed mode runs",
 }
 
 # The scenarios that act on a process only the host build starts, or on
@@ -1129,6 +1133,10 @@ HOST_ROOT_SCENARIOS = {
     "writes outside /data, /user and /mnt/usb* answer protected and exit 87 "
     "without asking, and so does Ariel's token",
     "a file replaced after approval answers approval_stale and exit 78",
+    "a file replaced after a chmod approval answers approval_stale and keeps "
+    "its mode",
+    "chmod, chown and chgrp answer protected through hard and symbolic links "
+    "to a protected object, even when approved",
 }
 
 
@@ -2493,7 +2501,8 @@ def scenario_no_system_change_on_agent_port(server):
     Every command outside the allowlist now asks the owner (75), or is held
     by the notification gap (76) because this scenario does not move the
     clock. A write outside the host test root is protected (87), so the
-    host's own /data is never asked about or touched.
+    host's own /data is never asked about or touched; chmod is protected the
+    same way, where it used to ask (75) before attribute commands were gated.
     """
     secret = secret_path(server, "token")
     for command in (
@@ -2516,8 +2525,7 @@ def scenario_no_system_change_on_agent_port(server):
             lines = reply_lines(read_reply(sock))
         finally:
             sock.close()
-        if command.startswith("rm ") or command.startswith("mkdir ") or (
-                command.startswith("touch ")):
+        if command.startswith(("rm ", "mkdir ", "touch ", "chmod ")):
             assert lines == ["protected", "exit 87"], (
                 "%s must answer protected, got %r" % (command, lines))
         else:
@@ -2782,6 +2790,158 @@ def scenario_file_action_names_its_facts(server):
     assert "\nsha256=none\n" in action, action
     assert "\noption.kind=file\n" in action, action
     assert "\noption.dev=" in action and "\noption.ino=" in action, action
+
+
+ATTRIBUTE_TEMPLATES = ("chmod 0777 {p}", "chown 0 {p}", "chgrp 0 {p}")
+
+
+def file_mode(path):
+    return os.stat(path).st_mode & 0o7777
+
+
+def make_file(server, name, mode):
+    path = os.path.join(server.root, "data", name)
+    with open(path, "wb") as handle:
+        handle.write(b"attribute\n")
+    os.chmod(path, mode)
+    return path
+
+
+def scenario_attribute_commands_need_the_owner(server):
+    """chmod, chown and chgrp ask first, run once per signature and are audited."""
+    target = make_file(server, "attr-file", 0o644)
+    uid = os.getuid()
+    gid = os.getgid()
+
+    approval, challenge = gate_request(server, "chmod 0600 " + target)
+    assert file_mode(target) == 0o644, "an unsigned chmod must not run"
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "chmod 0600 " + target) == ["exit 0"], (
+        "a signed chmod must run")
+    assert file_mode(target) == 0o600, "chmod must set the mode"
+
+    # The signature is spent: the same chmod needs a new one.
+    spent, _ = gate_request(server, "chmod 0600 " + target)
+    assert spent != approval, "a spent approval must not be asked again"
+
+    approval, challenge = gate_request(server, "chown %d %s" % (uid, target))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "chown %d %s" % (uid, target)) == ["exit 0"], (
+        "a signed chown must run")
+    assert os.stat(target).st_uid == uid, "chown must set the owner"
+
+    approval, challenge = gate_request(server, "chgrp %d %s" % (gid, target))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "chgrp %d %s" % (gid, target)) == ["exit 0"], (
+        "a signed chgrp must run")
+    assert os.stat(target).st_gid == gid, "chgrp must set the group"
+
+    # A chmod naming two paths is not one this port runs: it is unlisted.
+    approval, challenge = gate_request(
+        server, "chmod 0755 %s %s" % (target, target))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "chmod 0755 %s %s" % (target, target)) == [
+        "unknown_command", "exit 1"], (
+        "a chmod with two paths must be gated as an unlisted command")
+    assert file_mode(target) == 0o600, "a refused chmod must change nothing"
+
+    kinds = set()
+    for line in run_exit_zero(server, "audit tail 64"):
+        fields = line.split()
+        if len(fields) == 5:
+            kinds.add(fields[1])
+    for kind in ("chmod.request", "chmod.done", "chown.done", "chgrp.done",
+                 "unlisted.refused"):
+        assert kind in kinds, "audit tail must show %s, got %r" % (
+            kind, sorted(kinds))
+
+
+def scenario_attribute_mode_is_bound_to_approval(server):
+    """A chmod approved for one mode answers approval_stale for another."""
+    target = make_file(server, "mode-bound", 0o644)
+    approval, challenge = gate_request(server, "chmod 0600 " + target)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "chmod 0644 " + target) == [
+        "approval_stale", "exit 78"], (
+        "a chmod to another mode than the one signed must answer 78")
+    assert file_mode(target) == 0o644, "a stale chmod must change nothing"
+
+    approval, challenge = gate_request(server, "chmod 0600 " + target)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "chmod 0600 " + target) == ["exit 0"], (
+        "the mode that was signed must run")
+    assert file_mode(target) == 0o600, "the signed mode must be set"
+
+
+def scenario_attribute_file_replaced_answers_78(server):
+    """A file replaced after a chmod approval answers approval_stale and keeps its mode."""
+    target = make_file(server, "replaced-attr", 0o644)
+    approval, challenge = gate_request(server, "chmod 0600 " + target)
+    sign_and_grant(server, approval, challenge)
+
+    replacement = target + "-new"
+    with open(replacement, "wb") as handle:
+        handle.write(b"replacement\n")
+    os.chmod(replacement, 0o644)
+    os.replace(replacement, target)
+
+    assert run_command(server, "chmod 0600 " + target) == [
+        "approval_stale", "exit 78"], (
+        "a file replaced after approval must answer approval_stale")
+    assert file_mode(target) == 0o644, (
+        "a stale chmod must not change the replacement's mode")
+
+
+def scenario_attribute_commands_refuse_protected_aliases(server):
+    """chmod, chown and chgrp answer protected on a protected object, by any alias.
+
+    A link to an ordinary file is not followed: it answers symbolic_link and
+    the file keeps its mode.
+    """
+    secret = secret_path(server, "token")
+    mode = file_mode(secret)
+    hard = os.path.join(server.root, "data", "alias-hard")
+    soft = os.path.join(server.root, "data", "alias-soft")
+    make_link(hard, secret, hard=True)
+    make_link(soft, secret, hard=False)
+    for path in (secret, hard, soft):
+        for template in ATTRIBUTE_TEMPLATES:
+            assert_protected(server, template.format(p=path))
+    assert file_mode(secret) == mode, "a protected object must keep its mode"
+
+    ordinary = make_file(server, "alias-target", 0o644)
+    link = os.path.join(server.root, "data", "alias-link")
+    make_link(link, ordinary, hard=False)
+    assert run_command(server, "chmod 0600 " + link) == [
+        "symbolic_link", "exit 1"], "a link to an ordinary file is not followed"
+    assert file_mode(ordinary) == 0o644, "a refused link must change nothing"
+
+
+def scenario_attribute_operands_are_checked_first(server):
+    """A bad mode, owner or group, or a missing operand, answers its word and asks nothing."""
+    path = "/data/attr-operands"
+    for command, word in (
+            ("chmod 9 " + path, "bad_mode"),
+            ("chmod 10000 " + path, "bad_mode"),
+            ("chmod rwx " + path, "bad_mode"),
+            ("chown -1 " + path, "bad_owner"),
+            ("chown 4294967295 " + path, "bad_owner"),
+            ("chown root " + path, "bad_owner"),
+            ("chgrp 4294967295 " + path, "bad_group"),
+            ("chgrp 1x " + path, "bad_group")):
+        assert run_command(server, command) == [word, "exit 1"], (
+            "%s must answer %s and exit 1" % (command, word))
+    for command in ("chmod", "chmod 0755", "chown 0", "chgrp 0"):
+        assert run_command(server, command) == ["missing_operand", "exit 1"], (
+            "%s must answer missing_operand and exit 1" % command)
+
+    kinds = set()
+    for line in run_exit_zero(server, "audit tail 64"):
+        fields = line.split()
+        if len(fields) == 5:
+            kinds.add(fields[1])
+    assert "chmod.refused" in kinds, (
+        "a refused chmod must reach audit tail, got %r" % sorted(kinds))
 
 
 def scenario_two_connections(server):
@@ -3772,6 +3932,18 @@ SCENARIOS = [
      scenario_protected_paths_answer_87_without_asking, HOST_ROOT_REASON),
     ("a file command's audit lines reach audit tail",
      scenario_file_commands_are_audited, True),
+    ("chmod, chown and chgrp run only after the owner signs, once each, and "
+     "are audited", scenario_attribute_commands_need_the_owner, True),
+    ("a chmod approved for one mode answers approval_stale for another, and "
+     "the signed mode runs", scenario_attribute_mode_is_bound_to_approval, True),
+    ("a file replaced after a chmod approval answers approval_stale and keeps "
+     "its mode", scenario_attribute_file_replaced_answers_78,
+     HOST_ROOT_REASON),
+    ("chmod, chown and chgrp answer protected through hard and symbolic links "
+     "to a protected object, even when approved",
+     scenario_attribute_commands_refuse_protected_aliases, HOST_ROOT_REASON),
+    ("bad mode, owner or group and a missing operand answer their word, exit 1, "
+     "and are audited", scenario_attribute_operands_are_checked_first, None),
     ("the challenge of a file command names its path, sha256 none and identity",
      scenario_file_action_names_its_facts, True),
     ("pwd and ls <absolute path> run through the agent port",

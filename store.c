@@ -829,12 +829,23 @@ decimal(uint64_t value, char *out, size_t size) {
 }
 
 
+/** The option that names the requested value of an attribute command. **/
+static const char *
+value_key(const char *command) {
+  if(!strcmp(command, "chmod")) {
+    return "mode";
+  }
+  return !strcmp(command, "chown") ? "owner" : "group";
+}
+
+
 /**
  * The action an approval is of, with its options. A payload's build is an
  * action on its name. A gated command is an action on its target, with the
  * entry's kind and identity, or with the argument count of a command nothing
- * implements. A kill is an action on its pid, with the hash of its pid and
- * start, its signal and start. text holds the numbers the options point at.
+ * implements, and with the requested value of chmod, chown or chgrp. A kill
+ * is an action on its pid, with the hash of its pid and start, its signal and
+ * start. text holds the numbers the options point at.
  **/
 static void
 action_build(const approval_facts_t *facts, approval_action_t *action,
@@ -866,6 +877,11 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[0].key = "argc";
       options[0].value = text[0];
       action->noptions = 1;
+    }
+    if(facts->value[0]) {
+      options[action->noptions].key = value_key(facts->command);
+      options[action->noptions].value = facts->value;
+      action->noptions++;
     }
   } else {
     decimal(facts->size, text[0], sizeof(text[0]));
@@ -984,12 +1000,13 @@ store_approval_request(const approval_facts_t *facts,
 
 /**
  * Whether two targets are the same object: the same kind, device and inode,
- * and for a kill the same signal and process start.
+ * the same requested value, and for a kill the same signal and process start.
  **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
   return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
-         !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start);
+         !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start) &&
+         !strcmp(a->value, b->value);
 }
 
 

@@ -32,23 +32,28 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_LINK       9
 #define FILEOPS_CHANGED   10
 #define FILEOPS_FAILED    11
+#define FILEOPS_BAD_MODE  12
+#define FILEOPS_BAD_OWNER 13
+#define FILEOPS_BAD_GROUP 14
 
 /**
  * Check one file command without acting. path must be absolute and inside a
- * writable root below root (root is "" on a console). The entry's kind, device
- * and inode go into facts. Returns FILEOPS_OK when the command could run now,
- * or the refusal that stops it.
+ * writable root below root (root is "" on a console). operand is the mode,
+ * owner or group of chmod, chown or chgrp, and NULL for the others. The
+ * entry's kind, device and inode, and the canonical operand, go into facts.
+ * Returns FILEOPS_OK when the command could run now, or the refusal that
+ * stops it.
  **/
 int fileops_check(const char *root, const char *command, const char *path,
-                  approval_facts_t *facts);
+                  const char *operand, approval_facts_t *facts);
 
 /**
- * Perform one file command, after checking that the entry is still the one
- * expected names. Returns FILEOPS_OK, FILEOPS_CHANGED when the entry is no
- * longer the expected one, or the refusal that stops it.
+ * Perform one file command, after checking that the entry and the operand are
+ * still the ones expected names. Returns FILEOPS_OK, FILEOPS_CHANGED when they
+ * are no longer the expected ones, or the refusal that stops it.
  **/
 int fileops_act(const char *root, const char *command, const char *path,
-                const approval_facts_t *expected);
+                const char *operand, const approval_facts_t *expected);
 
 /** The protocol word of a refusal, and its exit status. **/
 const char *fileops_word(int rc);
