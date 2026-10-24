@@ -913,7 +913,22 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     action->target = facts->target;
     action->destination = facts->dest[0] ? facts->dest : NULL;
     action->sha256 = facts->sha256[0] ? facts->sha256 : APPROVAL_NO_HASH;
-    if(!strcmp(facts->command, "kill")) {
+    if(!strcmp(facts->command, "http2_get")) {
+      decimal(facts->dev, text[0], sizeof(text[0]));
+      decimal(facts->ino, text[1], sizeof(text[1]));
+      options[0].key = "url";
+      options[0].value = facts->url;
+      action->noptions = 1;
+      if(facts->dest[0]) {
+        options[1].key = "kind";
+        options[1].value = facts->kind;
+        options[2].key = "dev";
+        options[2].value = text[0];
+        options[3].key = "ino";
+        options[3].value = text[1];
+        action->noptions = 4;
+      }
+    } else if(!strcmp(facts->command, "kill")) {
       options[0].key = "signal";
       options[0].value = facts->signal;
       options[1].key = "start";
@@ -1147,6 +1162,13 @@ store_approval_request(const approval_facts_t *facts,
              facts->target, facts->signal, facts->start);
   } else if(slot->gated && !strcmp(facts->command, "run")) {
     run_prompt(prompt, promptlen, facts);
+  } else if(slot->gated && !strcmp(facts->command, "http2_get")) {
+    if(facts->dest[0]) {
+      snprintf(prompt, promptlen, "fetch %s to %s will run", facts->url,
+               facts->dest);
+    } else {
+      snprintf(prompt, promptlen, "fetch %s will run", facts->url);
+    }
   } else if(slot->gated && !strcmp(facts->command, "reboot")) {
     snprintf(prompt, promptlen,
              "reboot the console with boot list sha256 %s will run",
@@ -1196,6 +1218,7 @@ static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
   return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
          a->argc == b->argc && !strcmp(a->args, b->args) &&
+         !strcmp(a->url, b->url) &&
          !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start) &&
          !strcmp(a->value, b->value) && !strcmp(a->dest, b->dest) &&
          !strcmp(a->fstype, b->fstype) && !strcmp(a->from, b->from) &&

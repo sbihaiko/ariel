@@ -81,6 +81,7 @@ typedef struct {
   char value[16];  /** The requested mode or owner or group, canonical. **/
   char fstype[16];  /** mount: the file system type. **/
   char from[APPROVAL_TARGET_MAX + 1];  /** mount: the source path. **/
+  char url[APPROVAL_URL_MAX + 1];  /** http2_get: the URL fetched. **/
   char type[2];  /** mknod: b or c. **/
   uint64_t major;
   uint64_t minor;

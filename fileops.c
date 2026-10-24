@@ -733,6 +733,55 @@ fileops_read_open(const char *root, const char *path, int *fd) {
 
 
 int
+fileops_write_open(const char *root, const char *path,
+                   const approval_facts_t *expected, int *fd) {
+  approval_facts_t now;
+  char leaf[PATH_MAX];
+  struct stat st;
+  int absent = !strcmp(expected->kind, "absent");
+  int dirfd;
+  int rc;
+
+  memset(&now, 0, sizeof(now));
+  rc = inspect(root, path, &now, &dirfd, leaf, sizeof(leaf), 1);
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(now.kind, expected->kind) || now.dev != expected->dev ||
+     now.ino != expected->ino) {
+    close(dirfd);
+    return FILEOPS_CHANGED;
+  }
+
+  *fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_NOFOLLOW |
+               (absent ? O_EXCL : 0), S_IRUSR | S_IWUSR);
+  close(dirfd);
+  if(*fd < 0) {
+    return errno == EEXIST || errno == ELOOP ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+
+  if(fstat(*fd, &st)) {
+    close(*fd);
+    return FILEOPS_FAILED;
+  }
+  if(protected_stat(&st)) {
+    close(*fd);
+    return FILEOPS_PROTECTED;
+  }
+  if(!absent && ((uint64_t)st.st_dev != expected->dev ||
+                 (uint64_t)st.st_ino != expected->ino)) {
+    close(*fd);
+    return FILEOPS_CHANGED;
+  }
+  if(!absent && ftruncate(*fd, 0)) {
+    close(*fd);
+    return FILEOPS_FAILED;
+  }
+  return FILEOPS_OK;
+}
+
+
+int
 fileops_dir_open(const char *root, const char *path, int *fd) {
   return entry_open(root, path, 1, fd);
 }

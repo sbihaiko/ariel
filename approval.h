@@ -48,6 +48,7 @@ along with this program; see the file COPYING. If not, see
 
 /** The longest option value the encoder carries. **/
 #define APPROVAL_VALUE_MAX   64
+#define APPROVAL_URL_MAX     256
 
 /** The hash of an action with no content behind it. **/
 #define APPROVAL_NO_HASH "none"

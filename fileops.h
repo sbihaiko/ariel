@@ -102,6 +102,15 @@ int fileops_transfer_act(const char *root, const char *command,
  **/
 int fileops_read_open(const char *root, const char *path, int *fd);
 
+/**
+ * Open the file at path for writing, if it is still the entry expected: the
+ * same kind, device and inode, and not a protected object. An absent entry is
+ * created exclusively; an existing one is truncated only after it is verified.
+ * The descriptor is returned in fd.
+ **/
+int fileops_write_open(const char *root, const char *path,
+                       const approval_facts_t *expected, int *fd);
+
 /** Open the directory at path for reading, under the same checks. **/
 int fileops_dir_open(const char *root, const char *path, int *fd);
 

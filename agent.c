@@ -2688,6 +2688,148 @@ kill_command(agent_t *agent, int fd, const char *pid_text,
 }
 
 
+#define HTTP2_BODY_MAX (1024UL * 1024)
+
+struct http2_work {
+  char text[ALLOWLIST_TEXT_MAX];
+  allowlist_t list;
+  char body[HTTP2_BODY_MAX];
+};
+
+
+static void
+http2_refuse(int fd, const char *word, int status) {
+  char answer[64];
+
+  snprintf(answer, sizeof(answer), "%s\nexit %d\n", word, status);
+  audit_reply(fd, "http2_get", "refused", "download", word, answer);
+}
+
+
+static void
+http2_failed(int fd, const char *id, const char *word, int status) {
+  char answer[64];
+
+  audit_line("http2_get", "failed", "download", id);
+  snprintf(answer, sizeof(answer), "%s\nexit %d\n", word, status);
+  reply(fd, answer);
+}
+
+
+/**
+ * http2_get [-o PATH] URL: the owner signs the URL and, with -o, the
+ * destination's identity. The host must be on the download allowlist both
+ * before the owner is asked and again before anything is fetched. A redirect
+ * is refused, never followed.
+ **/
+static void
+http2_get_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  const char *root = agent->platform->fs_root;
+  const char *url = argv[argc - 1];
+  const char *dest = argc == 4 ? argv[2] : NULL;
+  platform_t *platform = agent->platform;
+  char authority[HTTP_HOST_MAX + 1];
+  char location[RELEASE_URL_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  struct text_sink text;
+  struct http2_work *work;
+  int status = 0;
+  int outfd;
+  int rc;
+
+  if(argc == 4 && strcmp(argv[1], "-o")) {
+    reply(fd, unknown);
+    return;
+  }
+
+  if(strlen(url) > APPROVAL_URL_MAX ||
+     (dest && strlen(dest) > APPROVAL_TARGET_MAX)) {
+    http2_refuse(fd, "bad_argument", 1);
+    return;
+  }
+
+  work = calloc(1, sizeof(*work));
+  if(!work) {
+    http2_refuse(fd, "download_failed", 1);
+    return;
+  }
+
+  if(http_url_host(url, authority, sizeof(authority)) ||
+     store_allowlist_read(work->text, sizeof(work->text)) ||
+     allowlist_parse(work->text, &work->list) ||
+     !allowlist_has_host(&work->list, authority)) {
+    http2_refuse(fd, "not_allowlisted", 1);
+    goto out;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  if(dest) {
+    rc = fileops_check(root, "touch", dest, NULL, &facts);
+    if(rc != FILEOPS_OK) {
+      http2_refuse(fd, fileops_word(rc), fileops_status(rc));
+      goto out;
+    }
+    snprintf(facts.dest, sizeof(facts.dest), "%s", dest);
+  }
+  snprintf(facts.command, sizeof(facts.command), "%s", "http2_get");
+  snprintf(facts.target, sizeof(facts.target), "%s", "download");
+  snprintf(facts.url, sizeof(facts.url), "%s", url);
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    goto out;
+  }
+
+  text.buf = work->body;
+  text.size = sizeof(work->body);
+  text.len = 0;
+  text.status = &status;
+  if(platform->http_get(platform, url, sizeof(work->body) - 1, text_sink, &text,
+                        &status, location, sizeof(location)) || status != 200) {
+    if(status >= 300 && status < 400) {
+      http2_failed(fd, challenge.id, "redirect_refused", 1);
+    } else {
+      http2_failed(fd, challenge.id, "download_failed", 1);
+    }
+    goto out;
+  }
+
+  if(dest) {
+    rc = fileops_write_open(root, dest, &facts, &outfd);
+    if(rc != FILEOPS_OK) {
+      http2_failed(fd, challenge.id, fileops_word(rc), fileops_status(rc));
+      goto out;
+    }
+    if(write_all(outfd, work->body, text.len)) {
+      close(outfd);
+      http2_failed(fd, challenge.id, "download_failed", 1);
+      goto out;
+    }
+    close(outfd);
+    if(audit_line("http2_get", "done", "download", challenge.id)) {
+      reply(fd, audit_failed);
+      goto out;
+    }
+    reply(fd, "exit 0\n");
+    goto out;
+  }
+
+  if(audit_line("http2_get", "done", "download", challenge.id)) {
+    reply(fd, audit_failed);
+    goto out;
+  }
+  if(write_all(fd, work->body, text.len) ||
+     (text.len && work->body[text.len - 1] != '\n' &&
+      write_all(fd, "\n", 1))) {
+    goto out;
+  }
+  reply(fd, "exit 0\n");
+
+out:
+  free(work);
+}
+
+
 /**
  * reboot: the owner signs the boot list the restart will run. The answer and
  * its audit line come before the restart, which replaces this process.
@@ -3286,6 +3428,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc >= 1 && builtin_gated(argv[0])) {
     builtin_command(agent, fd, argc, argv);
+    return;
+  }
+
+  if((argc == 2 || argc == 4) && !strcmp(argv[0], "http2_get")) {
+    http2_get_command(agent, fd, argc, argv);
     return;
   }
 

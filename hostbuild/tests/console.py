@@ -547,6 +547,15 @@ def check_kill_refusals(session, context):
         "SceShellCore must be refused with exit 87")
 
 
+def check_http2_get_refusal(session, context):
+    del context
+    link = session.link
+    lines = link.exchange("http2_get http://localhost:1/file")
+    assert lines == ["not_allowlisted", "exit 1"], (
+        "a host the console allowlist does not name must be refused, got %r"
+        % lines)
+
+
 def check_env_export_exec_refusals(session, context):
     del context
     link = session.link
@@ -882,6 +891,9 @@ CHECKS = [
     ("kill with a bad signal, a bad pid or no such process answers an "
      "error and exit 1, and SceShellCore is refused with exit 87",
      check_kill_refusals),
+    ("http2_get off the console allowlist is refused with not_allowlisted "
+     "and exit 1, without asking",
+     check_http2_get_refusal),
     ("env, export and exec refuse a bad name, a relative or missing path and "
      "the token without asking, and audit each refusal",
      check_env_export_exec_refusals),

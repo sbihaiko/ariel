@@ -1237,6 +1237,13 @@ HOST_FIXTURE_SCENARIOS = {
     "kill of Ariel's own process answers protected and exit 87",
     "reptyr of a restarted process answers approval_stale and exit 78 and "
     "touches nothing",
+    "http2_get refuses a URL off the allowlist without asking",
+    "http2_get answers 75 with its URL in the signed bytes",
+    "http2_get fetches its body after a grant and is audited",
+    "http2_get -o writes the body to the file after a grant",
+    "http2_get refuses an approved URL that left the allowlist",
+    "http2_get answers approval_stale when the destination changed after a grant",
+    "http2_get refuses a redirect without following it",
 }
 
 HOST_RESTART_SCENARIOS = {
@@ -1253,6 +1260,7 @@ HOST_RESTART_SCENARIOS = {
 # The scenarios that need the host test root: they write scratch files or
 # links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
+    "http2_get -o answers protected for the token and its hard link, unasked",
     "each gated built-in answers 75 and its challenge before anything runs",
     "a built-in's challenge names each argument after the target, in order",
     "a built-in that names Ariel's token answers protected and asks nothing",
@@ -7512,6 +7520,218 @@ INSTALL_SCENARIOS = [
 RELEASE_SCENARIOS = {title for title, _check, _reason in INSTALL_SCENARIOS}
 
 SCENARIOS.extend(INSTALL_SCENARIOS)
+
+
+HTTP2_BODY = b"fetched body"
+
+
+class FetchServer:
+    """A local origin for http2_get. /redirect answers with a 302 to a host
+    the allowlist does not name, so a followed hop would show in requests."""
+
+    def __init__(self):
+        self.requests = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, body=b"", location=None):
+                self.send_response(status)
+                if location is not None:
+                    self.send_header("Location", location)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                fake.requests.append(self.path)
+                if self.path == "/file":
+                    return self.reply(200, HTTP2_BODY)
+                if self.path == "/redirect":
+                    return self.reply(302, location="http://localhost:%d/offlist"
+                                      % fake.port)
+                return self.reply(404)
+
+        self.httpd = http.server.ThreadingHTTPServer((HOST, 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def url(self, path):
+        return "http://%s:%d%s" % (HOST, self.port, path)
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def with_fetch(scenario):
+    """Run scenario against a fresh Ariel whose allowlist names the origin only."""
+    origin = FetchServer()
+
+    def setup(root):
+        state = os.path.join(root, "data", "ariel")
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "allowlist"), "w") as fh:
+            fh.write("host %s:%d\n" % (HOST, origin.port))
+
+    server = Server(SERVER_BINARY, setup=setup)
+    server.origin = origin
+    try:
+        return scenario(server)
+    finally:
+        server.stop()
+        origin.stop()
+
+
+def audit_kinds(server):
+    return [event[0] for event in audit_events(server)]
+
+
+def scenario_http2_refuses_off_allowlist_without_asking(_server):
+    """A host the allowlist does not name is refused before anything is asked."""
+    def run(server):
+        url = "http://localhost:%d/file" % server.origin.port
+        assert run_command(server, "http2_get " + url) == [
+            "not_allowlisted", "exit 1"], (
+            "a host outside the allowlist must be refused")
+        assert server.origin.requests == [], "nothing may be fetched"
+        assert "http2_get.refused" in audit_kinds(server), audit_kinds(server)
+    with_fetch(run)
+
+
+def scenario_http2_asks_with_its_url_in_the_signed_bytes(_server):
+    """http2_get answers 75 and its challenge carries the URL."""
+    def run(server):
+        url = server.origin.url("/file")
+        gated_request(server, "http2_get " + url,
+                      ["command=http2_get", "target=download",
+                       "option.url=" + url],
+                      "fetch %s will run" % url)
+    with_fetch(run)
+
+
+def scenario_http2_fetches_its_body_after_a_grant(_server):
+    """After the owner's grant the body is replied and the request is audited."""
+    def run(server):
+        url = server.origin.url("/file")
+        command = "http2_get " + url
+        approval, challenge = gated_request(
+            server, command, ["option.url=" + url], "fetch %s will run" % url)
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, command) == ["fetched body", "exit 0"], (
+            "a granted http2_get must reply the body and exit 0")
+        assert server.origin.requests == ["/file"], server.origin.requests
+        kinds = audit_kinds(server)
+        assert "http2_get.request" in kinds and "http2_get.done" in kinds, kinds
+    with_fetch(run)
+
+
+def scenario_http2_output_file_is_written_after_a_grant(_server):
+    """-o writes the body to the named file once the owner has granted it."""
+    def run(server):
+        url = server.origin.url("/file")
+        dest = os.path.join(server.root, "data", "fetched")
+        command = "http2_get -o %s %s" % (dest, url)
+        approval, challenge = gated_request(
+            server, command, ["destination=" + dest, "option.url=" + url],
+            "fetch %s to %s will run" % (url, dest))
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, command) == ["exit 0"], (
+            "a granted -o fetch must answer exit 0 and reply nothing else")
+        path = os.path.join(server.root, "data", "fetched")
+        with open(path, "rb") as fh:
+            assert fh.read() == HTTP2_BODY, "the body must land in the file"
+    with_fetch(run)
+
+
+def scenario_http2_output_refuses_the_token_and_its_alias(_server):
+    """-o answers protected for the token and for a hard link to it, unasked."""
+    def run(server):
+        url = server.origin.url("/file")
+        token = secret_path(server, "token")
+        assert_protected(server, "http2_get -o %s %s" % (token, url))
+        alias = os.path.join(server.root, "data", "alias")
+        make_link(alias, token, hard=True)
+        assert_protected(server, "http2_get -o %s %s" % (alias, url))
+        assert server.origin.requests == [], "nothing may be fetched"
+    with_fetch(run)
+
+
+def scenario_http2_refuses_a_url_that_left_the_allowlist_after_its_grant(_server):
+    """An approved URL is refused once the allowlist no longer names its host."""
+    def run(server):
+        url = server.origin.url("/file")
+        command = "http2_get " + url
+        approval, challenge = gated_request(
+            server, command, ["option.url=" + url], "fetch %s will run" % url)
+        sign_and_grant(server, approval, challenge)
+        with open(os.path.join(server.root, "data", "ariel", "allowlist"), "w") as fh:
+            fh.write("host %s:%d\n" % (HOST, server.origin.port + 1))
+        assert run_command(server, command) == ["not_allowlisted", "exit 1"], (
+            "a URL the allowlist no longer names must be refused even when approved")
+        assert server.origin.requests == [], "nothing may be fetched"
+    with_fetch(run)
+
+
+def scenario_http2_destination_replaced_after_a_grant_is_stale(_server):
+    """A destination that appeared after the grant answers approval_stale, unwritten."""
+    def run(server):
+        url = server.origin.url("/file")
+        path = os.path.join(server.root, "data", "fetched")
+        command = "http2_get -o %s %s" % (path, url)
+        approval, challenge = gated_request(
+            server, command, ["destination=" + path, "option.url=" + url],
+            "fetch %s to %s will run" % (url, path))
+        sign_and_grant(server, approval, challenge)
+        with open(path, "wb") as fh:
+            fh.write(b"someone else")
+        assert run_command(server, command) == ["approval_stale", "exit 78"], (
+            "a destination that changed after the grant must answer approval_stale")
+        with open(path, "rb") as fh:
+            assert fh.read() == b"someone else", "the stale fetch must not write"
+        assert server.origin.requests == [], "nothing may be fetched"
+    with_fetch(run)
+
+
+def scenario_http2_refuses_a_redirect_without_following_it(_server):
+    """A redirect is refused, and the hop it names is never requested."""
+    def run(server):
+        url = server.origin.url("/redirect")
+        command = "http2_get " + url
+        approval, challenge = gated_request(
+            server, command, ["option.url=" + url], "fetch %s will run" % url)
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, command) == ["redirect_refused", "exit 1"], (
+            "a redirect must be refused")
+        assert server.origin.requests == ["/redirect"], (
+            "the redirect's hop must never be requested: %r" % server.origin.requests)
+    with_fetch(run)
+
+
+HTTP2_SCENARIOS = [
+    ("http2_get refuses a URL off the allowlist without asking",
+     scenario_http2_refuses_off_allowlist_without_asking, HOST_FIXTURE_REASON),
+    ("http2_get answers 75 with its URL in the signed bytes",
+     scenario_http2_asks_with_its_url_in_the_signed_bytes, HOST_FIXTURE_REASON),
+    ("http2_get fetches its body after a grant and is audited",
+     scenario_http2_fetches_its_body_after_a_grant, HOST_FIXTURE_REASON),
+    ("http2_get -o writes the body to the file after a grant",
+     scenario_http2_output_file_is_written_after_a_grant, HOST_FIXTURE_REASON),
+    ("http2_get -o answers protected for the token and its hard link, unasked",
+     scenario_http2_output_refuses_the_token_and_its_alias, HOST_ROOT_REASON),
+    ("http2_get refuses an approved URL that left the allowlist",
+     scenario_http2_refuses_a_url_that_left_the_allowlist_after_its_grant,
+     HOST_FIXTURE_REASON),
+    ("http2_get answers approval_stale when the destination changed after a grant",
+     scenario_http2_destination_replaced_after_a_grant_is_stale, HOST_FIXTURE_REASON),
+    ("http2_get refuses a redirect without following it",
+     scenario_http2_refuses_a_redirect_without_following_it, HOST_FIXTURE_REASON),
+]
+
+SCENARIOS.extend(HTTP2_SCENARIOS)
 
 
 def main():

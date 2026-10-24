@@ -201,9 +201,19 @@ option_key_ok(const char *key) {
  * source, which is a target.
  **/
 static int
+url_ok(const char *value) {
+  return !strncmp(value, "http://", 7) &&
+         in_set(value, 8, APPROVAL_URL_MAX, "._-/:?=&%~+", 0);
+}
+
+
+static int
 option_value_ok(const approval_option_t *option) {
   if(!strcmp(option->key, "from")) {
     return option->value[0] == '/' && target_ok(option->value);
+  }
+  if(!strcmp(option->key, "url")) {
+    return url_ok(option->value);
   }
   return in_set(option->value, 1, APPROVAL_VALUE_MAX, "._-", 0);
 }
