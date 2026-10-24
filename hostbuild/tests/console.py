@@ -189,11 +189,14 @@ class Session:
         digest = (hashlib.sha256(data).hexdigest()
                   if declared_hash is None else declared_hash)
         command = "payload push %s %d %s" % (name, size, digest)
+        return self.until_not_busy(lambda: self.link.exchange(command, data))
+
+    def until_not_busy(self, send):
+        """Send again while the console is busy, one notification every 10 s."""
         for attempt in range(BUSY_RETRIES + 1):
-            lines = self.link.exchange(command, data)
+            lines = send()
             if lines != ["approval_busy", "exit 76"] or attempt == BUSY_RETRIES:
                 return lines
-            # The console shows one notification every 10 s.
             self.operator.say(
                 "The console allows one notification every 10 s; waiting.")
             self._sleep(NOTIFICATION_SPACING)
@@ -261,17 +264,57 @@ def check_wrong_token(session, context):
 
 
 def check_unknown_command(session, context):
+    """A command outside the set asks the owner first, never unknown_command."""
     del context
     for command in ("payload status", "nonsense"):
         lines = session.link.exchange(command)
-        exits = [line for line in lines if line.startswith("exit ")]
-        assert len(exits) == 1, (
-            "expected exactly one exit line, got %r" % lines)
-        assert lines[:-1] == ["unknown_command"], (
-            "expected unknown_command before the exit line, got %r" % lines)
-        assert lines[-1] == exits[0], "the exit line must come last: %r" % lines
-        assert int(exits[0].split()[1]) != 0, (
-            "unknown_command must exit nonzero, got %r" % exits[0])
+        if lines == ["approval_busy", "exit 76"]:
+            continue
+        assert len(lines) == 3 and lines[2] == "exit 75", (
+            "%s must answer approval_required and exit 75, got %r"
+            % (command, lines))
+        assert APPROVAL_LINE.match(lines[0]), (
+            "expected approval_required, got %r" % lines[0])
+
+
+def check_protected_without_asking(session, context):
+    del context
+    for command in ("touch /etc/ariel-gate",
+                    "rm %s/token" % CONSOLE_STATE_DIR,
+                    "rm %s/approvals" % CONSOLE_STATE_DIR):
+        assert session.link.exchange(command) == ["protected", "exit 87"], (
+            "%s must answer protected and exit 87 without asking" % command)
+
+
+def run_gated_file_command(session, command):
+    """Ask for command, show the owner the challenge, grant it; return the approval ID."""
+    lines = session.until_not_busy(lambda: session.link.exchange(command))
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "%s must answer approval_required and exit 75, got %r" % (command, lines))
+    approval = APPROVAL_LINE.match(lines[0])
+    assert approval, "expected approval_required, got %r" % lines[0]
+    shown = "prompt %s %s will run" % (approval.group(1), command)
+    signature = session.operator.sign(command.split()[0], shown, lines[1])
+    assert session.grant(approval.group(1), signature) == [
+        "approval_granted %s" % approval.group(1), "exit 0"], (
+        "the owner's signature must grant %s" % command)
+    return approval.group(1)
+
+
+def check_file_command_runs_after_approval(session, context):
+    """mkdir and rmdir run once each, after the owner signs, on the console."""
+    del context
+    folder = "/data/gate-%s" % os.urandom(4).hex()
+    run_gated_file_command(session, "mkdir " + folder)
+    assert session.link.exchange("mkdir " + folder) == ["exit 0"], (
+        "a signed mkdir must run")
+    assert session.link.exchange("stat " + folder)[-1] == "exit 0", (
+        "mkdir must create the directory")
+    run_gated_file_command(session, "rmdir " + folder)
+    assert session.link.exchange("rmdir " + folder) == ["exit 0"], (
+        "a signed rmdir must run")
+    assert session.link.exchange("stat " + folder)[-1] == "exit 1", (
+        "rmdir must remove the directory")
 
 
 def check_truncated_upload(session, context):
@@ -509,8 +552,12 @@ CHECKS = [
     ("missing auth closes with exit 70", check_missing_auth),
     ("a line over 1 KiB closes the connection", check_line_limit),
     ("a wrong token closes with exit 70", check_wrong_token),
-    ("an unknown command answers unknown_command and exits nonzero",
-     check_unknown_command),
+    ("a command outside the set asks the owner first and never answers "
+     "unknown_command", check_unknown_command),
+    ("on the console, writes outside /data, /user and /mnt/usb* answer "
+     "protected and exit 87 without asking", check_protected_without_asking),
+    ("mkdir and rmdir run only after the owner signs, once each, on the console",
+     check_file_command_runs_after_approval),
     ("a truncated upload answers upload_mismatch and exit 81",
      check_truncated_upload),
     ("a hash mismatch answers upload_mismatch and exit 81",

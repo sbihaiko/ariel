@@ -113,7 +113,7 @@ main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  platform = platform_host(run_dir);
+  platform = platform_host(run_dir, root);
 
   // The store needs the platform's clock: approvals and staging objects
   // expire against it.

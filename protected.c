@@ -26,7 +26,9 @@ along with this program; see the file COPYING. If not, see
 #define PATH_MAX 4096
 #endif
 
-static const char *const protected_names[] = {"token", "approvals", "nonces"};
+static const char *const protected_names[] = {
+  "token", "approvals", "nonces", "audit.log", "state"
+};
 static char state_dir[PATH_MAX];
 
 
@@ -37,26 +39,33 @@ protected_init(const char *dir) {
 
 
 int
-protected_object(int fd) {
-  struct stat file;
+protected_stat(const struct stat *file) {
   struct stat guard;
   char path[PATH_MAX];
   size_t i;
 
-  if(fstat(fd, &file)) {
-    return -1;
-  }
-
   for(i=0; i<sizeof(protected_names)/sizeof(protected_names[0]); i++) {
     if(snprintf(path, sizeof(path), "%s/%s", state_dir, protected_names[i])
        >= (int)sizeof(path)) {
-      return -1;
+      return 1;
     }
     if(!stat(path, &guard) &&
-       guard.st_dev == file.st_dev && guard.st_ino == file.st_ino) {
+       guard.st_dev == file->st_dev && guard.st_ino == file->st_ino) {
       return 1;
     }
   }
 
   return 0;
+}
+
+
+int
+protected_object(int fd) {
+  struct stat file;
+
+  if(fstat(fd, &file)) {
+    return -1;
+  }
+
+  return protected_stat(&file);
 }

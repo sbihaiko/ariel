@@ -46,6 +46,9 @@ along with this program; see the file COPYING. If not, see
 /** At most this many options belong to one action. **/
 #define APPROVAL_OPTIONS_MAX 8
 
+/** The hash of an action with no content behind it. **/
+#define APPROVAL_NO_HASH "none"
+
 /**
  * The public half of the host build's test key. The host build pins it;
  * the PS5 build refuses it (approval_pin). Its private half is
@@ -74,14 +77,18 @@ typedef struct {
  * function that does so. Anything that could read two ways is refused, not
  * normalized: a target with a '..', an empty or '.' segment, a trailing
  * '/', a target of only '/', bytes outside ASCII, a repeated option, an
- * omitted field, a hash that is not 64 lowercase hex digits, and any
- * newline or space that would smuggle in a line. A leading '/' is one
- * spelling of a path, so an absolute target encodes as written. Options are
- * written in key order. Returns the length of the NUL-terminated text in
- * out, or -1 when the action is refused or does not fit in size.
+ * omitted field, a hash that is neither 64 lowercase hex digits nor none
+ * (the hash of an action with no content), and any newline or space that
+ * would smuggle in a line. A leading '/' is one spelling of a path, so an
+ * absolute target encodes as written. Options are written in key order.
+ * Returns the length of the NUL-terminated text in out, or -1 when the
+ * action is refused or does not fit in size.
  **/
 int approval_canonical(const approval_action_t *action, char *out,
                        size_t size);
+
+/** Whether target is one the encoder accepts. Returns 1 when it is. **/
+int approval_target_valid(const char *target);
 
 /**
  * Build the message a signature covers: a domain tag, the console

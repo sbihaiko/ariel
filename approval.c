@@ -142,9 +142,20 @@ target_ok(const char *target) {
 }
 
 
+int
+approval_target_valid(const char *target) {
+  return target_ok(target);
+}
+
+
+/** A content hash, or none for an action with no content behind it. **/
 static int
 hash_ok(const char *hash) {
   size_t i;
+
+  if(hash && !strcmp(hash, APPROVAL_NO_HASH)) {
+    return 1;
+  }
 
   if(!hash || strlen(hash) != HASH_LEN) {
     return 0;

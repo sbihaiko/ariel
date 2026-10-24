@@ -30,10 +30,18 @@ along with this program; see the file COPYING. If not, see
 /** An approval ID is short, for example a-1. **/
 #define APPROVAL_ID_MAX 32
 
+/** The longest path a gated file command names, the longest argv[0] of an
+    unimplemented command. **/
+#define APPROVAL_TARGET_MAX 128
+
 /**
  * The immutable fact record an approval is bound to: what exactly the
  * owner approves. A copy of it, never a pointer, is what the platform
  * holds, so a caller cannot change the facts after the request.
+ *
+ * A payload commit fills the name, size, hash, staging ID and run. A gated
+ * action, a file command or an unimplemented command, fills the target
+ * instead, with its entry's kind, device and inode, or its argument count.
  **/
 typedef struct {
   char command[APPROVAL_COMMAND_MAX + 1];
@@ -42,6 +50,11 @@ typedef struct {
   char sha256[65];
   char staging_id[APPROVAL_ID_MAX];
   int run;  /** The approved build will be executed. **/
+  char target[APPROVAL_TARGET_MAX + 1];
+  char kind[8];  /** file, dir, link, other or absent. **/
+  uint64_t dev;
+  uint64_t ino;
+  uint64_t argc;
 } approval_facts_t;
 
 /**
@@ -68,6 +81,12 @@ typedef struct {
 typedef struct platform platform_t;
 
 struct platform {
+  /**
+   * The directory the file commands' absolute paths are under: empty on a
+   * console, the test root on the host. Writable roots are below it.
+   **/
+  const char *fs_root;
+
   /** Return a socket listening on port, or -1 on error. **/
   int (*listen)(platform_t *self, uint16_t port);
 
@@ -184,8 +203,9 @@ struct platform {
 /**
  * The implementation for the host operating system. run_dir is a directory
  * only Ariel can read, where the bytes of a run are written before they are
- * executed and removed afterwards.
+ * executed and removed afterwards. fs_root is the test root that file
+ * commands' paths are under.
  **/
-platform_t *platform_host(const char *run_dir);
+platform_t *platform_host(const char *run_dir, const char *fs_root);
 
 #endif /* ARIEL_PLATFORM_H */

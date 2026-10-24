@@ -110,9 +110,11 @@ struct approval {
   int expired;
   int consumed;
   int released;
+  int gated;
   char id[APPROVAL_ID_MAX];
   uint64_t created_ms;
   approval_challenge_t challenge;
+  approval_facts_t facts;
 };
 
 /**
@@ -232,10 +234,10 @@ staged_find(const char *id) {
 
 /**
  * An empty slot, or NULL when no row can give one up. A row gives its slot
- * up only once it has answered (consumed, expired or denied) and no staged
- * object still names it: the staging TTL outlives the approval's window, so
- * a row a staged object names must stay for that commit to find. The oldest
- * such row goes first.
+ * up only once it has answered (consumed, expired or denied) and nothing
+ * still needs it: a payload's staged object must find its row at commit, so
+ * a payload row waits for its release; a gated row has no staged object and
+ * goes once it has answered. The oldest such row goes first.
  **/
 static struct approval *
 approval_slot(void) {
@@ -251,8 +253,8 @@ approval_slot(void) {
   for(i=0; i<APPROVALS_MAX; i++) {
     struct approval *slot = &approvals[i];
 
-    if(!slot->released || !(slot->consumed || slot->expired ||
-                            (slot->decided && !slot->approved))) {
+    if(!(slot->released || slot->gated) ||
+       !(slot->consumed || slot->expired || (slot->decided && !slot->approved))) {
       continue;
     }
     if(!oldest || slot->created_ms < oldest->created_ms) {
@@ -827,13 +829,59 @@ decimal(uint64_t value, char *out, size_t size) {
 }
 
 
+/**
+ * The action an approval is of, with its options. A payload's build is an
+ * action on its name. A gated command is an action on its target, with the
+ * entry's kind and identity, or with the argument count of a command nothing
+ * implements. text holds the numbers the options point at.
+ **/
+static void
+action_build(const approval_facts_t *facts, approval_action_t *action,
+             approval_option_t options[APPROVAL_OPTIONS_MAX],
+             char text[3][24]) {
+  if(facts->target[0]) {
+    action->command = facts->command;
+    action->target = facts->target;
+    action->sha256 = APPROVAL_NO_HASH;
+    if(facts->kind[0]) {
+      decimal(facts->dev, text[0], sizeof(text[0]));
+      decimal(facts->ino, text[1], sizeof(text[1]));
+      options[0].key = "kind";
+      options[0].value = facts->kind;
+      options[1].key = "dev";
+      options[1].value = text[0];
+      options[2].key = "ino";
+      options[2].value = text[1];
+      action->noptions = 3;
+    } else {
+      decimal(facts->argc, text[0], sizeof(text[0]));
+      options[0].key = "argc";
+      options[0].value = text[0];
+      action->noptions = 1;
+    }
+  } else {
+    decimal(facts->size, text[0], sizeof(text[0]));
+    options[0].key = "size";
+    options[0].value = text[0];
+    options[1].key = "run";
+    options[1].value = "1";
+    action->command = facts->command;
+    action->target = facts->name;
+    action->sha256 = facts->sha256;
+    action->noptions = facts->run ? 2 : 1;
+  }
+
+  action->options = options;
+}
+
+
 int
 store_approval_request(const approval_facts_t *facts,
                        approval_challenge_t *challenge, char *prompt,
                        size_t promptlen) {
-  char size_text[24];
+  char text[3][24];
   char id[APPROVAL_ID_MAX] = {0};
-  approval_option_t options[2];
+  approval_option_t options[APPROVAL_OPTIONS_MAX];
   approval_action_t action;
   struct approval *slot;
   const char *console;
@@ -841,20 +889,10 @@ store_approval_request(const approval_facts_t *facts,
   int tries;
   int len;
 
-  decimal(facts->size, size_text, sizeof(size_text));
-  options[0].key = "size";
-  options[0].value = size_text;
-  options[1].key = "run";
-  options[1].value = "1";
-
   // The approval is of this one action. What the owner reads and signs is
   // the output of the one encoder, and a build whose facts it refuses can
   // not be approved at all.
-  action.command = facts->command;
-  action.target = facts->name;
-  action.sha256 = facts->sha256;
-  action.options = options;
-  action.noptions = facts->run ? 2 : 1;
+  action_build(facts, &action, options, text);
 
   pthread_mutex_lock(&lock);
   now = now_ms();
@@ -901,6 +939,8 @@ store_approval_request(const approval_facts_t *facts,
 
   slot->used = 1;
   slot->created_ms = now;
+  slot->gated = facts->target[0] != '\0';
+  slot->facts = *facts;
   // Built once outside the table: GCC's -Wrestrict reads a copy from
   // slot->id into slot->challenge.id as an overlap in `approvals`.
   snprintf(id, sizeof(id), "a-%lx", ++approval_count);
@@ -912,9 +952,14 @@ store_approval_request(const approval_facts_t *facts,
   slot->challenge.issued_ms = now;
   slot->challenge.expires_ms = now + APPROVAL_EXPIRY_MS;
 
-  snprintf(prompt, promptlen,
-           "payload %s (%llu bytes, sha256 %s) will run",
-           facts->name, (unsigned long long)facts->size, facts->sha256);
+  if(slot->gated) {
+    snprintf(prompt, promptlen, "%s %s will run", facts->command,
+             facts->target);
+  } else {
+    snprintf(prompt, promptlen,
+             "payload %s (%llu bytes, sha256 %s) will run",
+             facts->name, (unsigned long long)facts->size, facts->sha256);
+  }
 
   *challenge = slot->challenge;
   notified = 1;
@@ -922,6 +967,83 @@ store_approval_request(const approval_facts_t *facts,
 
   pthread_mutex_unlock(&lock);
   return 0;
+}
+
+
+/** Whether two entries are the same object: the same kind, device and inode. **/
+static int
+same_identity(const approval_facts_t *a, const approval_facts_t *b) {
+  return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino;
+}
+
+
+/**
+ * The gate for a gated command, one check per attempt. An open row (not
+ * consumed, expired or released) for the same command and target is the
+ * only one that can answer; there is at most one. The caller holds the lock.
+ **/
+static struct approval *
+gate_row(const approval_facts_t *facts) {
+  int i;
+
+  for(i=0; i<APPROVALS_MAX; i++) {
+    struct approval *row = &approvals[i];
+
+    if(row->used && row->gated && !row->consumed && !row->expired &&
+       !row->released && !strcmp(row->facts.command, facts->command) &&
+       !strcmp(row->facts.target, facts->target)) {
+      return row;
+    }
+  }
+  return NULL;
+}
+
+
+int
+store_gate_check(const approval_facts_t *facts,
+                 approval_challenge_t *challenge) {
+  char text[3][24];
+  approval_option_t options[APPROVAL_OPTIONS_MAX];
+  approval_action_t action;
+  char canonical[APPROVAL_ACTION_MAX + 1];
+  struct approval *row;
+  int rc;
+
+  action_build(facts, &action, options, text);
+  if(approval_canonical(&action, canonical, sizeof(canonical)) < 0) {
+    return STORE_GATE_REFUSED;
+  }
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+  row = gate_row(facts);
+
+  if(!row) {
+    rc = STORE_GATE_NEW;
+  } else if(!row->decided) {
+    if(same_identity(&row->facts, facts)) {
+      *challenge = row->challenge;
+      rc = STORE_GATE_PENDING;
+    } else {
+      // The entry changed while the owner was asked: the question is stale.
+      row->decided = 1;
+      row->approved = 0;
+      row->released = 1;
+      rc = STORE_GATE_NEW;
+    }
+  } else if(!row->approved) {
+    *challenge = row->challenge;
+    row->released = 1;
+    rc = STORE_GATE_DENIED;
+  } else {
+    // The owner signed this command: the signature is spent by this answer.
+    *challenge = row->challenge;
+    row->consumed = 1;
+    rc = same_identity(&row->facts, facts) ? STORE_GATE_GO : STORE_GATE_STALE;
+  }
+
+  pthread_mutex_unlock(&lock);
+  return rc;
 }
 
 
@@ -1021,7 +1143,10 @@ store_approval_facts(const char *id, approval_facts_t *facts) {
   pthread_mutex_lock(&lock);
   request = approval_find(id);
 
-  if(request) {
+  if(request && request->gated) {
+    *facts = request->facts;
+    found = 1;
+  } else if(request) {
     for(i=0; i<STAGING_MAX; i++) {
       entry = &staged[i];
       if(entry->used && !strcmp(entry->approval_id, id)) {

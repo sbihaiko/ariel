@@ -257,6 +257,18 @@ def assert_unknown(reply):
     assert status != 0, "unknown_command must exit nonzero, got %d" % status
 
 
+def assert_gated(reply):
+    """A command nothing implements is gated: the owner is asked (75), or busy (76)."""
+    lines = reply_lines(reply)
+    exits = [line for line in lines if line.startswith("exit ")]
+    assert len(exits) == 1, "expected exactly one exit line, got %r" % lines
+    assert lines[-1] == exits[0], "the exit line must come last: %r" % lines
+    assert exits[0] in ("exit 75", "exit 76"), (
+        "an unlisted command must exit 75 or 76, got %r" % lines)
+    assert "unknown_command" not in lines, (
+        "an unlisted command is gated, never unknown_command: %r" % lines)
+
+
 def push(server, name, data, declared_size=None, declared_hash=None,
          fragments=None, timeout=5.0, throttle=True):
     """Send one payload push and return the lines the server answered.
@@ -1079,6 +1091,10 @@ CLOCK_SCENARIOS = {
     "and an expired staged object still answers approval_expired",
     "the challenge names the command, target, hash, size and run of the "
     "approval",
+    "mkdir, rmdir, touch and rm run only after the owner signs, once each",
+    "a command nothing implements asks the owner and then does nothing",
+    "a file command's audit lines reach audit tail",
+    "the challenge of a file command names its path, sha256 none and identity",
 }
 
 # The read-only scenarios that need the host test root: they write scratch
@@ -1092,6 +1108,9 @@ HOST_ROOT_SCENARIOS = {
     "through a symbolic link",
     "the token, approval state and nonces answer protected and exit 87 "
     "through a hard link",
+    "writes outside /data, /user and /mnt/usb* answer protected and exit 87 "
+    "without asking, and so does Ariel's token",
+    "a file replaced after approval answers approval_stale and exit 78",
 }
 
 
@@ -2221,6 +2240,11 @@ def scenario_wrong_token(server):
 
 
 def scenario_unknown_command(server):
+    """A command outside the allowlist is gated, never answered unknown_command.
+
+    Nothing implements these, so the owner is asked first; the notification
+    gap holds the second and third without a clock move, answering 76.
+    """
     # payload run <name> is a Stage 2 command from #26 on, so it is not a probe.
     for command in (
         "payload stop helloworld",
@@ -2232,9 +2256,16 @@ def scenario_unknown_command(server):
             sock.sendall(
                 ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
             )
-            assert_unknown(read_reply(sock))
+            lines = reply_lines(read_reply(sock))
         finally:
             sock.close()
+        assert lines[-1] in ("exit 75", "exit 76") and lines[0] != (
+            "unknown_command"), (
+            "%r must be gated, answered %r" % (command, lines))
+        if lines[-1] == "exit 75":
+            assert APPROVAL_LINE.match(lines[0]), (
+                "%r must name its approval, got %r" % (command, lines))
+            server.next_line()
 
 
 def run_command(server, command):
@@ -2423,9 +2454,15 @@ def scenario_no_system_change_on_agent_port(server):
     checks the other half of the boundary: every command that changes the
     system on the telnet shell is refused here, and the only way to put code
     on the console is a push, which waits for an approval.
+
+    Every command outside the allowlist now asks the owner (75), or is held
+    by the notification gap (76) because this scenario does not move the
+    clock. A write outside the host test root is protected (87), so the
+    host's own /data is never asked about or touched.
     """
+    secret = secret_path(server, "token")
     for command in (
-        "rm /data/ariel/token",
+        "rm " + secret,
         "kill 1",
         "mount -t nullfs / /mnt",
         "mkdir /data/x",
@@ -2441,9 +2478,20 @@ def scenario_no_system_change_on_agent_port(server):
             sock.sendall(
                 ("auth %s\n%s\n" % (server.token, command)).encode("ascii")
             )
-            assert_unknown(read_reply(sock))
+            lines = reply_lines(read_reply(sock))
         finally:
             sock.close()
+        if command.startswith("rm ") or command.startswith("mkdir ") or (
+                command.startswith("touch ")):
+            assert lines == ["protected", "exit 87"], (
+                "%s must answer protected, got %r" % (command, lines))
+        else:
+            assert lines[-1] in ("exit 75", "exit 76"), (
+                "%s must be gated, answered %r" % (command, lines))
+            assert lines[-1] == "exit 76" or APPROVAL_LINE.match(lines[0]), (
+                "%s must answer approval_required, got %r" % (command, lines))
+            if lines[-1] == "exit 75":
+                server.next_line()
     # A push is the one way in. It names an approval and shows the owner a
     # prompt; the scenario denies it so nothing stays staged.
     decide_push(server, "boundary", b"\x7fELF telnet boundary", "deny")
@@ -2567,6 +2615,154 @@ def scenario_authid_is_not_available_on_the_host(server):
         sock.close()
 
 
+GATE_PROMPT = re.compile(r"^prompt (a-[0-9a-f]+) ")
+
+
+def gate_request(server, command):
+    """Send a gated command and check the owner is asked: 75, a challenge, a prompt.
+
+    Ten seconds of test clock pass first, so the notification gap is clear.
+    Returns the approval ID and the challenge line.
+    """
+    server.advance(10_000)
+    lines = run_command(server, command)
+    assert len(lines) == 3 and lines[2] == "exit 75", (
+        "%s must answer approval_required and exit 75, got %r"
+        % (command, lines))
+    approval = APPROVAL_LINE.match(lines[0])
+    assert approval, "expected approval_required, got %r" % lines[0]
+    challenge = CHALLENGE_LINE.match(lines[1])
+    assert challenge and challenge.group(1) == approval.group(1), (
+        "the challenge must name the approval, got %r" % lines[1])
+    prompt = GATE_PROMPT.match(server.next_line() or "")
+    assert prompt and prompt.group(1) == approval.group(1), (
+        "the owner must be asked about %s" % command)
+    return approval.group(1), lines[1]
+
+
+def stat_exit(server, path):
+    return run_command(server, "stat " + path)[-1]
+
+
+def scenario_file_commands_need_the_owner(server):
+    """Each of mkdir, rmdir, touch and rm asks first and runs once per signature."""
+    folder = os.path.join(server.root, "data", "gate-dir")
+    target = os.path.join(server.root, "data", "gate-file")
+
+    approval, challenge = gate_request(server, "mkdir " + folder)
+    assert stat_exit(server, folder) == "exit 1", "an unsigned mkdir must not run"
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "mkdir " + folder) == ["exit 0"], (
+        "a signed mkdir must run")
+    assert stat_exit(server, folder) == "exit 0", "mkdir must create the directory"
+
+    approval, challenge = gate_request(server, "rmdir " + folder)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "rmdir " + folder) == ["exit 0"], (
+        "a signed rmdir must run")
+    assert stat_exit(server, folder) == "exit 1", "rmdir must remove the directory"
+
+    approval, challenge = gate_request(server, "touch " + target)
+    assert stat_exit(server, target) == "exit 1", (
+        "an unsigned touch must not create the file")
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "touch " + target) == ["exit 0"], (
+        "a signed touch must run")
+    assert stat_exit(server, target) == "exit 0", "touch must create the file"
+
+    # The signature is spent: the same touch needs a new one.
+    spent, _ = gate_request(server, "touch " + target)
+    assert spent != approval, "a spent approval must not be asked again"
+
+    approval, challenge = gate_request(server, "rm " + target)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "rm " + target) == ["exit 0"], (
+        "a signed rm must run")
+    assert stat_exit(server, target) == "exit 1", "rm must remove the file"
+
+
+def scenario_file_replaced_after_approval_answers_78(server):
+    """A file replaced after the owner signs answers approval_stale and survives."""
+    target = os.path.join(server.root, "data", "stale-file")
+    approval, challenge = gate_request(server, "touch " + target)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "touch " + target) == ["exit 0"]
+
+    approval, challenge = gate_request(server, "rm " + target)
+    sign_and_grant(server, approval, challenge)
+
+    # A new file under the same name has a new identity.
+    replacement = target + "-new"
+    open(replacement, "wb").close()
+    os.replace(replacement, target)
+
+    assert run_command(server, "rm " + target) == [
+        "approval_stale", "exit 78"], (
+        "a file replaced after approval must answer approval_stale")
+    assert stat_exit(server, target) == "exit 0", (
+        "a stale approval must not remove the file")
+
+
+def scenario_unlisted_command_is_gated(server):
+    """A command nothing implements asks the owner, then does nothing once signed."""
+    approval, challenge = gate_request(server, "nonsense")
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "nonsense") == ["unknown_command", "exit 1"], (
+        "a signed command that nothing implements must still do nothing")
+
+
+def scenario_protected_paths_answer_87_without_asking(server):
+    """Writes outside the allowed roots, and Ariel's token, answer protected."""
+    outside = [
+        "touch /etc/ariel-gate",
+        "mkdir " + os.path.join(server.root, "elsewhere"),
+        "touch " + os.path.join(server.root, "elsewhere", "x"),
+        "mkdir " + os.path.join(server.root, "user"),
+        "mkdir " + os.path.join(server.root, "data"),
+        "touch " + os.path.join(server.root, "database", "x"),
+        "rm " + secret_path(server, "token"),
+    ]
+    for command in outside:
+        assert run_command(server, command) == ["protected", "exit 87"], (
+            "%s must answer protected and exit 87" % command)
+    server.assert_no_line()
+
+
+def scenario_file_commands_are_audited(server):
+    """Requests, runs and protected refusals of file commands reach audit tail."""
+    target = os.path.join(server.root, "data", "audited-file")
+    approval, challenge = gate_request(server, "touch " + target)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "touch " + target) == ["exit 0"]
+    assert run_command(server, "rm " + secret_path(server, "token")) == [
+        "protected", "exit 87"]
+
+    kinds = set()
+    for line in run_exit_zero(server, "audit tail 64"):
+        fields = line.split()
+        if len(fields) == 5:
+            kinds.add(fields[1])
+    for kind in ("touch.request", "touch.done", "rm.protected"):
+        assert kind in kinds, "audit tail must show %s, got %r" % (
+            kind, sorted(kinds))
+
+
+def scenario_file_action_names_its_facts(server):
+    """The challenge names the command, the path, and the file's identity."""
+    target = os.path.join(server.root, "data", "facts-file")
+    approval, challenge = gate_request(server, "touch " + target)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "touch " + target) == ["exit 0"]
+
+    _, challenge = gate_request(server, "rm " + target)
+    action = challenge_action(challenge)
+    assert action.startswith("ariel-action-v1\ncommand=rm\n"), action
+    assert "\ntarget=%s\n" % target in action, action
+    assert "\nsha256=none\n" in action, action
+    assert "\noption.kind=file\n" in action, action
+    assert "\noption.dev=" in action and "\noption.ino=" in action, action
+
+
 def scenario_two_connections(server):
     first = server.connect(timeout=3.0)
     try:
@@ -2579,12 +2775,12 @@ def scenario_two_connections(server):
                 ("auth %s\nanything\n" % server.token).encode("ascii")
             )
             second.settimeout(2.0)
-            assert_unknown(read_reply(second))
+            assert_gated(read_reply(second))
         finally:
             second.close()
         first.sendall(b"anything\n")
         first.settimeout(2.0)
-        assert_unknown(read_reply(first))
+        assert_gated(read_reply(first))
     finally:
         first.close()
 
@@ -2675,7 +2871,7 @@ def scenario_stalled_upload_does_not_block(server):
         try:
             sock.sendall(("auth %s\nnonsense\n" % server.token)
                          .encode("ascii"))
-            assert_unknown(read_reply(sock))
+            assert_gated(read_reply(sock))
         finally:
             sock.close()
         elapsed = time.monotonic() - started
@@ -3124,8 +3320,9 @@ def scenario_ps5_has_no_pad(server):
 # The audit log (issue #21). Ariel appends every action; audit tail reads it.
 # ---------------------------------------------------------------------------
 
+# A file action has no payload hash, so its line records none in the sha256 field.
 AUDIT_LINE = re.compile(
-    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64})$")
+    r"^(\d+) (\S+) (\S+) (\S+) ([0-9a-f]{64}|none)$")
 
 
 def audit_log_path(server):
@@ -3378,6 +3575,19 @@ SCENARIOS = [
     ("the agent port opens no system change outside the gate and the "
      "telnet shell stays out of scope",
      scenario_no_system_change_on_agent_port, None),
+    ("mkdir, rmdir, touch and rm run only after the owner signs, once each",
+     scenario_file_commands_need_the_owner, True),
+    ("a file replaced after approval answers approval_stale and exit 78",
+     scenario_file_replaced_after_approval_answers_78, HOST_ROOT_REASON),
+    ("a command nothing implements asks the owner and then does nothing",
+     scenario_unlisted_command_is_gated, True),
+    ("writes outside /data, /user and /mnt/usb* answer protected and exit 87 "
+     "without asking, and so does Ariel's token",
+     scenario_protected_paths_answer_87_without_asking, HOST_ROOT_REASON),
+    ("a file command's audit lines reach audit tail",
+     scenario_file_commands_are_audited, True),
+    ("the challenge of a file command names its path, sha256 none and identity",
+     scenario_file_action_names_its_facts, True),
     ("pwd and ls <absolute path> run through the agent port",
      scenario_pwd_and_ls, None),
     ("cd on the agent port answers an error: no working directory",

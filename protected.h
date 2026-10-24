@@ -17,6 +17,8 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_PROTECTED_H
 #define ARIEL_PROTECTED_H
 
+#include <sys/stat.h>
+
 /**
  * Record Ariel's state directory. The token, the approval state and the
  * consumed nonces below it are protected. Call once, before any command.
@@ -30,5 +32,11 @@ void protected_init(const char *state_dir);
  * -1 on error.
  **/
 int protected_object(int fd);
+
+/**
+ * Whether the object with the identity in file is a protected one, by the
+ * same device and inode test as protected_object. Returns 1 or 0.
+ **/
+int protected_stat(const struct stat *file);
 
 #endif /* ARIEL_PROTECTED_H */

@@ -751,11 +751,12 @@ open_max(void) {
 
 
 platform_t *
-platform_host(const char *dir) {
+platform_host(const char *dir, const char *fs_root) {
   long limit;
 
   testclock_init();
   snprintf(run_dir, sizeof(run_dir), "%s", dir);
+  host_platform.fs_root = fs_root;
 
   // Read the descriptor bound here, before any connection thread exists:
   // the child after fork sweeps descriptors up to it and may not call

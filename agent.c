@@ -26,6 +26,7 @@ along with this program; see the file COPYING. If not, see
 
 #include "agent.h"
 #include "approval.h"
+#include "fileops.h"
 #include "runs.h"
 #include "sha256.h"
 #include "store.h"
@@ -470,6 +471,195 @@ reply(int fd, const char *text) {
 }
 
 
+/**
+ * The question the owner answers: the approval, and the challenge that signs
+ * it. The canonical action goes as hex, so no byte of it can be reshaped.
+ **/
+static void
+challenge_reply(int fd, const approval_challenge_t *challenge) {
+  char action_hex[2 * APPROVAL_ACTION_MAX + 1];
+  char nonce_hex[2 * APPROVAL_NONCE_LEN + 1];
+  char answer[2048];
+  int len;
+
+  approval_hex_encode((const unsigned char*)challenge->action,
+                      challenge->action_len, action_hex);
+  approval_hex_encode(challenge->nonce, sizeof(challenge->nonce), nonce_hex);
+
+  len = snprintf(answer, sizeof(answer),
+                 "approval_required %s\n"
+                 "challenge %s %s %s %llu %llu %s\nexit 75\n",
+                 challenge->id, challenge->id, challenge->console, nonce_hex,
+                 (unsigned long long)challenge->issued_ms,
+                 (unsigned long long)challenge->expires_ms, action_hex);
+  write_all(fd, answer, (size_t)len);
+}
+
+
+/** The answer for one file command's outcome: its word and exit, or ok. **/
+static void
+outcome_text(int rc, char *out, size_t size) {
+  if(rc == FILEOPS_OK) {
+    snprintf(out, size, "exit 0\n");
+    return;
+  }
+  snprintf(out, size, "%s\nexit %d\n", fileops_word(rc), fileops_status(rc));
+}
+
+
+static const char *
+outcome_event(int rc) {
+  switch(rc) {
+  case FILEOPS_OK:
+    return "done";
+  case FILEOPS_PROTECTED:
+    return "protected";
+  case FILEOPS_CHANGED:
+    return "stale";
+  case FILEOPS_FAILED:
+    return "failed";
+  default:
+    return "refused";
+  }
+}
+
+
+/**
+ * Append one line for command's event: "<command>.<event> <target> <id> none".
+ * An invalid target is logged as "-", so no argument can reshape the line.
+ **/
+static int
+audit_line(const char *command, const char *event, const char *target,
+           const char *id) {
+  char kind[64];
+  const char *name = approval_target_valid(target) ? target : "-";
+
+  snprintf(kind, sizeof(kind), "%s.%s", command, event);
+  return store_audit_append(kind, name, id, APPROVAL_NO_HASH);
+}
+
+
+/**
+ * Record one action or refusal, then answer it. The line lands before the
+ * answer, so an action the log cannot record is never reported as done.
+ **/
+static void
+audit_reply(int fd, const char *command, const char *event,
+            const char *target, const char *id, const char *answer) {
+  if(audit_line(command, event, target, id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  reply(fd, answer);
+}
+
+
+static void
+file_outcome(int fd, const char *command, const char *target, const char *id,
+             int rc) {
+  char text[64];
+
+  outcome_text(rc, text, sizeof(text));
+  audit_reply(fd, command, outcome_event(rc), target, id, text);
+}
+
+
+/**
+ * Decide whether a gated command may run now. Returns 1 when the owner signed
+ * these facts: the approval is spent by that answer and the caller acts.
+ * Otherwise the answer is written here and 0 is returned.
+ **/
+static int
+gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
+          approval_challenge_t *challenge) {
+  switch(store_gate_check(facts, challenge)) {
+  case STORE_GATE_GO:
+    return 1;
+  case STORE_GATE_PENDING:
+    challenge_reply(fd, challenge);
+    return 0;
+  case STORE_GATE_STALE:
+    audit_reply(fd, facts->command, "stale", facts->target, challenge->id,
+                approval_stale);
+    return 0;
+  case STORE_GATE_DENIED:
+    audit_reply(fd, facts->command, "denied", facts->target, challenge->id,
+                approval_denied);
+    return 0;
+  case STORE_GATE_REFUSED:
+    audit_reply(fd, facts->command, "refused", facts->target, "-", unknown);
+    return 0;
+  default:
+    break;
+  }
+
+  if(agent->platform->approval_request(agent->platform, facts, challenge)) {
+    reply(fd, approval_busy);
+    return 0;
+  }
+
+  if(audit_line(facts->command, "request", facts->target, challenge->id)) {
+    store_approval_deny(challenge->id);
+    reply(fd, audit_failed);
+    return 0;
+  }
+
+  challenge_reply(fd, challenge);
+  return 0;
+}
+
+
+/** One file command, mkdir, rmdir, touch or rm, on one absolute path. **/
+static void
+file_command(agent_t *agent, int fd, const char *command, const char *path) {
+  const char *root = agent->platform->fs_root;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int rc;
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_check(root, command, path, &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, command, path, "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", command);
+  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_act(root, command, path, &facts);
+  file_outcome(fd, command, path, challenge.id, rc);
+}
+
+
+/**
+ * A command nothing implements. The owner is asked about it like any other;
+ * once signed it still does nothing, and the answer is unknown_command.
+ **/
+static void
+unlisted_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+
+  if(strlen(argv[0]) > APPROVAL_TARGET_MAX) {
+    audit_reply(fd, "unlisted", "refused", "-", "-", unknown);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "unlisted");
+  snprintf(facts.target, sizeof(facts.target), "%s", argv[0]);
+  facts.argc = (uint64_t)argc;
+
+  if(gate_pass(agent, fd, &facts, &challenge)) {
+    audit_reply(fd, "unlisted", "refused", argv[0], challenge.id, unknown);
+  }
+}
+
+
 static void
 payload_push(agent_t *agent, int fd, int wake, const char *name,
              const char *size_text, const char *hash_text) {
@@ -541,10 +731,7 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
 
   {
     approval_challenge_t challenge;
-    char action_hex[2 * APPROVAL_ACTION_MAX + 1];
-    char nonce_hex[2 * APPROVAL_NONCE_LEN + 1];
-    char answer[2048];
-    int len;
+    char answer[64];
 
     if(platform->approval_request(platform, &facts, &challenge)) {
       store_staging_discard(staging_id);
@@ -562,19 +749,9 @@ payload_push(agent_t *agent, int fd, int wake, const char *name,
       return;
     }
 
-    // The challenge is everything the owner's signer needs: the canonical
-    // action as bytes in hex, so no byte of it can be reshaped on the way.
-    approval_hex_encode((const unsigned char*)challenge.action,
-                        challenge.action_len, action_hex);
-    approval_hex_encode(challenge.nonce, sizeof(challenge.nonce), nonce_hex);
-
-    len = snprintf(answer, sizeof(answer),
-                   "staged %s\napproval_required %s\n"
-                   "challenge %s %s %s %llu %llu %s\nexit 75\n",
-                   staging_id, challenge.id, challenge.id, challenge.console,
-                   nonce_hex, (unsigned long long)challenge.issued_ms,
-                   (unsigned long long)challenge.expires_ms, action_hex);
-    write_all(fd, answer, (size_t)len);
+    snprintf(answer, sizeof(answer), "staged %s\n", staging_id);
+    reply(fd, answer);
+    challenge_reply(fd, &challenge);
   }
 }
 
@@ -738,7 +915,8 @@ approval_grant(agent_t *agent, int fd, const char *id,
     // The grant stands once recorded, so a grant the log cannot record is
     // reported as such and is not undone.
     if(store_approval_facts(id, &facts) ||
-       store_audit_append("grant", facts.name, id, facts.sha256)) {
+       store_audit_append("grant", facts.target[0] ? facts.target : facts.name,
+                          id, facts.sha256[0] ? facts.sha256 : APPROVAL_NO_HASH)) {
       reply(fd, audit_failed);
       return;
     }
@@ -1087,11 +1265,22 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
+  if(argc == 2 && (!strcmp(argv[0], "mkdir") || !strcmp(argv[0], "rmdir") ||
+                   !strcmp(argv[0], "touch") || !strcmp(argv[0], "rm"))) {
+    file_command(agent, fd, argv[0], argv[1]);
+    return;
+  }
+
   if(argc >= 1 && run_command(agent, fd, argc, argv)) {
     return;
   }
 
-  reply(fd, unknown);
+  if(argc < 1) {
+    reply(fd, unknown);
+    return;
+  }
+
+  unlisted_command(agent, fd, argc, argv);
 }
 
 

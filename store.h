@@ -99,6 +99,26 @@ int store_approval_request(const approval_facts_t *facts,
                            approval_challenge_t *challenge, char *prompt,
                            size_t promptlen);
 
+/** What a gated command's check ended in. **/
+#define STORE_GATE_GO      0
+#define STORE_GATE_PENDING 1
+#define STORE_GATE_NEW     2
+#define STORE_GATE_STALE   3
+#define STORE_GATE_DENIED  4
+#define STORE_GATE_REFUSED 5
+
+/**
+ * Check a gated command against its approval, and spend the approval when it
+ * is answered. GO: the owner signed these facts, and the approval is spent.
+ * PENDING: the owner has not answered; challenge is the one to show. NEW: no
+ * approval stands for these facts, so one must be requested, and the caller
+ * does so with the platform. STALE: the entry changed after the owner signed.
+ * DENIED: the owner refused. REFUSED: the facts cannot be signed. challenge
+ * holds the approval's challenge for every answer that has one.
+ **/
+int store_gate_check(const approval_facts_t *facts,
+                     approval_challenge_t *challenge);
+
 /** What one signature submitted for an approval ended in. **/
 #define STORE_GRANT_OK       0
 #define STORE_GRANT_UNKNOWN  1

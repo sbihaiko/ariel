@@ -326,6 +326,7 @@ ps5_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
 static platform_t ps5_platform = {
   // A console has no test clock, so no wait has a wake pipe and every
   // deadline runs on real time.
+  .fs_root = "",
   .listen = ps5_listen,
   .accept = ps5_accept,
   .clock = ps5_clock,
