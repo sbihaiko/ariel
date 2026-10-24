@@ -18,6 +18,7 @@ along with this program; see the file COPYING. If not, see
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -364,11 +365,12 @@ parse_hash(const char *text, char out[SHA256_HEX_LEN + 1]) {
  * written to outfd and hashed; anything past size is read and dropped, so
  * the reply still comes after the whole upload. Returns 0 on an end of
  * stream, -1 on a stall, error or overrun, and -2 when the file write fails.
+ * buf holds READ_CHUNK bytes.
  **/
 static int
-upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
-            sha256_t *hash, uint64_t *received) {
-  unsigned char buf[READ_CHUNK];
+upload_read_into(platform_t *platform, int wake, int fd, int outfd,
+                 uint64_t size, sha256_t *hash, uint64_t *received,
+                 unsigned char *buf) {
   int64_t deadline = now_ms(platform) + UPLOAD_STALL_MS;
   uint64_t total = 0;
 
@@ -382,7 +384,7 @@ upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
       return -1;
     }
 
-    n = read(fd, buf, sizeof(buf));
+    n = read(fd, buf, READ_CHUNK);
     if(n < 0) {
       if(errno == EINTR) {
         continue;
@@ -412,6 +414,27 @@ upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
 
   *received = total;
   return 0;
+}
+
+
+/**
+ * upload_read_into with its chunk on the heap: a connection thread's stack
+ * is CONNECTION_STACK, and a READ_CHUNK frame alone would overflow it.
+ **/
+static int
+upload_read(platform_t *platform, int wake, int fd, int outfd, uint64_t size,
+            sha256_t *hash, uint64_t *received) {
+  unsigned char *buf;
+  int rc;
+
+  if(!(buf=malloc(READ_CHUNK))) {
+    *received = 0;
+    return -1;
+  }
+  rc = upload_read_into(platform, wake, fd, outfd, size, hash, received, buf);
+  free(buf);
+
+  return rc;
 }
 
 

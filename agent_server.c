@@ -36,6 +36,14 @@ along with this program; see the file COPYING. If not, see
 /** Past every refusal slot, at most this many closes wait for one drain. **/
 #define DRAIN_MAX 16
 
+/**
+ * Every connection thread gets this stack, on the PS5 and on the host alike.
+ * It is the PS5's default thread stack: a frame that overflows it crashed
+ * Ariel on a console while the host's larger default hid it, so the host
+ * build runs with the same limit and its suite finds such a frame first.
+ **/
+#define CONNECTION_STACK (64 * 1024)
+
 
 struct connection {
   agent_t *agent;
@@ -300,6 +308,24 @@ serve_connection(void *arg) {
 }
 
 
+/** Start one connection thread on a CONNECTION_STACK stack. **/
+static int
+spawn_connection(pthread_t *thread, struct connection *conn) {
+  pthread_attr_t attr;
+  int rc;
+
+  if((rc=pthread_attr_init(&attr))) {
+    return rc;
+  }
+  if(!(rc=pthread_attr_setstacksize(&attr, CONNECTION_STACK))) {
+    rc = pthread_create(thread, &attr, serve_connection, conn);
+  }
+  pthread_attr_destroy(&attr);
+
+  return rc;
+}
+
+
 void
 agent_server_serve(agent_t *agent, int srvfd) {
   int connfd;
@@ -335,7 +361,7 @@ agent_server_serve(agent_t *agent, int srvfd) {
     conn->wake = agent->platform->wake_new ?
                  agent->platform->wake_new(agent->platform) : -1;
 
-    rc = pthread_create(&thread, NULL, serve_connection, conn);
+    rc = spawn_connection(&thread, conn);
     if(rc) {
       fprintf(stderr, "pthread_create: %s\n", strerror(rc));
       close(connfd);

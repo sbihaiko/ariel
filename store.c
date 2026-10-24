@@ -1079,11 +1079,11 @@ current_write(int dirfd, const char *name, const char *hash) {
 /**
  * Copy the staging object into a temporary object, hashing the bytes as
  * they pass, so the object that enters the store is exactly the bytes the
- * hash covers. Returns 0 on success.
+ * hash covers. buf holds MOVE_CHUNK bytes. Returns 0 on success.
  **/
 static int
-object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
-  unsigned char buf[MOVE_CHUNK];
+object_copy_into(int src, int dst, uint64_t *total,
+                 char hex[SHA256_HEX_LEN + 1], unsigned char *buf) {
   unsigned char digest[SHA256_DIGEST_LEN];
   sha256_t hash;
 
@@ -1091,7 +1091,7 @@ object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
   *total = 0;
 
   while(1) {
-    ssize_t n = read(src, buf, sizeof(buf));
+    ssize_t n = read(src, buf, MOVE_CHUNK);
 
     if(n < 0) {
       if(errno == EINTR) {
@@ -1114,6 +1114,25 @@ object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
   sha256_hex(digest, hex);
 
   return 0;
+}
+
+
+/**
+ * object_copy_into with its chunk on the heap: commits run on a connection
+ * thread, whose stack is too small for a MOVE_CHUNK frame.
+ **/
+static int
+object_copy(int src, int dst, uint64_t *total, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char *buf;
+  int rc;
+
+  if(!(buf=malloc(MOVE_CHUNK))) {
+    return -1;
+  }
+  rc = object_copy_into(src, dst, total, hex, buf);
+  free(buf);
+
+  return rc;
 }
 
 
