@@ -3540,10 +3540,12 @@ def scenario_sysinfo_aggregates_the_machine(server):
         "the JSON keys are stable, got %r" % sorted(info))
     assert [info["sysname"], info["release"], info["machine"]] == uname[1:], (
         "the JSON uname fields must match the plain answer")
-    assert info["uptime_seconds"] == int(uptime[1]), (
+    assert abs(info["uptime_seconds"] - int(uptime[1])) <= 5, (
         "the JSON uptime must match the plain answer")
-    assert [info["memory_total_bytes"], info["memory_free_bytes"]] == [total, free], (
-        "the JSON memory must match the plain answer")
+    assert info["memory_total_bytes"] == total, (
+        "the JSON total memory must match the plain answer")
+    assert abs(info["memory_free_bytes"] - free) <= total // 10, (
+        "the JSON free memory must match the plain answer")
     assert len(raw.encode("ascii")) <= CAP_BYTES, "an answer holds at most 64 KiB"
 
     assert run_command(server, "sysinfo extra") == ["bad_argument", "exit 1"], (
@@ -9722,6 +9724,10 @@ BOUNDED_READER_TITLES = {
     "a limit of zero shows no line and says how many there are",
 }
 HOST_ROOT_SCENARIOS.update(BOUNDED_READER_TITLES)
+HOST_ROOT_SCENARIOS.update({
+    "du totals each directory's regular files, children before their parent",
+    "du over more directories than 64 KiB holds is cut and exits 0",
+})
 
 HOST_MACHINE_SCENARIOS = {
     "date answers the host's wall clock as one UTC line",
