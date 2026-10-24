@@ -1124,11 +1124,10 @@ run_prompt(char *prompt, size_t promptlen, const approval_facts_t *facts) {
 }
 
 
-/** The commands a freeze lets through: the recovery-signed key commands. **/
+/** The one command a freeze lets through: the recovery-signed key unfreeze. **/
 static int
 freeze_exempt(const char *command) {
-  return !strcmp(command, "key.unfreeze") ||
-         !strcmp(command, "key.rotate-recovery");
+  return !strcmp(command, "key.unfreeze");
 }
 
 
@@ -1166,7 +1165,7 @@ store_approval_request(const approval_facts_t *facts,
 
   // Two requests for one rollback can both have found none open before
   // either inserted; the second must not open a second approval for it.
-  // While frozen only the recovery-signed key commands may ask, and they do
+  // While frozen only the recovery-signed key unfreeze may ask, and it does
   // not wait behind the pending limit.
   if((!exempt && frozen) ||
      (!exempt && pending_count() >= PENDING_MAX) ||
