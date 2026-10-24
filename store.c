@@ -1545,7 +1545,7 @@ store_audit_append(const char *kind, const char *name, const char *id,
     return -1;
   }
 
-  state_fd = state_open();
+  state_fd = root_open();
   if(state_fd >= 0) {
     fd = open_entry(state_fd, AUDIT_FILE, O_WRONLY | O_CREAT | O_APPEND);
     close(state_fd);
@@ -1583,7 +1583,7 @@ audit_tail_locked(unsigned long n, char *buf, size_t size) {
   int state_fd;
   int fd;
 
-  if((state_fd=state_open()) < 0) {
+  if((state_fd=root_open()) < 0) {
     return -1;
   }
 
