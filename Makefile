@@ -126,8 +126,18 @@ capture-spike.elf: capture_spike.o notify.o
 primitives-probe.elf: primitives_probe.o
 	$(CC) -lkernel_sys -o $@ $^
 
+# The reference addon is the example docs/addons.md describes. It is built on
+# request and never part of all; the owner installs it on the console out of
+# band (ADR-0010).
+addon-sight: addons/sight/sight.elf
+
+addons/sight/sight.elf: addons/sight/sight.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+.PHONY: addon-sight
+
 clean:
-	rm -f *.o *.elf
+	rm -f *.o *.elf addons/sight/*.elf
 
 test: shsrv-ps5.elf
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
