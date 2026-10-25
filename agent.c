@@ -5071,7 +5071,7 @@ static void
 shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
   approval_challenge_t challenge;
   approval_facts_t facts;
-  shot_t shots[SHOTS_MAX];
+  shot_t *shots;
   int count = 0;
   int kept = 0;
   int i;
@@ -5108,6 +5108,13 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
     return;
   }
 
+  // SHOTS_MAX of these paths alone is several times a connection thread's
+  // stack on a build whose PATH_MAX is 4096, so they are held on the heap.
+  if(!(shots=calloc(SHOTS_MAX, sizeof(*shots)))) {
+    audit_reply(fd, "shots", "failed", "-", "-", shots_failed);
+    return;
+  }
+
   {
     const char *root = agent->platform->fs_root;
     char gallery[PATH_MAX];
@@ -5116,17 +5123,17 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
     if(snprintf(gallery, sizeof(gallery), "%s%s", root, SHOTS_GALLERY)
        >= (int)sizeof(gallery)) {
       audit_reply(fd, "shots", "refused", "-", "-", shots_failed);
-      return;
+      goto out;
     }
     if((dirfd = shots_dir_open(root, gallery)) < 0) {
       /* No gallery is no image: the Create button has written nothing. */
       audit_reply(fd, "shots", "refused", "-", "-", no_shots);
-      return;
+      goto out;
     }
     if(shots_collect(dirfd, SHOTS_GALLERY, shots, &count)) {
       close(dirfd);
       audit_reply(fd, "shots", "refused", "-", "-", shots_failed);
-      return;
+      goto out;
     }
     close(dirfd);
   }
@@ -5148,7 +5155,7 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
   }
   if(!kept) {
     audit_reply(fd, "shots", "refused", "-", "-", no_shots);
-    return;
+    goto out;
   }
   kept = 0;
 
@@ -5158,12 +5165,12 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
   snprintf(facts.value, sizeof(facts.value), "%s:%ld",
            by_minutes ? "minutes" : "count", number);
   if(!gate_pass(agent, fd, &facts, &challenge)) {
-    return;
+    goto out;
   }
 
   if(shots_mkdir(agent->platform->fs_root)) {
     audit_reply(fd, "shots", "failed", SHOTS_DIR, challenge.id, shots_failed);
-    return;
+    goto out;
   }
 
   for(i = 0; i < count && kept < SHOTS_MAX; i++) {
@@ -5178,16 +5185,18 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
     if(shot_copy(agent, fd, &shots[i], kept, copied, sizeof(copied), hex)) {
       audit_reply(fd, "shots", "failed", SHOTS_DIR, challenge.id, shots_failed);
-      return;
+      goto out;
     }
     if(store_audit_append("shots.done", copied, challenge.id, hex)) {
       reply(fd, audit_failed);
-      return;
+      goto out;
     }
     kept++;
   }
 
   reply(fd, shots_done);
+out:
+  free(shots);
 }
 static void
 builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
