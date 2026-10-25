@@ -149,6 +149,12 @@ int fileops_write_open(const char *root, const char *path,
                        const approval_facts_t *expected, int *fd);
 
 /**
+ * Remove the regular file at path, which must be writable and not protected.
+ * Returns FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_discard(const char *root, const char *path);
+
+/**
  * Check one write of a new file at path without acting. path must be a
  * writable entry, not protected, not a link to a protected object, and its
  * parent directory must not be protected. The entry's kind, device and inode

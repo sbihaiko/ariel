@@ -514,7 +514,8 @@ host_file_remove(const struct host_file *file) {
  **/
 static int
 host_start(const unsigned char *bytes, size_t size, char *const argv[],
-           int outfd, struct host_file *file, pid_t *child) {
+           int outfd, struct host_file *file, pid_t *child, int isolated) {
+  char *const no_env[] = {NULL};
   int errpipe[2] = {-1, -1};
   int exec_failed = 0;
   int filefd = -1;
@@ -598,7 +599,11 @@ host_start(const unsigned char *bytes, size_t size, char *const argv[],
     // payload runs.
     close_extra_fds(errpipe[1]);
 
-    execv(file->path, argv);
+    if(isolated) {
+      execve(file->path, argv, no_env);
+    } else {
+      execv(file->path, argv);
+    }
     child_fail(errpipe[1], errno);
   }
 
@@ -672,7 +677,7 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
 
   (void)self;
 
-  if(host_start(bytes, size, argv, outfd, &file, &pid)) {
+  if(host_start(bytes, size, argv, outfd, &file, &pid, 0)) {
     return -1;
   }
 
@@ -689,13 +694,12 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
 
 
 static int
-host_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
-                 char *const argv[], int outfd, pid_t *pid) {
+host_spawn_start_mode(const unsigned char *bytes, size_t size,
+                      char *const argv[], int outfd, pid_t *pid,
+                      int isolated) {
   struct host_started *slot = NULL;
   size_t i;
   int rc;
-
-  (void)self;
 
   pthread_mutex_lock(&started_lock);
   for(i=0; i<HOST_STARTED_MAX && !slot; i++) {
@@ -713,7 +717,7 @@ host_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
     return -1;
   }
 
-  rc = host_start(bytes, size, argv, outfd, &slot->file, pid);
+  rc = host_start(bytes, size, argv, outfd, &slot->file, pid, isolated);
 
   pthread_mutex_lock(&started_lock);
   if(rc) {
@@ -724,6 +728,25 @@ host_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
   pthread_mutex_unlock(&started_lock);
 
   return rc;
+}
+
+
+static int
+host_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
+                 char *const argv[], int outfd, pid_t *pid) {
+  (void)self;
+
+  return host_spawn_start_mode(bytes, size, argv, outfd, pid, 0);
+}
+
+
+static int
+host_spawn_start_isolated(platform_t *self, const unsigned char *bytes,
+                          size_t size, char *const argv[], int outfd,
+                          pid_t *pid) {
+  (void)self;
+
+  return host_spawn_start_mode(bytes, size, argv, outfd, pid, 1);
 }
 
 
@@ -849,6 +872,7 @@ static platform_t host_platform = {
   .approval_grant = host_approval_grant,
   .spawn = host_spawn,
   .spawn_start = host_spawn_start,
+  .spawn_start_isolated = host_spawn_start_isolated,
   .spawn_poll = host_spawn_poll,
   .spawn_kill = host_spawn_kill,
   .http_get = host_http_get,

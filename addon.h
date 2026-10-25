@@ -17,6 +17,18 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_ADDON_H
 #define ARIEL_ADDON_H
 
+#include <stddef.h>
+
+#include "platform.h"
+
+typedef enum {
+  ADDON_RAN,
+  ADDON_TIMED_OUT,
+  ADDON_TOO_LARGE,
+  ADDON_SPAWN_FAILED,
+  ADDON_FAILED
+} addon_run_t;
+
 /** Set the state directory whose addons directory the checks read. **/
 void addon_init(const char *state_dir);
 
@@ -25,5 +37,20 @@ void addon_check(int fd, const char *name);
 
 /** Answer `addon list`: one verdict line per addon, then exit 0. **/
 void addon_list(int fd);
+
+/**
+ * Judge the addon named name for a run with argc arguments. Returns 1 and its
+ * manifest digest in hex when it may be asked for. Otherwise answers the
+ * refusal and exit line on fd and returns 0.
+ **/
+int addon_accept(int fd, const char *name, int argc, char hex[65]);
+
+/**
+ * Run the addon named name with args in a process of its own, bounded. On
+ * ADDON_RAN its output is in the file named by result; any other outcome
+ * leaves no file.
+ **/
+addon_run_t addon_run(platform_t *platform, const char *name, int argc,
+                      char *const args[], char *result, size_t size);
 
 #endif /* ARIEL_ADDON_H */

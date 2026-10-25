@@ -232,6 +232,15 @@ struct platform {
   int (*spawn_kill)(platform_t *self, pid_t pid);
 
   /**
+   * Start a payload as spawn_start does, but with an empty environment: it
+   * gets argv and outfd and nothing else from Ariel. The console's loader
+   * passes no environment, so there both starts are the same.
+   **/
+  int (*spawn_start_isolated)(platform_t *self, const unsigned char *bytes,
+                              size_t size, char *const argv[], int outfd,
+                              pid_t *pid);
+
+  /**
    * Run one noninteractive shell command: argv[0] is the command and
    * argv[argc] is NULL. Its output goes to outfd and its diagnostics to
    * errfd, and its own exit status comes back in status. A connection has

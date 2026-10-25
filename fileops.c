@@ -753,6 +753,24 @@ entry_open(const char *root, const char *path, int dir, int *fd) {
 
 
 int
+fileops_discard(const char *root, const char *path) {
+  approval_facts_t now;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  memset(&now, 0, sizeof(now));
+  rc = inspect(root, path, &now, &dirfd, leaf, sizeof(leaf), 1);
+  if(rc) {
+    return rc;
+  }
+  rc = unlinkat(dirfd, leaf, 0) ? FILEOPS_FAILED : FILEOPS_OK;
+  close(dirfd);
+  return rc;
+}
+
+
+int
 fileops_read_open(const char *root, const char *path, int *fd) {
   return entry_open(root, path, 0, fd);
 }

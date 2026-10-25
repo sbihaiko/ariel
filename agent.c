@@ -1975,6 +1975,60 @@ exec_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
 
 static void
+addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  platform_t *platform = agent->platform;
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  char result[PATH_MAX];
+  char text[PATH_MAX + 32];
+  char hex[SHA256_HEX_LEN + 1];
+  addon_run_t outcome;
+  int args = argc - 3;
+  int len;
+
+  if(!addon_accept(fd, argv[2], args, hex)) {
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "addon");
+  snprintf(facts.target, sizeof(facts.target), "%s", argv[2]);
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
+  facts.argc = (uint64_t)args;
+  args_hash(args, &argv[3], facts.args);
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  if(audit_line("addon", "done", argv[2], challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+
+  outcome = addon_run(platform, argv[2], args, &argv[3], result, sizeof(result));
+  switch(outcome) {
+  case ADDON_RAN:
+    len = snprintf(text, sizeof(text), "result %s\nstatus 0\nexit 0\n", result);
+    write_all(fd, text, (size_t)len);
+    return;
+  case ADDON_TIMED_OUT:
+    audit_reply(fd, "addon", "failed", argv[2], challenge.id, timed_out_reply);
+    return;
+  case ADDON_TOO_LARGE:
+    audit_reply(fd, "addon", "failed", argv[2], challenge.id, too_large);
+    return;
+  case ADDON_SPAWN_FAILED:
+    audit_reply(fd, "addon", "failed", argv[2], challenge.id, spawn_failed);
+    return;
+  default:
+    audit_reply(fd, "addon", "failed", argv[2], challenge.id, operation_failed);
+    return;
+  }
+}
+
+
+static void
 payload_push(agent_t *agent, int fd, int wake, const char *name,
              const char *size_text, const char *hash_text) {
   char staging_id[APPROVAL_ID_MAX];
@@ -4459,6 +4513,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 2 && !strcmp(argv[0], "addon") && !strcmp(argv[1], "list")) {
     addon_list(fd);
+    return;
+  }
+
+  if(argc >= 3 && !strcmp(argv[0], "addon") && !strcmp(argv[1], "run")) {
+    addon_run_command(agent, fd, argc, argv);
     return;
   }
 

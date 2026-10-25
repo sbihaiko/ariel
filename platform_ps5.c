@@ -595,6 +595,7 @@ static platform_t ps5_platform = {
   .approval_grant = ps5_approval_grant,
   .spawn = ps5_spawn,
   .spawn_start = ps5_spawn_start,
+  .spawn_start_isolated = ps5_spawn_start,
   .spawn_poll = ps5_spawn_poll,
   .spawn_kill = ps5_spawn_kill,
   .http_get = ps5_http_get,

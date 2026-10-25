@@ -12095,6 +12095,226 @@ MANIFEST_SCENARIOS = [
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in MANIFEST_SCENARIOS)
 SCENARIOS.extend(MANIFEST_SCENARIOS)
 
+ADDON_RUN_CLEAN_TITLE = ("an addon run waits for the owner's grant, runs once with its "
+                         "arguments and an empty environment, and its output lands "
+                         "under /data")
+ADDON_RUN_REFUSED_TITLE = ("an addon run whose manifest is refused answers addon_refused "
+                           "and the owner is not asked")
+ADDON_RUN_TIMEOUT_TITLE = ("an addon run that passes its 10 second timeout answers "
+                           "timed_out, keeps no output, and Ariel survives")
+ADDON_RUN_TOO_LARGE_TITLE = ("an addon run that writes past the 64 KiB output cap "
+                             "answers too_large, keeps no output, and Ariel survives")
+ADDON_RUN_KILLED_TITLE = ("an addon run that is killed answers operation_failed, "
+                          "keeps no output, and Ariel survives")
+
+ADDON_RUN_TIMEOUT_MS = 10_000
+
+RUNNER_SOURCE = """
+#include <stdio.h>
+
+extern char **environ;
+
+int
+main(int argc, char **argv) {
+  int env = 0;
+  int i;
+
+  while(environ[env]) {
+    env++;
+  }
+  printf("argc %d\\n", argc);
+  for(i = 1; i < argc; i++) {
+    printf("arg %d = %s\\n", i, argv[i]);
+  }
+  printf("env %d\\n", env);
+  return 0;
+}
+"""
+
+STUCK_SOURCE = """
+#include <unistd.h>
+
+int
+main(void) {
+  (void)write(1, "started\\n", 8);
+  for(;;) {
+    sleep(60);
+  }
+}
+"""
+
+FLOOD_SOURCE = """
+#include <stdio.h>
+
+int
+main(void) {
+  long i;
+
+  for(i = 0; i < 65537; i++) {
+    putchar('x');
+  }
+  return 0;
+}
+"""
+
+KILLED_SOURCE = """
+#include <signal.h>
+
+int
+main(void) {
+  raise(SIGKILL);
+  return 0;
+}
+"""
+
+
+def addon_runner(server, name, source):
+    """Install a host addon: its manifest, which this build accepts, and its ELF."""
+    manifest = manifest_text(name, args="0-3")
+    path = make_addon(server, name, manifest)
+    with open(os.path.join(path, "elf"), "wb") as handle:
+        handle.write(compile_payload(source, name))
+    return hashlib.sha256(manifest.encode("ascii")).hexdigest()
+
+
+def addon_run_request(server, name, manifest_sha, args):
+    """Ask for addon run of name with args and check the challenge names the addon."""
+    command = " ".join(["addon", "run", name] + list(args))
+    return gated_request(
+        server, command,
+        ["command=addon", "target=%s" % name, "sha256=%s" % manifest_sha,
+         "option.argc=%d" % len(args), "option.args=%s" % args_hash(*args)],
+        "addon %s will run" % name)
+
+
+def addon_results(server, name):
+    """The result files that runs of name left under /data."""
+    data = os.path.join(server.root, "data")
+    return sorted(entry for entry in os.listdir(data)
+                  if entry.startswith("addon-%s-" % name))
+
+
+def cleanup_addon(server, name):
+    drop_addon(server, name)
+    for entry in addon_results(server, name):
+        os.remove(os.path.join(server.root, "data", entry))
+
+
+def wait_for_addon_output(server, name, text, timeout=5.0):
+    """Wait until a run of name has written text to its result file."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for entry in addon_results(server, name):
+            with open(os.path.join(server.root, "data", entry), "rb") as handle:
+                if handle.read().startswith(text.encode("ascii")):
+                    return
+        time.sleep(0.02)
+    raise AssertionError("an addon run of %s must write %r" % (name, text))
+
+
+def assert_addon_survives(server):
+    lines = run_command(server, "echo still answering")
+    assert lines[-1] == "exit 0", (
+        "Ariel must answer after an addon run ends badly, got %r" % lines)
+
+
+def scenario_addon_run_is_granted_and_bare(server):
+    manifest_sha = addon_runner(server, "runner", RUNNER_SOURCE)
+    try:
+        approval, challenge = addon_run_request(server, "runner", manifest_sha,
+                                                ["one", "two"])
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, "addon run runner one two")
+        match = re.match(r"^result (/data/addon-runner-\d+)$", lines[0]) if lines else None
+        assert match and lines[1:] == ["status 0", "exit 0"], (
+            "a granted addon run must name its result and exit 0, got %r" % lines)
+        with open(os.path.join(server.root, match.group(1).lstrip("/")), "r") as handle:
+            output = handle.read()
+        assert output == "argc 3\narg 1 = one\narg 2 = two\nenv 0\n", (
+            "the addon must get its arguments and an empty environment, got %r"
+            % output)
+        assert_asks_again(server, "addon run runner one two")
+    finally:
+        cleanup_addon(server, "runner")
+
+
+def scenario_addon_run_refused_is_not_asked(server):
+    make_addon(server, "newer", manifest_text("newer", abi="2"))
+    try:
+        lines = run_command(server, "addon run newer one")
+        assert lines == ["addon_refused newer abi", "exit 1"], (
+            "a refused addon must answer addon_refused without asking, got %r" % lines)
+    finally:
+        drop_addon(server, "newer")
+
+
+def scenario_addon_run_timeout_is_cut(server):
+    manifest_sha = addon_runner(server, "stuck", STUCK_SOURCE)
+    try:
+        approval, challenge = addon_run_request(server, "stuck", manifest_sha, [])
+        sign_and_grant(server, approval, challenge)
+        reply = {}
+        worker = threading.Thread(target=lambda: reply.update(
+            lines=run_command(server, "addon run stuck", timeout=30.0)))
+        worker.start()
+        wait_for_addon_output(server, "stuck", "started\n")
+        server.advance(ADDON_RUN_TIMEOUT_MS - 1)
+        time.sleep(0.2)
+        assert worker.is_alive(), "an addon run must not be cut before its timeout"
+        server.advance(1)
+        worker.join(30.0)
+        assert not worker.is_alive() and reply.get("lines") == [
+            "timed_out", "exit 1"], (
+            "an addon run past its timeout must answer timed_out, got %r"
+            % reply.get("lines"))
+        assert addon_results(server, "stuck") == [], (
+            "a timed out addon run must keep no output")
+        assert_addon_survives(server)
+    finally:
+        cleanup_addon(server, "stuck")
+
+
+def scenario_addon_run_output_cap_is_too_large(server):
+    manifest_sha = addon_runner(server, "flood", FLOOD_SOURCE)
+    try:
+        approval, challenge = addon_run_request(server, "flood", manifest_sha, [])
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "addon run flood") == ["too_large", "exit 1"], (
+            "an addon run past the 64 KiB output cap must answer too_large")
+        assert addon_results(server, "flood") == [], (
+            "a too large addon run must keep no output")
+        assert_addon_survives(server)
+    finally:
+        cleanup_addon(server, "flood")
+
+
+def scenario_addon_run_killed_is_operation_failed(server):
+    manifest_sha = addon_runner(server, "killed", KILLED_SOURCE)
+    try:
+        approval, challenge = addon_run_request(server, "killed", manifest_sha, [])
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "addon run killed") == [
+            "operation_failed", "exit 1"], (
+            "a killed addon run must answer operation_failed")
+        assert addon_results(server, "killed") == [], (
+            "a killed addon run must keep no output")
+        assert_addon_survives(server)
+    finally:
+        cleanup_addon(server, "killed")
+
+
+ADDON_RUN_SCENARIOS = [
+    (ADDON_RUN_CLEAN_TITLE, scenario_addon_run_is_granted_and_bare, HOST_ROOT_REASON),
+    (ADDON_RUN_REFUSED_TITLE, scenario_addon_run_refused_is_not_asked, HOST_ROOT_REASON),
+    (ADDON_RUN_TIMEOUT_TITLE, scenario_addon_run_timeout_is_cut, HOST_ROOT_REASON),
+    (ADDON_RUN_TOO_LARGE_TITLE, scenario_addon_run_output_cap_is_too_large,
+     HOST_ROOT_REASON),
+    (ADDON_RUN_KILLED_TITLE, scenario_addon_run_killed_is_operation_failed,
+     HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_RUN_SCENARIOS)
+SCENARIOS.extend(ADDON_RUN_SCENARIOS)
+
 
 def main():
     argv = sys.argv[1:]

@@ -1022,7 +1022,8 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[1].key = "start";
       options[1].value = facts->start;
       action->noptions = 2;
-    } else if(!strcmp(facts->command, "exec")) {
+    } else if(!strcmp(facts->command, "exec") ||
+              !strcmp(facts->command, "addon")) {
       decimal(facts->argc, text[0], sizeof(text[0]));
       options[0].key = "argc";
       options[0].value = text[0];
