@@ -58,7 +58,7 @@ Ariel asks the owner — you — to sign every action that changes the console. 
 
 ```console
 $ git clone https://github.com/sbihaiko/ariel.git && cd ariel
-$ git checkout stage-4
+$ git checkout stage-5.1
 $ make -C hostbuild
 $ mkdir -p ~/.config/ariel
 $ ./hostbuild/ariel-sign keygen ~/.config/ariel/owner.key

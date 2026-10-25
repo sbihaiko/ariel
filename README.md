@@ -156,7 +156,7 @@ Agents usually reach the console through one-shot connections (one command per c
 - Every command also works without a session, with absolute paths: `pwd` answers `/`, `cd` answers `no_working_directory` and a relative path answers `relative_path`, byte for byte as before this stage.
 - A session ID is not a secret the way the token is. It is sniffable on a plain-text network like the token, and `session list` shows every live ID to any token holder, but it authorizes nothing; it is kept out of the audit log, which records `session.new` and `session.close` with `-` as the target, so a log shared for diagnosis never hands over a live handle.
 
-The one grammar change and the resolve-before-the-gate rule are [ADR-0014](docs/adr/0014-the-session-prefix-and-the-resolved-path.md). The host acceptance suite drives every part of this through the agent port; the one console round trip is [pending](docs/console-findings.md#issue-107-the-stage-5-round-trip-pending).
+The one grammar change and the resolve-before-the-gate rule are [ADR-0014](docs/adr/0014-the-session-prefix-and-the-resolved-path.md). The host acceptance suite drives every part of this through the agent port; the one console round trip is [recorded from the console](docs/console-findings.md#issue-107-the-stage-5-round-trip).
 
 ### Stage 6 (optional): network sight
 
@@ -254,7 +254,7 @@ It makes the two keys if they are not there, builds the payload with them pinned
 
 By hand, it is four steps:
 
-1. Clone the `stage-5` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
+1. Clone the `stage-5.1` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
 2. Make two keys with `./hostbuild/ariel-sign keygen`: the primary that signs everyday approvals, and a recovery key kept offline.
 3. Build the payload with both public keys pinned: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`.
 4. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
