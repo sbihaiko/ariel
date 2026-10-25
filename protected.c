@@ -15,8 +15,10 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -29,7 +31,6 @@ along with this program; see the file COPYING. If not, see
 #endif
 
 #define ADDON_DIR "addons"
-#define ADDON_DEPTH_MAX 8
 
 static const char *const protected_names[] = {
   "token", "approvals", "nonces", "audit.log", "state", "allowlist", "keyring",
@@ -44,43 +45,100 @@ protected_init(const char *dir) {
 }
 
 
+static int
+push_dir(char ***todo, size_t *count, size_t *cap, const char *path) {
+  char **grown;
+
+  if(*count == *cap) {
+    size_t next = *cap ? *cap * 2 : 8;
+
+    if(!(grown=realloc(*todo, next * sizeof(*grown)))) {
+      return -1;
+    }
+    *todo = grown;
+    *cap = next;
+  }
+  if(!((*todo)[*count]=strdup(path))) {
+    return -1;
+  }
+  (*count)++;
+
+  return 0;
+}
+
+
 /**
- * Whether dir holds the object file, at any depth up to ADDON_DEPTH_MAX. Links
- * are compared as the entries they are, never followed.
+ * Whether the object file is in the addon directory tree at any depth. The
+ * walk keeps its own list of directories, and no link below root is followed.
+ * Returns 1 when it is, 0 when it is not, and -1 when some part of the tree
+ * could not be read, so the caller must treat the object as protected.
  **/
 static int
-addon_member(const char *dir, const struct stat *file, int depth) {
-  struct dirent *ent;
-  DIR *list;
+addon_member(const char *root, const struct stat *file) {
+  char **todo = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+  struct stat top;
   int found = 0;
+  int failed = 0;
+  size_t i;
 
-  if(depth > ADDON_DEPTH_MAX || !(list=opendir(dir))) {
+  if(stat(root, &top)) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  if(!S_ISDIR(top.st_mode)) {
     return 0;
   }
-  while(!found && (ent=readdir(list))) {
-    char path[PATH_MAX];
-    struct stat st;
-
-    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
-      continue;
-    }
-    if(snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name)
-       >= (int)sizeof(path)) {
-      found = 1;
-      break;
-    }
-    if(lstat(path, &st)) {
-      continue;
-    }
-    if(st.st_dev == file->st_dev && st.st_ino == file->st_ino) {
-      found = 1;
-    } else if(S_ISDIR(st.st_mode)) {
-      found = addon_member(path, file, depth + 1);
-    }
+  if(push_dir(&todo, &count, &cap, root)) {
+    return -1;
   }
-  closedir(list);
 
-  return found;
+  while(count > 0 && !found && !failed) {
+    char *here = todo[--count];
+    struct dirent *ent;
+    DIR *list = opendir(here);
+
+    if(!list) {
+      failed = 1;
+    }
+    while(list && !found && !failed) {
+      char path[PATH_MAX];
+      struct stat st;
+
+      errno = 0;
+      if(!(ent=readdir(list))) {
+        failed = errno != 0;
+        break;
+      }
+      if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+        continue;
+      }
+      if(snprintf(path, sizeof(path), "%s/%s", here, ent->d_name)
+         >= (int)sizeof(path) || lstat(path, &st)) {
+        failed = 1;
+        break;
+      }
+      if(st.st_dev == file->st_dev && st.st_ino == file->st_ino) {
+        found = 1;
+      } else if(S_ISDIR(st.st_mode) && push_dir(&todo, &count, &cap, path)) {
+        failed = 1;
+      }
+    }
+    if(list) {
+      closedir(list);
+    }
+    free(here);
+  }
+
+  for(i=0; i<count; i++) {
+    free(todo[i]);
+  }
+  free(todo);
+
+  if(found) {
+    return 1;
+  }
+  return failed ? -1 : 0;
 }
 
 
@@ -110,7 +168,7 @@ protected_stat(const struct stat *file) {
      >= (int)sizeof(path)) {
     return 1;
   }
-  return addon_member(path, file, 0);
+  return addon_member(path, file) != 0;
 }
 
 

@@ -36,8 +36,9 @@ int protected_object(int fd);
 /**
  * Whether the object with the identity in file is a protected one, by the
  * same device and inode test as protected_object: the state directory itself,
- * the objects named below it, the addon directory and every object in it.
- * Returns 1 or 0.
+ * the objects named below it, the addon directory and every object in it at
+ * any depth. An addon directory that cannot be read is protected as a whole,
+ * since its objects cannot be ruled out. Returns 1 or 0.
  **/
 int protected_stat(const struct stat *file);
 

@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -11600,11 +11601,171 @@ def scenario_addon_directory_answers_protected(server):
     assert not failures, "\n".join(failures)
 
 
+ADDON_DEEP_DEPTH = 40
+ADDON_DEEP_TITLE = ("a hard link to an addon file nested 40 directories deep "
+                    "answers protected, and an overwrite through it is refused")
+ADDON_WALK_TITLE = ("find and du from the data directory skip the addon "
+                    "directory, the state directory and a hard link to an "
+                    "addon file")
+ADDON_UNREADABLE_TITLE = ("an unreadable addon directory refuses a path it "
+                          "cannot rule out, until it is readable again")
+ADDON_FETCH_TITLE = ("http2_get -o answers protected for an addon file 40 "
+                     "directories deep and its hard link, unasked")
+
+
+ADDON_DEEP_BYTES = b"\x7fELF deep addon"
+
+
+def deep_addon(paths):
+    """An addon file nested ADDON_DEEP_DEPTH directories below the addon directory."""
+    deep = paths["addons"]
+    for _ in range(ADDON_DEEP_DEPTH):
+        deep = os.path.join(deep, "d")
+    os.makedirs(deep)
+    elf = os.path.join(deep, "elf")
+    with open(elf, "wb") as f:
+        f.write(ADDON_DEEP_BYTES)
+    return elf
+
+
+def scenario_addon_deep_hard_link(server):
+    """A hard link to an addon file at any depth is the addon file, for every command."""
+    paths = addon_fixtures(server)
+    data = os.path.join(server.root, "data")
+    elf = deep_addon(paths)
+    link = os.path.join(data, "addon-deep-hard")
+    source = os.path.join(data, "addon-deep-source")
+    with open(source, "wb") as f:
+        f.write(b"overwrite")
+    try:
+        make_link(link, elf, hard=True)
+        failures = []
+        for template in ("cat {p}", "stat {p}", "sha256sum {p}", "rm {p}",
+                         "cp {p} {out}", "cp {src} {p}", "mv {src} {p}"):
+            command = template.format(p=link, out=paths["out"], src=source)
+            lines = run_command(server, command)
+            if lines != ["protected", "exit 87"]:
+                failures.append("%s answered %r" % (command, lines))
+        with open(elf, "rb") as f:
+            if f.read() != ADDON_DEEP_BYTES:
+                failures.append("the addon file changed through its alias")
+        assert not failures, "\n".join(failures)
+    finally:
+        if os.path.lexists(link):
+            os.unlink(link)
+        shutil.rmtree(os.path.join(paths["addons"], "d"), ignore_errors=True)
+
+
+def scenario_addon_output_refuses_deep_link(_server):
+    """http2_get -o answers protected for an addon file at any depth and for its hard link, unasked."""
+    def run(server):
+        url = server.origin.url("/file")
+        paths = addon_fixtures(server)
+        elf = deep_addon(paths)
+        link = os.path.join(server.root, "data", "addon-fetch-hard")
+        try:
+            make_link(link, elf, hard=True)
+            assert_protected(server, "http2_get -o %s %s" % (link, url))
+            assert server.origin.requests == [], "nothing may be fetched"
+        finally:
+            if os.path.lexists(link):
+                os.unlink(link)
+            shutil.rmtree(os.path.join(paths["addons"], "d"), ignore_errors=True)
+    with_fetch(run)
+
+
+def state_identities(state):
+    """The identity of the state directory and of every object below it."""
+    ids = {(os.stat(state).st_dev, os.stat(state).st_ino)}
+    for dirpath, dirnames, filenames in os.walk(state):
+        for name in dirnames + filenames:
+            st = os.lstat(os.path.join(dirpath, name))
+            ids.add((st.st_dev, st.st_ino))
+    return ids
+
+
+def du_expected(root, state):
+    """The bytes du must total under root: regular files, not the state tree or its identities."""
+    protected = state_identities(state)
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if os.path.join(dirpath, d) != state]
+        for name in filenames:
+            st = os.lstat(os.path.join(dirpath, name))
+            if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) not in protected:
+                total += st.st_size
+    return total
+
+
+def scenario_addon_walk_skips_protected(server):
+    """find and du from the data directory list and total nothing protected."""
+    paths = addon_fixtures(server)
+    data = os.path.join(server.root, "data")
+    state = os.path.join(data, "ariel")
+    plain = os.path.join(data, "find-plain.txt")
+    hard = os.path.join(data, "find-elf-hard")
+    with open(plain, "wb") as f:
+        f.write(b"plain")
+    try:
+        make_link(hard, paths["elf"], hard=True)
+        found = run_exit_zero(server, "find " + data)
+        failures = []
+        if plain not in found:
+            failures.append("find must still list %s, got %r" % (plain, found))
+        for line in found:
+            if line == hard or line == state or line.startswith(state + "/"):
+                failures.append("find listed a protected path: %s" % line)
+            if "addons" in line.split("/"):
+                failures.append("find listed the addon directory: %s" % line)
+
+        du_lines = run_exit_zero(server, "du " + data)
+        root_line = "%d %s" % (du_expected(data, state), data)
+        if root_line not in du_lines:
+            failures.append("du must total %r, got %r" % (root_line, du_lines))
+        for line in du_lines:
+            if line.split(" ", 1)[1].startswith(state):
+                failures.append("du reported a protected path: %s" % line)
+        assert not failures, "\n".join(failures)
+    finally:
+        if os.path.lexists(hard):
+            os.unlink(hard)
+        if os.path.lexists(plain):
+            os.unlink(plain)
+
+
+def scenario_addon_unreadable_refuses(server):
+    """An addon directory Ariel cannot read makes every path it cannot rule out protected."""
+    paths = addon_fixtures(server)
+    data = os.path.join(server.root, "data")
+    plain = os.path.join(data, "unreadable-plain.txt")
+    locked = os.path.join(paths["addons"], "locked")
+    with open(plain, "wb") as f:
+        f.write(b"plain\n")
+    os.makedirs(locked, exist_ok=True)
+    try:
+        os.chmod(locked, 0)
+        assert run_command(server, "cat " + plain) == ["protected", "exit 87"], (
+            "a path the addon walk cannot rule out must answer protected")
+    finally:
+        os.chmod(locked, 0o755)
+        os.rmdir(locked)
+    assert run_command(server, "cat " + plain) == ["plain", "exit 0"], (
+        "once the addon directory is readable, the path answers again")
+    os.unlink(plain)
+
+
 ADDON_SCENARIOS = [
     (ADDON_DIRECTORY_TITLE, scenario_addon_directory_answers_protected,
      HOST_ROOT_REASON),
+    (ADDON_DEEP_TITLE, scenario_addon_deep_hard_link, HOST_ROOT_REASON),
+    (ADDON_WALK_TITLE, scenario_addon_walk_skips_protected, HOST_ROOT_REASON),
+    (ADDON_UNREADABLE_TITLE, scenario_addon_unreadable_refuses,
+     HOST_ROOT_REASON),
+    (ADDON_FETCH_TITLE, scenario_addon_output_refuses_deep_link,
+     HOST_ROOT_REASON),
 ]
-HOST_ROOT_SCENARIOS.add(ADDON_DIRECTORY_TITLE)
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_SCENARIOS)
 SCENARIOS.extend(ADDON_SCENARIOS)
 
 

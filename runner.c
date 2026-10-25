@@ -185,6 +185,14 @@ refuse_protected(const char *path, int errfd) {
 }
 
 
+static int
+protected_entry(const char *path) {
+  struct stat st;
+
+  return !lstat(path, &st) && protected_stat(&st);
+}
+
+
 // Reads up to cap bytes, fewer only at end of file; -1 on error.
 static ssize_t
 fill(int fd, char *buf, size_t cap) {
@@ -1513,6 +1521,10 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
         free(child);
         continue;
       }
+      if(protected_stat(&child_st)) {
+        free(child);
+        continue;
+      }
       if(find_wanted(child, &child_st, name, type)) {
         answer_path(&answer, json, child);
       }
@@ -1634,7 +1646,9 @@ du_walk(du_walk_t *walk, const char *path) {
         walk->oom = 1;
         break;
       }
-      total += du_walk(walk, child);
+      if(!protected_entry(child)) {
+        total += du_walk(walk, child);
+      }
       free(child);
     }
   }
