@@ -239,7 +239,14 @@ From Stage 7, MCP tools are also marked as destructive, so the MCP client asks a
 
 ## Quick start
 
-To build Ariel, start it on a console and run your first `helloworld.elf` from its shell, follow the [quick start tutorial](docs/quick-start.md).
+The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a payload installed and run on a console, through the gate, with the owner's key:
+
+1. Clone the `stage-4` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
+2. Make two keys with `./hostbuild/ariel-sign keygen`: the primary that signs everyday approvals, and a recovery key kept offline.
+3. Build the payload with both public keys pinned: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`.
+4. Send `shsrv-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
+
+The release ships source only, and it has to: a build with no key pinned refuses every grant, and a build pinned to someone else's keys could only be approved by them. The console carries the public half of **your** pair, so the ELF is built once, by you.
 
 ## Using it today
 
