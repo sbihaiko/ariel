@@ -9571,6 +9571,26 @@ def scenario_session_gated_relative_signs_the_absolute_path(server):
     assert not os.path.exists(target)
 
 
+def scenario_session_path_longer_than_the_signed_target(server):
+    """A resolved path the owner could not sign answers bad_path, uncut."""
+    server.fresh()
+    sid = session_mint(server)
+    folder = os.path.join(server.root, "data")
+    deep = os.path.join(folder, "d" * 40, "e" * 40, "f" * 40)
+    os.makedirs(deep, exist_ok=True)
+    target = os.path.join(deep, "gone.txt")
+    with open(target, "wb") as handle:
+        handle.write(b"x\n")
+    assert len(target) > 129, "the test path must be longer than a signed target"
+
+    assert run_command(server, "@%s cd %s" % (sid, folder)) == ["exit 0"]
+    relative = os.path.join("d" * 40, "e" * 40, "f" * 40, "gone.txt")
+    assert run_command(server, "@%s rm %s" % (sid, relative)) == [
+        "bad_path", "exit 1"], (
+        "a resolved path past the signed target must answer bad_path")
+    assert os.path.exists(target), "a refused path must remove nothing"
+
+
 def scenario_session_full_at_eight(server):
     """Eight sessions live; the ninth answers session_full and frees nothing."""
     server.fresh()
@@ -10138,6 +10158,7 @@ HOST_ROOT_SCENARIOS.update({
     "cd moves the session, pwd reads it back, and a refusal changes nothing",
     "a relative path in a session names the entry below its directory",
     "a gated session command signs the resolved path, with no dot segment",
+    "a session path longer than a signed target answers bad_path, uncut",
     "eight sessions live, and the ninth answers session_full",
     "an export inside a session stays there, and env answers the session's "
     "value over the process's own",
@@ -10374,6 +10395,8 @@ SCENARIOS = [
      scenario_session_relative_paths_resolve, HOST_ROOT_REASON),
     ("a gated session command signs the resolved path, with no dot segment",
      scenario_session_gated_relative_signs_the_absolute_path, HOST_ROOT_REASON),
+    ("a session path longer than a signed target answers bad_path, uncut",
+     scenario_session_path_longer_than_the_signed_target, HOST_ROOT_REASON),
     ("eight sessions live, and the ninth answers session_full",
      scenario_session_full_at_eight, HOST_ROOT_REASON),
     ("an export inside a session stays there, and env answers the session's "

@@ -1067,6 +1067,14 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
  * chown or chgrp with its operand. operand is NULL for the first four. A
  * recursive rm takes the whole tree below path.
  **/
+/**
+ * The longest path a gated action can name. The canonical action refuses a
+ * longer target, so a resolved path that does not fit is refused here, with
+ * the word a path refusal already answers, rather than cut to size.
+ **/
+#define GATED_PATH_MAX (APPROVAL_TARGET_MAX + 1)
+
+
 /** Resolve one operand against the session's directory, answering the
     refusal itself when it cannot. Returns NULL once it has. **/
 static const char *
@@ -1089,7 +1097,7 @@ file_command(agent_t *agent, int fd, runner_session_t *session,
              const char *command, const char *path, const char *operand,
              int recursive) {
   const char *root = agent->platform->fs_root;
-  char resolved[PATH_MAX];
+  char resolved[GATED_PATH_MAX];
   approval_challenge_t challenge;
   approval_facts_t facts;
   int rc;
@@ -1128,8 +1136,8 @@ transfer_command(agent_t *agent, int fd, runner_session_t *session,
                  const char *command, const char *source,
                  const char *destination, int recursive) {
   const char *root = agent->platform->fs_root;
-  char resolved_source[PATH_MAX];
-  char resolved_destination[PATH_MAX];
+  char resolved_source[GATED_PATH_MAX];
+  char resolved_destination[GATED_PATH_MAX];
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
   approval_facts_t facts;
@@ -1332,8 +1340,8 @@ tar_vet_job(void *ctx) {
 static void
 unzip_command(agent_t *agent, int fd, runner_session_t *session,
               const char *archive, const char *destination) {
-  char resolved_archive[PATH_MAX];
-  char resolved_dest[PATH_MAX];
+  char resolved_archive[GATED_PATH_MAX];
+  char resolved_dest[GATED_PATH_MAX];
   const char *root = agent->platform->fs_root;
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
@@ -1382,8 +1390,8 @@ unzip_command(agent_t *agent, int fd, runner_session_t *session,
 static void
 tar_extract_command(agent_t *agent, int fd, runner_session_t *session,
                     const char *archive, const char *dest) {
-  char resolved_archive[PATH_MAX];
-  char resolved_dest[PATH_MAX];
+  char resolved_archive[GATED_PATH_MAX];
+  char resolved_dest[GATED_PATH_MAX];
   const char *root = agent->platform->fs_root;
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
@@ -2562,7 +2570,7 @@ write_command(agent_t *agent, int fd, int wake, runner_session_t *session,
               const char *path, const char *size_text, const char *hash_text) {
   const char *root = agent->platform->fs_root;
   platform_t *platform = agent->platform;
-  char resolved_path[PATH_MAX];
+  char resolved_path[GATED_PATH_MAX];
   char declared[SHA256_HEX_LEN + 1];
   char computed[SHA256_HEX_LEN + 1];
   unsigned char digest[SHA256_DIGEST_LEN];
