@@ -175,6 +175,16 @@ refuse_relative(const char *path, int errfd) {
 }
 
 
+static int
+refuse_protected(const char *path, int errfd) {
+  if(protected_path(path)) {
+    say(errfd, "protected\n");
+    return 1;
+  }
+  return 0;
+}
+
+
 // Reads up to cap bytes, fewer only at end of file; -1 on error.
 static ssize_t
 fill(int fd, char *buf, size_t cap) {
@@ -358,6 +368,9 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
     return 1;
   }
   path = argv[first];
+  if(refuse_protected(path, errfd)) {
+    return STATUS_PROTECTED;
+  }
 
   if(!(dir = opendir(path))) {
     int err = errno;
@@ -424,6 +437,9 @@ open_target(const char *cmd, const char *path, int errfd, int *fd) {
 
   if(refuse_relative(path, errfd)) {
     return 1;
+  }
+  if(refuse_protected(path, errfd)) {
+    return STATUS_PROTECTED;
   }
 
   if((*fd=open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)) < 0) {
@@ -1300,6 +1316,9 @@ run_df(int json, int argc, char *const argv[], int outfd, int errfd) {
   if(refuse_relative(argv[1], errfd)) {
     return 1;
   }
+  if(refuse_protected(argv[1], errfd)) {
+    return STATUS_PROTECTED;
+  }
   if(statvfs(argv[1], &vfs)) {
     report("df", argv[1], errfd, errno);
     return 1;
@@ -1441,6 +1460,9 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
   }
   if(refuse_relative(argv[1], errfd)) {
     return 1;
+  }
+  if(refuse_protected(argv[1], errfd)) {
+    return STATUS_PROTECTED;
   }
   if(lstat(argv[1], &st)) {
     report("find", argv[1], errfd, errno);
@@ -1643,6 +1665,9 @@ run_du(int argc, char *const argv[], int outfd, int errfd) {
   }
   if(refuse_relative(argv[1], errfd)) {
     return 1;
+  }
+  if(refuse_protected(argv[1], errfd)) {
+    return STATUS_PROTECTED;
   }
   if(lstat(argv[1], &st)) {
     report("du", argv[1], errfd, errno);

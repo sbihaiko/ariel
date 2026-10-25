@@ -11528,6 +11528,85 @@ SCENARIOS.extend(WRITE_SCENARIOS)
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in SFOCREATE_SCENARIOS)
 SCENARIOS.extend(SFOCREATE_SCENARIOS)
 
+ADDON_DIRECTORY_TITLE = ("a path under the addon directory or the state "
+                         "directory answers protected and exit 87 for every "
+                         "command, through a link and a hard link too")
+ADDON_COMMANDS = (
+    "ls {addons}", "ls {sight}", "stat {elf}", "file {elf}", "cat {elf}",
+    "head {elf}", "grep . {elf}", "sha256sum {elf}", "read {elf}",
+    "cmp {elf} {elf}", "find {addons}", "du {addons}", "tar -t {tar}",
+    "unzip -l {zip}", "cp {elf} {out}", "mv {elf} {out}", "ln {elf} {out}",
+    "rm {elf}", "rm -r {sight}", "touch {sight}/new", "mkdir {sight}/newdir",
+    "tar -x {tar} {out}", "unzip {zip} {out}", "ls {state}",
+    "touch {state}/new",
+)
+ADDON_LINK_COMMANDS = (
+    "ls {p}", "cat {p}", "rm {p}", "cp {p} {out}", "mv {p} {out}",
+    "ln {p} {out}", "touch {p}/new",
+)
+
+
+def addon_fixtures(server):
+    addons = os.path.join(server.root, "data", "ariel", "addons")
+    sight = os.path.join(addons, "sight")
+    os.makedirs(sight, exist_ok=True)
+    elf = os.path.join(sight, "elf")
+    with open(elf, "wb") as f:
+        f.write(b"\x7fELF" + bytes(range(256)))
+    tar = os.path.join(sight, "pack.tar")
+    with tarfile.open(tar, "w") as archive:
+        member = tarfile.TarInfo("a.txt")
+        member.size = 1
+        archive.addfile(member, io.BytesIO(b"x"))
+    zip_path = os.path.join(sight, "pack.zip")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("a.txt", b"x")
+    return {
+        "addons": addons, "sight": sight, "elf": elf, "tar": tar,
+        "zip": zip_path, "state": os.path.join(server.root, "data", "ariel"),
+        "out": os.path.join(server.root, "data", "addon-out"),
+    }
+
+
+def scenario_addon_directory_answers_protected(server):
+    """Addon paths, nested, linked or hard linked, answer protected for every command."""
+    paths = addon_fixtures(server)
+    data = os.path.join(server.root, "data")
+    dir_link = os.path.join(data, "addon-dir-link")
+    elf_link = os.path.join(data, "addon-elf-link")
+    elf_hard = os.path.join(data, "addon-elf-hard")
+    make_link(dir_link, paths["addons"], hard=False)
+    make_link(elf_link, paths["elf"], hard=False)
+    make_link(elf_hard, paths["elf"], hard=True)
+
+    failures = []
+    for template in ADDON_COMMANDS:
+        command = template.format(**paths)
+        lines = run_command(server, command)
+        if lines != ["protected", "exit 87"]:
+            failures.append("%s answered %r" % (command, lines))
+    nested_by_dir_link = os.path.join(dir_link, "sight", "elf")
+    for link in (dir_link, nested_by_dir_link, elf_link, elf_hard):
+        for template in ADDON_LINK_COMMANDS:
+            command = template.format(p=link, out=paths["out"])
+            lines = run_command(server, command)
+            if lines != ["protected", "exit 87"]:
+                failures.append("%s answered %r" % (command, lines))
+
+    lines = run_command(server, "ls " + data)
+    if lines[-1:] != ["exit 0"]:
+        failures.append("ls of the data directory must still list, got %r"
+                        % lines)
+    assert not failures, "\n".join(failures)
+
+
+ADDON_SCENARIOS = [
+    (ADDON_DIRECTORY_TITLE, scenario_addon_directory_answers_protected,
+     HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.add(ADDON_DIRECTORY_TITLE)
+SCENARIOS.extend(ADDON_SCENARIOS)
+
 
 def main():
     argv = sys.argv[1:]

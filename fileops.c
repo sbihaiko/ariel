@@ -111,10 +111,20 @@ walk_refusal(int err) {
 }
 
 
+/** Whether the entry name under dirfd, followed through a link, is protected. **/
+static int
+entry_protected(int dirfd, const char *name) {
+  struct stat st;
+
+  return !fstatat(dirfd, name, &st, 0) && protected_stat(&st);
+}
+
+
 /**
  * Open the directory that holds the last name of rel, walking down from root
  * without following a symbolic link, and copy that name into leaf. The walk
- * starts at root, or at the file system root when root is empty.
+ * starts at root, or at the file system root when root is empty. Every
+ * directory it opens is checked for protection by identity.
  **/
 static int
 parent_open(const char *root, const char *rel, int *dirfd, char *leaf,
@@ -124,6 +134,7 @@ parent_open(const char *root, const char *rel, int *dirfd, char *leaf,
   char *slash;
   int fd;
   int next;
+  int state;
 
   if(snprintf(walk, sizeof(walk), "%s", rel + 1) >= (int)sizeof(walk)) {
     return FILEOPS_BAD_PATH;
@@ -133,16 +144,29 @@ parent_open(const char *root, const char *rel, int *dirfd, char *leaf,
   if(fd < 0) {
     return FILEOPS_FAILED;
   }
+  state = protected_object(fd);
+  if(state) {
+    close(fd);
+    return state > 0 ? FILEOPS_PROTECTED : FILEOPS_FAILED;
+  }
 
   part = walk;
   while((slash = strchr(part, '/'))) {
     *slash = '\0';
     next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if(next < 0) {
-      int refusal = walk_refusal(errno);
+      int err = errno;
+      int refusal = entry_protected(fd, part) ? FILEOPS_PROTECTED
+                                              : walk_refusal(err);
 
       close(fd);
       return refusal;
+    }
+    state = protected_object(next);
+    if(state) {
+      close(fd);
+      close(next);
+      return state > 0 ? FILEOPS_PROTECTED : FILEOPS_FAILED;
     }
     close(fd);
     fd = next;
@@ -170,7 +194,8 @@ identity(int dirfd, const char *leaf, approval_facts_t *facts) {
     return FILEOPS_OK;
   }
 
-  if(protected_stat(&st)) {
+  if(protected_stat(&st) ||
+     (S_ISLNK(st.st_mode) && entry_protected(dirfd, leaf))) {
     return FILEOPS_PROTECTED;
   }
 
@@ -1537,6 +1562,9 @@ archive_read(const char *root, const char *archive, approval_facts_t *facts,
   if(!below(root, archive)) {
     return FILEOPS_NO_FILE;
   }
+  if(protected_path(archive)) {
+    return FILEOPS_PROTECTED;
+  }
 
   fd = open(archive, O_RDONLY | O_CLOEXEC);
   if(fd < 0) {
@@ -1857,6 +1885,9 @@ fileops_unzip_check(const char *root, const char *archive,
   int dest;
   int rc;
 
+  if(protected_path(archive)) {
+    return FILEOPS_PROTECTED;
+  }
   rc = destination_open(root, destination, &dest);
   if(rc) {
     return rc;

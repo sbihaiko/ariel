@@ -35,9 +35,17 @@ int protected_object(int fd);
 
 /**
  * Whether the object with the identity in file is a protected one, by the
- * same device and inode test as protected_object: the state directory itself
- * and the objects named below it. Returns 1 or 0.
+ * same device and inode test as protected_object: the state directory itself,
+ * the objects named below it, the addon directory and every object in it.
+ * Returns 1 or 0.
  **/
 int protected_stat(const struct stat *file);
+
+/**
+ * Whether the absolute path names a protected object, or passes through a
+ * protected directory. Each prefix of path is statted, following links, so a
+ * link into a protected directory counts. Returns 1 or 0.
+ **/
+int protected_path(const char *path);
 
 #endif /* ARIEL_PROTECTED_H */
