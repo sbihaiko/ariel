@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** Stages 1 and 2 are done and validated on a real PS5. Stage 2 closed on 2026-10-24 with the console suite at 36/36 and the whole key hierarchy exercised on the console. Stages 3 to 6 have not started. See [Progress](#progress).
+> **Status:** Stages 1 to 3 are done, with their console runs on firmware 11.20. Stage 4 is in progress; Stages 5 and 6 have not started. See [Progress](#progress).
 >
 > **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have. The decision is [ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md).
 
@@ -23,40 +23,34 @@ Ariel closes that gap. The idea is that an agent connects to one endpoint on the
 
 ## Progress
 
-Work happens on the `dev` branch; `master` follows it at milestones. Each stage is a spec issue whose sub-issues are the work.
+Work happens on the `dev` branch; `master` follows it at milestones. Each stage is a spec issue whose sub-issues are the work. Every console run is on a CFI-2014 on firmware 11.20.
 
 | Stage | Spec | Status |
 |---|---|---|
-| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Validated on a CFI-2014 on firmware 11.20: console suite 10/10, quick start and telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
-| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done. 37 sub-issues closed; console suite 36/36 on firmware 11.20, with the key hierarchy exercised on the console ([#46](https://github.com/sbihaiko/ariel/issues/46), [#48](https://github.com/sbihaiko/ariel/issues/48)). |
-| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done on `dev` and `master`. All nine sub-issues closed: the grammar [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md) ([#58](https://github.com/sbihaiko/ariel/issues/58), `8e87996`); one parser, quotes, escaped canonical actions and the 60 s connection deadline ([#59](https://github.com/sbihaiko/ariel/issues/59), `02e9f0e`); the bounded readers and the `truncated` marker ([#60](https://github.com/sbihaiko/ariel/issues/60), `cadf9ec`); the binary `read` ([#61](https://github.com/sbihaiko/ariel/issues/61), `641f2f9`); the gated `write` ([#62](https://github.com/sbihaiko/ariel/issues/62), `9c2380e`); `--json` on `ps`, `ls`, `stat`, `df` and `find` ([#63](https://github.com/sbihaiko/ariel/issues/63), `cd62866`); the missing flags on `ls`, `grep`, `find`, `rm` and `cp` ([#64](https://github.com/sbihaiko/ariel/issues/64), `03eef1c`); the diagnostics `date`, `du`, `dmesg` and `sysinfo` ([#65](https://github.com/sbihaiko/ariel/issues/65), `e99af35`); and `sfocreate` under the gate ([#49](https://github.com/sbihaiko/ariel/issues/49), `5afbb06`). The optional `diff` and the network diagnostics were not built. |
-| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | Not started. |
+| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Console suite 10/10; the quick start and the telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
+| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done on 2026-10-24. 37 sub-issues closed; console suite 36/36 and the telnet boundary check passed ([#46](https://github.com/sbihaiko/ariel/issues/46)). |
+| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done. Nine sub-issues closed; 356 host scenarios. |
+| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | In progress on `dev`. |
 | 5. Sessions (optional) | | Not started. |
 | 6. MCP (optional) | | Not started. |
 
-**Stage 2, complete on `dev` and `master`:**
+**Stage 2** built everything [its goals](#stage-2-persist-and-recover) name, and `unzip` and `tar` refuse a member that escapes. The key work is the hierarchy and rotation ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)), the freeze ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)). The key run on the console rotated, revoked, froze, unfroze, started without the keyring and restored it ([console findings](docs/console-findings.md#issue-48-keys-on-the-console)).
 
-- ✅ The state file, the audit log and `audit tail`, transactions and the journal, `approval status`.
-- ✅ The read-only and inspection commands on the agent port, with Ariel's secrets protected.
-- ✅ Every command that changes the system is gated, and so is any command not in the read-only set: file commands, `kill` (critical processes refused), `mount` and friends, `env`/`export`/`exec`, running an ELF by path, the PS5 built-ins, `reboot` and `http2_get`.
-- ✅ `payload run` in the background and `payload logs`, `payload rollback`, one-shot and service health checks with automatic rollback.
-- ✅ `autoload show`, `edit` and `safe-boot`.
-- ✅ `unzip` and `tar`, refusing members that escape.
-- ✅ `payload install` from an allowlisted GitHub release, by latest release or pinned tag, with a pinned hash or one the owner approves.
-- ✅ The owner's key hierarchy: a primary and an offline recovery key pinned as the anchor, a keyring with a generation, `key rotate` and `key rotate-recovery`, crash-safe ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)).
-- ✅ Freezing the console when a key leaks ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a compromised lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)).
-- ✅ Validation on a real PS5 ([#46](https://github.com/sbihaiko/ariel/issues/46)): the telnet boundary check passed, and the console suite passes 36/36. The key run on 2026-10-24 rotated, revoked, froze, unfroze, started without the keyring and restored it; it is recorded in [docs/console-findings.md](docs/console-findings.md).
+**Stage 3** implements the grammar of [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md):
 
-**Stage 3, complete on `dev` and `master`:**
+| Issue | Delivered | Commit |
+|---|---|---|
+| [#58](https://github.com/sbihaiko/ariel/issues/58) | The grammar, ADR-0012 | `8e87996` |
+| [#59](https://github.com/sbihaiko/ariel/issues/59) | One parser: quotes, the escaped canonical action the owner signs, the 60 s connection deadline | `02e9f0e` |
+| [#60](https://github.com/sbihaiko/ariel/issues/60) | Bounded readers and the `truncated` marker | `cadf9ec` |
+| [#61](https://github.com/sbihaiko/ariel/issues/61) | The binary `read` | `641f2f9` |
+| [#62](https://github.com/sbihaiko/ariel/issues/62) | `write`, gated | `9c2380e` |
+| [#63](https://github.com/sbihaiko/ariel/issues/63) | `--json` on `ps`, `ls`, `stat`, `df` and `find` | `cd62866` |
+| [#64](https://github.com/sbihaiko/ariel/issues/64) | Missing flags: `ls -l -a`, `grep -r -l -c -e`, `find -name -type`, `rm -r` and `cp -r` | `03eef1c` |
+| [#65](https://github.com/sbihaiko/ariel/issues/65) | Diagnostics: `date`, `du`, `dmesg` and `sysinfo` | `e99af35` |
+| [#49](https://github.com/sbihaiko/ariel/issues/49) | `sfocreate`, gated | `5afbb06` |
 
-- ✅ One grammar for every command: the tokenizer that refuses `bad_quoting` and a line over 64 tokens, the escaped canonical action the owner signs, one `bad_option` for a word a command does not take, and the 60 s connection deadline that answers `timed_out`.
-- ✅ One output frame and one cap: no answer carries more than 64 KiB, a cut one ends with `truncated <shown> of <total>`, and `read` is the binary frame — `bytes <size> <sha256>`, then exactly that many bytes.
-- ✅ An error channel of its own and an exit status the agent can branch on (`docs/exit-codes.md`).
-- ✅ Optional JSON: `ps`, `ls`, `stat`, `df`, `find` and `sysinfo` answer one object per line (`docs/json-output.md`).
-- ✅ No pipes and no redirection: `grep -r -l -c -e`, `--limit` everywhere a listing can flood, `head`, `tail`, `wc`, and `ls -l -a`, `find -name -type`.
-- ✅ `write` and `sfocreate` run only after the owner signs, and the two recursive file commands, `cp -r` and `rm -r`, are gated like every other file command.
-- ✅ Diagnostics: `date`, `dmesg`, `du` and `sysinfo`, and no separate `timeout` — the connection deadline is the timeout.
-- ✅ 356 host scenarios, and the console evidence for this stage (read ranges, `cp -r`/`rm -r`, `sfocreate`/`sfoinfo`) is recorded in [docs/console-findings.md](docs/console-findings.md).
+The tokenizer refuses `bad_quoting` and a line over 64 tokens, and a word a command does not take answers `bad_option`. The deadline answers `timed_out`, so there is no separate `timeout`. No answer carries more than 64 KiB. A cut answer ends with `truncated <shown> of <total>`, and `read` answers `bytes <size> <sha256>`, then exactly that many bytes. Every command has its own error channel and an exit status from [docs/exit-codes.md](docs/exit-codes.md). The JSON commands and `sysinfo` answer one object per line ([docs/json-output.md](docs/json-output.md)), and `--limit` caps every listing that can flood. `cp -r` and `rm -r` are gated like every other file command. The optional `diff` and the network diagnostics were not built. The console evidence (read ranges, `cp -r`/`rm -r`, `sfocreate`/`sfoinfo`) is in [console findings](docs/console-findings.md#issue-61-64-and-49-stage-3-on-the-console).
 
 ## Goals
 
@@ -73,7 +67,7 @@ The first milestone is the smallest loop that proves the whole idea: an agent bu
 - **`payload run --wait <name>`** runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports the payload's exit status on a `status <n>` line, apart from the protocol's `exit` line.
 - **A host build** of Ariel behind a platform port, with a test clock and a virtual controller that can only deny, for tests. It never ships in the PS5 build.
 
-The agent port offers only these commands. Everything else, including every command that changes the system, stays on the telnet shell exactly as in upstream shsrv until Stage 2. Until then, approval protects only the agent port: anyone who can reach the telnet shell can still do what they can today.
+The agent port offers only these commands. Every command that changes the system stays on the telnet shell, exactly as in upstream shsrv, until Stage 2 gates it on the agent port.
 
 **What protects the telnet shell is the [trusted-network rule](#safety-model) and nothing else.** It listens on port 2323 on every interface, asks for no token and no approval, and is the owner's escape hatch: the approval gate does not cover it. The decision is [ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) decision 10, and [docs/telnet-boundary.md](docs/telnet-boundary.md) holds the manual check for this boundary. The headless suite covers the other half: the agent port refuses every command that changes the system, and a push waits for an approval.
 
@@ -86,7 +80,7 @@ Make the console safe to leave in an agent's hands:
 3. **Run it in the background** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
 4. **Persist it**: record what is installed (source, identifiers, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot. Approving an installation explicitly includes approving that the payload runs on every boot. `autoload safe-boot` skips autoload on the next boot, so a payload that crashes the console at startup can always be removed.
 5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
-6. **Gate everything that changes the system on the agent port**: every existing command that changes the system, starts code or reveals the environment, including running an ELF by path (the full list is in [Command coverage](#command-coverage)). The telnet shell is not gated: its copies of these commands stay ungated and need no token, as in upstream shsrv. It is the owner's escape hatch, and gating it needs a designed recovery path for a lost key first ([ADR-0008](docs/adr/0008-the-telnet-shell-stays-outside-the-gate.md), [the telnet boundary](docs/telnet-boundary.md)). That path is the key hierarchy in item 7.
+6. **Gate everything that changes the system on the agent port**: every existing command that changes the system, starts code or reveals the environment, including running an ELF by path (the full list is in [Command coverage](#command-coverage)). The telnet shell stays outside the gate, as [Stage 1](#stage-1-hello-world-end-to-end) says. Gating it needs a designed recovery path for a lost key first ([ADR-0008](docs/adr/0008-the-telnet-shell-stays-outside-the-gate.md), [the telnet boundary](docs/telnet-boundary.md)), and that path is the key hierarchy in item 7.
 7. **Survive a leaked or lost key.** The build pins two keys: a primary that signs everyday approvals and an offline recovery key that is never on the agent's machine. A keyring on the console tracks the active keys and a generation, so the owner can rotate either key without a rebuild, and a signature made under one generation never verifies under another. A leaked key can be stopped: the owner freezes the console over the telnet shell, and only the recovery key can lift the freeze or revoke the compromised keys, suspending every grant they made. Damaged key state fails closed.
 
 Ariel itself is never overwritten while it is running, so the agent can never lock itself out.
@@ -142,7 +136,7 @@ The first addon is the screenshot ([#53](https://github.com/sbihaiko/ariel/issue
 
 ### Stage 5 (optional): sessions
 
-Stages 1 to 4 are enough for an agent to operate the console and to see it. Stages 5 and 6 are optional conveniences on top of them.
+Stages 1 to 4 are enough for an agent to operate the console and to see it; the two below are conveniences on top of them.
 
 Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
 
@@ -162,7 +156,7 @@ Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server
 
 Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S5 are Stages 1 to 5; S1 and S2 items are on `dev` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
+**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S5 are Stages 1 to 5; S1 to S3 items are on `dev` and `master` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
