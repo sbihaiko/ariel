@@ -33,6 +33,7 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | In progress on `dev`. |
 | 5. Sessions (optional) | | Not started. |
 | 6. MCP (optional) | | Not started. |
+| 7. Network sight (optional) | [#94](https://github.com/sbihaiko/ariel/issues/94) | Not started; one command, and a console spike gates it. |
 
 **Stage 2** built everything [its goals](#stage-2-persist-and-recover) name, and `unzip` and `tar` refuse a member that escapes. The key work is the hierarchy and rotation ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)), the freeze ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)). The key run on the console rotated, revoked, froze, unfroze, started without the keyring and restored it ([console findings](docs/console-findings.md#issue-48-keys-on-the-console)).
 
@@ -91,7 +92,7 @@ New commands in this stage (see [Command coverage](#command-coverage)):
 
 - `payload install | run | list | logs | rollback | config`. `run` without `--wait` starts a payload in the background and captures its output to a log; `config` sets a payload's health check.
 - `autoload show | edit | safe-boot`, to inspect the autoload configuration and to boot without it when a payload keeps crashing.
-- `sha256sum`, because the existing `sum` is a BSD checksum, not SHA-256.
+- `sha256sum` was planned here and is not built: `read <path> --limit 0` answers `bytes 0 <sha256>`, the whole file's hash, in one read-only call, so a separate command would add a word and no capability.
 - `unzip` and `tar`, because many GitHub releases ship payloads inside an archive.
 - `reboot`, gated, to test that installed payloads survive a restart.
 - `approval status <id>`, to poll a pending approval.
@@ -114,8 +115,8 @@ New and extended commands in this stage:
 - Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`, including a way to pull a binary file back for Stage 4's screenshot.
 - Writing files without redirection: `write <path>`, which reads the content from stdin.
 - Missing flags on existing commands: `ls -l -a`, `grep -r -l -c`, more `find` predicates, `rm -r` and `cp -r`.
-- Diagnostics: `date`, `dmesg`, `du`, a `sysinfo` command that aggregates `uname`, `uptime` and memory, and `timeout` so a command cannot hang the connection.
-- Optional: `diff` and network diagnostics (`ifconfig`, `netstat`, `ping`).
+- Diagnostics: `date`, `dmesg`, `du`, and a `sysinfo` command that aggregates `uname`, `uptime` and memory. `timeout` was planned here and is not built: the 60 s connection deadline answers `timed_out`, and a health check carries its own bound through `payload config`.
+- Optional, not built: `diff` (`cmp` answers same-or-differ and `hexdump` shows the bytes; a finer comparison is the agent's own work on its own machine), and `ifconfig` and `ping` (the console's address is the one the agent connected to, and a download that fails already answers reachability). `netstat` moved to [Stage 7](#stage-7-optional-network-sight), where it waits on a console spike.
 
 ### Stage 4: addons, and sight as the first one
 
@@ -154,11 +155,21 @@ Agents usually reach the console through one-shot connections (one command per c
 
 Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
 
+### Stage 7 (optional): network sight
+
+Stage 4 gave the agent sight of the screen. This one gives it sight of the console's own network state, which no current command exposes: which ports the console listens on and which peers it is connected to. Today an agent can only infer that by trying to connect ([#94](https://github.com/sbihaiko/ariel/issues/94)).
+
+- One command, `netstat [-l] [-t] [-u] [--limit N] [--json]`, read-only and ungated like `ps` and `sysinfo`, numeric addresses only, bounded by the readers' 64 KiB cap and its `truncated` marker.
+- It answers which payload is serving and which is not, which is the question an agent asks right after it launches one.
+- A console spike comes first: prove on firmware 11.20 that a payload can enumerate the socket table without freezing the console or needing privileges it lacks, and record the interface it used in [console findings](docs/console-findings.md). The command is built only if the spike passes, and the stage closes either way. A failed spike is a result, as the capture spike was for sight.
+- It deliberately builds no `ping`, `ifconfig`, `diff`, `timeout` or `sha256sum`: each is already covered by another mechanism, and the coverage table below says which.
+- No new exit code and no change to the approval design: a read-only command is not gated, and `operation_failed` and the platform refusal carry its failures.
+
 ## Command coverage
 
 Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
 
-**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S5 are Stages 1 to 5; S1 to S3 items are on `dev` and `master` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
+**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S7 are Stages 1 to 7; S1 to S3 items are on `dev` and `master` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
@@ -171,7 +182,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c`, `-e`, `--`, `--limit` |
 | `find` | | ⚠️ only `-name`, `-type` | S3: `-name`, `-type f\|d\|l`, `--limit`, `--json` |
 | `cmp`, `hexdump` | | ✅ | |
-| `diff` | | ❌ | S3, optional; not built |
+| `diff` | | ❌ | Not built: `cmp` answers same-or-differ with the first offset and `hexdump` shows the bytes; a finer diff is the agent's own work on its own machine |
 | `df` | | ✅ | |
 | `du` | | ✅ | |
 | `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S2: gated |
@@ -185,7 +196,7 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `kill` | | ✅ | S2: gated, critical processes protected |
 | `payload run` | `cmd &`, `nohup` | ❌ | S1: `--wait` runs an approved build in the foreground. S2: background runs with a log |
 | `payload push`, `payload commit` | `scp`, `curl -T` | ❌ | S1, hash approved by the owner |
-| `timeout` | | ❌ | Not built: the 60 s connection deadline answers `timed_out` instead |
+| `timeout` | | ❌ | Not built: the 60 s connection deadline answers `timed_out`, and a health check carries its own bound through `payload config` |
 | `sleep`, `id`, `sync` | | ✅ | |
 | `env`, `export`, `exec` | | ✅ | S2: gated |
 | `sysinfo` | `uname`, `uptime`, `free` | ✅ | |
@@ -194,8 +205,9 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `mount`, `umount`, `chroot`, `mknod` | | ✅ | S2: gated |
 | `reboot` | | ❌ | S2: gated; the host build simulates it |
 | `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
-| `sha256sum` | | ❌ (`sum` is a BSD checksum) | S2 |
-| `ifconfig`, `netstat`, `ping` | | ❌ | S3, optional; not built |
+| `sha256sum` | | ❌ (`sum` is a BSD checksum) | Not built: `read <path> --limit 0` answers `bytes 0 <sha256>`, the whole file's hash, in one read-only call |
+| `netstat` | | ❌ | S7 (optional): built only if the console spike proves the socket table is readable; see [Stage 7](#stage-7-optional-network-sight) |
+| `ifconfig`, `ping` | | ❌ | Not built: the console's address is the one the agent connected to, and a download that fails already answers reachability |
 
 PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated, and `sfocreate` joined them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) `session` (Stage 5) and `screenshot` (Stage 4).
 
