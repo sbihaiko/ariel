@@ -52,23 +52,11 @@ jobs:
         path: ariel-ps5.elf
         if-no-files-found: error
 
-  release:
-    needs: build
-    permissions:
-      contents: write
-
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: Payload
-          path: .
-
-      - name: Create GitHub Release (pre-release)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          prerelease: true
-          files: ariel-ps5.elf
+# No job here publishes a release. A build made on a runner pins no anchor:
+# ARIEL_PUBKEY and ARIEL_RECOVERY_PUBKEY are empty, so ps5_anchor() answers -1
+# and the payload can approve nothing, while the notes say the key never leaves
+# the owner's computer and the release is source only. Attaching that binary
+# advertised one every owner would have to replace, and marking the release a
+# pre-release hid it from the sidebar. A tag keeps its build as the workflow
+# artifact above; the release itself is made by hand, with notes, from a build
+# the owner made with their own two keys.
