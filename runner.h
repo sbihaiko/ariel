@@ -25,13 +25,24 @@ along with this program; see the file COPYING. If not, see
 
 /**
  * Run one command of the agent port: argv[0] is the command, argv[argc] is
- * NULL. Output goes to outfd and diagnostics to errfd. A connection has no
- * working directory, so every path is absolute and cd is an error. Returns
- * 0 and the command's status in status when the command is known, or -1
- * when it is not a runner command. platform is the port a command that waits
- * runs on, such as sleep.
+ * NULL. Output goes to outfd and diagnostics to errfd. session names the
+ * working directory the command runs in and receives the one a cd chose,
+ * or is NULL for a connection with no working directory, where every path
+ * is absolute and cd is an error. Returns 0 and the command's status in
+ * status when the command is known, or -1 when it is not a runner command.
+ * platform is the port a command that waits runs on, such as sleep.
  **/
 int runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
-               int errfd, int *status);
+               int errfd, runner_session_t *session, int *status);
+
+/**
+ * Resolve one path against a session's directory: a relative path is joined
+ * to it, an absolute one is normalised as it stands. The join is lexical,
+ * so no symbolic link is followed, and a ".." that would leave the root
+ * answers bad_path. With no session a relative path answers relative_path,
+ * exactly as it always has. Returns 0 when out holds the path.
+ **/
+int runner_resolve(const runner_session_t *session, const char *path,
+                   char *out, size_t size, int errfd);
 
 #endif /* ARIEL_RUNNER_H */

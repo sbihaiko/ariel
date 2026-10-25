@@ -17,9 +17,16 @@ along with this program; see the file COPYING. If not, see
 // sync() is not POSIX; glibc declares it only with _DEFAULT_SOURCE.
 #define _DEFAULT_SOURCE
 
+#if defined(__APPLE__)
+// macOS hides O_NOFOLLOW behind _DARWIN_C_SOURCE once _POSIX_C_SOURCE is
+// defined, and cd opens its directory without following a symbolic link.
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <regex.h>
@@ -165,12 +172,194 @@ bad_arguments(const char *cmd, int errfd) {
 }
 
 
+/**
+ * The session of the command this thread is running, or NULL. One
+ * connection thread runs one command at a time, and every path-taking
+ * command reaches the two helpers below, so the working directory travels
+ * here instead of as an argument repeated at fourteen call sites. It is
+ * thread-local, so two connections never share one; runner_run sets it for
+ * the length of its dispatch and puts back what it found.
+ **/
+static _Thread_local runner_session_t *session_current;
+
+static int resolve_path(const char *cwd, const char *path, char *out,
+                        size_t size, int errfd);
+static int refuse_protected(const char *path, int errfd);
+
+
+int
+runner_resolve(const runner_session_t *session, const char *path, char *out,
+               size_t size, int errfd) {
+  return resolve_path(session ? session->cwd : NULL, path, out, size, errfd);
+}
+
+
+/** The path a command will act on, resolved against the session's directory
+    when it is relative. Returns 0 when out holds it. **/
 static int
-refuse_relative(const char *path, int errfd) {
-  if(path[0] != '/') {
-    say(errfd, "relative_path\n");
+resolve_operand(const char *path, char *out, size_t size, int errfd) {
+  return resolve_path(session_current ? session_current->cwd : NULL,
+                      path, out, size, errfd);
+}
+
+
+/**
+ * Resolve one path against the session's directory: an absolute path is
+ * normalised as it stands and a relative one is joined to cwd, so a command
+ * names the same entry however it was written. The join is lexical, so no
+ * symbolic link is followed here and the checks after it still see one, and
+ * a ".." that would leave the root answers bad_path. A relative path with
+ * no working directory answers relative_path, as it always has. Returns 0
+ * when out holds the path.
+ **/
+static int
+resolve_path(const char *cwd, const char *path, char *out, size_t size,
+             int errfd) {
+  char joined[PATH_MAX * 2];
+  const char *part;
+  size_t used = 0;
+
+  if(!path[0]) {
+    say(errfd, "bad_path\n");
     return 1;
   }
+
+  if(path[0] == '/') {
+    if(snprintf(joined, sizeof(joined), "%s", path) >= (int)sizeof(joined)) {
+      say(errfd, "bad_path\n");
+      return 1;
+    }
+  } else {
+    if(!cwd) {
+      say(errfd, "relative_path\n");
+      return 1;
+    }
+    if(snprintf(joined, sizeof(joined), "%s/%s", cwd, path)
+       >= (int)sizeof(joined)) {
+      say(errfd, "bad_path\n");
+      return 1;
+    }
+  }
+
+  // Rebuild the path one segment at a time, so "." disappears, ".." pops a
+  // segment and no other segment is touched.
+  out[0] = '\0';
+  part = joined;
+  while(*part) {
+    const char *slash;
+    size_t len;
+
+    while(*part == '/') {
+      part++;
+    }
+    if(!*part) {
+      break;
+    }
+
+    slash = strchr(part, '/');
+    len = slash ? (size_t)(slash - part) : strlen(part);
+
+    if(len == 1 && part[0] == '.') {
+      // The current directory names itself.
+    } else if(len == 2 && part[0] == '.' && part[1] == '.') {
+      if(used == 0) {
+        say(errfd, "bad_path\n");
+        return 1;
+      }
+      while(used > 0 && out[used - 1] != '/') {
+        used--;
+      }
+      if(used > 0) {
+        used--;
+      }
+      out[used] = '\0';
+    } else {
+      if(used + 1 + len + 1 > size) {
+        say(errfd, "bad_path\n");
+        return 1;
+      }
+      out[used++] = '/';
+      memcpy(out + used, part, len);
+      used += len;
+      out[used] = '\0';
+    }
+
+    part = slash ? slash + 1 : part + len;
+  }
+
+  if(used == 0) {
+    out[0] = '/';
+    out[1] = '\0';
+  }
+
+  return 0;
+}
+
+
+/**
+ * cd PATH: take the session into a directory, judged as ls judges a path.
+ * A symbolic link answers for itself and is never followed, so the session
+ * only ever holds a path it named. The chosen directory comes back through
+ * the session for the caller that stores it.
+ **/
+static int
+run_cd(runner_session_t *session, int argc, char *const argv[], int errfd,
+       int *status) {
+  char resolved[PATH_MAX];
+  struct stat st;
+  int fd;
+
+  *status = 1;
+
+  // A connection with no session cannot change directory at all, so it
+  // answers that whatever it was asked; the argument count matters only
+  // where there is a directory to change to.
+  if(!session || !session->cwd) {
+    say(errfd, "no_working_directory\n");
+    return 0;
+  }
+  if(argc != 2) {
+    say(errfd, "bad_argument\n");
+    return 0;
+  }
+
+  if(resolve_path(session->cwd, argv[1], resolved, sizeof(resolved), errfd)) {
+    return 0;
+  }
+  if(refuse_protected(resolved, errfd)) {
+    *status = STATUS_PROTECTED;
+    return 0;
+  }
+
+  // lstat first, so a symbolic link answers for itself whether or not the
+  // platform's open would have followed it.
+  if(lstat(resolved, &st)) {
+    report("cd", resolved, errfd, errno);
+    return 0;
+  }
+  if(S_ISLNK(st.st_mode)) {
+    say(errfd, "symbolic_link\n");
+    return 0;
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    say(errfd, "not_a_directory\n");
+    return 0;
+  }
+
+  if((fd=open(resolved, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    report("cd", resolved, errfd, errno);
+    return 0;
+  }
+  close(fd);
+
+  if(!session->new_cwd ||
+     snprintf(session->new_cwd, session->new_cwd_size, "%s", resolved)
+     >= (int)session->new_cwd_size) {
+    say(errfd, "bad_path\n");
+    return 0;
+  }
+
+  *status = 0;
   return 0;
 }
 
@@ -337,6 +526,7 @@ ls_detail(const char *dir, const char *name, int json, answer_t *answer,
 
 static int
 run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   char **names = NULL;
   size_t count = 0;
   size_t cap = 0;
@@ -371,11 +561,14 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
     }
     first++;
   }
-  if(argc - first != 1 || argv[first][0] != '/') {
+  if(argc - first != 1) {
     say(errfd, "relative_path\n");
     return 1;
   }
-  path = argv[first];
+  if(resolve_operand(argv[first], resolved, sizeof(resolved), errfd)) {
+    return 1;
+  }
+  path = resolved;
   if(refuse_protected(path, errfd)) {
     return STATUS_PROTECTED;
   }
@@ -440,12 +633,15 @@ run_ls(int json, int argc, char *const argv[], int outfd, int errfd) {
 // The open follows symbolic links; O_NONBLOCK keeps a FIFO from blocking.
 static int
 open_target(const char *cmd, const char *path, int errfd, int *fd) {
+  char resolved[PATH_MAX];
   int state;
   int err;
 
-  if(refuse_relative(path, errfd)) {
+  if(resolve_operand(path, resolved, sizeof(resolved), errfd)) {
     return 1;
   }
+  path = resolved;
+
   if(refuse_protected(path, errfd)) {
     return STATUS_PROTECTED;
   }
@@ -1315,26 +1511,27 @@ run_date(int argc, char *const argv[], int outfd, int errfd) {
 
 static int
 run_df(int json, int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   char line[OUT_LINE_CAP];
   struct statvfs vfs;
 
   if(argc != 2) {
     return bad_arguments("df", errfd);
   }
-  if(refuse_relative(argv[1], errfd)) {
+  if(resolve_operand(argv[1], resolved, sizeof(resolved), errfd)) {
     return 1;
   }
-  if(refuse_protected(argv[1], errfd)) {
+  if(refuse_protected(resolved, errfd)) {
     return STATUS_PROTECTED;
   }
-  if(statvfs(argv[1], &vfs)) {
-    report("df", argv[1], errfd, errno);
+  if(statvfs(resolved, &vfs)) {
+    report("df", resolved, errfd, errno);
     return 1;
   }
 
   if(json) {
     say(outfd, "{\"path\":");
-    json_say_string(outfd, argv[1]);
+    json_say_string(outfd, resolved);
     snprintf(line, sizeof(line),
              ",\"total_bytes\":%llu,\"free_bytes\":%llu,\"available_bytes\":%llu}\n",
              (unsigned long long)vfs.f_blocks * vfs.f_frsize,
@@ -1346,7 +1543,7 @@ run_df(int json, int argc, char *const argv[], int outfd, int errfd) {
 
   snprintf(line, sizeof(line),
            "%s: %llu bytes total, %llu bytes free, %llu bytes available\n",
-           argv[1],
+           resolved,
            (unsigned long long)vfs.f_blocks * vfs.f_frsize,
            (unsigned long long)vfs.f_bfree * vfs.f_frsize,
            (unsigned long long)vfs.f_bavail * vfs.f_frsize);
@@ -1416,6 +1613,7 @@ find_wanted(const char *path, const struct stat *st, const char *name, char type
 
 static int
 run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   char **todo = NULL;
   size_t count = 0;
   size_t cap = 0;
@@ -1466,27 +1664,27 @@ run_find(int json, int argc, char *const argv[], int outfd, int errfd) {
       return bad_arguments("find", errfd);
     }
   }
-  if(refuse_relative(argv[1], errfd)) {
+  if(resolve_operand(argv[1], resolved, sizeof(resolved), errfd)) {
     return 1;
   }
-  if(refuse_protected(argv[1], errfd)) {
+  if(refuse_protected(resolved, errfd)) {
     return STATUS_PROTECTED;
   }
-  if(lstat(argv[1], &st)) {
-    report("find", argv[1], errfd, errno);
+  if(lstat(resolved, &st)) {
+    report("find", resolved, errfd, errno);
     return 1;
   }
 
   answer_init(&answer, outfd, limit);
-  if(find_wanted(argv[1], &st, name, type)) {
-    answer_path(&answer, json, argv[1]);
+  if(find_wanted(resolved, &st, name, type)) {
+    answer_path(&answer, json, resolved);
   }
   if(!S_ISDIR(st.st_mode)) {
     answer_done(&answer);
     return 0;
   }
 
-  root = strdup(argv[1]);
+  root = strdup(resolved);
   if(!root || push_path(&todo, &count, &cap, root)) {
     free(root);
     free(todo);
@@ -1665,6 +1863,7 @@ du_walk(du_walk_t *walk, const char *path) {
 
 static int
 run_du(int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   answer_t answer;
   du_walk_t walk;
   struct stat st;
@@ -1677,14 +1876,14 @@ run_du(int argc, char *const argv[], int outfd, int errfd) {
     }
     return bad_arguments("du", errfd);
   }
-  if(refuse_relative(argv[1], errfd)) {
+  if(resolve_operand(argv[1], resolved, sizeof(resolved), errfd)) {
     return 1;
   }
-  if(refuse_protected(argv[1], errfd)) {
+  if(refuse_protected(resolved, errfd)) {
     return STATUS_PROTECTED;
   }
-  if(lstat(argv[1], &st)) {
-    report("du", argv[1], errfd, errno);
+  if(lstat(resolved, &st)) {
+    report("du", resolved, errfd, errno);
     return 1;
   }
 
@@ -1693,9 +1892,9 @@ run_du(int argc, char *const argv[], int outfd, int errfd) {
   walk.errfd = errfd;
   walk.failed = 0;
   walk.oom = 0;
-  total = du_walk(&walk, argv[1]);
+  total = du_walk(&walk, resolved);
   if(!S_ISDIR(st.st_mode)) {
-    du_say(&walk, argv[1], total);
+    du_say(&walk, resolved, total);
   }
 
   if(walk.oom) {
@@ -1968,6 +2167,7 @@ run_sleep(platform_t *platform, int argc, char *const argv[], int errfd) {
 
 static int
 run_sum(int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   int rc;
   unsigned long checksum = 0;
   unsigned char buf[SUM_BLOCK];
@@ -1980,12 +2180,11 @@ run_sum(int argc, char *const argv[], int outfd, int errfd) {
     say(errfd, "missing_operand\n");
     return 1;
   }
-  if(argv[1][0] != '/') {
-    say(errfd, "relative_path\n");
+  if(resolve_operand(argv[1], resolved, sizeof(resolved), errfd)) {
     return 1;
   }
 
-  if((rc=open_target("sum", argv[1], errfd, &fd))) {
+  if((rc=open_target("sum", resolved, errfd, &fd))) {
     return rc;
   }
 
@@ -2058,6 +2257,7 @@ say_sfo_value(int outfd, const unsigned char *val, uint32_t len, uint32_t type) 
 
 static int
 run_sfoinfo(int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   int rc;
   unsigned char *buf;
   struct stat st;
@@ -2074,16 +2274,15 @@ run_sfoinfo(int argc, char *const argv[], int outfd, int errfd) {
     say(errfd, "missing_operand\n");
     return 1;
   }
-  if(argv[1][0] != '/') {
-    say(errfd, "relative_path\n");
+  if(resolve_operand(argv[1], resolved, sizeof(resolved), errfd)) {
     return 1;
   }
 
-  if((rc=open_target("sfoinfo", argv[1], errfd, &fd))) {
+  if((rc=open_target("sfoinfo", resolved, errfd, &fd))) {
     return rc;
   }
   if(fstat(fd, &st)) {
-    say_failure(errfd, "sfoinfo", argv[1], errno);
+    say_failure(errfd, "sfoinfo", resolved, errno);
     close(fd);
     return 1;
   }
@@ -2305,9 +2504,9 @@ run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
 }
 
 
-int
-runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
-           int errfd, int *status) {
+static int
+runner_dispatch(platform_t *platform, int argc, char *const argv[], int outfd,
+                int errfd, runner_session_t *session, int *status) {
   size_t i;
 
   if(argc < 1) {
@@ -2319,7 +2518,11 @@ runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
   }
 
   if(argc == 1 && !strcmp(argv[0], "pwd")) {
-    say(outfd, "/\n");
+    char line[PATH_MAX + 2];
+
+    snprintf(line, sizeof(line), "%s\n",
+             (session && session->cwd) ? session->cwd : "/");
+    say(outfd, line);
     *status = 0;
     return 0;
   }
@@ -2330,9 +2533,7 @@ runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
   }
 
   if(argc >= 1 && !strcmp(argv[0], "cd")) {
-    say(errfd, "no_working_directory\n");
-    *status = 1;
-    return 0;
+    return run_cd(session, argc, argv, errfd, status);
   }
 
   if(!strcmp(argv[0], "echo")) {
@@ -2390,4 +2591,17 @@ runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
   }
 
   return readers_run(0, argc, argv, outfd, errfd, status);
+}
+
+
+int
+runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
+           int errfd, runner_session_t *session, int *status) {
+  runner_session_t *previous = session_current;
+  int rc;
+
+  session_current = session;
+  rc = runner_dispatch(platform, argc, argv, outfd, errfd, session, status);
+  session_current = previous;
+  return rc;
 }

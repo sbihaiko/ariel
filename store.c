@@ -5166,6 +5166,31 @@ store_session_use(const char *id, store_session_t *info) {
 }
 
 
+int
+store_session_set_cwd(const char *id, const char *cwd) {
+  struct session *entry;
+  int rc = STORE_SESSION_UNKNOWN;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = session_find_locked(id);
+  if(entry) {
+    if(strlen(cwd) >= sizeof(entry->cwd)) {
+      rc = STORE_SESSION_FAILED;
+    } else {
+      snprintf(entry->cwd, sizeof(entry->cwd), "%s", cwd);
+      entry->used_ms = now_ms();
+      rc = STORE_SESSION_OK;
+    }
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  return rc;
+}
+
+
 size_t
 store_session_list(store_session_t *entries, size_t max, size_t *count) {
   size_t live = 0;

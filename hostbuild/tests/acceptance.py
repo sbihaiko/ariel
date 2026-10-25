@@ -9413,6 +9413,164 @@ def scenario_session_expires_when_idle(server):
         "an expired session must answer session_expired")
 
 
+def scenario_session_prefix_runs_the_rest_in_the_session(server):
+    """@<sid> runs the rest of the line there, and a bad ID asks nobody."""
+    server.fresh()
+    sid = session_mint(server)
+    assert run_command(server, "@%s ls /" % sid) == run_command(server, "ls /"), (
+        "a command through the prefix must answer as it does without one")
+
+    assert run_command(server, "@%s ls /" % ("0" * 32)) == [
+        "session_expired", "exit 93"], (
+        "an unknown ID must answer session_expired and run nothing")
+    for bad in ("@", "@abc", "@" + "0" * 31, "@" + "0" * 33, "@" + "G" * 32):
+        reply = run_command(server, bad + " ls /")
+        assert reply == ["session_expired", "exit 93"], (
+            "%r must answer session_expired, got %r" % (bad, reply))
+    server.assert_no_line()
+
+    server.advance(SESSION_TTL_MS)
+    server.settle(0)
+    assert run_command(server, "@%s ls /" % sid) == [
+        "session_expired", "exit 93"], (
+        "an expired ID must answer session_expired")
+
+
+def scenario_session_prefix_keeps_the_gate(server):
+    """A gated command in a session still asks the owner and signs no ID."""
+    server.fresh()
+    sid = session_mint(server)
+    data = os.path.join(server.root, "data")
+    os.makedirs(data, exist_ok=True)
+    path = os.path.join(data, "gated-in-session.txt")
+    with open(path, "wb") as handle:
+        handle.write(b"x\n")
+
+    approval, challenge = gate_request(server, "@%s rm %s" % (sid, path))
+    action = decoded_action(challenge_action(challenge))
+    assert action.startswith("ariel-action-v1\ncommand=rm\n"), action
+    assert "\ntarget=" + path in action, action
+    assert sid not in action, "the session ID must never enter the signed action"
+    assert os.path.exists(path), "an unsigned rm must not run"
+
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "@%s rm %s" % (sid, path)) == ["exit 0"], (
+        "a signed rm must run inside its session")
+    assert not os.path.exists(path)
+
+
+def scenario_session_use_refreshes_its_idle_time(server):
+    """Every command through the prefix restarts the idle clock."""
+    server.fresh()
+    sid = session_mint(server)
+
+    server.advance(SESSION_TTL_MS - 1)
+    assert run_command(server, "@%s ls /" % sid)[-1] == "exit 0", (
+        "a session must still answer one millisecond before its TTL")
+    server.advance(SESSION_TTL_MS - 1)
+    server.settle(0)
+    assert sid in session_ids(server), (
+        "a used session must not expire on its first TTL")
+
+    server.advance(1)
+    server.settle(0)
+    assert sid not in session_ids(server), (
+        "an untouched session must leave at its TTL")
+
+
+def scenario_session_cd_and_pwd(server):
+    """cd moves the session, pwd reads it back, and a refusal changes nothing."""
+    server.fresh()
+    sid = session_mint(server)
+    folder = scratch_dir(server)
+
+    assert run_command(server, "@%s pwd" % sid) == ["/", "exit 0"], (
+        "a new session must start at the root")
+    assert run_command(server, "@%s cd %s" % (sid, folder)) == ["exit 0"], (
+        "cd into an existing directory must succeed")
+    assert run_command(server, "@%s pwd" % sid) == [folder, "exit 0"], (
+        "the directory must survive into the next connection")
+
+    missing = os.path.join(folder, "no-such-dir")
+    assert run_command(server, "@%s cd %s" % (sid, missing)) == [
+        "no_such_file", "exit 1"], "a missing directory must answer no_such_file"
+    plain = write_scratch(server, "cd-plain.txt", b"x")
+    assert run_command(server, "@%s cd %s" % (sid, plain)) == [
+        "not_a_directory", "exit 1"], "a file must answer not_a_directory"
+    link = os.path.join(folder, "cd-link")
+    make_link(link, folder, hard=False)
+    assert run_command(server, "@%s cd %s" % (sid, link)) == [
+        "symbolic_link", "exit 1"], "a symbolic link must answer for itself"
+    assert run_command(server, "@%s cd %s" % (sid, secret_path(server, "token"))) == [
+        "protected", "exit 87"], "Ariel's state must answer protected"
+    assert run_command(server, "@%s pwd" % sid) == [folder, "exit 0"], (
+        "a refused cd must leave the session where it was")
+
+    # A connection with no session keeps today's answers byte for byte.
+    assert run_command(server, "pwd") == ["/", "exit 0"], (
+        "pwd without a session must still answer /")
+    assert run_command(server, "cd " + folder) == [
+        "no_working_directory", "exit 1"], (
+        "cd without a session must still answer no_working_directory")
+
+
+def scenario_session_relative_paths_resolve(server):
+    """A relative path in a session names the entry below its directory."""
+    server.fresh()
+    sid = session_mint(server)
+    folder = scratch_dir(server)
+    os.makedirs(os.path.join(folder, "bin"), exist_ok=True)
+    with open(os.path.join(folder, "bin", "tool.txt"), "wb") as handle:
+        handle.write(b"tool\n")
+    with open(os.path.join(folder, "README"), "wb") as handle:
+        handle.write(b"readme\n")
+
+    assert run_command(server, "@%s cd %s" % (sid, folder)) == ["exit 0"]
+    assert run_command(server, "@%s ls bin" % sid) == ["tool.txt", "exit 0"], (
+        "a relative operand must name the entry below the session")
+    assert run_command(server, "@%s cat README" % sid) == ["readme", "exit 0"]
+    assert run_command(server, "@%s head 1 README" % sid) == ["readme", "exit 0"]
+    found = run_command(server, "@%s find . -name tool.txt" % sid)
+    assert os.path.join(folder, "bin", "tool.txt") in found, (
+        "find . must walk from the session's directory: %r" % (found,))
+
+    root_sid = session_mint(server)
+    assert run_command(server, "@%s cd .." % root_sid) == ["bad_path", "exit 1"], (
+        "a relative path that would leave the root must answer bad_path")
+    assert run_command(server, "@%s cat ../data/ariel/token" % sid) == [
+        "protected", "exit 87"], (
+        "a relative path into Ariel's state must answer protected")
+
+    # Nothing changes for a connection without a session.
+    assert run_command(server, "cat README") == ["relative_path", "exit 1"], (
+        "a relative path with no session must still answer relative_path")
+    assert run_command(server, "ls bin") == ["relative_path", "exit 1"]
+
+
+def scenario_session_gated_relative_signs_the_absolute_path(server):
+    """A gated command's action carries the resolved path, with no dot segment."""
+    server.fresh()
+    sid = session_mint(server)
+    folder = os.path.join(server.root, "data")
+    os.makedirs(os.path.join(folder, "deep"), exist_ok=True)
+    target = os.path.join(folder, "deep", "gone.txt")
+    with open(target, "wb") as handle:
+        handle.write(b"x\n")
+    assert run_command(server, "@%s cd %s" % (sid, folder)) == ["exit 0"]
+
+    approval, challenge = gate_request(server, "@%s rm ./deep/../deep/gone.txt" % sid)
+    action = decoded_action(challenge_action(challenge))
+    assert "\ntarget=" + target + "\n" in action, (
+        "the owner must sign the resolved path, got %r" % action)
+    assert "/./" not in action and "/../" not in action, (
+        "the canonical action must carry no dot segment: %r" % action)
+    assert sid not in action, "the session ID must never enter the signed action"
+
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "@%s rm ./deep/../deep/gone.txt" % sid) == ["exit 0"]
+    assert not os.path.exists(target)
+
+
 def scenario_session_full_at_eight(server):
     """Eight sessions live; the ninth answers session_full and frees nothing."""
     server.fresh()
@@ -9629,6 +9787,12 @@ HOST_ROOT_SCENARIOS.update({
     "an empty gallery answers no_shots before the owner is asked",
     "session new mints an ID and its TTL, list shows it, and close ends it",
     "a session nobody used for its TTL is gone and its ID answers exit 93",
+    "@<sid> runs the rest of the line there, and a bad ID asks nobody",
+    "a gated command in a session still asks the owner and signs no ID",
+    "a command through the prefix restarts the session's idle clock",
+    "cd moves the session, pwd reads it back, and a refusal changes nothing",
+    "a relative path in a session names the entry below its directory",
+    "a gated session command signs the resolved path, with no dot segment",
     "eight sessions live, and the ninth answers session_full",
 })
 
@@ -9841,6 +10005,18 @@ SCENARIOS = [
      scenario_session_is_minted_listed_and_closed, HOST_ROOT_REASON),
     ("a session nobody used for its TTL is gone and its ID answers exit 93",
      scenario_session_expires_when_idle, HOST_ROOT_REASON),
+    ("@<sid> runs the rest of the line there, and a bad ID asks nobody",
+     scenario_session_prefix_runs_the_rest_in_the_session, HOST_ROOT_REASON),
+    ("a gated command in a session still asks the owner and signs no ID",
+     scenario_session_prefix_keeps_the_gate, HOST_ROOT_REASON),
+    ("a command through the prefix restarts the session's idle clock",
+     scenario_session_use_refreshes_its_idle_time, HOST_ROOT_REASON),
+    ("cd moves the session, pwd reads it back, and a refusal changes nothing",
+     scenario_session_cd_and_pwd, HOST_ROOT_REASON),
+    ("a relative path in a session names the entry below its directory",
+     scenario_session_relative_paths_resolve, HOST_ROOT_REASON),
+    ("a gated session command signs the resolved path, with no dot segment",
+     scenario_session_gated_relative_signs_the_absolute_path, HOST_ROOT_REASON),
     ("eight sessions live, and the ninth answers session_full",
      scenario_session_full_at_eight, HOST_ROOT_REASON),
     ("rm -r refuses protected objects and links before anything is removed",

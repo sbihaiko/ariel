@@ -806,8 +806,8 @@ host_spawn_kill(platform_t *self, pid_t pid) {
 
 static int
 host_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
-         int *status) {
-  return runner_run(self, argc, argv, outfd, errfd, status);
+         runner_session_t *session, int *status) {
+  return runner_run(self, argc, argv, outfd, errfd, session, status);
 }
 
 

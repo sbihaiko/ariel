@@ -121,6 +121,19 @@ typedef struct platform platform_t;
 /** Receives the next piece of a fetched body. Returns 0, or -1 to stop. **/
 typedef int (*http_sink_t)(void *ctx, const unsigned char *data, size_t len);
 
+/**
+ * What a shell command needs from its session, and what it answers back.
+ * With cwd NULL the connection has no working directory, which is every
+ * connection that names no session: paths must be absolute and cd refuses.
+ * A command that changes the directory fills new_cwd, and the caller that
+ * owns the session stores it.
+ **/
+typedef struct {
+  const char *cwd;
+  char *new_cwd;
+  size_t new_cwd_size;
+} runner_session_t;
+
 struct platform {
   /**
    * The directory the file commands' absolute paths are under: empty on a
@@ -251,13 +264,13 @@ struct platform {
   /**
    * Run one noninteractive shell command: argv[0] is the command and
    * argv[argc] is NULL. Its output goes to outfd and its diagnostics to
-   * errfd, and its own exit status comes back in status. A connection has
-   * no working directory, so every path is absolute and cd is an error.
-   * Returns 0 when the command ran, -1 when this platform has no such
-   * command.
+   * errfd, and its own exit status comes back in status. session names the
+   * working directory the command runs in, or NULL for the connection that
+   * has none, where every path is absolute and cd is an error. Returns 0
+   * when the command ran, -1 when this platform has no such command.
    **/
   int (*run)(platform_t *self, int argc, char *const argv[], int outfd,
-             int errfd, int *status);
+             int errfd, runner_session_t *session, int *status);
 
   /**
    * Perform a gated system command, mount, umount, chroot or mknod, on the

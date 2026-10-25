@@ -47,6 +47,7 @@ along with this program; see the file COPYING. If not, see
 #include "http.h"
 #include "protected.h"
 #include "release.h"
+#include "runner.h"
 #include "runs.h"
 #include "sha256.h"
 #include "store.h"
@@ -1058,13 +1059,36 @@ gate_pass(agent_t *agent, int fd, const approval_facts_t *facts,
  * chown or chgrp with its operand. operand is NULL for the first four. A
  * recursive rm takes the whole tree below path.
  **/
+/** Resolve one operand against the session's directory, answering the
+    refusal itself when it cannot. Returns NULL once it has. **/
+static const char *
+session_operand(runner_session_t *session, const char *path, char *buf,
+                size_t size, int fd) {
+  // The resolver writes the word; a refused path exits 1, and the reply is
+  // not finished until its status line follows.
+  static const char refusal_exit[] = "exit 1\n";
+
+  if(runner_resolve(session, path, buf, size, fd)) {
+    reply(fd, refusal_exit);
+    return NULL;
+  }
+  return buf;
+}
+
+
 static void
-file_command(agent_t *agent, int fd, const char *command, const char *path,
-             const char *operand, int recursive) {
+file_command(agent_t *agent, int fd, runner_session_t *session,
+             const char *command, const char *path, const char *operand,
+             int recursive) {
   const char *root = agent->platform->fs_root;
+  char resolved[PATH_MAX];
   approval_challenge_t challenge;
   approval_facts_t facts;
   int rc;
+
+  if(!(path=session_operand(session, path, resolved, sizeof(resolved), fd))) {
+    return;
+  }
 
   memset(&facts, 0, sizeof(facts));
   facts.recursive = recursive;
@@ -1092,13 +1116,24 @@ file_command(agent_t *agent, int fd, const char *command, const char *path,
  * A recursive cp takes the whole tree below source.
  **/
 static void
-transfer_command(agent_t *agent, int fd, const char *command,
-                 const char *source, const char *destination, int recursive) {
+transfer_command(agent_t *agent, int fd, runner_session_t *session,
+                 const char *command, const char *source,
+                 const char *destination, int recursive) {
   const char *root = agent->platform->fs_root;
+  char resolved_source[PATH_MAX];
+  char resolved_destination[PATH_MAX];
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
   approval_facts_t facts;
   int rc;
+
+  if(!(source=session_operand(session, source, resolved_source,
+                              sizeof(resolved_source), fd)) ||
+     !(destination=session_operand(session, destination,
+                                   resolved_destination,
+                                   sizeof(resolved_destination), fd))) {
+    return;
+  }
 
   if(strlen(source) + strlen(destination) + 1 > TRANSFER_SUBJECT_MAX) {
     file_outcome(fd, command, "-", "-", FILEOPS_BAD_PATH);
@@ -1137,7 +1172,8 @@ transfer_command(agent_t *agent, int fd, const char *command,
  * when the line was answered here.
  **/
 static int
-file_options(agent_t *agent, int fd, int argc, char *argv[]) {
+file_options(agent_t *agent, int fd, runner_session_t *session, int argc,
+             char *argv[]) {
   int cp = !strcmp(argv[0], "cp");
   int recursive;
   int i;
@@ -1167,9 +1203,9 @@ file_options(agent_t *agent, int fd, int argc, char *argv[]) {
     } else if(operands > (cp ? 2 : 1)) {
       audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
     } else if(cp) {
-      transfer_command(agent, fd, "cp", argv[2], argv[3], 1);
+      transfer_command(agent, fd, session, "cp", argv[2], argv[3], 1);
     } else {
-      file_command(agent, fd, "rm", argv[2], NULL, 1);
+      file_command(agent, fd, session, "rm", argv[2], NULL, 1);
     }
     return 1;
   }
@@ -1186,11 +1222,18 @@ file_options(agent_t *agent, int fd, int argc, char *argv[]) {
 
 /** unzip -l ARCHIVE: the members and their sizes, at once. Nothing is written, so nothing is asked. **/
 static void
-unzip_list(agent_t *agent, int fd, const char *archive) {
+unzip_list(agent_t *agent, int fd, runner_session_t *session,
+           const char *archive) {
+  char resolved[PATH_MAX];
   const char *root = agent->platform->fs_root;
   char *text = NULL;
   size_t len = 0;
   int rc;
+
+  if(!(archive=session_operand(session, archive, resolved, sizeof(resolved),
+                               fd))) {
+    return;
+  }
 
   rc = fileops_unzip_list(root, archive, &text, &len);
   if(rc) {
@@ -1234,10 +1277,16 @@ list_member(void *ctx, const tar_member_t *member) {
 
 /** tar -t ARCHIVE: every member name at once, in archive order. **/
 static void
-tar_list_command(agent_t *agent, int fd, const char *path) {
+tar_list_command(agent_t *agent, int fd, runner_session_t *session,
+                 const char *path) {
+  char resolved[PATH_MAX];
   struct tar_list list;
   int archive;
   int rc;
+
+  if(!(path=session_operand(session, path, resolved, sizeof(resolved), fd))) {
+    return;
+  }
 
   rc = fileops_read_open(agent->platform->fs_root, path, &archive);
   if(rc) {
@@ -1273,13 +1322,22 @@ tar_vet_job(void *ctx) {
  * its hash and DEST. Every member is checked before the first one is written.
  **/
 static void
-unzip_command(agent_t *agent, int fd, const char *archive,
-              const char *destination) {
+unzip_command(agent_t *agent, int fd, runner_session_t *session,
+              const char *archive, const char *destination) {
+  char resolved_archive[PATH_MAX];
+  char resolved_dest[PATH_MAX];
   const char *root = agent->platform->fs_root;
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
   approval_facts_t facts;
   int rc;
+
+  if(!(archive=session_operand(session, archive, resolved_archive,
+                               sizeof(resolved_archive), fd)) ||
+     !(destination=session_operand(session, destination, resolved_dest,
+                                   sizeof(resolved_dest), fd))) {
+    return;
+  }
 
   if(strlen(archive) + strlen(destination) + 1 > TRANSFER_SUBJECT_MAX) {
     file_outcome(fd, "unzip", "-", "-", FILEOPS_BAD_PATH);
@@ -1314,8 +1372,10 @@ unzip_command(agent_t *agent, int fd, const char *archive,
  * still the object that was signed.
  **/
 static void
-tar_extract_command(agent_t *agent, int fd, const char *archive,
-                    const char *dest) {
+tar_extract_command(agent_t *agent, int fd, runner_session_t *session,
+                    const char *archive, const char *dest) {
+  char resolved_archive[PATH_MAX];
+  char resolved_dest[PATH_MAX];
   const char *root = agent->platform->fs_root;
   char subject[TRANSFER_SUBJECT_MAX + 1];
   approval_challenge_t challenge;
@@ -1323,6 +1383,13 @@ tar_extract_command(agent_t *agent, int fd, const char *archive,
   tar_job_t job;
   int go;
   int rc;
+
+  if(!(archive=session_operand(session, archive, resolved_archive,
+                               sizeof(resolved_archive), fd)) ||
+     !(dest=session_operand(session, dest, resolved_dest,
+                            sizeof(resolved_dest), fd))) {
+    return;
+  }
 
   if(strlen(archive) + strlen(dest) + 1 > TRANSFER_SUBJECT_MAX) {
     file_outcome(fd, "tar", "-", "-", FILEOPS_BAD_PATH);
@@ -1351,13 +1418,14 @@ tar_extract_command(agent_t *agent, int fd, const char *archive,
 
 
 static void
-tar_command(agent_t *agent, int fd, int argc, char *argv[]) {
+tar_command(agent_t *agent, int fd, runner_session_t *session, int argc,
+            char *argv[]) {
   if(argc == 3 && !strcmp(argv[1], "-t")) {
-    tar_list_command(agent, fd, argv[2]);
+    tar_list_command(agent, fd, session, argv[2]);
     return;
   }
   if(argc == 4 && !strcmp(argv[1], "-x")) {
-    tar_extract_command(agent, fd, argv[2], argv[3]);
+    tar_extract_command(agent, fd, session, argv[2], argv[3]);
     return;
   }
   file_outcome(fd, "tar", "-", "-", FILEOPS_BAD_ARG);
@@ -1553,7 +1621,8 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
  * commands. More than one path is not one of them, so it is unlisted.
  **/
 static void
-attribute_command(agent_t *agent, int fd, int argc, char *argv[]) {
+attribute_command(agent_t *agent, int fd, runner_session_t *session, int argc,
+                  char *argv[]) {
   int i;
 
   // chmod, chown and chgrp take a mode and a path, and no option at all: a
@@ -1579,7 +1648,7 @@ attribute_command(agent_t *agent, int fd, int argc, char *argv[]) {
     unlisted_command(agent, fd, argc, argv);
     return;
   }
-  file_command(agent, fd, argv[0], argv[2], argv[1], 0);
+  file_command(agent, fd, session, argv[0], argv[2], argv[1], 0);
 }
 
 
@@ -2291,10 +2360,11 @@ write_outcome(int fd, const char *target, const char *id, int rc) {
  * owner is asked, and each attempt sends it again.
  **/
 static void
-write_command(agent_t *agent, int fd, int wake, const char *path,
-              const char *size_text, const char *hash_text) {
+write_command(agent_t *agent, int fd, int wake, runner_session_t *session,
+              const char *path, const char *size_text, const char *hash_text) {
   const char *root = agent->platform->fs_root;
   platform_t *platform = agent->platform;
+  char resolved_path[PATH_MAX];
   char declared[SHA256_HEX_LEN + 1];
   char computed[SHA256_HEX_LEN + 1];
   unsigned char digest[SHA256_DIGEST_LEN];
@@ -2306,6 +2376,10 @@ write_command(agent_t *agent, int fd, int wake, const char *path,
   sha256_t hash;
   int rc;
 
+  if(!(path=session_operand(session, path, resolved_path,
+                            sizeof(resolved_path), fd))) {
+    return;
+  }
   if(parse_size(size_text, &size) || parse_hash(hash_text, declared)) {
     reply(fd, unknown);
     return;
@@ -3469,14 +3543,16 @@ payload_logs(int fd, const char *name) {
 
 /** One command, one connection: output and diagnostics both go to fd. **/
 static int
-run_command(agent_t *agent, int fd, int argc, char *argv[]) {
+run_command(agent_t *agent, int fd, int argc, char *argv[],
+            runner_session_t *session) {
   char answer[32];
   int status = 0;
   int len;
 
   argv[argc] = NULL;
 
-  if(agent->platform->run(agent->platform, argc, argv, fd, fd, &status)) {
+  if(agent->platform->run(agent->platform, argc, argv, fd, fd, session,
+                          &status)) {
     return 0;
   }
 
@@ -4411,7 +4487,7 @@ builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
     reply(fd, audit_failed);
     return;
   }
-  if(!run_command(agent, fd, argc, argv)) {
+  if(!run_command(agent, fd, argc, argv, NULL)) {
     reply(fd, spawn_failed);
   }
 }
@@ -4997,10 +5073,33 @@ builtin_command(agent_t *agent, int fd, int argc, char *argv[]) {
 }
 
 
+/** An ID is exactly 32 lowercase hex characters and nothing else. **/
+static int
+session_id_valid(const char *id) {
+  int i;
+
+  for(i=0; i<SESSION_ID_MAX; i++) {
+    char c = id[i];
+
+    if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return 0;
+    }
+  }
+
+  return id[SESSION_ID_MAX] == '\0';
+}
+
+
 static void
 handle_command(agent_t *agent, int fd, int wake, char *line) {
   char *argv[MAX_TOKENS + 1];
+  char session_id[SESSION_ID_MAX + 1];
+  char session_cwd[SESSION_CWD_MAX];
+  char session_new_cwd[SESSION_CWD_MAX];
+  runner_session_t session;
+  runner_session_t *context = NULL;
   int argc = tokenize(line, argv, MAX_TOKENS);
+  int i;
 
   if(argc < 0) {
     reply(fd, bad_quoting_reply);
@@ -5012,6 +5111,41 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
+  // The session prefix: any first token that begins with '@' must name a
+  // live session, and is refused before the rest of the line is read as a
+  // command. It never reaches the unlisted-command path, which would ask
+  // the owner for a signature, so a typo costs one reply and no prompt.
+  if(argc >= 1 && argv[0][0] == '@') {
+    store_session_t info;
+
+    if(!session_id_valid(argv[0] + 1) ||
+       store_session_use(argv[0] + 1, &info) != STORE_SESSION_OK) {
+      reply(fd, session_expired);
+      return;
+    }
+
+    if(argc == 1) {
+      reply(fd, unknown);
+      return;
+    }
+
+    memcpy(session_id, info.id, sizeof(session_id));
+    memcpy(session_cwd, info.cwd, sizeof(session_cwd));
+    session_new_cwd[0] = '\0';
+    memset(&session, 0, sizeof(session));
+    session.cwd = session_cwd;
+    session.new_cwd = session_new_cwd;
+    session.new_cwd_size = sizeof(session_new_cwd);
+    context = &session;
+
+    // Run the rest of the line as an ordinary command.
+    for(i=1; i<argc; i++) {
+      argv[i - 1] = argv[i];
+    }
+    argv[argc - 1] = NULL;
+    argc--;
+  }
+
   // Exactly one command per connection.
   if(argc == 5 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "push")) {
     payload_push(agent, fd, wake, argv[2], argv[3], argv[4]);
@@ -5019,7 +5153,7 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   }
 
   if(argc == 4 && !strcmp(argv[0], "write")) {
-    write_command(agent, fd, wake, argv[1], argv[2], argv[3]);
+    write_command(agent, fd, wake, context, argv[1], argv[2], argv[3]);
     return;
   }
 
@@ -5134,30 +5268,30 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
-  if(argc >= 2 && file_options(agent, fd, argc, argv)) {
+  if(argc >= 2 && file_options(agent, fd, context, argc, argv)) {
     return;
   }
 
   if(argc == 2 && (!strcmp(argv[0], "mkdir") || !strcmp(argv[0], "rmdir") ||
                    !strcmp(argv[0], "touch") || !strcmp(argv[0], "rm"))) {
-    file_command(agent, fd, argv[0], argv[1], NULL, 0);
+    file_command(agent, fd, context, argv[0], argv[1], NULL, 0);
     return;
   }
 
   if(argc >= 1 && (!strcmp(argv[0], "chmod") || !strcmp(argv[0], "chown") ||
                    !strcmp(argv[0], "chgrp"))) {
-    attribute_command(agent, fd, argc, argv);
+    attribute_command(agent, fd, context, argc, argv);
     return;
   }
 
   if(argc == 3 && (!strcmp(argv[0], "cp") || !strcmp(argv[0], "mv") ||
                    !strcmp(argv[0], "ln"))) {
-    transfer_command(agent, fd, argv[0], argv[1], argv[2], 0);
+    transfer_command(agent, fd, context, argv[0], argv[1], argv[2], 0);
     return;
   }
 
   if(argc >= 1 && !strcmp(argv[0], "tar")) {
-    tar_command(agent, fd, argc, argv);
+    tar_command(agent, fd, context, argc, argv);
     return;
   }
 
@@ -5212,9 +5346,9 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "unzip")) {
     if(!strcmp(argv[1], "-l")) {
-      unzip_list(agent, fd, argv[2]);
+      unzip_list(agent, fd, context, argv[2]);
     } else {
-      unzip_command(agent, fd, argv[1], argv[2]);
+      unzip_command(agent, fd, context, argv[1], argv[2]);
     }
     return;
   }
@@ -5244,7 +5378,12 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
-  if(argc >= 1 && run_command(agent, fd, argc, argv)) {
+  if(argc >= 1 && run_command(agent, fd, argc, argv, context)) {
+    // Only cd fills new_cwd, and the caller that owns the session is the
+    // one that stores it: the runner never holds session state itself.
+    if(context && context->new_cwd[0]) {
+      store_session_set_cwd(session_id, context->new_cwd);
+    }
     return;
   }
 

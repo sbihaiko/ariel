@@ -520,6 +520,13 @@ int store_session_close(const char *id);
 int store_session_use(const char *id, store_session_t *info);
 
 /**
+ * Take one session into a directory: a path the caller has already judged.
+ * Marking the use restarts the idle clock. STORE_SESSION_UNKNOWN when the
+ * ID is not live, STORE_SESSION_FAILED when the path does not fit.
+ **/
+int store_session_set_cwd(const char *id, const char *cwd);
+
+/**
  * Fill entries with the live sessions, at most max of them, newest use
  * first, and set count to how many were copied. Returns the number of live
  * sessions, which may exceed max.
