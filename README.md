@@ -132,7 +132,7 @@ The first addon is the screenshot ([#53](https://github.com/sbihaiko/ariel/issue
 
 - One capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash.
 - The shot lands under `/data`, never in Ariel's protected state directory, and Stage 3's reader returns it under its size limit.
-- The capture API is measured on a real console first ([#55](https://github.com/sbihaiko/ariel/issues/55)), including a capture while a game runs and a capture of a protected screen, before anything is built on it.
+- The capture API was measured on a real console ([#55](https://github.com/sbihaiko/ariel/issues/55)) before anything was built on it. It is the system screenshot daemon's IPC client: a payload loads it and sets its parameters, but `Capture` never completes, and **the console freezes until the owner resets it by hand** ([#79](https://github.com/sbihaiko/ariel/issues/79)). The screenshot therefore waits on a path that does not hang the console, and **no capture attempt runs unless the owner is present and willing to reset it** ([console findings](docs/console-findings.md#issue-55-the-capture-api-on-the-console)).
 
 ### Stage 5 (optional): sessions
 
