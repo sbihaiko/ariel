@@ -2069,10 +2069,10 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     addon_failure(fd, argv[2], challenge.id, "too_large", result);
     return;
   case ADDON_PROTECTED:
-    audit_reply(fd, "addon", "failed", argv[2], challenge.id, protected_process);
+    addon_failure(fd, argv[2], challenge.id, "protected", result);
     return;
   case ADDON_BAD_PATH:
-    audit_reply(fd, "addon", "failed", argv[2], challenge.id, bad_path);
+    addon_failure(fd, argv[2], challenge.id, "bad_path", result);
     return;
   case ADDON_SPAWN_FAILED:
     addon_failure(fd, argv[2], challenge.id, "spawn_failed", result);

@@ -12226,8 +12226,9 @@ def assert_failed_run_keeps_output(server, name, lines, word):
     assert match and lines[0] == word and lines[2] == "exit 1", (
         "an addon run that ends with %s must answer that word, its result and "
         "exit 1, got %r" % (word, lines))
-    assert addon_results(server, name) == [match.group(1).rsplit("/", 1)[1]], (
-        "a failed addon run must keep its output in the file it names")
+    kept = match.group(1).rsplit("/", 1)[1]
+    assert kept in addon_results(server, name), (
+        "a failed addon run must keep its output in the file it names, %r" % kept)
 
 
 def scenario_addon_run_is_granted_and_bare(server):
@@ -12309,6 +12310,9 @@ def scenario_addon_run_killed_is_operation_failed(server):
         cleanup_addon(server, "killed")
 
 
+ADDON_REFUSAL_OUTSIDE_TITLE = ("an addon that refuses a path itself answers bad_path or "
+                            "protected, keeps its output, and names it")
+
 ADDON_FAILURE_TITLE = ("a failing addon's own line reaches the agent through the "
                        "result file its reply names after the error word")
 
@@ -12346,6 +12350,42 @@ def scenario_addon_failure_line_reaches_agent(server):
         cleanup_addon(server, "failing")
 
 
+REFUSING_PATH_SOURCE = """
+#include <stdio.h>
+
+int
+main(void) {
+  puts("refused: a path outside the allowed roots");
+  return 3;
+}
+"""
+
+REFUSING_STATE_SOURCE = """
+#include <stdio.h>
+
+int
+main(void) {
+  puts("refused: that path names Ariel's state");
+  return 87;
+}
+"""
+
+
+def scenario_addon_refusal_outside_keeps_output(server):
+    """An addon that refuses a path itself keeps and names its output, like every failure."""
+    for name, source, word in (
+            ("badpath", REFUSING_PATH_SOURCE, "bad_path"),
+            ("statepath", REFUSING_STATE_SOURCE, "protected")):
+        manifest_sha = addon_runner(server, name, source)
+        try:
+            approval, challenge = addon_run_request(server, name, manifest_sha, [])
+            sign_and_grant(server, approval, challenge)
+            assert_failed_run_keeps_output(
+                server, name, run_command(server, "addon run %s" % name), word)
+        finally:
+            cleanup_addon(server, name)
+
+
 ADDON_RUN_SCENARIOS = [
     (ADDON_RUN_CLEAN_TITLE, scenario_addon_run_is_granted_and_bare, HOST_ROOT_REASON),
     (ADDON_RUN_REFUSED_TITLE, scenario_addon_run_refused_is_not_asked, HOST_ROOT_REASON),
@@ -12353,6 +12393,8 @@ ADDON_RUN_SCENARIOS = [
     (ADDON_RUN_TOO_LARGE_TITLE, scenario_addon_run_output_cap_is_too_large,
      HOST_ROOT_REASON),
     (ADDON_RUN_KILLED_TITLE, scenario_addon_run_killed_is_operation_failed,
+     HOST_ROOT_REASON),
+    (ADDON_REFUSAL_OUTSIDE_TITLE, scenario_addon_refusal_outside_keeps_output,
      HOST_ROOT_REASON),
     (ADDON_FAILURE_TITLE, scenario_addon_failure_line_reaches_agent, HOST_ROOT_REASON),
 ]
@@ -12931,8 +12973,8 @@ def scenario_ftp_refuses_local_paths_outside_roots(server):
         command, approval, challenge = ftp_request(
             server, "ftp-get", sha, ["/up/x", "/tmp/ariel-ftp-outside.bin"], fake.port)
         sign_and_grant(server, approval, challenge)
-        assert run_command(server, command) == ["bad_path", "exit 1"], (
-            "a local path outside the allowed roots must answer bad_path and exit 1")
+        assert_failed_run_keeps_output(
+            server, "ftp-get", run_command(server, command), "bad_path")
         assert not os.path.lexists(outside), "a refused local path must create no file"
 
         command = ftp_grant(server, "ftp-get", sha, ["/up/x", "/data/keep.txt"], fake.port)

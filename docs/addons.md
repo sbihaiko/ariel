@@ -51,7 +51,7 @@ When a run is granted, Ariel starts the `elf` in a process of its own:
 - **Writes.** Its standard output and standard error go to the same pipe, which Ariel reads and copies, as the addon writes it, into a new file `/data/addon-<name>-<ms>`. `<ms>` is the platform clock in milliseconds. Nothing is written inside `/data/ariel`.
 - **Working directory.** On the console the process starts in `/`. The host build starts it in the host build's own working directory.
 - **Success.** An addon says it succeeded by exiting with status 0. Ariel keeps the file and answers `result /data/addon-<name>-<ms>`, then `status 0` and `exit 0`.
-- **Failure.** An addon says it failed by exiting with any non-zero status. A death by signal is also a failure. Ariel then answers `operation_failed` (exit 1) and keeps the file it wrote, naming it with a `result <path>` line before the exit line, so what the addon wrote — its standard error included — reaches the agent.
+- **Failure.** An addon says it failed by exiting with any non-zero status. A death by signal is also a failure. Ariel then answers `operation_failed` (exit 1), except for two exits it names: 3, which says the addon refused a path and answers `bad_path`, and 87, which says the path names protected state and answers `protected` and keeps the file it wrote, naming it with a `result <path>` line before the exit line, so what the addon wrote — its standard error included — reaches the agent.
 - **Start.** If the process cannot start, the run answers `spawn_failed` (exit 1), and there is no output to keep.
 
 Starting an addon is serialized with every other ELF start under the loader lock.
