@@ -298,7 +298,15 @@ Measured on 2026-10-25, read-only, on the console at firmware 11.200.005 (CFI-20
 
 **The console had no Ariel when this was measured.** `/data` held the owner's other payloads and no `ariel` directory, port 2324 was closed, and 2323 answered `Welcome to shsrv.elf running on pid 97, compiled Aug 2 2026 at 16:40:44` — upstream shsrv, not Ariel. The keyring recorded after [#48](#issue-48-keys-on-the-console) went with the state directory, so the generation-2 primary no longer applies to this console until it is provisioned again.
 
-**The round trip waits for the owner.** [#89](https://github.com/sbihaiko/ariel/issues/89) asks for `ftp-put` then `ftp-get` of a file with a space in its name, and a protected local path answering `protected`, signed on the console. Running it now would mean killing a payload the owner deployed, deploying an anchored build, and letting a fresh `/data/ariel` start at generation 0 from the build's anchor — which discards the key-run state on purpose. The repository's own rule is that this is only done with the console in hand, so the criterion stays open, labelled for the owner.
+**The round trip ran on 2026-10-25.** With the owner on hand, an anchored build of `d30134d` (`ARIEL_PUBKEY` = `ced29c6d…5858`, the primary in `~/.config/ariel/owner.key`) was loaded through the ELF loader on 9021. Ariel came up on the agent port 2324 without touching the payload already on 2323, and a second run of the payload was harmless: the telnet shell fails to bind and retries, while the agent port serves.
+
+- `ftp-put` moved `/data/src a.bin` (48 bytes) to `/data/ftp-up/my file.bin` through the console's own ftpsrv, signed with the anchor key: `result /data/addon-ftp-put-13993681`, `status 0`.
+- `ftp-get` brought it back to `/data/back a.bin`: the same SHA-256, `7ecc3e74…6cb2e2`, and `cmp` equal.
+- `ftp-get /data/ariel/token /data/token-copy` answered `protected` with exit 87, asked nobody, and created nothing.
+
+The remote operands were the console's own absolute paths, so the same run measures the root: ftpsrv served `/data/ftp-up/my file.bin` for that path, which makes the root `/` and not `/data`.
+
+The console's state is not what it was: `/data/ariel` is now a fresh generation-0 directory anchored to `owner.key`, and the key-run state recorded after #48 is gone. The token is the one the payload printed at start, and a rebuild with another anchor would strand this directory.
 
 ## What other projects say
 

@@ -97,20 +97,30 @@ timeout (10 seconds), the 64 KiB output cap and the kill apply to every run.
 - The addon sets no socket timeout. The only time bound is the loader's
   10 second timeout, which kills the run.
 
-## Console round trip (documented, not run)
+## Console round trip (run on a console)
 
-Not run here. It needs a console, and this change does not touch one. On a
-console with the addon installed and the `server` file pointing at its
-ftpsrv:
+Run on 2026-10-25 against a CFI-2014 on firmware 11.20, with Ariel deployed
+from `d30134d` and the four addon directories under `/data/ariel/addons`. The
+`server` file named the console's own ftpsrv, `192.168.68.74:2121`.
 
-1. Create a file with a space in its name, for example `/data/src a.bin`.
-2. `addon run ftp-put '/up/my file.bin' '/data/src a.bin'`, then sign the
-   prompt.
-3. `addon run ftp-get '/up/my file.bin' '/data/back a.bin'`, then sign the
-   prompt.
-4. Compare the two files byte for byte.
-5. `addon run ftp-get '/data/ariel/token' '/data/token-copy'` answers
-   `protected` with exit 87, and no local file is created.
+1. `/data/src a.bin` was uploaded over ftpsrv: 48 bytes,
+   `7ecc3e745f1c57ff1d1a4f44c3be9a4a450cb275af44eba3235fd557cc6cb2e2`.
+2. `addon run ftp-put '/data/ftp-up/my file.bin' '/data/src a.bin'`, signed
+   with the anchor key: `result /data/addon-ftp-put-13993681`, `status 0`,
+   `exit 0`. The server listed `my file.bin`, 48 bytes.
+3. `addon run ftp-get '/data/ftp-up/my file.bin' '/data/back a.bin'`, signed
+   the same way: `result /data/addon-ftp-get-13998108`, `status 0`, `exit 0`.
+4. `/data/back a.bin` is byte for byte `/data/src a.bin`: the same SHA-256,
+   `cmp` equal.
+5. `addon run ftp-get '/data/ariel/token' '/data/token-copy'` answered
+   `protected` with exit 87, asked nobody, and `/data/token-copy` was never
+   created.
+
+The remote operands above are the console's own absolute paths, which is what
+measures the root: ftpsrv served `/data/ftp-up/my file.bin` for the path the
+addon asked for, so the root is `/` ([console findings](../../docs/console-findings.md)).
+The addon keeps its check of both roots, because the root belongs to ftpsrv
+and is not this addon's to assume.
 
 The host acceptance suite covers the same behavior against an in-memory
 passive FTP server.
