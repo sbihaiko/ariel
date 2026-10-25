@@ -9590,6 +9590,351 @@ def scenario_session_full_at_eight(server):
     assert replacement not in ids, "a freed slot must take a fresh session"
 
 
+# The payload every session-environment scenario proves the layer with: it
+# prints each variable of its own environment whose name begins with argv[1],
+# or with ARIEL_SESSION_ when it is given none, then how many it printed. With
+# a started and a release path it reports, says it started, waits to be
+# released and reports again, so a scenario changes the session between the
+# two reads without guessing how long a spawn takes.
+PRINT_ENV_SOURCE = """
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static void
+report(const char* prefix) {
+  extern char** environ;
+  size_t len = strlen(prefix);
+  int seen = 0;
+  int i;
+
+  for(i=0; environ[i]; i++) {
+    if(!strncmp(environ[i], prefix, len)) {
+      printf("%s\\n", environ[i]);
+      seen++;
+    }
+  }
+  printf("seen %d\\n", seen);
+  fflush(stdout);
+}
+
+int
+main(int argc, char* argv[]) {
+  const char* prefix = argc > 1 ? argv[1] : "ARIEL_SESSION_";
+  struct timespec pause = {0, 10 * 1000 * 1000};
+  FILE* started;
+
+  report(prefix);
+  if(argc < 4) {
+    return 0;
+  }
+
+  started = fopen(argv[2], "w");
+  if(!started) {
+    return 2;
+  }
+  if(fputs("started\\n", started) == EOF) {
+    (void)fclose(started);
+    return 2;
+  }
+  if(fclose(started) != 0) {
+    return 2;
+  }
+
+  while(access(argv[3], F_OK) != 0) {
+    (void)nanosleep(&pause, NULL);
+  }
+
+  report(prefix);
+  return 0;
+}
+"""
+
+SESSION_ENV_NAME = "ARIEL_SESSION_PROBE"
+SESSION_ENV_NAMES_MAX = 16
+SESSION_ENV_NAME_MAX = 32
+SESSION_ENV_ASSIGN_MAX = 1024
+
+
+def session_export(server, sid, name, value):
+    """Sign and perform one export inside a session, and check its action.
+
+    The action carries option.scope=session and the hash of the value, and
+    never the session ID.
+    """
+    command = "@%s export %s=%s" % (sid, name, value)
+    # Ten seconds of test clock, as every host gate request moves: the
+    # session's idle window is two minutes, and a connection's deadline one.
+    approval, challenge = gated_request(
+        server, command,
+        ["command=export", "target=%s" % name,
+         "sha256=%s" % hashlib.sha256(value.encode("ascii")).hexdigest(),
+         "option.scope=session"],
+        "export %s will run" % name, wait_ms=10_000)
+    action = decoded_action(challenge_action(challenge))
+    assert "option.scope=session" in action.split("\n"), (
+        "an export inside a session must sign its scope, got %r" % action)
+    assert sid not in action, "the session ID must never enter the signed action"
+    return approval, challenge
+
+
+def session_export_perform(server, sid, name, value):
+    """A granted session export, performed, answering exported NAME."""
+    approval, challenge = session_export(server, sid, name, value)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "@%s export %s=%s" % (sid, name, value)) == [
+        "exported %s" % name, "exit 0"], "a granted session export must run"
+    return approval
+
+
+def session_env(server, sid, name):
+    """Sign and perform one env inside a session; return the reply lines."""
+    command = "@%s env %s" % (sid, name)
+    approval, challenge = gated_request(
+        server, command, ["command=env", "target=%s" % name],
+        "env %s will run" % name, wait_ms=10_000)
+    sign_and_grant(server, approval, challenge)
+    return run_command(server, command)
+
+
+def plain_env(server, name):
+    """Sign and perform one env with no session; return the reply lines."""
+    approval, challenge = gated_request(
+        server, "env " + name, ["command=env", "target=%s" % name],
+        "env %s will run" % name, wait_ms=10_000)
+    sign_and_grant(server, approval, challenge)
+    return run_command(server, "env " + name)
+
+
+def scenario_session_export_and_env_are_layered(server):
+    """An export inside a session stays there, env answers the session's value
+    over the process's own, and the map dies with the session."""
+    server.fresh()
+    sid = session_mint(server)
+    other = session_mint(server)
+    name = SESSION_ENV_NAME
+
+    session_export_perform(server, sid, name, "bar")
+    assert session_env(server, sid, name) == ["%s=bar" % name, "exit 0"], (
+        "env in a session must answer the value the session exported")
+    assert session_env(server, sid, "PATH") == [
+        "PATH=%s" % os.environ["PATH"], "exit 0"], (
+        "a name the session did not set must answer the process value")
+
+    # The session is the only place the value landed: no process variable
+    # changed, and another session does not see it.
+    assert plain_env(server, name) == ["exit 0"], (
+        "a session export must not reach the process environment")
+    assert session_env(server, other, name) == ["exit 0"], (
+        "a session export must not reach another session")
+
+    row = next(line for line in run_command(server, "session list")
+               if line.startswith("session %s " % sid))
+    assert re.fullmatch(r"session %s idle \d+ cwd / env 1" % sid, row), (
+        "session list must count the session's names: %r" % row)
+
+    assert run_command(server, "session close " + sid) == [
+        "session_closed " + sid, "exit 0"]
+    assert run_command(server, "@%s env %s" % (sid, name)) == [
+        "session_expired", "exit 93"], (
+        "the map must die with the session")
+
+
+def scenario_session_export_outside_signs_as_before(server):
+    """With no session, export and env sign and answer exactly as they did."""
+    server.fresh()
+    # A name outside the fixture's ARIEL_SESSION_ prefix: this scenario
+    # really sets a process variable, as it must, and no later payload may
+    # mistake it for a session's.
+    name = "ARIEL_PLAIN_OUTSIDE"
+    value = "plain"
+    command = "export %s=%s" % (name, value)
+    approval, challenge = gated_request(
+        server, command,
+        ["command=export", "target=%s" % name,
+         "sha256=%s" % hashlib.sha256(value.encode("ascii")).hexdigest()],
+        "export %s will run" % name)
+    action = decoded_action(challenge_action(challenge))
+    assert "\noption.scope" not in action, (
+        "an export with no session must sign no scope, got %r" % action)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, command) == ["exported %s" % name, "exit 0"], (
+        "an export with no session must still set the process variable")
+    assert plain_env(server, name) == ["%s=%s" % (name, value), "exit 0"], (
+        "an export with no session must reach the process environment")
+
+
+def scenario_session_environment_reaches_a_payload(server):
+    """A foreground and a background run started from a session receive the
+    session's value, and a run with no session does not."""
+    server.fresh()
+    sid = session_mint(server)
+    name = SESSION_ENV_NAME
+    install_payload(server, "probe", compile_payload(PRINT_ENV_SOURCE, "probe"))
+    session_export_perform(server, sid, name, "payload")
+
+    # The name is the fixture's prefix as well, so a variable another
+    # scenario left in the process environment cannot be mistaken for this
+    # session's.
+    assert run_command(server, "@%s payload run --wait probe %s" % (sid, name),
+                       timeout=20.0) == [
+        "%s=payload" % name, "seen 1", "status 0", "exit 0"], (
+        "a foreground run in a session must receive its value")
+
+    lines = run_command(server, "@%s payload run probe" % sid)
+    assert len(lines) == 2 and re.fullmatch(r"pid \d+", lines[0]) \
+        and lines[1] == "exit 0", (
+        "a background run in a session must answer its pid, got %r" % lines)
+    assert payload_logs(server, "probe") == [
+        "%s=payload" % name, "seen 1", "exit 0"], (
+        "a background run in a session must receive its value")
+
+    assert run_command(server, "payload run --wait probe %s" % name,
+                       timeout=20.0) == [
+        "seen 0", "status 0", "exit 0"], (
+        "a run with no session must not receive a session's value")
+
+
+def scenario_session_environment_reaches_an_exec(server):
+    """An exec started from a session receives the session's value."""
+    server.fresh()
+    sid = session_mint(server)
+    name = SESSION_ENV_NAME
+    data = compile_payload(PRINT_ENV_SOURCE, "exec-session")
+    path = write_scratch(server, "exec-session", data)
+    session_export_perform(server, sid, name, "exec")
+
+    approval, challenge = exec_request(server, path, data, [name])
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "@%s exec %s %s" % (sid, path, name),
+                       timeout=20.0) == [
+        "%s=exec" % name, "seen 1", "status 0", "exit 0"], (
+        "an exec in a session must receive its value")
+
+
+def scenario_session_environment_is_copied_at_spawn(server):
+    """A payload keeps what it was started with when the session changes."""
+    server.fresh()
+    sid = session_mint(server)
+    name = SESSION_ENV_NAME
+    install_payload(server, "copy", compile_payload(PRINT_ENV_SOURCE, "copy"))
+    session_export_perform(server, sid, name, "first")
+
+    workdir = tempfile.mkdtemp(prefix="ariel-session-copy-")
+    started = os.path.join(workdir, "started")
+    release = os.path.join(workdir, "release")
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(
+        run_command(server, "@%s payload run --wait copy %s %s %s"
+                    % (sid, name, started, release), timeout=30.0)))
+    worker.start()
+    try:
+        assert wait_for_file(started), (
+            "the payload never signalled that it started")
+        session_export_perform(server, sid, name, "second")
+    finally:
+        with open(release, "w") as handle:
+            handle.write("go\n")
+        worker.join(30.0)
+
+    assert not worker.is_alive(), "the payload run must finish"
+    assert outcome and outcome[0] == [
+        "%s=first" % name, "seen 1",
+        "%s=first" % name, "seen 1", "status 0", "exit 0"], (
+        "a payload must keep the environment it was started with, got %r"
+        % (outcome,))
+
+
+def scenario_session_environment_is_bounded(server):
+    """A session holds sixteen names, and a seventeenth answers export_failed."""
+    server.fresh()
+    sid = session_mint(server)
+    for index in range(SESSION_ENV_NAMES_MAX):
+        session_export_perform(server, sid, "ARIEL_SESSION_N%d" % index, "v")
+
+    row = next(line for line in run_command(server, "session list")
+               if line.startswith("session %s " % sid))
+    assert row.endswith(" env %d" % SESSION_ENV_NAMES_MAX), (
+        "the session must hold sixteen names, got %r" % row)
+
+    # A name the session already holds can still be given a new value.
+    session_export_perform(server, sid, "ARIEL_SESSION_N0", "again")
+    assert session_env(server, sid, "ARIEL_SESSION_N0") == [
+        "ARIEL_SESSION_N0=again", "exit 0"], (
+        "a full session must still update a name it holds")
+
+    approval, challenge = session_export(server, sid, "ARIEL_SESSION_LAST", "1")
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "@%s export ARIEL_SESSION_LAST=1" % sid) == [
+        "export_failed", "exit 1"], (
+        "a seventeenth name must answer the existing refusal word")
+    assert kill_audit(server, "export.failed", "ARIEL_SESSION_LAST"), (
+        "a refused export must be audited")
+
+
+def scenario_session_environment_assignment_is_bounded(server):
+    """A name is at most 32 bytes and an assignment at most 1024."""
+    server.fresh()
+    sid = session_mint(server)
+
+    longest_name = "A" * SESSION_ENV_NAME_MAX
+    session_export_perform(server, sid, longest_name, "v")
+    assert session_env(server, sid, longest_name) == [
+        "%s=v" % longest_name, "exit 0"], "a 32-byte name must be accepted"
+
+    assert run_command(server, "@%s export %s=1" % (
+        sid, "A" * (SESSION_ENV_NAME_MAX + 1))) == ["bad_name", "exit 1"], (
+        "a name over 32 bytes must answer bad_name without asking")
+    server.assert_no_line()
+
+    name = "ARIEL_SESSION_MAX"
+    value = "x" * (SESSION_ENV_ASSIGN_MAX - len(name) - 1)
+    session_export_perform(server, sid, name, value)
+    row = next(line for line in run_command(server, "session list")
+               if line.startswith("session %s " % sid))
+    assert row.endswith(" env 2"), (
+        "an assignment of exactly 1024 bytes must be held, got %r" % row)
+    assert session_env(server, sid, name) == [
+        "%s=%s" % (name, value), "exit 0"], (
+        "env must answer a session assignment of the whole limit")
+
+    over = "ARIEL_SESSION_OVER"
+    approval, challenge = session_export(
+        server, sid, over, "x" * (SESSION_ENV_ASSIGN_MAX - len(over)))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "@%s export %s=%s"
+                       % (sid, over, "x" * (SESSION_ENV_ASSIGN_MAX - len(over)))) == [
+        "value_too_long", "exit 1"], (
+        "an assignment over 1024 bytes must answer value_too_long")
+
+
+def scenario_session_environment_never_reaches_an_addon(server):
+    """An addon started from a session keeps its empty environment."""
+    server.fresh()
+    sid = session_mint(server)
+    name = SESSION_ENV_NAME
+    manifest_sha = addon_runner(server, "probe", RUNNER_SOURCE)
+    try:
+        session_export_perform(server, sid, name, "addon")
+        approval, challenge = addon_run_request(server, "probe", manifest_sha, [])
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, "@%s addon run probe" % sid)
+        match = (re.match(r"^result (/data/addon-probe-\d+)$", lines[0])
+                 if lines else None)
+        assert match and lines[1:] == ["status 0", "exit 0"], (
+            "a granted addon run in a session must name its result, got %r"
+            % (lines,))
+        with open(os.path.join(server.root, match.group(1).lstrip("/")), "r") as handle:
+            output = handle.read()
+        assert output == "argc 1\nenv 0\n", (
+            "an addon must run with its empty environment and never see a "
+            "session, got %r" % output)
+    finally:
+        cleanup_addon(server, "probe")
+
+
 def scenario_rm_recursive_needs_the_owner(server):
     """rm -r asks once for the whole tree, removes it after the signature, and binds -r."""
     tree = make_tree(server, "rm-tree", {"a.txt": b"x", "sub/b.txt": b"y"})
@@ -9794,6 +10139,18 @@ HOST_ROOT_SCENARIOS.update({
     "a relative path in a session names the entry below its directory",
     "a gated session command signs the resolved path, with no dot segment",
     "eight sessions live, and the ninth answers session_full",
+    "an export inside a session stays there, and env answers the session's "
+    "value over the process's own",
+    "with no session, export and env sign and answer as they always did",
+    "a foreground and a background run started from a session receive its "
+    "value",
+    "an exec started from a session receives its value",
+    "a payload keeps the environment it was started with when the session "
+    "changes",
+    "a session holds sixteen names and a seventeenth answers export_failed",
+    "a name over 32 bytes answers bad_name and an assignment over 1024 bytes "
+    "answers value_too_long",
+    "an addon started from a session keeps its empty environment",
 })
 
 
@@ -10019,6 +10376,26 @@ SCENARIOS = [
      scenario_session_gated_relative_signs_the_absolute_path, HOST_ROOT_REASON),
     ("eight sessions live, and the ninth answers session_full",
      scenario_session_full_at_eight, HOST_ROOT_REASON),
+    ("an export inside a session stays there, and env answers the session's "
+     "value over the process's own",
+     scenario_session_export_and_env_are_layered, HOST_ROOT_REASON),
+    ("with no session, export and env sign and answer as they always did",
+     scenario_session_export_outside_signs_as_before, HOST_ROOT_REASON),
+    ("a foreground and a background run started from a session receive its "
+     "value",
+     scenario_session_environment_reaches_a_payload, HOST_ROOT_REASON),
+    ("an exec started from a session receives its value",
+     scenario_session_environment_reaches_an_exec, HOST_ROOT_REASON),
+    ("a payload keeps the environment it was started with when the session "
+     "changes",
+     scenario_session_environment_is_copied_at_spawn, HOST_ROOT_REASON),
+    ("a session holds sixteen names and a seventeenth answers export_failed",
+     scenario_session_environment_is_bounded, HOST_ROOT_REASON),
+    ("a name over 32 bytes answers bad_name and an assignment over 1024 bytes "
+     "answers value_too_long",
+     scenario_session_environment_assignment_is_bounded, HOST_ROOT_REASON),
+    ("an addon started from a session keeps its empty environment",
+     scenario_session_environment_never_reaches_an_addon, HOST_ROOT_REASON),
     ("rm -r refuses protected objects and links before anything is removed",
      scenario_rm_recursive_refusals, HOST_ROOT_REASON),
     ("cp -r copies a tree after the owner signs, and refuses an existing destination",

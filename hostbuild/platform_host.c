@@ -520,7 +520,8 @@ host_file_remove(const struct host_file *file) {
  **/
 static int
 host_start(const unsigned char *bytes, size_t size, char *const argv[],
-           int outfd, struct host_file *file, pid_t *child, int isolated) {
+           char *const envp[], int outfd, struct host_file *file, pid_t *child,
+           int isolated) {
   char *const no_env[] = {NULL};
   int errpipe[2] = {-1, -1};
   int exec_failed = 0;
@@ -607,6 +608,8 @@ host_start(const unsigned char *bytes, size_t size, char *const argv[],
 
     if(isolated) {
       execve(file->path, argv, no_env);
+    } else if(envp) {
+      execve(file->path, argv, envp);
     } else {
       execv(file->path, argv);
     }
@@ -676,14 +679,14 @@ host_status(int wait_status, int *status) {
 
 static int
 host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
-           char *const argv[], int outfd, int *status) {
+           char *const argv[], char *const envp[], int outfd, int *status) {
   struct host_file file;
   int wait_status;
   pid_t pid;
 
   (void)self;
 
-  if(host_start(bytes, size, argv, outfd, &file, &pid, 0)) {
+  if(host_start(bytes, size, argv, envp, outfd, &file, &pid, 0)) {
     return -1;
   }
 
@@ -701,8 +704,8 @@ host_spawn(platform_t *self, const unsigned char *bytes, size_t size,
 
 static int
 host_spawn_start_mode(const unsigned char *bytes, size_t size,
-                      char *const argv[], int outfd, pid_t *pid,
-                      int isolated) {
+                      char *const argv[], char *const envp[], int outfd,
+                      pid_t *pid, int isolated) {
   struct host_started *slot = NULL;
   size_t i;
   int rc;
@@ -723,7 +726,7 @@ host_spawn_start_mode(const unsigned char *bytes, size_t size,
     return -1;
   }
 
-  rc = host_start(bytes, size, argv, outfd, &slot->file, pid, isolated);
+  rc = host_start(bytes, size, argv, envp, outfd, &slot->file, pid, isolated);
 
   pthread_mutex_lock(&started_lock);
   if(rc) {
@@ -739,10 +742,11 @@ host_spawn_start_mode(const unsigned char *bytes, size_t size,
 
 static int
 host_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
-                 char *const argv[], int outfd, pid_t *pid) {
+                 char *const argv[], char *const envp[], int outfd,
+                 pid_t *pid) {
   (void)self;
 
-  return host_spawn_start_mode(bytes, size, argv, outfd, pid, 0);
+  return host_spawn_start_mode(bytes, size, argv, envp, outfd, pid, 0);
 }
 
 
@@ -752,7 +756,7 @@ host_spawn_start_isolated(platform_t *self, const unsigned char *bytes,
                           pid_t *pid) {
   (void)self;
 
-  return host_spawn_start_mode(bytes, size, argv, outfd, pid, 1);
+  return host_spawn_start_mode(bytes, size, argv, NULL, outfd, pid, 1);
 }
 
 

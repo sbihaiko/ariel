@@ -70,7 +70,8 @@ run_autoload(platform_t *platform) {
   for(p=text; (nl=strchr(p, '\n')); p=nl + 1) {
     *nl = '\0';
     if(strcmp(p, "ariel") && store_run_load(p, &object) == STORE_RUN_OK) {
-      runs_start(platform, p, object.sha256, object.bytes, object.size, &pid);
+      runs_start(platform, p, object.sha256, object.bytes, object.size, NULL,
+                 &pid);
       store_object_free(&object);
     }
     *nl = '\n';

@@ -257,9 +257,10 @@ platform_ps5_loader_unlock(void) {
 
 
 static int
-ps5_start(const unsigned char *bytes, char *const argv[], int outfd,
-          int isolated, pid_t *pid) {
+ps5_start(const unsigned char *bytes, char *const argv[], char *const envp[],
+          int outfd, int isolated, pid_t *pid) {
   char *const no_env[] = {NULL};
+  char cwd[1024];
 
   // The loader only reads the bytes; the store holds the verified object
   // in memory, so nothing is loaded from a path.
@@ -268,6 +269,16 @@ ps5_start(const unsigned char *bytes, char *const argv[], int outfd,
     // The payload starts at the root, not at Ariel's working directory.
     *pid = elfldr_spawn_env(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv,
                             (char**)no_env, "/");
+  } else if(envp) {
+    // A session's environment is the payload's whole environment, and the
+    // payload starts where Ariel runs, as the loader's own spawn does.
+    const char *dir = getenv("PWD");
+
+    if(!dir) {
+      dir = getcwd(cwd, sizeof(cwd)) ? cwd : "/";
+    }
+    *pid = elfldr_spawn_env(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv,
+                            (char**)envp, dir);
   } else {
     *pid = elfldr_spawn(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv);
   }
@@ -284,11 +295,12 @@ ps5_start(const unsigned char *bytes, char *const argv[], int outfd,
 
 static int
 ps5_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
-                char *const argv[], int outfd, pid_t *pid) {
+                char *const argv[], char *const envp[], int outfd,
+                pid_t *pid) {
   (void)self;
   (void)size;
 
-  return ps5_start(bytes, argv, outfd, 0, pid);
+  return ps5_start(bytes, argv, envp, outfd, 0, pid);
 }
 
 
@@ -299,7 +311,7 @@ ps5_spawn_start_isolated(platform_t *self, const unsigned char *bytes,
   (void)self;
   (void)size;
 
-  return ps5_start(bytes, argv, outfd, 1, pid);
+  return ps5_start(bytes, argv, NULL, outfd, 1, pid);
 }
 
 
@@ -319,11 +331,11 @@ ps5_status(int wait_status, int *status) {
 
 static int
 ps5_spawn(platform_t *self, const unsigned char *bytes, size_t size,
-          char *const argv[], int outfd, int *status) {
+          char *const argv[], char *const envp[], int outfd, int *status) {
   int wait_status;
   pid_t pid;
 
-  if(ps5_spawn_start(self, bytes, size, argv, outfd, &pid)) {
+  if(ps5_spawn_start(self, bytes, size, argv, envp, outfd, &pid)) {
     return -1;
   }
 

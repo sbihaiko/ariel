@@ -117,7 +117,8 @@ reaper(void *arg) {
 
 int
 runs_start(platform_t *platform, const char *name, const char *sha256,
-           const unsigned char *bytes, size_t size, pid_t *pid) {
+           const unsigned char *bytes, size_t size, char *const envp[],
+           pid_t *pid) {
   char id[24];
   char *argv[2];
   struct run *run = NULL;
@@ -154,7 +155,7 @@ runs_start(platform_t *platform, const char *name, const char *sha256,
 
   argv[0] = (char*)name;
   argv[1] = NULL;
-  if(platform->spawn_start(platform, bytes, size, argv, logfd, pid)) {
+  if(platform->spawn_start(platform, bytes, size, argv, envp, logfd, pid)) {
     close(logfd);
     release(run);
     return RUNS_FAILED;
@@ -210,7 +211,8 @@ runs_health(platform_t *platform, const char *name, const char *sha256,
   argv[0] = (char*)name;
   argv[1] = NULL;
   deadline = platform_ms(platform) + timeout_ms;
-  if(platform->spawn_start(platform, bytes, size, argv, logfd, &pid)) {
+  if(platform->spawn_start(platform, bytes, size, argv, NULL, logfd,
+                            &pid)) {
     close(logfd);
     return health_failed_event(name, "spawn", sha256);
   }

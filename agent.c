@@ -448,6 +448,14 @@ typedef struct {
 /** One command line, answered in full, or cancelled by its deadline. **/
 static void handle_command(agent_t *agent, int fd, int wake, char *line);
 
+/**
+ * The environment a child of this connection receives: the session's layer
+ * over the process's, or NULL when there is no session or it set nothing.
+ * Returns 0 when *envp is ready, or -1 when the copy cannot be made; the
+ * caller frees a non-NULL result with free.
+ **/
+static int session_environ(const char *session_id, char ***envp);
+
 
 /**
  * Stop the connection at its deadline. The watchdog does not read the
@@ -1533,12 +1541,14 @@ audit_status(const char *path, const char *id, int status) {
  * is not an executable this platform runs, so the caller treats it as unlisted.
  **/
 static int
-elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
+elf_command(agent_t *agent, int fd, int argc, char *argv[],
+            const char *session_id) {
   const char *root = agent->platform->fs_root;
   char path[PATH_MAX];
   approval_challenge_t challenge;
   approval_facts_t facts;
   unsigned char *bytes = NULL;
+  char **envp = NULL;
   size_t size = 0;
   char answer[64];
   int status = 0;
@@ -1597,12 +1607,20 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
   }
 
   argv[argc] = NULL;
-  if(agent->platform->spawn(agent->platform, bytes, size, argv, fd, &status)) {
+  if(session_environ(session_id, &envp)) {
+    free(bytes);
+    reply(fd, spawn_failed);
+    return 1;
+  }
+  if(agent->platform->spawn(agent->platform, bytes, size, argv, envp, fd,
+                            &status)) {
+    free(envp);
     free(bytes);
     audit_line("run", "failed", path, challenge.id);
     reply(fd, spawn_failed);
     return 1;
   }
+  free(envp);
   free(bytes);
 
   if(audit_status(path, challenge.id, status)) {
@@ -1944,13 +1962,38 @@ key_unfreeze_command(agent_t *agent, int fd) {
 }
 
 
-/** env NAME: reveals the one variable the owner signed for. **/
+/** NAME=value from the process environment, as env always answered it. **/
+static int
+process_env_line(const char *name, char *line, size_t size) {
+  const char *value;
+  int len = 0;
+
+  pthread_mutex_lock(&environ_lock);
+  value = getenv(name);
+  if(value) {
+    len = snprintf(line, size, "%s=%s\n", name, value);
+  }
+  pthread_mutex_unlock(&environ_lock);
+
+  return len;
+}
+
+
+/**
+ * env NAME: reveals the one variable the owner signed for. Inside a session
+ * the answer is the layered view a payload started there would see, the
+ * session's map over the process environment; outside one it is the process
+ * environment, as it always was.
+ **/
 static void
-env_command(agent_t *agent, int fd, const char *name) {
+env_command(agent_t *agent, int fd, const char *name, const char *session_id) {
   approval_challenge_t challenge;
   approval_facts_t facts;
   char line[ENV_LINE_MAX];
-  const char *value;
+  char session_line[SESSION_ENV_ASSIGN_MAX + 2];
+  char value[SESSION_ENV_ASSIGN_MAX + 1];
+  char *text = line;
+  size_t room = sizeof(line);
   int len = 0;
 
   if(!env_name_valid(name)) {
@@ -1965,14 +2008,28 @@ env_command(agent_t *agent, int fd, const char *name) {
     return;
   }
 
-  pthread_mutex_lock(&environ_lock);
-  value = getenv(name);
-  if(value) {
-    len = snprintf(line, sizeof(line), "%s=%s\n", name, value);
-  }
-  pthread_mutex_unlock(&environ_lock);
+  if(session_id) {
+    int held = store_session_env_get(session_id, name, value, sizeof(value));
 
-  if(len < 0 || len >= (int)sizeof(line)) {
+    if(held < 0) {
+      // The session the prefix named is gone: the map went with it.
+      reply(fd, session_expired);
+      return;
+    }
+    if(held) {
+      // A session's assignment is a whole line of its own, up to the limit
+      // export holds it at, so the answer is never cut.
+      text = session_line;
+      room = sizeof(session_line);
+      len = snprintf(text, room, "%s=%s\n", name, value);
+    } else {
+      len = process_env_line(name, line, sizeof(line));
+    }
+  } else {
+    len = process_env_line(name, line, sizeof(line));
+  }
+
+  if(len < 0 || (size_t)len >= room) {
     audit_reply(fd, "env", "failed", name, challenge.id, value_too_long);
     return;
   }
@@ -1981,14 +2038,20 @@ env_command(agent_t *agent, int fd, const char *name) {
     reply(fd, audit_failed);
     return;
   }
-  write_all(fd, line, (size_t)len);
+  write_all(fd, text, (size_t)len);
   reply(fd, "exit 0\n");
 }
 
 
-/** export NAME=VALUE: sets the one variable the owner signed the value of. **/
+/**
+ * export NAME=VALUE: sets the one variable the owner signed the value of.
+ * Inside a session the value lands in that session's map and the signed
+ * action says so; outside one it sets the process variable, as it always
+ * did, so nothing leaks between the two.
+ **/
 static void
-export_command(agent_t *agent, int fd, const char *assign) {
+export_command(agent_t *agent, int fd, const char *assign,
+               const char *session_id) {
   approval_challenge_t challenge;
   approval_facts_t facts;
   char name[ENV_NAME_MAX + 1];
@@ -2015,21 +2078,43 @@ export_command(agent_t *agent, int fd, const char *assign) {
   memset(&facts, 0, sizeof(facts));
   snprintf(facts.command, sizeof(facts.command), "%s", "export");
   snprintf(facts.target, sizeof(facts.target), "%s", name);
+  facts.session = session_id != NULL;
   hash_hex(value, strlen(value), facts.sha256);
   if(!gate_pass(agent, fd, &facts, &challenge)) {
     return;
+  }
+
+  // A session's map is written before its line is recorded, because the
+  // write itself is what can refuse: a full map or an assignment past the
+  // line limit answers its existing word.
+  if(session_id) {
+    switch(store_session_env_set(session_id, assign)) {
+    case STORE_SESSION_OK:
+      break;
+    case STORE_SESSION_UNKNOWN:
+      reply(fd, session_expired);
+      return;
+    case STORE_SESSION_FULL:
+      audit_reply(fd, "export", "failed", name, challenge.id, export_failed);
+      return;
+    default:
+      audit_reply(fd, "export", "failed", name, challenge.id, value_too_long);
+      return;
+    }
   }
 
   if(audit_line("export", "done", name, challenge.id)) {
     reply(fd, audit_failed);
     return;
   }
-  pthread_mutex_lock(&environ_lock);
-  rc = setenv(name, value, 1);
-  pthread_mutex_unlock(&environ_lock);
-  if(rc) {
-    audit_reply(fd, "export", "failed", name, challenge.id, export_failed);
-    return;
+  if(!session_id) {
+    pthread_mutex_lock(&environ_lock);
+    rc = setenv(name, value, 1);
+    pthread_mutex_unlock(&environ_lock);
+    if(rc) {
+      audit_reply(fd, "export", "failed", name, challenge.id, export_failed);
+      return;
+    }
   }
 
   snprintf(answer, sizeof(answer), "exported %s\nexit 0\n", name);
@@ -2037,13 +2122,119 @@ export_command(agent_t *agent, int fd, const char *assign) {
 }
 
 
+extern char **environ;
+
+
+/**
+ * The environment a payload started from a session receives, as the NULL
+ * terminated array a spawn call takes: the session's map over the process's
+ * own, copied now so a later export cannot reach a payload that is already
+ * running. *envp is NULL for a connection with no session, which hands the
+ * child the process environment exactly as every payload got before one, or
+ * when the session holds no name, so nothing changes for it either. Returns
+ * 0 when *envp is ready, or -1 when the copy cannot be made; the caller
+ * frees *envp with free.
+ **/
+static int
+session_environ(const char *session_id, char ***envp) {
+  char (*assignments)[SESSION_ENV_ASSIGN_MAX + 1];
+  size_t session_count = 0;
+  size_t session_bytes = 0;
+  size_t process_bytes = 0;
+  size_t entries = 0;
+  size_t names;
+  size_t size;
+  char *block;
+  char *cursor;
+  size_t i;
+  size_t j;
+
+  *envp = NULL;
+  if(!session_id) {
+    return 0;
+  }
+
+  assignments = calloc(SESSION_ENV_MAX, SESSION_ENV_ASSIGN_MAX + 1);
+  if(!assignments) {
+    return -1;
+  }
+  if(store_session_env_list(session_id, assignments, SESSION_ENV_MAX,
+                            &session_count) < 0) {
+    free(assignments);
+    return -1;
+  }
+  if(!session_count) {
+    free(assignments);
+    return 0;
+  }
+
+  // The process entries are copied under the lock, so an export on another
+  // connection cannot free a string this array still points at.
+  pthread_mutex_lock(&environ_lock);
+  for(names=0; environ[names]; names++) {
+    process_bytes += strlen(environ[names]) + 1;
+  }
+  for(i=0; i<session_count; i++) {
+    session_bytes += strlen(assignments[i]) + 1;
+  }
+
+  // One block holds the array, the process strings and the session's, so a
+  // caller frees the environment with one free.
+  size = (names + session_count + 1) * sizeof(char *) + process_bytes +
+         session_bytes;
+  if(!(block=malloc(size))) {
+    pthread_mutex_unlock(&environ_lock);
+    free(assignments);
+    return -1;
+  }
+
+  cursor = block + (names + session_count + 1) * sizeof(char *);
+  for(i=0; i<names; i++) {
+    size_t len = strlen(environ[i]);
+
+    // A session's value wins over the process's own.
+    for(j=0; j<session_count; j++) {
+      size_t name_len = strcspn(assignments[j], "=");
+
+      if(!strncmp(environ[i], assignments[j], name_len) &&
+         environ[i][name_len] == '=') {
+        break;
+      }
+    }
+    if(j < session_count) {
+      continue;
+    }
+    memcpy(cursor, environ[i], len + 1);
+    ((char **)block)[entries++] = cursor;
+    cursor += len + 1;
+  }
+  pthread_mutex_unlock(&environ_lock);
+
+  for(i=0; i<session_count; i++) {
+    size_t len = strlen(assignments[i]);
+
+    memcpy(cursor, assignments[i], len + 1);
+    ((char **)block)[entries++] = cursor;
+    cursor += len + 1;
+  }
+  ((char **)block)[entries] = NULL;
+
+  free(assignments);
+  *envp = (char **)block;
+
+  return 0;
+}
+
+
 /** exec <path> [args]: runs the bytes the owner signed for, with its arguments. **/
 static void
-exec_command(agent_t *agent, int fd, int argc, char *argv[]) {
+exec_command(agent_t *agent, int fd, int argc, char *argv[],
+             const char *session_id) {
   platform_t *platform = agent->platform;
   approval_challenge_t challenge;
   approval_facts_t facts;
   unsigned char *bytes = NULL;
+  char **envp = NULL;
   size_t size = 0;
   char answer[64];
   int status = 0;
@@ -2073,11 +2264,18 @@ exec_command(agent_t *agent, int fd, int argc, char *argv[]) {
     reply(fd, audit_failed);
     return;
   }
-  if(platform->spawn(platform, bytes, size, &argv[1], fd, &status)) {
+  if(session_environ(session_id, &envp)) {
+    free(bytes);
+    reply(fd, spawn_failed);
+    return;
+  }
+  if(platform->spawn(platform, bytes, size, &argv[1], envp, fd, &status)) {
+    free(envp);
     free(bytes);
     audit_reply(fd, "exec", "failed", argv[1], challenge.id, spawn_failed);
     return;
   }
+  free(envp);
   free(bytes);
 
   len = snprintf(answer, sizeof(answer), "status %d\nexit 0\n", status);
@@ -3182,9 +3380,11 @@ approval_grant(agent_t *agent, int fd, const char *id,
 
 
 static void
-payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
+payload_run(agent_t *agent, int fd, const char *name, char *argv[],
+            const char *session_id) {
   store_object_t object;
   char answer[64];
+  char **envp = NULL;
   int status = 0;
   int outcome;
   int len;
@@ -3219,13 +3419,21 @@ payload_run(agent_t *agent, int fd, const char *name, char *argv[]) {
     return;
   }
 
-  if(agent->platform->spawn(agent->platform, object.bytes, object.size,
-                            argv, fd, &status)) {
+  if(session_environ(session_id, &envp)) {
     store_object_free(&object);
     reply(fd, spawn_failed);
     return;
   }
 
+  if(agent->platform->spawn(agent->platform, object.bytes, object.size,
+                            argv, envp, fd, &status)) {
+    free(envp);
+    store_object_free(&object);
+    reply(fd, spawn_failed);
+    return;
+  }
+
+  free(envp);
   store_object_free(&object);
 
   // status is the payload's own exit status; exit is the protocol's.
@@ -3425,9 +3633,10 @@ payload_installed(const char *name) {
  * comes back at once; its output goes to the payload's log.
  **/
 static void
-payload_start(agent_t *agent, int fd, const char *name) {
+payload_start(agent_t *agent, int fd, const char *name, const char *session_id) {
   store_object_t object;
   char answer[64];
+  char **envp = NULL;
   pid_t pid = 0;
   int outcome;
   int started;
@@ -3460,8 +3669,15 @@ payload_start(agent_t *agent, int fd, const char *name) {
     return;
   }
 
+  if(session_environ(session_id, &envp)) {
+    store_object_free(&object);
+    reply(fd, spawn_failed);
+    return;
+  }
+
   started = runs_start(agent->platform, name, object.sha256, object.bytes,
-                       object.size, &pid);
+                       object.size, envp, &pid);
+  free(envp);
   store_object_free(&object);
 
   switch(started) {
@@ -5230,14 +5446,14 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc >= 4 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "run") &&
      !strcmp(argv[2], "--wait")) {
     argv[argc] = NULL;
-    payload_run(agent, fd, argv[3], &argv[3]);
+    payload_run(agent, fd, argv[3], &argv[3], context ? session_id : NULL);
     return;
   }
 
   // payload run <name> and payload logs <name>: the Stage 2 background pair.
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "run") &&
      strcmp(argv[2], "--wait")) {
-    payload_start(agent, fd, argv[2]);
+    payload_start(agent, fd, argv[2], context ? session_id : NULL);
     return;
   }
 
@@ -5329,18 +5545,18 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   // env, export and exec are gated on the one name or program they carry.
   if(argc == 2 && !strcmp(argv[0], "env")) {
-    env_command(agent, fd, argv[1]);
+    env_command(agent, fd, argv[1], context ? session_id : NULL);
     return;
   }
 
   if(argc == 2 && !strcmp(argv[0], "export") && strchr(argv[1], '=')) {
-    export_command(agent, fd, argv[1]);
+    export_command(agent, fd, argv[1], context ? session_id : NULL);
     return;
   }
 
   if(argc >= 2 && !strcmp(argv[0], "exec")) {
     argv[argc] = NULL;
-    exec_command(agent, fd, argc, argv);
+    exec_command(agent, fd, argc, argv, context ? session_id : NULL);
     return;
   }
 
@@ -5392,7 +5608,7 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
-  if(elf_command(agent, fd, argc, argv)) {
+  if(elf_command(agent, fd, argc, argv, context ? session_id : NULL)) {
     return;
   }
 

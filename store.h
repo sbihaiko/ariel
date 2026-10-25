@@ -469,7 +469,7 @@ int store_audit_tail(unsigned long n, char *buf, size_t size);
 
 /**
  * Sessions: optional state that outlives a connection and never a restart.
- * A session holds a working directory and, later, an environment; it carries
+ * A session holds a working directory and a small environment; it carries
  * no authorization, and every gated command inside one still asks the owner.
  * The table lives in this process's memory like the approval table, so a
  * restart drops every session.
@@ -484,6 +484,17 @@ int store_audit_tail(unsigned long n, char *buf, size_t size);
 /** An ID is 32 lowercase hex characters; a directory is at most this long. **/
 #define SESSION_ID_MAX  32
 #define SESSION_CWD_MAX 256
+
+/** At most this many names one session holds. **/
+#define SESSION_ENV_MAX 16
+
+/**
+ * The longest name a session holds, the same limit every variable name has,
+ * and the longest NAME=VALUE assignment it holds, the same limit a line has.
+ * One assignment is bounded as written, so the name and the value share it.
+ **/
+#define SESSION_ENV_NAME_MAX   32
+#define SESSION_ENV_ASSIGN_MAX 1024
 
 /** One live session, as the answers describe it. **/
 typedef struct {
@@ -532,5 +543,33 @@ int store_session_set_cwd(const char *id, const char *cwd);
  * sessions, which may exceed max.
  **/
 size_t store_session_list(store_session_t *entries, size_t max, size_t *count);
+
+/**
+ * Copy the value a session holds for name into value, without the name.
+ * value must hold SESSION_ENV_ASSIGN_MAX + 1 bytes. Returns 1 when the
+ * session holds the name, 0 when it does not, and -1 when no live session
+ * has that ID, so the caller can fall back to the process environment.
+ **/
+int store_session_env_get(const char *id, const char *name, char *value,
+                          size_t size);
+
+/**
+ * Set one NAME=VALUE in a session's own map, replacing the value when it
+ * already holds the name. STORE_SESSION_UNKNOWN when no live session has
+ * that ID, STORE_SESSION_FULL when it already holds SESSION_ENV_MAX names
+ * and this is not one of them, and STORE_SESSION_FAILED when the assignment
+ * is longer than SESSION_ENV_ASSIGN_MAX or has no name.
+ **/
+int store_session_env_set(const char *id, const char *assign);
+
+/**
+ * Copy a session's whole map into assignments, each a NAME=VALUE text, at
+ * most max of them, and set count to how many were copied. Returns the
+ * number the session holds, which may exceed max, or -1 when no live
+ * session has that ID.
+ **/
+int store_session_env_list(const char *id,
+                           char assignments[][SESSION_ENV_ASSIGN_MAX + 1],
+                           size_t max, size_t *count);
 
 #endif /* ARIEL_STORE_H */

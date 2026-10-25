@@ -54,7 +54,9 @@ along with this program; see the file COPYING. If not, see
  * chmod, chown and chgrp also fill value with the requested mode or owner.
  * A transfer, cp, mv or ln, also fills dest with its destination path.
  * For exec, the target is the program, sha256 its bytes, argc the arguments
- * after it and args their hash. For export, sha256 is the hash of the value.
+ * after it and args their hash. For export, sha256 is the hash of the value,
+ * and session is set when the command runs inside a session, so its value
+ * lands in the session's map and the owner signs that scope.
  * A PS5 built-in fills arg with its arguments after the target, as text.
  * For a run, argc counts the arguments after its name and arg holds each one.
  **/
@@ -92,6 +94,7 @@ typedef struct {
   char args[ARGS_HASH_MAX + 1];
   char arg[RUN_ARGS_MAX][APPROVAL_ARG_MAX + 1];  /** A built-in's or a run's. **/
   char server[APPROVAL_VALUE_MAX + 1];  /** An addon's server, from its server file. **/
+  int session;  /** The command runs inside a session. **/
 } approval_facts_t;
 
 /**
@@ -229,19 +232,24 @@ struct platform {
    * Run a payload in the foreground from its verified bytes: put the bytes
    * in a fresh file only Ariel can read, execute it with argv (argv[0] is
    * the payload's name) with its output on outfd, wait for it and return
-   * its exit status in status. Returns 0 when the payload ran, -1 on a
-   * platform error. The bytes are never loaded from a path.
+   * its exit status in status. envp is the NULL-terminated environment the
+   * payload receives, which a caller starts from a session builds from the
+   * session's map over the process's own; NULL gives it Ariel's own
+   * environment, as every payload got before a session. Returns 0 when the
+   * payload ran, -1 on a platform error. The bytes are never loaded from a
+   * path.
    **/
   int (*spawn)(platform_t *self, const unsigned char *bytes, size_t size,
-               char *const argv[], int outfd, int *status);
+               char *const argv[], char *const envp[], int outfd, int *status);
 
   /**
    * Start a payload from its verified bytes as spawn does, but return at
-   * once: pid is the started payload, and its output goes to outfd. Returns
-   * 0 when it started, -1 on a platform error.
+   * once: pid is the started payload, and its output goes to outfd. envp is
+   * as spawn takes it. Returns 0 when it started, -1 on a platform error.
    **/
   int (*spawn_start)(platform_t *self, const unsigned char *bytes, size_t size,
-                     char *const argv[], int outfd, pid_t *pid);
+                     char *const argv[], char *const envp[], int outfd,
+                     pid_t *pid);
 
   /**
    * Check on a payload that spawn_start started, without blocking. Returns 1

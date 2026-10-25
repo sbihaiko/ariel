@@ -35,9 +35,14 @@ along with this program; see the file COPYING. If not, see
 #define RUNS_FAILED  3
 #define RUNS_AUDIT   4
 
-/** Start verified bytes as name in the background, setting pid on success. **/
+/**
+ * Start verified bytes as name in the background, setting pid on success.
+ * envp is the NULL-terminated environment the payload receives, or NULL for
+ * Ariel's own, exactly as the platform port's spawn_start takes it.
+ **/
 int runs_start(platform_t *platform, const char *name, const char *sha256,
-               const unsigned char *bytes, size_t size, pid_t *pid);
+               const unsigned char *bytes, size_t size, char *const envp[],
+               pid_t *pid);
 
 /** What a one-shot health check ended in. **/
 #define RUNS_HEALTHY   5

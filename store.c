@@ -173,6 +173,8 @@ struct session {
   char cwd[SESSION_CWD_MAX];
   uint64_t created_ms;
   uint64_t used_ms;
+  unsigned env_count;
+  char env[SESSION_ENV_MAX][SESSION_ENV_ASSIGN_MAX + 1];
 };
 
 /**
@@ -956,7 +958,8 @@ value_key(const char *command) {
  * start. A rollback is an action on its name, with the build it replaces. An
  * exec is an action on its program, with the hash of its bytes, its argument
  * count and the hash of its arguments. env and export name one variable, so
- * they have no options.
+ * they have no options, and an export inside a session also carries the
+ * scope the value lands in, option.scope=session.
  * A reptyr is an action on its pid with its start, and a PS5 built-in also
  * carries its arguments after the target as text, arg1 first, so the owner
  * reads them. A run is an action on its path with the hash, kind and
@@ -1083,6 +1086,12 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     } else if(!strcmp(facts->command, "env") ||
               !strcmp(facts->command, "export")) {
       action->noptions = 0;
+      if(facts->session) {
+        // The owner signs where the value lands, never the session's ID.
+        options[0].key = "scope";
+        options[0].value = "session";
+        action->noptions = 1;
+      }
     } else if(!strcmp(facts->command, "write")) {
       decimal(facts->size, text[0], sizeof(text[0]));
       options[0].key = "size";
@@ -1396,7 +1405,8 @@ same_args(const approval_facts_t *a, const approval_facts_t *b) {
  **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
-  return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
+  return a->session == b->session &&
+         !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
          a->recursive == b->recursive &&
          a->argc == b->argc && !strcmp(a->args, b->args) &&
          !strcmp(a->server, b->server) &&
@@ -5080,7 +5090,7 @@ session_describe(struct session *entry, store_session_t *info) {
   memcpy(info->id, entry->id, sizeof(info->id));
   memcpy(info->cwd, entry->cwd, sizeof(info->cwd));
   info->idle_ms = elapsed_ms(now_ms(), entry->used_ms);
-  info->env_count = 0;
+  info->env_count = entry->env_count;
 }
 
 
@@ -5217,4 +5227,135 @@ store_session_list(store_session_t *entries, size_t max, size_t *count) {
     *count = copied;
   }
   return live;
+}
+
+
+/** Whether entry, a NAME=VALUE text, carries the name assignment does. **/
+static int
+session_env_is(const char *entry, const char *assign, size_t name_len) {
+  return !strncmp(entry, assign, name_len) && entry[name_len] == '=';
+}
+
+
+int
+store_session_env_get(const char *id, const char *name, char *value,
+                      size_t size) {
+  struct session *entry;
+  size_t name_len = strlen(name);
+  int rc = 0;
+  int i;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = session_find_locked(id);
+  if(!entry) {
+    pthread_mutex_unlock(&lock);
+    return -1;
+  }
+
+  for(i=0; i<(int)entry->env_count; i++) {
+    if(!strncmp(entry->env[i], name, name_len) &&
+       entry->env[i][name_len] == '=') {
+      const char *held = entry->env[i] + name_len + 1;
+
+      // The caller's buffer holds a whole assignment, so a value always fits.
+      if(strlen(held) < size) {
+        snprintf(value, size, "%s", held);
+        rc = 1;
+      }
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  return rc;
+}
+
+
+int
+store_session_env_set(const char *id, const char *assign) {
+  struct session *entry;
+  size_t name_len;
+  size_t len;
+  int slot = -1;
+  int rc;
+  int i;
+
+  name_len = strcspn(assign, "=");
+  len = strlen(assign);
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = session_find_locked(id);
+  if(!entry) {
+    pthread_mutex_unlock(&lock);
+    return STORE_SESSION_UNKNOWN;
+  }
+
+  // A name is NAME=VALUE, bounded as the line it arrived on is, and one
+  // without a name sets nothing.
+  if(name_len == 0 || name_len > SESSION_ENV_NAME_MAX ||
+     len > SESSION_ENV_ASSIGN_MAX) {
+    pthread_mutex_unlock(&lock);
+    return STORE_SESSION_FAILED;
+  }
+
+  for(i=0; i<(int)entry->env_count; i++) {
+    if(session_env_is(entry->env[i], assign, name_len)) {
+      slot = i;
+      break;
+    }
+  }
+
+  if(slot < 0) {
+    if(entry->env_count >= SESSION_ENV_MAX) {
+      pthread_mutex_unlock(&lock);
+      return STORE_SESSION_FULL;
+    }
+    slot = (int)entry->env_count;
+  }
+
+  memcpy(entry->env[slot], assign, len + 1);
+  if(slot == (int)entry->env_count) {
+    entry->env_count++;
+  }
+  rc = STORE_SESSION_OK;
+
+  pthread_mutex_unlock(&lock);
+
+  return rc;
+}
+
+
+int
+store_session_env_list(const char *id,
+                       char assignments[][SESSION_ENV_ASSIGN_MAX + 1],
+                       size_t max, size_t *count) {
+  struct session *entry;
+  size_t copied = 0;
+  unsigned held = 0;
+  size_t i;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = session_find_locked(id);
+  if(entry) {
+    held = entry->env_count;
+    for(i=0; i<held && copied<max; i++) {
+      snprintf(assignments[copied], SESSION_ENV_ASSIGN_MAX + 1, "%s",
+               entry->env[i]);
+      copied++;
+    }
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  if(count) {
+    *count = copied;
+  }
+  return entry ? (int)held : -1;
 }
