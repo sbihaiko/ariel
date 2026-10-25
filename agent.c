@@ -223,6 +223,15 @@ static const char value_too_long[] =
   "value_too_long\n"
   "exit 1\n";
 
+// A session ID that is malformed, unknown or expired answers this one word,
+// so a client knows to mint a new session whatever went wrong with this one.
+static const char session_expired[] =
+  "session_expired\n"
+  "exit 93\n";
+static const char session_full[] =
+  "session_full\n"
+  "exit 1\n";
+
 /** Serializes the environment: setenv and getenv must not run at once. **/
 static pthread_mutex_t environ_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char bad_argument[] =
@@ -4660,6 +4669,96 @@ shot_copy(agent_t *agent, int fd, const shot_t *shot, int index,
 
 
 /**
+ * session new | close <sid> | list: the Stage 5 lifecycle.
+ *
+ * A session is state, never authority: minting one needs the token every
+ * connection already presents, and a gated command run inside one still
+ * asks the owner. The ID never lands in the audit log or in a signed
+ * action, and the table dies with the process.
+ **/
+static void
+session_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  store_session_t entries[SESSIONS_MAX];
+  char answer[128];
+  size_t live;
+  size_t count = 0;
+  size_t i;
+
+  (void)agent;
+
+  if(argc == 2 && !strcmp(argv[1], "new")) {
+    char id[SESSION_ID_MAX + 1];
+
+    switch(store_session_new(id)) {
+    case STORE_SESSION_OK:
+      if(store_audit_append("session.new", "-", "-", "-")) {
+        reply(fd, audit_failed);
+        return;
+      }
+      snprintf(answer, sizeof(answer), "session %s ttl %llu\nexit 0\n", id,
+               (unsigned long long)(SESSION_TTL_MS / 1000));
+      reply(fd, answer);
+      return;
+    case STORE_SESSION_FULL:
+      reply(fd, session_full);
+      return;
+    default:
+      reply(fd, operation_failed);
+      return;
+    }
+  }
+
+  if(argc == 3 && !strcmp(argv[1], "close")) {
+    switch(store_session_close(argv[2])) {
+    case STORE_SESSION_OK:
+      if(store_audit_append("session.close", "-", "-", "-")) {
+        reply(fd, audit_failed);
+        return;
+      }
+      snprintf(answer, sizeof(answer), "session_closed %s\nexit 0\n", argv[2]);
+      reply(fd, answer);
+      return;
+    case STORE_SESSION_UNKNOWN:
+      reply(fd, session_expired);
+      return;
+    default:
+      reply(fd, operation_failed);
+      return;
+    }
+  }
+
+  if(argc == 2 && !strcmp(argv[1], "list")) {
+    live = store_session_list(entries, SESSIONS_MAX, &count);
+
+    // The table is capped at SESSIONS_MAX, so the answer is bounded by
+    // construction and never reaches the one output cap.
+    for(i=0; i<count; i++) {
+      char line[SESSION_CWD_MAX + 96];
+      int len = snprintf(line, sizeof(line),
+                         "session %s idle %llu cwd %s env %u\n",
+                         entries[i].id,
+                         (unsigned long long)(entries[i].idle_ms / 1000),
+                         entries[i].cwd, entries[i].env_count);
+
+      if(len < 0 || len >= (int)sizeof(line)) {
+        reply(fd, operation_failed);
+        return;
+      }
+      write_all(fd, line, (size_t)len);
+    }
+
+    (void)live;
+    reply(fd, "exit 0\n");
+    return;
+  }
+
+  // session, and any other word or count of them, takes nothing: the three
+  // forms above are the whole grammar.
+  reply(fd, bad_option);
+}
+
+
+/**
  * shots --last, shots --count <n> or shots --minutes <n>: copy the Create
  * button's images out of the gallery into /data/shots.
  *
@@ -5117,6 +5216,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     } else {
       unzip_command(agent, fd, argv[1], argv[2]);
     }
+    return;
+  }
+
+  if(argc >= 1 && !strcmp(argv[0], "session")) {
+    session_command(agent, fd, argc, argv);
     return;
   }
 

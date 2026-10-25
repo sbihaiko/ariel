@@ -467,4 +467,63 @@ int store_audit_append(const char *kind, const char *name, const char *id,
  **/
 int store_audit_tail(unsigned long n, char *buf, size_t size);
 
+/**
+ * Sessions: optional state that outlives a connection and never a restart.
+ * A session holds a working directory and, later, an environment; it carries
+ * no authorization, and every gated command inside one still asks the owner.
+ * The table lives in this process's memory like the approval table, so a
+ * restart drops every session.
+ **/
+
+/** How many sessions may be live at once. **/
+#define SESSIONS_MAX 8
+
+/** A session nobody used for this long is gone. **/
+#define SESSION_TTL_MS (600ULL * 1000ULL)
+
+/** An ID is 32 lowercase hex characters; a directory is at most this long. **/
+#define SESSION_ID_MAX  32
+#define SESSION_CWD_MAX 256
+
+/** One live session, as the answers describe it. **/
+typedef struct {
+  char id[SESSION_ID_MAX + 1];
+  char cwd[SESSION_CWD_MAX];
+  uint64_t idle_ms;
+  unsigned env_count;
+} store_session_t;
+
+/** What asking the session table ended in. **/
+#define STORE_SESSION_OK      0
+#define STORE_SESSION_UNKNOWN 1
+#define STORE_SESSION_FULL    2
+#define STORE_SESSION_FAILED  3
+
+/**
+ * Mint one session: a random 128-bit ID and a working directory of "/".
+ * Copies the 32 hex characters and a terminator into id. STORE_SESSION_FULL
+ * when every slot is live, STORE_SESSION_FAILED when no random source
+ * answered.
+ **/
+int store_session_new(char id[SESSION_ID_MAX + 1]);
+
+/**
+ * End one session. STORE_SESSION_UNKNOWN when no live session has that ID,
+ * including one the clock outlived.
+ **/
+int store_session_close(const char *id);
+
+/**
+ * Look one session up and mark it used, so its idle clock restarts. Fills
+ * info when it is not NULL. STORE_SESSION_UNKNOWN when it is not live.
+ **/
+int store_session_use(const char *id, store_session_t *info);
+
+/**
+ * Fill entries with the live sessions, at most max of them, newest use
+ * first, and set count to how many were copied. Returns the number of live
+ * sessions, which may exceed max.
+ **/
+size_t store_session_list(store_session_t *entries, size_t max, size_t *count);
+
 #endif /* ARIEL_STORE_H */

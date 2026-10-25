@@ -166,12 +166,24 @@ struct approval {
   approval_facts_t facts;
 };
 
+/** One member of the session table. **/
+struct session {
+  int used;
+  char id[SESSION_ID_MAX + 1];
+  char cwd[SESSION_CWD_MAX];
+  uint64_t created_ms;
+  uint64_t used_ms;
+};
+
 /**
  * One mutex covers the staging table, the approval table and the pending
  * count. Consuming an approval is atomic because no other connection can
  * look at the tables while a commit holds it.
  **/
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+/** The live sessions, dropped by the same sweep that expires approvals. **/
+static struct session sessions[SESSIONS_MAX];
 
 static struct staged staged[STAGING_MAX];
 static struct approval approvals[APPROVALS_MAX];
@@ -642,6 +654,15 @@ expire_locked(uint64_t now) {
 
     staged_leave(entry);
   }
+
+  // A session nobody used within its TTL is gone, slot and all: unlike an
+  // approval, nothing needs to answer about it afterwards.
+  for(i=0; i<SESSIONS_MAX; i++) {
+    if(sessions[i].used &&
+       elapsed_ms(now, sessions[i].used_ms) >= SESSION_TTL_MS) {
+      memset(&sessions[i], 0, sizeof(sessions[i]));
+    }
+  }
 }
 
 
@@ -664,6 +685,18 @@ next_expiry_locked(uint64_t now) {
     age = elapsed_ms(now, staged[i].created_ms);
     if(age < STAGING_TTL_MS && STAGING_TTL_MS - age < left) {
       left = STAGING_TTL_MS - age;
+    }
+  }
+
+  for(i=0; i<SESSIONS_MAX; i++) {
+    uint64_t age;
+
+    if(!sessions[i].used) {
+      continue;
+    }
+    age = elapsed_ms(now, sessions[i].used_ms);
+    if(age < SESSION_TTL_MS && SESSION_TTL_MS - age < left) {
+      left = SESSION_TTL_MS - age;
     }
   }
 
@@ -4997,4 +5030,166 @@ store_audit_tail(unsigned long n, char *buf, size_t size) {
   pthread_mutex_unlock(&lock);
 
   return rc;
+}
+
+
+/** Write one ID as lowercase hex, which is the only form a session has. **/
+static void
+session_hex(const unsigned char *raw, size_t len, char *out) {
+  static const char digits[] = "0123456789abcdef";
+  size_t i;
+
+  for(i=0; i<len; i++) {
+    out[2*i] = digits[raw[i] >> 4];
+    out[2*i + 1] = digits[raw[i] & 0x0f];
+  }
+  out[2*len] = '\0';
+}
+
+
+/** The live session with this ID, or NULL. The caller holds the lock. **/
+static struct session *
+session_find_locked(const char *id) {
+  size_t len;
+  int i;
+
+  if(!id) {
+    return NULL;
+  }
+  len = strlen(id);
+  if(len != SESSION_ID_MAX) {
+    return NULL;
+  }
+
+  for(i=0; i<SESSIONS_MAX; i++) {
+    if(sessions[i].used && !memcmp(sessions[i].id, id, SESSION_ID_MAX)) {
+      return &sessions[i];
+    }
+  }
+
+  return NULL;
+}
+
+
+/** Copy a live session into the answer shape. The caller holds the lock. **/
+static void
+session_describe(struct session *entry, store_session_t *info) {
+  if(!info) {
+    return;
+  }
+  memcpy(info->id, entry->id, sizeof(info->id));
+  memcpy(info->cwd, entry->cwd, sizeof(info->cwd));
+  info->idle_ms = elapsed_ms(now_ms(), entry->used_ms);
+  info->env_count = 0;
+}
+
+
+int
+store_session_new(char id[SESSION_ID_MAX + 1]) {
+  unsigned char raw[SESSION_ID_MAX / 2];
+  struct session *slot = NULL;
+  uint64_t now;
+  int i;
+
+  pthread_mutex_lock(&lock);
+  now = now_ms();
+  expire_locked(now);
+
+  for(i=0; i<SESSIONS_MAX; i++) {
+    if(!sessions[i].used) {
+      slot = &sessions[i];
+      break;
+    }
+  }
+  if(!slot) {
+    pthread_mutex_unlock(&lock);
+    return STORE_SESSION_FULL;
+  }
+
+  // The ID is minted under the lock, so two connections asking at once can
+  // never be handed the same slot with different numbers.
+  if(platform->random(platform, raw, sizeof(raw))) {
+    pthread_mutex_unlock(&lock);
+    return STORE_SESSION_FAILED;
+  }
+
+  memset(slot, 0, sizeof(*slot));
+  slot->used = 1;
+  slot->created_ms = now;
+  slot->used_ms = now;
+  snprintf(slot->cwd, sizeof(slot->cwd), "%s", "/");
+  session_hex(raw, sizeof(raw), slot->id);
+
+  memcpy(id, slot->id, sizeof(slot->id));
+  pthread_mutex_unlock(&lock);
+
+  return STORE_SESSION_OK;
+}
+
+
+int
+store_session_close(const char *id) {
+  struct session *entry;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = session_find_locked(id);
+  if(entry) {
+    memset(entry, 0, sizeof(*entry));
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  return entry ? STORE_SESSION_OK : STORE_SESSION_UNKNOWN;
+}
+
+
+int
+store_session_use(const char *id, store_session_t *info) {
+  struct session *entry;
+  int rc = STORE_SESSION_UNKNOWN;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  entry = session_find_locked(id);
+  if(entry) {
+    entry->used_ms = now_ms();
+    session_describe(entry, info);
+    rc = STORE_SESSION_OK;
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  return rc;
+}
+
+
+size_t
+store_session_list(store_session_t *entries, size_t max, size_t *count) {
+  size_t live = 0;
+  size_t copied = 0;
+  int i;
+
+  pthread_mutex_lock(&lock);
+  expire_locked(now_ms());
+
+  for(i=0; i<SESSIONS_MAX; i++) {
+    if(!sessions[i].used) {
+      continue;
+    }
+    live++;
+    if(copied < max) {
+      session_describe(&sessions[i], &entries[copied]);
+      copied++;
+    }
+  }
+
+  pthread_mutex_unlock(&lock);
+
+  if(count) {
+    *count = copied;
+  }
+  return live;
 }

@@ -9333,6 +9333,105 @@ def scenario_shots_empty_gallery_needs_no_owner(server):
     server.assert_no_line()
 
 
+SESSION_TTL_MS = 600_000
+
+
+def session_mint(server):
+    """Mint one session and return its ID."""
+    lines = run_command(server, "session new")
+    assert len(lines) == 2 and lines[1] == "exit 0", (
+        "session new must answer one line and exit 0: %r" % (lines,))
+    parts = lines[0].split()
+    assert len(parts) == 4 and parts[0] == "session" and parts[2] == "ttl", (
+        "session new must answer 'session <id> ttl <seconds>': %r" % (lines,))
+    assert re.fullmatch(r"[0-9a-f]{32}", parts[1]), (
+        "a session ID is 128 bits as lowercase hex: %r" % (parts[1],))
+    assert parts[3] == str(SESSION_TTL_MS // 1000), (
+        "the TTL is the idle window in seconds: %r" % (parts[3],))
+    return parts[1]
+
+
+def session_ids(server):
+    """The IDs session list reports, in its order."""
+    return [line.split()[1] for line in run_command(server, "session list")
+            if line.startswith("session ")]
+
+
+def scenario_session_is_minted_listed_and_closed(server):
+    """session new answers an ID and its TTL, list shows it, close ends it."""
+    server.fresh()
+    first = session_mint(server)
+    second = session_mint(server)
+    assert first != second, "two sessions must not share an ID"
+
+    listed = run_command(server, "session list")
+    assert listed[-1] == "exit 0", listed
+    assert sorted(session_ids(server)) == sorted([first, second]), (
+        "session list must show exactly the live sessions")
+    row = next(line for line in listed if line.startswith("session %s " % first))
+    assert re.fullmatch(r"session %s idle \d+ cwd / env 0" % first, row), (
+        "a session row is 'session <id> idle <s> cwd <path> env <n>': %r" % row)
+
+    assert run_command(server, "session close " + first) == [
+        "session_closed " + first, "exit 0"], (
+        "closing a live session must answer session_closed and exit 0")
+    assert run_command(server, "session close " + first) == [
+        "session_expired", "exit 93"], (
+        "closing it again must answer session_expired and exit 93")
+    assert session_ids(server) == [second], (
+        "a closed session must leave the table")
+
+    assert run_command(server, "session") == ["bad_option", "exit 1"]
+    assert run_command(server, "session bogus") == ["bad_option", "exit 1"]
+    assert run_command(server, "session close") == ["bad_option", "exit 1"]
+    server.assert_no_line()
+
+    events = audit_events(server)
+    assert ("session.new", "-") in [event[:2] for event in events], (
+        "a minted session must reach the audit log under its own event")
+    assert ("session.close", "-") in [event[:2] for event in events], (
+        "a closed session must reach the audit log under its own event")
+    assert not any(first in " ".join(event) for event in events), (
+        "the session ID must never land in the audit log")
+
+
+def scenario_session_expires_when_idle(server):
+    """A session nobody used for its TTL is gone, and its ID answers exit 93."""
+    server.fresh()
+    sid = session_mint(server)
+
+    server.advance(SESSION_TTL_MS - 1)
+    server.settle(0)
+    assert session_ids(server) == [sid], (
+        "a session must live until its TTL, not one millisecond sooner")
+
+    server.advance(1)
+    server.settle(0)
+    assert sid not in session_ids(server), "a session must leave at its TTL"
+    assert run_command(server, "session close " + sid) == [
+        "session_expired", "exit 93"], (
+        "an expired session must answer session_expired")
+
+
+def scenario_session_full_at_eight(server):
+    """Eight sessions live; the ninth answers session_full and frees nothing."""
+    server.fresh()
+    ids = [session_mint(server) for _ in range(8)]
+    assert len(set(ids)) == 8, "eight sessions must have eight IDs"
+
+    minted = [event for event in audit_events(server) if event[0] == "session.new"]
+    assert run_command(server, "session new") == ["session_full", "exit 1"], (
+        "the ninth session must answer session_full and exit 1")
+    assert len([event for event in audit_events(server)
+                if event[0] == "session.new"]) == len(minted), (
+        "a refused session must write no audit line")
+
+    assert run_command(server, "session close " + ids[0]) == [
+        "session_closed " + ids[0], "exit 0"]
+    replacement = session_mint(server)
+    assert replacement not in ids, "a freed slot must take a fresh session"
+
+
 def scenario_rm_recursive_needs_the_owner(server):
     """rm -r asks once for the whole tree, removes it after the signature, and binds -r."""
     tree = make_tree(server, "rm-tree", {"a.txt": b"x", "sub/b.txt": b"y"})
@@ -9528,6 +9627,9 @@ HOST_ROOT_SCENARIOS.update({
     "shots copies the newest images after the owner signs, and binds the selector",
     "shots --minutes keeps the images written inside the window",
     "an empty gallery answers no_shots before the owner is asked",
+    "session new mints an ID and its TTL, list shows it, and close ends it",
+    "a session nobody used for its TTL is gone and its ID answers exit 93",
+    "eight sessions live, and the ninth answers session_full",
 })
 
 
@@ -9735,6 +9837,12 @@ SCENARIOS = [
      scenario_shots_minutes_keeps_the_recent, HOST_ROOT_REASON),
     ("an empty gallery answers no_shots before the owner is asked",
      scenario_shots_empty_gallery_needs_no_owner, HOST_ROOT_REASON),
+    ("session new mints an ID and its TTL, list shows it, and close ends it",
+     scenario_session_is_minted_listed_and_closed, HOST_ROOT_REASON),
+    ("a session nobody used for its TTL is gone and its ID answers exit 93",
+     scenario_session_expires_when_idle, HOST_ROOT_REASON),
+    ("eight sessions live, and the ninth answers session_full",
+     scenario_session_full_at_eight, HOST_ROOT_REASON),
     ("rm -r refuses protected objects and links before anything is removed",
      scenario_rm_recursive_refusals, HOST_ROOT_REASON),
     ("cp -r copies a tree after the owner signs, and refuses an existing destination",
