@@ -250,7 +250,7 @@ The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a
 $ sh tools/install/ariel.sh <console address>
 ```
 
-It makes the two keys if they are not there, builds the payload with them pinned (in a container when no PS5 SDK is installed), sends it to port 9021, waits for the agent port, and leaves `ariel.env` holding `PS5_HOST` and `ARIEL_TOKEN`. `tools/install/ariel.command` is the same on a double-click on macOS and `tools/install/ariel.bat` on Windows; `--check` says what it would do and sends nothing.
+It makes the two keys if they are not there, builds the payload with them pinned — locally when the machine has an LLVM, in a container otherwise, with the PS5 payload SDK downloaded on the way — sends it to port 9021, waits for the agent port, and leaves `ariel.env` holding `PS5_HOST` and `ARIEL_TOKEN`. `tools/install/ariel.command` is the same on a double-click on macOS and `tools/install/ariel.bat` on Windows; `--check` says what it would do and sends nothing, and `ARIEL_BUILD=local` or `ARIEL_BUILD=docker` forces one route.
 
 By hand, it is four steps:
 
