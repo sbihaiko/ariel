@@ -120,6 +120,11 @@ controller-spike.elf: controller_spike.o notify.o pt.o
 capture-spike.elf: capture_spike.o notify.o
 	$(CC) -lkernel_sys -o $@ $^
 
+# The share spike is a separate payload, answering issue #100. It is never
+# linked into shsrv-ps5.elf; the operator sends it to elfldr on its own.
+share-spike.elf: share_spike.o notify.o
+	$(CC) -lkernel_sys -o $@ $^
+
 # The primitives probe is a separate payload. It is never linked into
 # shsrv-ps5.elf; the operator sends it to elfldr on its own. ps5_at.h is a
 # header, so the probe needs no extra object.
