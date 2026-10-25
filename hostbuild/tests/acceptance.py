@@ -12448,10 +12448,89 @@ def scenario_addon_surface_has_no_install(server):
         drop_addon(server, "held")
 
 
+ADDON_GUARD_TITLE = ("ADR-0010 guard: the agent port has no addon install path, and an "
+                     "addon command is gated at 75, audited with the gate's words, and "
+                     "answers only words and codes docs/exit-codes.md documents")
+ADDON_GUARD_WORDS = ("approval_required", "approval_denied", "approval_stale",
+                     "addon_refused", "timed_out", "too_large", "operation_failed",
+                     "manifest_missing", "unknown_command", "status", "result")
+ADDON_GUARD_CODES = (0, 1, 75, 77, 78, 91, 92)
+
+
+def scenario_addon_guard(server):
+    """ADR-0010's guard: no install path, and an addon command gated and coded like the rest."""
+    scenario_addon_surface_has_no_install(server)
+
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for word in ADDON_GUARD_WORDS:
+        assert "`%s" % word in registry, (
+            "docs/exit-codes.md must document %s before an addon reply uses it" % word)
+    for code in ADDON_GUARD_CODES:
+        assert re.search(r"^\| %d \|" % code, registry, re.M), (
+            "docs/exit-codes.md must assign exit %d" % code)
+
+    manifest_sha = addon_runner(server, "guardrun", RUNNER_SOURCE)
+    make_addon(server, "guardrefused", manifest_text("guardrefused", abi="2"))
+    try:
+        approval, _challenge = addon_run_request(server, "guardrun", manifest_sha, ["one"])
+        server.controller("deny %s" % approval, "denied %s" % approval)
+        assert run_command(server, "addon run guardrun one") == [
+            "approval_denied", "exit 77"], "a denied addon run must answer 77"
+        assert addon_events(server, "guardrun") == [
+            ("addon.request", "guardrun"), ("addon.denied", "guardrun")], (
+            "a gated addon run must audit request then denied, got %r"
+            % addon_events(server, "guardrun"))
+
+        assert run_command(server, "addon run guardrefused one") == [
+            "addon_refused guardrefused abi", "exit 1"], "a refused addon must answer 1"
+        assert addon_events(server, "guardrefused") == [
+            ("addon.refused", "guardrefused")], (
+            "a refused addon must audit addon.refused and no addon.request, got %r"
+            % addon_events(server, "guardrefused"))
+
+        for name, source, expected in (
+                ("guardflood", FLOOD_SOURCE, ["too_large", "exit 1"]),
+                ("guardkill", KILLED_SOURCE, ["operation_failed", "exit 1"])):
+            sha = addon_runner(server, name, source)
+            approval, challenge = addon_run_request(server, name, sha, [])
+            sign_and_grant(server, approval, challenge)
+            assert run_command(server, "addon run %s" % name) == expected, (
+                "%s must answer %r" % (name, expected))
+            assert addon_events(server, name) == [
+                ("addon.request", name), ("addon.done", name),
+                ("addon.failed", name)], (
+                "a failed addon run must audit request, done, failed; got %r"
+                % addon_events(server, name))
+
+        sha = addon_runner(server, "guardstuck", STUCK_SOURCE)
+        approval, challenge = addon_run_request(server, "guardstuck", sha, [])
+        sign_and_grant(server, approval, challenge)
+        reply = {}
+        worker = threading.Thread(target=lambda: reply.update(
+            lines=run_command(server, "addon run guardstuck", timeout=30.0)))
+        worker.start()
+        wait_for_addon_output(server, "guardstuck", "started\n")
+        server.advance(ADDON_RUN_TIMEOUT_MS)
+        worker.join(30.0)
+        assert reply.get("lines") == ["timed_out", "exit 1"], (
+            "a timed out addon run must answer timed_out, got %r" % reply.get("lines"))
+        assert addon_events(server, "guardstuck") == [
+            ("addon.request", "guardstuck"), ("addon.done", "guardstuck"),
+            ("addon.failed", "guardstuck")], (
+            "a timed out addon run must audit request, done, failed; got %r"
+            % addon_events(server, "guardstuck"))
+    finally:
+        for name in ("guardrun", "guardflood", "guardkill", "guardstuck"):
+            cleanup_addon(server, name)
+        drop_addon(server, "guardrefused")
+
+
 ADDON_GATE_SCENARIOS = [
     (ADDON_AUDIT_TITLE, scenario_addon_run_is_audited, HOST_ROOT_REASON),
     (ADDON_SIGNATURE_TITLE, scenario_addon_signature_runs_once, HOST_ROOT_REASON),
     (ADDON_SURFACE_TITLE, scenario_addon_surface_has_no_install, HOST_ROOT_REASON),
+    (ADDON_GUARD_TITLE, scenario_addon_guard, HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_GATE_SCENARIOS)
 SCENARIOS.extend(ADDON_GATE_SCENARIOS)
