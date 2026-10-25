@@ -1541,9 +1541,11 @@ run_df(int json, int argc, char *const argv[], int outfd, int errfd) {
     return 0;
   }
 
+  // The path is written on its own: it can be longer than a line buffer, and a
+  // line cut to fit would name a path the owner never asked about.
+  say(outfd, resolved);
   snprintf(line, sizeof(line),
-           "%s: %llu bytes total, %llu bytes free, %llu bytes available\n",
-           resolved,
+           ": %llu bytes total, %llu bytes free, %llu bytes available\n",
            (unsigned long long)vfs.f_blocks * vfs.f_frsize,
            (unsigned long long)vfs.f_bfree * vfs.f_frsize,
            (unsigned long long)vfs.f_bavail * vfs.f_frsize);
