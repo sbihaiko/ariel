@@ -12314,6 +12314,9 @@ def scenario_addon_run_killed_is_operation_failed(server):
 ADDON_REFUSAL_OUTSIDE_TITLE = ("an addon that refuses a path itself answers bad_path or "
                             "protected, keeps its output, and names it")
 
+ADDON_UNLOGGED_TITLE = ("a failed addon run whose audit line cannot be written "
+                        "answers audit_failed and leaves no file behind")
+
 ADDON_FAILURE_TITLE = ("a failing addon's own line reaches the agent through the "
                        "result file its reply names after the error word")
 
@@ -12396,6 +12399,57 @@ def scenario_addon_refusal_outside_keeps_output(server):
             cleanup_addon(server, name)
 
 
+UNLOGGED_LINE = "refused: the server is not there"
+
+UNLOGGED_SOURCE = """
+#include <stdio.h>
+#include <unistd.h>
+
+int
+main(int argc, char **argv) {
+  (void)argc;
+  puts("started");
+  fflush(stdout);
+  for(;;) {
+    if(access(argv[1], F_OK) == 0) {
+      puts("%s");
+      return 1;
+    }
+    usleep(20000);
+  }
+}
+""" % UNLOGGED_LINE
+
+
+def scenario_failed_run_whose_audit_fails_keeps_nothing(server):
+    """A failed run whose audit line cannot be written removes the file it kept."""
+    fresh = Server(server.binary)
+    flag = os.path.join(fresh.root, "data", "unlogged-flag")
+    try:
+        manifest_sha = addon_runner(fresh, "unlogged", UNLOGGED_SOURCE)
+        approval, challenge = addon_run_request(fresh, "unlogged", manifest_sha, [flag])
+        sign_and_grant(fresh, approval, challenge)
+        reply = {}
+        worker = threading.Thread(target=lambda: reply.update(
+            lines=run_command(fresh, "addon run unlogged %s" % flag, timeout=30.0)))
+        worker.start()
+        wait_for_addon_output(fresh, "unlogged", "started\n")
+        # The log breaks after the addon started and before its failure line.
+        log = audit_log_path(fresh)
+        os.remove(log)
+        os.mkdir(log)
+        open(flag, "w").close()
+        worker.join(30.0)
+        assert reply.get("lines") == ["audit_failed", "exit 1"], (
+            "a failed run the log cannot record must answer audit_failed, got %r"
+            % reply.get("lines"))
+        assert addon_results(fresh, "unlogged") == [], (
+            "a failed run the log cannot record must leave no file behind, found %r"
+            % addon_results(fresh, "unlogged"))
+    finally:
+        fresh.stop()
+
+
 ADDON_RUN_SCENARIOS = [
     (ADDON_RUN_CLEAN_TITLE, scenario_addon_run_is_granted_and_bare, HOST_ROOT_REASON),
     (ADDON_RUN_REFUSED_TITLE, scenario_addon_run_refused_is_not_asked, HOST_ROOT_REASON),
@@ -12407,6 +12461,8 @@ ADDON_RUN_SCENARIOS = [
     (ADDON_REFUSAL_OUTSIDE_TITLE, scenario_addon_refusal_outside_keeps_output,
      HOST_ROOT_REASON),
     (ADDON_FAILURE_TITLE, scenario_addon_failure_line_reaches_agent, HOST_ROOT_REASON),
+    (ADDON_UNLOGGED_TITLE, scenario_failed_run_whose_audit_fails_keeps_nothing,
+     HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_RUN_SCENARIOS)
 SCENARIOS.extend(ADDON_RUN_SCENARIOS)

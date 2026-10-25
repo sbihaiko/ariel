@@ -1999,19 +1999,30 @@ addon_path_protected(const char *root, const char *path) {
 /**
  * A failed addon run answers its word, its kept output and its exit code.
  * Every failure exits 1, except a path that names protected state, which
- * keeps the 87 that word answers everywhere else.
+ * keeps the 87 that word answers everywhere else. An audit line that cannot
+ * be written removes the kept file first, so nothing is left that the reply
+ * does not name.
  **/
 static void
-addon_failure(int fd, const char *name, const char *id, const char *word,
-              const char *result, int code) {
+addon_failure(int fd, const char *root, const char *name, const char *id,
+              const char *word, const char *result, int code) {
   char text[PATH_MAX + 64];
+  char full[PATH_MAX];
 
   if(result[0]) {
     snprintf(text, sizeof(text), "%s\nresult %s\nexit %d\n", word, result, code);
   } else {
     snprintf(text, sizeof(text), "%s\nexit %d\n", word, code);
   }
-  audit_reply(fd, "addon", "failed", name, id, text);
+  if(audit_line("addon", "failed", name, id)) {
+    if(result[0] &&
+       snprintf(full, sizeof(full), "%s%s", root, result) < (int)sizeof(full)) {
+      (void)fileops_discard(root, full);
+    }
+    reply(fd, audit_failed);
+    return;
+  }
+  reply(fd, text);
 }
 
 
@@ -2067,22 +2078,22 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     write_all(fd, text, (size_t)len);
     return;
   case ADDON_TIMED_OUT:
-    addon_failure(fd, argv[2], challenge.id, "timed_out", result, 1);
+    addon_failure(fd, platform->fs_root, argv[2], challenge.id, "timed_out", result, 1);
     return;
   case ADDON_TOO_LARGE:
-    addon_failure(fd, argv[2], challenge.id, "too_large", result, 1);
+    addon_failure(fd, platform->fs_root, argv[2], challenge.id, "too_large", result, 1);
     return;
   case ADDON_PROTECTED:
-    addon_failure(fd, argv[2], challenge.id, "protected", result, 87);
+    addon_failure(fd, platform->fs_root, argv[2], challenge.id, "protected", result, 87);
     return;
   case ADDON_BAD_PATH:
-    addon_failure(fd, argv[2], challenge.id, "bad_path", result, 1);
+    addon_failure(fd, platform->fs_root, argv[2], challenge.id, "bad_path", result, 1);
     return;
   case ADDON_SPAWN_FAILED:
-    addon_failure(fd, argv[2], challenge.id, "spawn_failed", result, 1);
+    addon_failure(fd, platform->fs_root, argv[2], challenge.id, "spawn_failed", result, 1);
     return;
   default:
-    addon_failure(fd, argv[2], challenge.id, "operation_failed", result, 1);
+    addon_failure(fd, platform->fs_root, argv[2], challenge.id, "operation_failed", result, 1);
     return;
   }
 }
