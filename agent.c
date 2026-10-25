@@ -1996,6 +1996,21 @@ addon_path_protected(const char *root, const char *path) {
 }
 
 
+/** A failed addon run answers its word, its kept output and exit 1. **/
+static void
+addon_failure(int fd, const char *name, const char *id, const char *word,
+              const char *result) {
+  char text[PATH_MAX + 64];
+
+  if(result[0]) {
+    snprintf(text, sizeof(text), "%s\nresult %s\nexit 1\n", word, result);
+  } else {
+    snprintf(text, sizeof(text), "%s\nexit 1\n", word);
+  }
+  audit_reply(fd, "addon", "failed", name, id, text);
+}
+
+
 static void
 addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   platform_t *platform = agent->platform;
@@ -2048,10 +2063,10 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     write_all(fd, text, (size_t)len);
     return;
   case ADDON_TIMED_OUT:
-    audit_reply(fd, "addon", "failed", argv[2], challenge.id, timed_out_reply);
+    addon_failure(fd, argv[2], challenge.id, "timed_out", result);
     return;
   case ADDON_TOO_LARGE:
-    audit_reply(fd, "addon", "failed", argv[2], challenge.id, too_large);
+    addon_failure(fd, argv[2], challenge.id, "too_large", result);
     return;
   case ADDON_PROTECTED:
     audit_reply(fd, "addon", "failed", argv[2], challenge.id, protected_process);
@@ -2060,10 +2075,10 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     audit_reply(fd, "addon", "failed", argv[2], challenge.id, bad_path);
     return;
   case ADDON_SPAWN_FAILED:
-    audit_reply(fd, "addon", "failed", argv[2], challenge.id, spawn_failed);
+    addon_failure(fd, argv[2], challenge.id, "spawn_failed", result);
     return;
   default:
-    audit_reply(fd, "addon", "failed", argv[2], challenge.id, operation_failed);
+    addon_failure(fd, argv[2], challenge.id, "operation_failed", result);
     return;
   }
 }

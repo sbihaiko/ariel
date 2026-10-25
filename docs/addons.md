@@ -51,14 +51,18 @@ When a run is granted, Ariel starts the `elf` in a process of its own:
 - **Writes.** Its standard output and standard error go to the same pipe, which Ariel reads and copies, as the addon writes it, into a new file `/data/addon-<name>-<ms>`. `<ms>` is the platform clock in milliseconds. Nothing is written inside `/data/ariel`.
 - **Working directory.** On the console the process starts in `/`. The host build starts it in the host build's own working directory.
 - **Success.** An addon says it succeeded by exiting with status 0. Ariel keeps the file and answers `result /data/addon-<name>-<ms>`, then `status 0` and `exit 0`.
-- **Failure.** An addon says it failed by exiting with any non-zero status. A death by signal is also a failure. Ariel then answers `operation_failed` (exit 1) and removes the file, so what the addon wrote to standard error, which is part of its output, does not reach the agent.
-- **Start.** If the process cannot start, the run answers `spawn_failed` (exit 1).
+- **Failure.** An addon says it failed by exiting with any non-zero status. A death by signal is also a failure. Ariel then answers `operation_failed` (exit 1) and keeps the file it wrote, naming it with a `result <path>` line before the exit line, so what the addon wrote — its standard error included — reaches the agent.
+- **Start.** If the process cannot start, the run answers `spawn_failed` (exit 1), and there is no output to keep.
 
 Starting an addon is serialized with every other ELF start under the loader lock.
 
+## The first line
+
+An addon that is about to fail writes, before anything else, one line saying what is wrong and what to do about it. Ariel does not parse that line; it keeps the output and names the file, and the first line is the one a reader acts on. An addon that finds no server on the host and port it is configured for writes `no FTP server on <host>:<port>; load ftpsrv on the console`, not a bare failure.
+
 ## The bounds
 
-A run is bounded on three sides. Each bound ends the run with its own answer and removes the output.
+A run is bounded on three sides. Each bound ends the run with its own answer and keeps the output, named as the process contract says.
 
 - **Timeout.** The process has 10 seconds from the start. At the deadline Ariel kills it and answers `timed_out` (exit 1).
 - **Output cap.** Standard output and standard error together may write 64 KiB (65536 bytes). More than that kills the process and answers `too_large` (exit 1). Exactly 64 KiB is allowed.

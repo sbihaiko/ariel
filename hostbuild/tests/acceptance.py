@@ -12101,11 +12101,11 @@ ADDON_RUN_CLEAN_TITLE = ("an addon run waits for the owner's grant, runs once wi
 ADDON_RUN_REFUSED_TITLE = ("an addon run whose manifest is refused answers addon_refused "
                            "and the owner is not asked")
 ADDON_RUN_TIMEOUT_TITLE = ("an addon run that passes its 10 second timeout answers "
-                           "timed_out, keeps no output, and Ariel survives")
+                           "timed_out and the result it kept, and Ariel survives")
 ADDON_RUN_TOO_LARGE_TITLE = ("an addon run that writes past the 64 KiB output cap "
-                             "answers too_large, keeps no output, and Ariel survives")
-ADDON_RUN_KILLED_TITLE = ("an addon run that is killed answers operation_failed, "
-                          "keeps no output, and Ariel survives")
+                             "answers too_large and the result it kept, and Ariel survives")
+ADDON_RUN_KILLED_TITLE = ("an addon run that is killed answers operation_failed and "
+                          "the result it kept, and Ariel survives")
 
 ADDON_RUN_TIMEOUT_MS = 10_000
 
@@ -12219,6 +12219,17 @@ def assert_addon_survives(server):
         "Ariel must answer after an addon run ends badly, got %r" % lines)
 
 
+def assert_failed_run_keeps_output(server, name, lines, word):
+    """A failed run answers its word, the result it kept, and exit 1; that file is on disk."""
+    match = (re.match(r"^result (/data/addon-%s-\d+)$" % re.escape(name), lines[1])
+             if len(lines) == 3 else None)
+    assert match and lines[0] == word and lines[2] == "exit 1", (
+        "an addon run that ends with %s must answer that word, its result and "
+        "exit 1, got %r" % (word, lines))
+    assert addon_results(server, name) == [match.group(1).rsplit("/", 1)[1]], (
+        "a failed addon run must keep its output in the file it names")
+
+
 def scenario_addon_run_is_granted_and_bare(server):
     manifest_sha = addon_runner(server, "runner", RUNNER_SOURCE)
     try:
@@ -12264,12 +12275,9 @@ def scenario_addon_run_timeout_is_cut(server):
         assert worker.is_alive(), "an addon run must not be cut before its timeout"
         server.advance(1)
         worker.join(30.0)
-        assert not worker.is_alive() and reply.get("lines") == [
-            "timed_out", "exit 1"], (
-            "an addon run past its timeout must answer timed_out, got %r"
-            % reply.get("lines"))
-        assert addon_results(server, "stuck") == [], (
-            "a timed out addon run must keep no output")
+        assert not worker.is_alive(), "an addon run past its timeout must end"
+        assert_failed_run_keeps_output(server, "stuck", reply.get("lines", []),
+                                       "timed_out")
         assert_addon_survives(server)
     finally:
         cleanup_addon(server, "stuck")
@@ -12280,10 +12288,9 @@ def scenario_addon_run_output_cap_is_too_large(server):
     try:
         approval, challenge = addon_run_request(server, "flood", manifest_sha, [])
         sign_and_grant(server, approval, challenge)
-        assert run_command(server, "addon run flood") == ["too_large", "exit 1"], (
-            "an addon run past the 64 KiB output cap must answer too_large")
-        assert addon_results(server, "flood") == [], (
-            "a too large addon run must keep no output")
+        assert_failed_run_keeps_output(server, "flood",
+                                       run_command(server, "addon run flood"),
+                                       "too_large")
         assert_addon_survives(server)
     finally:
         cleanup_addon(server, "flood")
@@ -12294,14 +12301,49 @@ def scenario_addon_run_killed_is_operation_failed(server):
     try:
         approval, challenge = addon_run_request(server, "killed", manifest_sha, [])
         sign_and_grant(server, approval, challenge)
-        assert run_command(server, "addon run killed") == [
-            "operation_failed", "exit 1"], (
-            "a killed addon run must answer operation_failed")
-        assert addon_results(server, "killed") == [], (
-            "a killed addon run must keep no output")
+        assert_failed_run_keeps_output(server, "killed",
+                                       run_command(server, "addon run killed"),
+                                       "operation_failed")
         assert_addon_survives(server)
     finally:
         cleanup_addon(server, "killed")
+
+
+ADDON_FAILURE_TITLE = ("a failing addon's own line reaches the agent through the "
+                       "result file its reply names after the error word")
+
+FAILING_LINE = "no FTP server on 127.0.0.1:2121; load ftpsrv on the console"
+
+FAILING_SOURCE = """
+#include <stdio.h>
+
+int
+main(void) {
+  puts("%s");
+  return 1;
+}
+""" % FAILING_LINE
+
+
+def scenario_addon_failure_line_reaches_agent(server):
+    manifest_sha = addon_runner(server, "failing", FAILING_SOURCE)
+    try:
+        approval, challenge = addon_run_request(server, "failing", manifest_sha, [])
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, "addon run failing")
+        match = (re.match(r"^result (/data/addon-failing-\d+)$", lines[1])
+                 if len(lines) == 3 else None)
+        assert match and lines[0] == "operation_failed" and lines[2] == "exit 1", (
+            "a failing addon run must answer operation_failed, its result, then "
+            "exit 1, got %r" % lines)
+        # The host build's readers take paths under the test root, as the other scenarios do.
+        host_path = os.path.join(server.root, match.group(1).lstrip("/"))
+        shown = run_command(server, "cat " + host_path)
+        assert shown == [FAILING_LINE, "exit 0"], (
+            "the addon's line must reach the agent through the result file, got %r"
+            % shown)
+    finally:
+        cleanup_addon(server, "failing")
 
 
 ADDON_RUN_SCENARIOS = [
@@ -12312,6 +12354,7 @@ ADDON_RUN_SCENARIOS = [
      HOST_ROOT_REASON),
     (ADDON_RUN_KILLED_TITLE, scenario_addon_run_killed_is_operation_failed,
      HOST_ROOT_REASON),
+    (ADDON_FAILURE_TITLE, scenario_addon_failure_line_reaches_agent, HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_RUN_SCENARIOS)
 SCENARIOS.extend(ADDON_RUN_SCENARIOS)

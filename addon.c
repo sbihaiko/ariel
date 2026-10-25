@@ -674,9 +674,11 @@ addon_run(platform_t *platform, const char *name, int argc,
   int pipefd[2] = {-1, -1};
   int opened = -1;
   int created = 0;
+  int spawned = 0;
   pid_t pid = 0;
   int i;
 
+  result[0] = '\0';
   if(read_elf(name, &elf, &elf_size)) {
     return ADDON_FAILED;
   }
@@ -715,6 +717,7 @@ addon_run(platform_t *platform, const char *name, int argc,
     outcome = ADDON_SPAWN_FAILED;
     goto done;
   }
+  spawned = 1;
   close(pipefd[1]);
   pipefd[1] = -1;
 
@@ -724,8 +727,11 @@ done:
   if(opened >= 0) {
     close(opened);
   }
-  if(created && outcome != ADDON_RAN) {
-    (void)fileops_discard(platform->fs_root, file);
+  if(!spawned) {
+    if(created) {
+      (void)fileops_discard(platform->fs_root, file);
+    }
+    result[0] = '\0';
   }
   if(pipefd[0] >= 0) {
     close(pipefd[0]);

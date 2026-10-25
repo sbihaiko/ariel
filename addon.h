@@ -50,10 +50,11 @@ int addon_accept(const char *name, int argc, char hex[65], char server[65],
                  char *refusal, size_t size);
 
 /**
- * Run the addon named name with args in a process of its own, bounded. On
- * ADDON_RAN its output is in the file named by result; any other outcome
- * leaves no file. An addon that exits 3 refused a path, and one that exits 87
- * named protected state.
+ * Run the addon named name with args in a process of its own, bounded. Once
+ * the addon has started, its output is in the file named by result whatever
+ * the outcome; a run that never started leaves no file and an empty result.
+ * An addon that exits 3 refused a path, and one that exits 87 named protected
+ * state.
  **/
 addon_run_t addon_run(platform_t *platform, const char *name, int argc,
                       char *const args[], char *result, size_t size);
