@@ -12311,6 +12311,35 @@ def scenario_addon_run_killed_is_operation_failed(server):
         cleanup_addon(server, "killed")
 
 
+ADDON_SPAWN_FAILED_TITLE = ("an addon run that never started answers spawn_failed "
+                            "alone and leaves no file behind")
+
+
+def scenario_addon_run_that_never_started_keeps_nothing(server):
+    # The manifest is accepted, so the owner is asked and the run reaches its
+    # spawn; the elf is not an executable, so the spawn is what fails. That is
+    # the one failure that must not name a file: nothing ever wrote one.
+    name = "dead"
+    path = make_addon(server, name, manifest_text(name, args="0-3"))
+    with open(os.path.join(path, "elf"), "wb") as handle:
+        handle.write(b"this is not an executable\n")
+    manifest_sha = hashlib.sha256(
+        manifest_text(name, args="0-3").encode("ascii")).hexdigest()
+    try:
+        approval, challenge = addon_run_request(server, name, manifest_sha, ["one"])
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, "addon run dead one")
+        assert lines == ["spawn_failed", "exit 1"], (
+            "a run that never started must answer its word alone, with no "
+            "result line, got %r" % lines)
+        assert addon_results(server, name) == [], (
+            "a run that never started must leave no result file, got %r"
+            % addon_results(server, name))
+        assert_addon_survives(server)
+    finally:
+        cleanup_addon(server, name)
+
+
 ADDON_REFUSAL_OUTSIDE_TITLE = ("an addon that refuses a path itself answers bad_path or "
                             "protected, keeps its output, and names it")
 
@@ -12457,6 +12486,8 @@ ADDON_RUN_SCENARIOS = [
     (ADDON_RUN_TOO_LARGE_TITLE, scenario_addon_run_output_cap_is_too_large,
      HOST_ROOT_REASON),
     (ADDON_RUN_KILLED_TITLE, scenario_addon_run_killed_is_operation_failed,
+     HOST_ROOT_REASON),
+    (ADDON_SPAWN_FAILED_TITLE, scenario_addon_run_that_never_started_keeps_nothing,
      HOST_ROOT_REASON),
     (ADDON_REFUSAL_OUTSIDE_TITLE, scenario_addon_refusal_outside_keeps_output,
      HOST_ROOT_REASON),
