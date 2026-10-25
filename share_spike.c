@@ -42,8 +42,8 @@ along with this program; see the file COPYING. If not, see
 
 
 #define SPIKE_LOG      "/data/share-spike.log"
-#define SPIKE_LIB      "/system/common/lib/libSceShare.sprx"
-#define SPIKE_LIB_SHORT "libSceShare.sprx"
+#define SPIKE_LIB      "/system/common/lib/libSceShare.native.sprx"
+#define SPIKE_LIB_SHORT "libSceShare.native.sprx"
 
 /** The request id the capture calls answer with, when they answer. **/
 #define SHARE_REQUEST_ID_INVALID (-1)
@@ -146,6 +146,9 @@ main(void) {
   int   i;
   int32_t req_id;
   share_status_t status;
+  struct {
+    unsigned char bytes[0x40];
+  } capture;
 
   logfd = open(SPIKE_LOG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   log_line("share spike start");
@@ -236,6 +239,52 @@ main(void) {
     log_line("CaptureScreenshotExtended(null) -> %d (%#x) req %d",
              rc, rc, req_id);
     log_line("survived CaptureScreenshotExtended(null)");
+  }
+
+  // The disassembly of the export rejects a null block and requires bytes
+  // 0x08 to 0x1f to be zero, with a kind word at 0x04 compared against 2: a
+  // zeroed block of 0x40 bytes is the smallest thing that passes.
+  fn = resolve_logged(handle, "ErH6tKS7fzE");
+  if(fn) {
+    memset(&capture, 0, sizeof(capture));
+    req_id = SHARE_REQUEST_ID_INVALID;
+    log_line("call CaptureScreenshot(zeroed 0x40, req_id)");
+    rc = ((int (*)(const void*, int32_t*))fn)(&capture, &req_id);
+    log_line("CaptureScreenshot(zeroed) -> %d (%#x) req %d", rc, rc, req_id);
+    log_line("survived CaptureScreenshot(zeroed)");
+  }
+
+  // The status and the capture both answer 0x8196000C, which reads as the
+  // share feature being unavailable to this process. The library also carries
+  // a permit and a prohibit for feature flags: ask for the flag the status
+  // call was given, then read the status and ask for a capture once more.
+  fn = resolve_logged(handle, "YBiIdcDPrxs");
+  if(fn) {
+    log_line("call FeaturePermit(flag 1)");
+    rc = ((int (*)(unsigned int))fn)(1u);
+    log_line("FeaturePermit(1) -> %d (%#x)", rc, rc);
+    log_line("survived FeaturePermit");
+  }
+
+  memset(&status, 0, sizeof(status));
+  fn = resolve_logged(handle, "QNop2YAtIDE");
+  if(fn) {
+    log_line("call GetCurrentStatus(flag 1) after the permit");
+    rc = ((int (*)(uint32_t, share_status_t*))fn)(1u, &status);
+    log_line("GetCurrentStatus() -> %d (%#x), status %02x%02x%02x%02x",
+             rc, rc, status.bytes[0], status.bytes[1], status.bytes[2],
+             status.bytes[3]);
+  }
+
+  fn = resolve_logged(handle, "ErH6tKS7fzE");
+  if(fn) {
+    memset(&capture, 0, sizeof(capture));
+    req_id = SHARE_REQUEST_ID_INVALID;
+    log_line("call CaptureScreenshot(zeroed 0x40) after the permit");
+    rc = ((int (*)(const void*, int32_t*))fn)(&capture, &req_id);
+    log_line("CaptureScreenshot(after permit) -> %d (%#x) req %d",
+             rc, rc, req_id);
+    log_line("survived CaptureScreenshot(after permit)");
   }
 
   log_line("share spike end");

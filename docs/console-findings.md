@@ -271,6 +271,32 @@ Four things this run settled:
 
 **Not measured.** The time and memory a capture costs, the size and format of the file (the system's PNG/JPEG setting), what a protected scene answers (no game or video app was run), and whether a capture works while a title is in the foreground. Each needs a console that completes a capture first.
 
+## Issue #100: the share route, and the error it stops at
+
+Run on 2026-10-25 with the owner on hand, on the same console, after the capture attempts above had already been reset away. The spike is `share_spike.c` and the `share-spike.elf` target in the `Makefile`; like the capture spike it is not part of `all`, is never linked into `shsrv-ps5.elf`, and writes each step to `/data/share-spike.log` before taking it. The question it asks is the owner's: the screenshot client in `libSceScreenShot` is the VSH's own IPC client and wedges the console, so is the system's share feature a second door a payload can open?
+
+**What the library is.** `/system/common/lib/libSceShare.native.sprx` is the share implementation, not a client of one: the file the loader wants by that exact name (`libSceShare.sprx` answers `0x80020002`, no such module). Its exports carry the capture the share menu offers — `ShareCaptureScreenshot`, `ShareCaptureScreenshotExtended`, `ShareGetCurrentStatus`, `ShareSetCaptureSource`, and a `ShareFeaturePermit`/`ShareFeatureProhibit` pair — so a capture through it would be the system's own, not a daemon round trip.
+
+**What the console answered.**
+
+| Attempt | Reply |
+| --- | --- |
+| `dlopen` of the library, by path and by name | null with `dlerror()` null, as with every system library in a payload |
+| `sceKernelLoadStartModule` after `libSceIpmi` and `libSceSysUtil` | loaded: handles 33, 34, 35, mapbase `0x8004b4000` |
+| `kernel_dynlib_resolve` for the seven exports | all seven resolve (`8004c0fa0` … `8004c1680`) |
+| `ShareGetCurrentStatus(1, status)` | `0x8196000C`, status block untouched |
+| `ShareCaptureScreenshot(NULL, &req)` | `0x81960002` (invalid argument), request id untouched |
+| `ShareCaptureScreenshotExtended(NULL, &req)` | `0x81960002`, request id untouched |
+| `ShareCaptureScreenshot(&zeroed 0x40, &req)` | `0x8196000C`, request id untouched |
+| `ShareFeaturePermit(1)` | `0x8196000C` |
+| `ShareGetCurrentStatus(1, …)` and the capture again, after the permit | `0x8196000C` both |
+
+**What this settles.** The calls run: a null parameter block is rejected by the export's own validation (`0x81960002`), so the library is executing and not failing before it looks. What it then answers is `0x8196000C` for every shape — the share feature is unavailable to this process, and the library's own permit for that feature is refused with the same error, so the refusal is above the library, not something the caller can grant itself. No file is produced and no request id is handed back. Unlike the screenshot client, **the console survives every share attempt**: 9021, 2121 and 2324 answered after each one, and nothing had to be reset.
+
+**Not measured.** Whether a foreground title, or the share process's own identity, changes the feature's availability; what the extended capture's parameter block wants beyond the zeroed 0x40 bytes its validation accepts; and whether the permit needs a second flag or a token the payload does not have.
+
+**Where the route ends.** Two doors, two answers: `libSceScreenShot` accepts the request and never completes it, then wedges the console; `libSceShare.native` refuses with a feature error and leaves it running. Neither hands a payload an image, so a screenshot addon has no path on firmware 11.20 that this project can build on.
+
 ## Issue #72 and #81: the console suite after the state directory closed
 
 Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014), with `dev` at `93f47ee` — the build that carries #74's per-component protection — anchored with the owner's primary and recovery keys and sent to the loader on 9021. The console had gone to rest on its own; a magic packet did not wake it that time, it came back later, and every payload had to be sent again.
