@@ -337,12 +337,27 @@ static int
 wait_readable(platform_t *platform, int wake, int fd, int64_t deadline_ms) {
   while(1) {
     struct pollfd pfd[2];
+    struct pollfd here;
     nfds_t nfds = 1;
     int64_t left;
     int rc;
 
     left = deadline_ms - now_ms(platform);
     if(left <= 0) {
+      // The deadline ends an idle wait; it does not drop a line that is
+      // already here. A caller reads a line a byte at a time, and an advance
+      // between two bytes would otherwise lose the rest of a line that
+      // arrived before it. The client cannot extend the wait this way: the
+      // deadline above is absolute and the remaining bytes are already in
+      // the socket.
+      here.fd = fd;
+      here.events = POLLIN;
+      here.revents = 0;
+
+      if(poll(&here, 1, 0) > 0 &&
+         (here.revents & (POLLIN | POLLHUP | POLLERR))) {
+        return 1;
+      }
       return 0;
     }
 
