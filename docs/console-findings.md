@@ -290,6 +290,16 @@ Each approval was signed offline with the owner's key and granted over the agent
 
 **Not measured.** The rest of the console suite was not run in this pass; it is the next console session's job. The `write` check's own body handling was proven only through the `read` check and the host scenarios.
 
+## Issue #89: ftpsrv's root, and the round trip that waits for the owner
+
+Measured on 2026-10-25, read-only, on the console at firmware 11.200.005 (CFI-2014 A01X, S/N E456015EB10480711), with no Ariel deployed.
+
+**ftpsrv's root is `/`.** A listing of `ftp://<console>:2121/` answers the system tree (`adm`, `app_temp0`, `data`, `dev`, `hdd`, `host`, `user`), and a listing of `/data` answers that directory's entries; so ftpsrv serves the console's filesystem from `/`, not from `/data`. The ftp addon checked both mappings because this was unknown; the first check is the one that fires on a console, and the second stays as a guard, since the root belongs to ftpsrv and the addon must not depend on it.
+
+**The console had no Ariel when this was measured.** `/data` held the owner's other payloads and no `ariel` directory, port 2324 was closed, and 2323 answered `Welcome to shsrv.elf running on pid 97, compiled Aug 2 2026 at 16:40:44` — upstream shsrv, not Ariel. The keyring recorded after [#48](#issue-48-keys-on-the-console) went with the state directory, so the generation-2 primary no longer applies to this console until it is provisioned again.
+
+**The round trip waits for the owner.** [#89](https://github.com/sbihaiko/ariel/issues/89) asks for `ftp-put` then `ftp-get` of a file with a space in its name, and a protected local path answering `protected`, signed on the console. Running it now would mean killing a payload the owner deployed, deploying an anchored build, and letting a fresh `/data/ariel` start at generation 0 from the build's anchor — which discards the key-run state on purpose. The repository's own rule is that this is only done with the console in hand, so the criterion stays open, labelled for the owner.
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.
