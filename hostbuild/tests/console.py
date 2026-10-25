@@ -49,6 +49,10 @@ SECRET_READS = (
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 STAGED_LINE = re.compile(r"^staged (s-[0-9a-f]+)$")
 APPROVAL_LINE = re.compile(r"^approval_required (a-[0-9a-f]+)$")
+READ_HEADER = re.compile(r"bytes ([0-9]+) ([0-9a-f]{64})\Z")
+EXIT_0 = b"exit 0\n"
+READ_OFFSET = 12
+READ_LIMIT = 24
 
 # One notification every 10 s and approvals that expire after 120 s are the
 # console's own limits; console mode waits in real time, since it can move
@@ -126,8 +130,8 @@ class Operator:
         return (self._read("Signature (128 hex digits): ") or "").strip()
 
 
-def read_reply(sock):
-    """Read a reply until the server closes the connection."""
+def read_all(sock):
+    """Read the bytes of a reply until the server closes the connection."""
     data = b""
     try:
         while True:
@@ -137,7 +141,11 @@ def read_reply(sock):
             data += chunk
     except ConnectionResetError:
         pass
-    return data.decode("ascii", "replace")
+    return data
+
+
+def read_reply(sock):
+    return read_all(sock).decode("ascii", "replace")
 
 
 def reply_lines(reply):
@@ -161,6 +169,11 @@ class Link:
 
     def exchange(self, command, body=None, token=None):
         """Send one command after auth and return the lines the console replied."""
+        return reply_lines(self.exchange_bytes(command, body, token)
+                           .decode("ascii", "replace"))
+
+    def exchange_bytes(self, command, body=None, token=None):
+        """Send one command after auth and return the reply's bytes, unsplit."""
         sock = self.open()
         try:
             sock.sendall(("auth %s\n%s\n" % (token or self.token, command))
@@ -168,7 +181,7 @@ class Link:
             if body is not None:
                 sock.sendall(body)
             sock.shutdown(socket.SHUT_WR)
-            return reply_lines(read_reply(sock))
+            return read_all(sock)
         finally:
             sock.close()
 
@@ -350,6 +363,55 @@ def check_file_command_runs_after_approval(session, context):
         "a signed rmdir must run")
     assert session.link.exchange("stat " + folder)[-1] == "exit 1", (
         "rmdir must remove the directory")
+
+
+def listing(session, path):
+    lines = session.link.exchange("ls " + path)
+    assert lines and lines[-1] == "exit 0", (
+        "ls %s must exit 0, got %r" % (path, lines))
+    return [line.split()[-1] for line in lines[:-1]]
+
+
+def remove_throwaway(session, path):
+    """Remove a throwaway path a failed check left behind, once the owner signs."""
+    if session.link.exchange("stat " + path)[-1:] != ["exit 0"]:
+        return
+    command = "rm -r " + path
+    run_gated_file_command(session, command)
+    assert session.link.exchange(command) == ["exit 0"], (
+        "the cleanup of %s must remove it" % path)
+
+
+def check_recursive_copy_and_remove(session, context):
+    """cp -r copies a throwaway tree and rm -r removes the copy, both signed."""
+    del context
+    base = "/data/gate-%s" % os.urandom(4).hex()
+    copy = base + "-copy"
+    try:
+        run_gated_file_command(session, "mkdir " + base)
+        assert session.link.exchange("mkdir " + base) == ["exit 0"], (
+            "a signed mkdir must run")
+        run_gated_file_command(session, "touch %s/entry" % base)
+        assert session.link.exchange("touch %s/entry" % base) == ["exit 0"], (
+            "a signed touch must run")
+        run_gated_file_command(session, "cp -r %s %s" % (base, copy))
+        assert session.link.exchange("cp -r %s %s" % (base, copy)) == ["exit 0"], (
+            "a signed cp -r must run")
+        source = listing(session, base)
+        assert source == ["entry"], (
+            "the throwaway source must list its entry, got %r" % source)
+        copied = listing(session, copy)
+        assert copied == source, (
+            "the copy must list the source's entries, got %r" % copied)
+        run_gated_file_command(session, "rm -r " + copy)
+        assert session.link.exchange("rm -r " + copy) == ["exit 0"], (
+            "a signed rm -r must run")
+        assert session.link.exchange("stat " + copy) == [
+            "no_such_file", "exit 1"], (
+            "stat of the removed copy must answer no_such_file")
+    finally:
+        remove_throwaway(session, copy)
+        remove_throwaway(session, base)
 
 
 def check_truncated_upload(session, context):
@@ -773,6 +835,52 @@ def install_build(session, name, data):
     return digest
 
 
+def split_read(reply):
+    """A read's reply: 'bytes <size> <sha256>', then size bytes, then exit 0."""
+    head, newline, rest = reply.partition(b"\n")
+    match = READ_HEADER.match(head.decode("ascii", "replace")) if newline else None
+    assert match, "read must answer 'bytes <size> <sha256>', got %r" % head[:80]
+    size = int(match.group(1))
+    assert rest[size:] == EXIT_0, (
+        "read must end its bytes with exit 0, got %r" % rest[size:][-32:])
+    return size, match.group(2), rest[:size]
+
+
+def cat_printed(reply):
+    """The bytes cat printed: its reply without the exit line."""
+    assert reply.endswith(EXIT_0), (
+        "cat must end with exit 0, got %r" % reply[-32:])
+    return reply[:-len(EXIT_0)]
+
+
+def check_read_matches_cat(session, context):
+    """read answers a whole build and a range of it as cat does, with a matching header."""
+    data = context.build("read")
+    digest = install_build(session, "consoleread", data)
+    path = "%s/store/objects/%s" % (CONSOLE_STATE_DIR, digest)
+    cat = cat_printed(session.link.exchange_bytes("cat " + path))
+    # cat ends a file that lacks a final newline with one, so the file's own
+    # bytes are compared through that rule.
+    printed = data if data.endswith(b"\n") else data + b"\n"
+    assert cat == printed, (
+        "cat must print the installed build's bytes, got %d bytes" % len(cat))
+
+    size, whole_hash, body = split_read(session.link.exchange_bytes(
+        "read " + path))
+    assert (size, whole_hash, body) == (len(data), digest, data), (
+        "a whole read must answer the build's size, SHA-256 and bytes, got "
+        "%d bytes and %s" % (size, whole_hash))
+
+    shown = data[READ_OFFSET:READ_OFFSET + READ_LIMIT]
+    size, whole_hash, body = split_read(session.link.exchange_bytes(
+        "read %s --offset %d --limit %d" % (path, READ_OFFSET, READ_LIMIT)))
+    assert (size, whole_hash) == (len(shown), digest), (
+        "a range read must answer the range's size and the whole file's "
+        "SHA-256, got %d bytes and %s" % (size, whole_hash))
+    assert body == shown == cat[READ_OFFSET:READ_OFFSET + READ_LIMIT], (
+        "a range read must return the bytes cat returns at that offset")
+
+
 def check_rollback_restores_previous(session, context):
     """A rollback waits for the owner, then restores the previous build and is audited."""
     name = "rollb" + uuid.uuid4().hex[:8]
@@ -949,6 +1057,11 @@ CHECKS = [
      "without asking", check_tar_refusals_without_asking),
     ("mkdir and rmdir run only after the owner signs, once each, on the console",
      check_file_command_runs_after_approval),
+    ("cp -r copies a throwaway tree after the owner signs, the copy lists the "
+     "source's entries, rm -r removes the copy, and both paths are removed",
+     check_recursive_copy_and_remove),
+    ("read answers a whole build and a range of it as cat does, with the "
+     "header's size and SHA-256", check_read_matches_cat),
     ("a truncated upload answers upload_mismatch and exit 81",
      check_truncated_upload),
     ("a hash mismatch answers upload_mismatch and exit 81",

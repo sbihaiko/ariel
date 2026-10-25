@@ -1639,7 +1639,7 @@ def scenario_console_checks_push_runnable_builds(server):
                 console.check_bad_name, console.check_install_bad_name_is_audited,
                 console.check_unsigned_commit}
     activating = {console.check_approval_then_install, console.check_audit_tail,
-                  console.check_approval_status,
+                  console.check_approval_status, console.check_read_matches_cat,
                   console.check_rollback_restores_previous,
                   console.check_rollback_refusals,
                   console.check_autoload_edit_asks_before_it_applies,
@@ -1688,6 +1688,190 @@ def scenario_console_checks_push_runnable_builds(server):
     assert len(rollback) == 2 and rollback[0][1] != rollback[1][1], (
         "a rollback needs two distinct runnable builds, got %r"
         % [name for name, _data in rollback])
+
+
+def cat_printed(data):
+    """What cat prints for a file: its bytes, and one newline if they lack one."""
+    return data if not data or data.endswith(b"\n") else data + b"\n"
+
+
+class FakeFileTree:
+    """A fake agent port over a file tree, with gated mkdir, touch, cp -r and rm -r.
+
+    A gated command answers 75 with a challenge until the owner's grant is
+    recorded, then runs once when it is sent again. drop_children makes cp -r
+    copy the directory and not what it holds.
+    """
+
+    GATED = ("mkdir", "touch", "cp", "rm")
+
+    def __init__(self, drop_children=False):
+        self.paths = set()
+        self.drop_children = drop_children
+        self.pending = {}
+        self.granted = set()
+        self.asked = 0
+
+    def exchange(self, command, body=None, token=None):
+        words = command.split()
+        if words[:2] == ["approval", "grant"]:
+            self.granted.add(self.pending.pop(words[2]))
+            return ["approval_granted %s" % words[2], "exit 0"]
+        if command in self.granted:
+            self.granted.discard(command)
+            return self.run(words)
+        if words[0] in self.GATED:
+            self.asked += 1
+            approval = "a-%d" % self.asked
+            self.pending[approval] = command
+            return ["approval_required %s" % approval,
+                    "challenge %s 00" % approval, "exit 75"]
+        return self.run(words)
+
+    def run(self, words):
+        if words[0] == "stat":
+            if words[1] in self.paths:
+                return ["%s: 0 bytes" % words[1], "exit 0"]
+            return ["no_such_file", "exit 1"]
+        if words[0] == "ls":
+            names = sorted(path.rsplit("/", 1)[1] for path in self.paths
+                           if path.rsplit("/", 1)[0] == words[1])
+            return ["-rw-r--r-- 0 %s" % name for name in names] + ["exit 0"]
+        if words[0] in ("mkdir", "touch"):
+            self.paths.add(words[1])
+            return ["exit 0"]
+        if words[:2] == ["cp", "-r"]:
+            source, destination = words[2], words[3]
+            for path in sorted(self.paths):
+                if path == source or path.startswith(source + "/"):
+                    if path == source or not self.drop_children:
+                        self.paths.add(destination + path[len(source):])
+            return ["exit 0"]
+        if words[:2] == ["rm", "-r"]:
+            target = words[2]
+            if target not in self.paths:
+                return ["no_such_file", "exit 1"]
+            self.paths -= {path for path in self.paths
+                           if path == target or path.startswith(target + "/")}
+            return ["exit 0"]
+        raise StopCheck(" ".join(words))
+
+
+class FakeBuildConsole:
+    """A fake agent port that installs builds and answers read and cat from them.
+
+    bad_header answers a whole-file hash that is not the file's; bad_range
+    changes the first byte of a range read. Each must fail the read check.
+    """
+
+    def __init__(self, bad_header=False, bad_range=False):
+        self.bad_header = bad_header
+        self.bad_range = bad_range
+        self.staged = {}
+        self.objects = {}
+
+    def exchange(self, command, body=None, token=None):
+        words = command.split()
+        if words[:2] == ["payload", "push"]:
+            index = len(self.staged) + 1
+            staging = "s-%d" % index
+            self.staged[staging] = (words[2], words[4], body)
+            return ["staged %s" % staging, "approval_required a-%d" % index,
+                    "challenge a-%d 00" % index, "exit 75"]
+        if words[:2] == ["approval", "grant"]:
+            return ["approval_granted %s" % words[2], "exit 0"]
+        if words[:2] == ["payload", "commit"]:
+            name, digest, data = self.staged[words[2]]
+            self.objects[digest] = data
+            return ["installed %s %s" % (name, digest), "exit 0"]
+        raise StopCheck(command)
+
+    def exchange_bytes(self, command):
+        words = command.split()
+        data = self.objects[words[1].rsplit("/", 1)[1]]
+        if words[0] == "cat":
+            return cat_printed(data) + b"exit 0\n"
+        if words[0] == "read":
+            offset, limit = (0, len(data)) if len(words) == 2 else (
+                int(words[3]), int(words[5]))
+            shown = min(len(data) - offset, limit)
+            body = data[offset:offset + shown]
+            if self.bad_range and len(words) > 2:
+                body = b"x" + body[1:]
+            digest = ("0" * 64 if self.bad_header
+                      else hashlib.sha256(data).hexdigest())
+            return (("bytes %d %s\n" % (shown, digest)).encode("ascii")
+                    + body + b"exit 0\n")
+        raise StopCheck(command)
+
+
+def fake_console_session(console, link):
+    operator = console.Operator(read=lambda prompt="": "",
+                                write=lambda line="": None,
+                                sleep=lambda s: None)
+    return console.Session(link, operator, sleep=lambda s: None)
+
+
+def scenario_console_recursive_copy_check_cleans_up(server):
+    """cp -r and rm -r on the console list the copy and remove both paths, pass or fail."""
+    del server  # the fake tree stands in for the console
+
+    import console
+
+    names = [check.__name__ for _title, check in console.CHECKS]
+    assert "check_recursive_copy_and_remove" in names, (
+        "console mode must check that cp -r copies and rm -r removes a tree")
+
+    tree = FakeFileTree()
+    console.check_recursive_copy_and_remove(
+        fake_console_session(console, tree), None)
+    assert tree.paths == set(), (
+        "a passing check must leave no throwaway path, left %r" % tree.paths)
+
+    tree = FakeFileTree(drop_children=True)
+    try:
+        console.check_recursive_copy_and_remove(
+            fake_console_session(console, tree), None)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a copy that drops its entries must fail the check")
+    assert tree.paths == set(), (
+        "a failed check must still remove both throwaway paths, left %r"
+        % tree.paths)
+
+
+def scenario_console_read_check_matches_cat(server):
+    """read's whole and range answers match cat and the header's size and hash."""
+    del server  # the fake console stands in for the agent port
+
+    import console
+
+    names = [check.__name__ for _title, check in console.CHECKS]
+    assert "check_read_matches_cat" in names, (
+        "console mode must check that read answers the bytes cat returns")
+
+    def context_for(data):
+        context = console.Context(host="192.0.2.1", port=console.PORT,
+                                  token="0" * 32, workdir="/nonexistent",
+                                  cc=["prospero-clang"],
+                                  document="quick-start.md")
+        context.build = lambda label: data
+        return context
+
+    data = b"\x7fELF runnable " + b"read" * 8
+    console.check_read_matches_cat(
+        fake_console_session(console, FakeBuildConsole()), context_for(data))
+
+    for faulty in (FakeBuildConsole(bad_header=True),
+                   FakeBuildConsole(bad_range=True)):
+        try:
+            console.check_read_matches_cat(
+                fake_console_session(console, faulty), context_for(data))
+        except AssertionError:
+            continue
+        raise AssertionError(
+            "a read that does not match cat must fail the check")
 
 
 def scenario_console_gated_asks_wait_out_busy(server):
@@ -9588,6 +9772,11 @@ SCENARIOS = [
      scenario_console_stale_check_installs_both_names, None),
     ("console mode's audit check allows appended lines and refuses a removed "
      "one", scenario_console_audit_check_allows_appended_lines, None),
+    ("console mode's cp -r and rm -r check lists the copy and removes both "
+     "throwaway paths, pass or fail", scenario_console_recursive_copy_check_cleans_up,
+     None),
+    ("console mode's read check matches cat and the header's size and hash",
+     scenario_console_read_check_matches_cat, None),
     ("a crash in prepared leaves the old version in payload list after restart",
      scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
     ("a crash in committed leaves the new version in payload list after restart",
