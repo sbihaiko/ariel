@@ -397,29 +397,64 @@ and for the removal, `command=rmdir` with `option.kind=dir`, `option.dev=6879311
 
 ## Network spike: the three probes on firmware 11.20
 
-The runbook is [network-spike.md](network-spike.md). `network-spike.elf` runs three probes in order, from the least to the most risky: the interface list, the socket tables, and one ICMP echo to the loopback address. Each probe is run alone with the selector, or all three together.
-
-**Every cell below that needs a console is pending owner-present execution.** No run of this payload has been made on a console, and nothing in these tables was measured. The owner fills them from `/data/network-spike.log` at the console, following section 6 of the runbook.
+The runbook is [network-spike.md](network-spike.md). `network-spike.elf` ran on 2026-10-25 on the CFI-2014 at 192.168.68.74, firmware 11.20, built from `32bc510` (sha256 `1efcca6af3e824c06be84be762b0c40fe646b68e3fa1e723347ca30fb2bb43f8`), with no selector file, so all three probes ran in order. The console stayed responsive and no probe froze it. The payload ran as euid 0 with uid 1, gid 1, egid 1.
 
 Each outcome is one of: `read` (the call returned the fact), `refused` (the call returned an error, with the errno it set), or `froze` (the log's last line is an `intent` line with no `result` line after it, and the console stopped responding).
 
 | probe | call | socket family | effective user | outcome | error codes seen |
 | --- | --- | --- | --- | --- | --- |
-| 1 interfaces | `sysctl` with mib `CTL_NET`, `PF_ROUTE`, `0`, `0`, `NET_RT_IFLIST`, `0`: a size query, then a read | `PF_ROUTE` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
-| 2 sockets, TCP | `sysctlbyname("net.inet.tcp.pcblist")`: a size query, then a read | `AF_INET` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
-| 2 sockets, UDP | `sysctlbyname("net.inet.udp.pcblist")`: a size query, then a read | `AF_INET` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
-| 3 echo | `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`, `sendto` to `127.0.0.1`, `recvfrom` with a 2-second deadline and up to 8 reads | `AF_INET` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
+| 1 interfaces | `sysctl` with mib `4.17.0.0.3.0` (`CTL_NET`, `PF_ROUTE`, `0`, `0`, `NET_RT_IFLIST`, `0`): a size query, then a read | `PF_ROUTE` | euid 0, uid 1, gid 1 | **read**: 1408 bytes, 4 interfaces, 5 addresses | none |
+| 2 sockets, TCP | `sysctlbyname("net.inet.tcp.pcblist")`: a size query, then a read | `AF_INET` | euid 0, uid 1, gid 1 | **refused** on the size query | errno 2, `No such file or directory` |
+| 2 sockets, UDP | `sysctlbyname("net.inet.udp.pcblist")`: a size query, then a read | `AF_INET` | euid 0, uid 1, gid 1 | **refused** on the size query | errno 2, `No such file or directory` |
+| 3 echo | `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`, `sendto` to `127.0.0.1`, `recvfrom` with a 2-second deadline and up to 8 reads | `AF_INET` | euid 0, uid 1, gid 1 | **read**: socket fd 16, 16 bytes sent, one reply of 36 bytes with ICMP type 0 | none |
 
 ### Transcripts
 
 Each probe's transcript is the set of its lines from `/data/network-spike.log`, copied from the console, from the probe's `effective user` line to its `result` line or its last `intent` line.
 
-- **Probe 1, interfaces:** pending owner-present execution.
-- **Probe 2, sockets:** pending owner-present execution.
-- **Probe 3, echo:** pending owner-present execution.
+**Probe 1, interfaces:**
+
+```text
+20:56:39 interfaces: effective user euid 0 (uid 1, gid 1, egid 1)
+20:56:39 interfaces: intent sysctl mib 4.17.0.0.3.0, family PF_ROUTE (17), size query
+20:56:39 interfaces: intent sysctl mib 4.17.0.0.3.0, read 1408 bytes
+20:56:39 interfaces: interface index 1 flags 0x40108842
+20:56:39 interfaces: interface index 2 flags 0x40108049
+20:56:39 interfaces: interface index 3 flags 0x49108843
+20:56:39 interfaces: interface index 4 flags 0x50108802
+20:56:39 interfaces: result read, 1408 bytes, 4 interfaces, 5 addresses
+```
+
+**Probe 2, sockets:**
+
+```text
+20:56:39 sockets: effective user euid 0 (uid 1, gid 1, egid 1)
+20:56:39 sockets: intent sysctlbyname(net.inet.tcp.pcblist), family AF_INET (2), size query
+20:56:39 sockets: result refused, net.inet.tcp.pcblist errno 2 (No such file or directory)
+20:56:39 sockets: intent sysctlbyname(net.inet.udp.pcblist), family AF_INET (2), size query
+20:56:39 sockets: result refused, net.inet.udp.pcblist errno 2 (No such file or directory)
+```
+
+**Probe 3, echo:**
+
+```text
+20:56:39 echo: effective user euid 0 (uid 1, gid 1, egid 1)
+20:56:39 echo: intent socket(AF_INET 2, SOCK_RAW 3, IPPROTO_ICMP 1)
+20:56:39 echo: result read, socket fd 16
+20:56:39 echo: intent sendto 127.0.0.1, ICMP echo request id 113 seq 1, 16 bytes
+20:56:39 echo: result read, sendto 16 bytes
+20:56:39 echo: intent recvfrom, wait 2000 ms, read 1 of 8
+20:56:39 echo: result read, echo reply from 127.0.0.1, icmp type 0 id 113, 36 bytes
+```
 
 ### Run record
 
 | firmware | model | selector used | console survived the run | last line of the log | owner |
 | --- | --- | --- | --- | --- | --- |
-| 11.20 | pending owner-present execution | pending owner-present execution | pending owner-present execution | pending owner-present execution | pending owner-present execution |
+| 11.20 | CFI-2014 | none, so all three probes ran | yes, no freeze | `network spike end, failures 2` | away; the Fable proxy for the owner approved the run |
+
+### What the probes answered
+
+- **The interface list can be read.** `ifconfig` has its fact on this firmware, through `PF_ROUTE` and `NET_RT_IFLIST`, and the payload needs no privilege beyond the one it already has.
+- **The ICMP echo works.** A raw ICMP socket opens and a loopback echo comes back, so `ping` has its fact too, and the console's network stack answered without the packet leaving the console.
+- **The socket tables are not exposed under the FreeBSD names.** Both `pcblist` names answer errno 2 before any read, which is the kernel saying the node does not exist rather than refusing the read. `netstat` therefore has no proven fact yet; what it answers, if it is built at all, follows the decision recorded on [#114](https://github.com/sbihaiko/ariel/issues/114).
