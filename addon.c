@@ -524,6 +524,10 @@ watch(platform_t *platform, pid_t pid, uint64_t deadline, int from, int to) {
       return ADDON_FAILED;
     }
     got = platform->spawn_poll(platform, pid, &status);
+    if(got < 0) {
+      stop_and_reap(platform, pid);
+      return ADDON_FAILED;
+    }
     if(got) {
       break;
     }
@@ -538,7 +542,7 @@ watch(platform_t *platform, pid_t pid, uint64_t deadline, int from, int to) {
   if(pumped == PUMP_BIG) {
     return ADDON_TOO_LARGE;
   }
-  if(pumped == PUMP_FAILED || got < 0 || status != 0) {
+  if(pumped == PUMP_FAILED || status != 0) {
     return ADDON_FAILED;
   }
   return ADDON_RAN;
@@ -620,7 +624,10 @@ addon_run(platform_t *platform, const char *name, int argc,
     goto done;
   }
   created = 1;
-  if(pipe(pipefd) || fcntl(pipefd[0], F_SETFL, O_NONBLOCK)) {
+  if(fcntl(opened, F_SETFD, FD_CLOEXEC) || pipe(pipefd) ||
+     fcntl(pipefd[0], F_SETFL, O_NONBLOCK) ||
+     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) ||
+     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC)) {
     goto done;
   }
 

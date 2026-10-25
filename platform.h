@@ -233,8 +233,7 @@ struct platform {
 
   /**
    * Start a payload as spawn_start does, but with an empty environment: it
-   * gets argv and outfd and nothing else from Ariel. The console's loader
-   * passes no environment, so there both starts are the same.
+   * gets argv and outfd and nothing else of Ariel's environment.
    **/
   int (*spawn_start_isolated)(platform_t *self, const unsigned char *bytes,
                               size_t size, char *const argv[], int outfd,

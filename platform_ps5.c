@@ -257,15 +257,20 @@ platform_ps5_loader_unlock(void) {
 
 
 static int
-ps5_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
-                char *const argv[], int outfd, pid_t *pid) {
-  (void)self;
-  (void)size;
+ps5_start(const unsigned char *bytes, char *const argv[], int outfd,
+          int isolated, pid_t *pid) {
+  char *const no_env[] = {NULL};
 
   // The loader only reads the bytes; the store holds the verified object
   // in memory, so nothing is loaded from a path.
   platform_ps5_loader_lock();
-  *pid = elfldr_spawn(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv);
+  if(isolated) {
+    // The payload starts at the root, not at Ariel's working directory.
+    *pid = elfldr_spawn_env(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv,
+                            (char**)no_env, "/");
+  } else {
+    *pid = elfldr_spawn(-1, outfd, outfd, (uint8_t*)bytes, (char**)argv);
+  }
   platform_ps5_loader_unlock();
 
   if(*pid < 0) {
@@ -274,6 +279,27 @@ ps5_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
   }
 
   return 0;
+}
+
+
+static int
+ps5_spawn_start(platform_t *self, const unsigned char *bytes, size_t size,
+                char *const argv[], int outfd, pid_t *pid) {
+  (void)self;
+  (void)size;
+
+  return ps5_start(bytes, argv, outfd, 0, pid);
+}
+
+
+static int
+ps5_spawn_start_isolated(platform_t *self, const unsigned char *bytes,
+                         size_t size, char *const argv[], int outfd,
+                         pid_t *pid) {
+  (void)self;
+  (void)size;
+
+  return ps5_start(bytes, argv, outfd, 1, pid);
 }
 
 
@@ -595,7 +621,7 @@ static platform_t ps5_platform = {
   .approval_grant = ps5_approval_grant,
   .spawn = ps5_spawn,
   .spawn_start = ps5_spawn_start,
-  .spawn_start_isolated = ps5_spawn_start,
+  .spawn_start_isolated = ps5_spawn_start_isolated,
   .spawn_poll = ps5_spawn_poll,
   .spawn_kill = ps5_spawn_kill,
   .http_get = ps5_http_get,

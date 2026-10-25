@@ -25,6 +25,14 @@ along with this program; see the file COPYING. If not, see
 pid_t elfldr_spawn(int stdin_fd, int stdout_fd, int stderr_fd,
 		   uint8_t *elf, char* argv[]);
 
+/**
+ * Spawn a new process with the environment envp and the working directory
+ * cwd, instead of Ariel's own.
+ **/
+pid_t elfldr_spawn_env(int stdin_fd, int stdout_fd, int stderr_fd,
+		       uint8_t *elf, char* argv[], char* envp[],
+		       const char* cwd);
+
 
 /**
  * Execute an ELF inside the process with the given pid.
