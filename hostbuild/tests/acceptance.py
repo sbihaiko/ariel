@@ -13180,8 +13180,8 @@ def scenario_ftp_refuses_a_directory_link_out_of_the_roots(server):
 
         put = ftp_grant(server, "ftp-put", sha["ftp-put"],
                         ["/up/escaped.bin", "/data/escape/secret.bin"], fake.port)
-        assert run_command(server, put) == ["bad_path", "exit 1"], (
-            "an ftp-put through a link out of the roots must answer bad_path and exit 1")
+        assert_failed_run_keeps_output(
+            server, "ftp-put", run_command(server, put), "bad_path")
         assert "STOR" not in [verb for verb, _ in fake.log], "a refused ftp-put must not send"
         assert "/up/escaped.bin" not in fake.files, "a refused ftp-put must write nothing remotely"
         with open(secret, "rb") as handle:
@@ -13189,8 +13189,8 @@ def scenario_ftp_refuses_a_directory_link_out_of_the_roots(server):
 
         get = ftp_grant(server, "ftp-get", sha["ftp-get"],
                         ["/up/secret.bin", "/data/escape/fetched.bin"], fake.port)
-        assert run_command(server, get) == ["bad_path", "exit 1"], (
-            "an ftp-get through a link out of the roots must answer bad_path and exit 1")
+        assert_failed_run_keeps_output(
+            server, "ftp-get", run_command(server, get), "bad_path")
         assert not os.path.lexists(os.path.join(outside, "fetched.bin")), (
             "a refused ftp-get must create no file outside the roots")
         assert "RETR" not in [verb for verb, _ in fake.log], "a refused ftp-get must not receive"
@@ -13282,8 +13282,8 @@ def scenario_ftp_moves_bytes_under_usb_mounts(server):
 
         leave = ftp_grant(server, "ftp-put", sha["ftp-put"],
                           ["/up/x.bin", "/mnt/usb1/secret.bin"], fake.port)
-        assert run_command(server, leave) == ["bad_path", "exit 1"], (
-            "a /mnt/usb<name> mount link that leaves the roots must answer bad_path")
+        assert_failed_run_keeps_output(
+            server, "ftp-put", run_command(server, leave), "bad_path")
         assert "/up/x.bin" not in fake.files, "a refused ftp-put must write nothing remotely"
     finally:
         fake.close()
