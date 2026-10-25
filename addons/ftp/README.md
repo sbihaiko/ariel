@@ -8,15 +8,27 @@ and the server before anything moves.
 
 ## Installing
 
-Each addon directory holds the same ELF, the manifest, and a `server` file:
+`make addon-ftp` builds `addons/ftp/ftp.elf`. Each addon directory holds that
+same ELF under the name Ariel runs, `elf`, the manifest, and a `server` file:
 
 ```
-/data/ariel/addons/ftp-get/ftp-get.elf
+/data/ariel/addons/ftp-get/elf
 /data/ariel/addons/ftp-get/manifest
 /data/ariel/addons/ftp-get/server
 ```
 
-The `server` file is one line, `HOST:PORT`, such as `192.168.1.20:2121`. The
+Each manifest names its own directory and the argument count the command table
+below gives, for example:
+
+```
+name ftp-get
+args 2-2
+abi 1
+platform ps5
+```
+
+`ftp-ls` and `ftp-rm` take one argument, `ftp-put` and `ftp-get` take two. The
+`server` file is one line, `HOST:PORT`, such as `192.168.1.20:2121`. The
 owner sets it. The agent cannot change it, and the command line never names a
 host or a port. Ariel reads the same file to write the server into the
 canonical action the owner signs. The addon reads it again itself.

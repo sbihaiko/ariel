@@ -129,7 +129,7 @@ An **addon** is an ELF and a manifest, and it runs in a process of its own ([ADR
 - The process is the isolation, and it is bounded on three sides: a timeout, an output cap and a kill. An addon that crashes, hangs or floods costs a refusal, not a reboot.
 - A manifest that names another ABI version or another platform is refused before the owner is asked.
 
-The how-to, with every manifest field, the process contract and the bounds, is [docs/addons.md](docs/addons.md). Its reference addon is [`addons/sight/`](addons/sight/).
+The how-to, with every manifest field, the process contract and the bounds, is [docs/addons.md](docs/addons.md). The repository holds two addons. [`addons/sight/`](addons/sight/) is the reference: it is the worked example every section of the how-to points at, and `make addon-sight` builds it once the capture path exists. [`addons/ftp/`](addons/ftp/) is the first addon that does work rather than refuse: one program built once and installed under four names, which moves files through the console's ftpsrv behind the one gate ([its page](addons/ftp/README.md)). Neither is part of `make all`.
 
 The first addon is the screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)):
 

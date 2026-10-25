@@ -134,10 +134,19 @@ addon-sight: addons/sight/sight.elf
 addons/sight/sight.elf: addons/sight/sight.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: addon-sight
+# The ftp addon moves files through the console's ftpsrv. It is one program,
+# built once and installed under four names, and it shares the payload's
+# protected-path checks, so it links protected.c. Built on request and never
+# part of all, the same as the reference addon.
+addon-ftp: addons/ftp/ftp.elf
+
+addons/ftp/ftp.elf: addons/ftp/ftp.c protected.c protected.h
+	$(CC) $(CFLAGS) -Wextra -O2 -I. -o $@ addons/ftp/ftp.c protected.c
+
+.PHONY: addon-sight addon-ftp
 
 clean:
-	rm -f *.o *.elf addons/sight/*.elf
+	rm -f *.o *.elf addons/sight/*.elf addons/ftp/*.elf
 
 test: shsrv-ps5.elf
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
