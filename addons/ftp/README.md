@@ -60,8 +60,10 @@ timeout (10 seconds), the 64 KiB output cap and the kill apply to every run.
 ## Safety
 
 - Every remote path is checked against protected.c as root+path and as
-  root+`/data`+path, following links. The ftpsrv root mapping (`/` or `/data`)
-  is not confirmed on a console, so both are checked.
+  root+`/data`+path, following links. ftpsrv's root was measured as `/` on a
+  console on 2026-10-25 ([console findings](../../docs/console-findings.md)),
+  so the first check is the one that fires; the second stays as a guard,
+  because the root belongs to ftpsrv and the addon must not depend on it.
 - Every local path is checked the same way. `ftp-put` checks the open source
   file with `protected_object`, so a hard link to protected state is refused.
 - `ftp-get` creates its local file with `O_EXCL | O_NOFOLLOW`. A failed download
