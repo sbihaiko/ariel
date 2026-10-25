@@ -1996,16 +1996,20 @@ addon_path_protected(const char *root, const char *path) {
 }
 
 
-/** A failed addon run answers its word, its kept output and exit 1. **/
+/**
+ * A failed addon run answers its word, its kept output and its exit code.
+ * Every failure exits 1, except a path that names protected state, which
+ * keeps the 87 that word answers everywhere else.
+ **/
 static void
 addon_failure(int fd, const char *name, const char *id, const char *word,
-              const char *result) {
+              const char *result, int code) {
   char text[PATH_MAX + 64];
 
   if(result[0]) {
-    snprintf(text, sizeof(text), "%s\nresult %s\nexit 1\n", word, result);
+    snprintf(text, sizeof(text), "%s\nresult %s\nexit %d\n", word, result, code);
   } else {
-    snprintf(text, sizeof(text), "%s\nexit 1\n", word);
+    snprintf(text, sizeof(text), "%s\nexit %d\n", word, code);
   }
   audit_reply(fd, "addon", "failed", name, id, text);
 }
@@ -2063,22 +2067,22 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     write_all(fd, text, (size_t)len);
     return;
   case ADDON_TIMED_OUT:
-    addon_failure(fd, argv[2], challenge.id, "timed_out", result);
+    addon_failure(fd, argv[2], challenge.id, "timed_out", result, 1);
     return;
   case ADDON_TOO_LARGE:
-    addon_failure(fd, argv[2], challenge.id, "too_large", result);
+    addon_failure(fd, argv[2], challenge.id, "too_large", result, 1);
     return;
   case ADDON_PROTECTED:
-    addon_failure(fd, argv[2], challenge.id, "protected", result);
+    addon_failure(fd, argv[2], challenge.id, "protected", result, 87);
     return;
   case ADDON_BAD_PATH:
-    addon_failure(fd, argv[2], challenge.id, "bad_path", result);
+    addon_failure(fd, argv[2], challenge.id, "bad_path", result, 1);
     return;
   case ADDON_SPAWN_FAILED:
-    addon_failure(fd, argv[2], challenge.id, "spawn_failed", result);
+    addon_failure(fd, argv[2], challenge.id, "spawn_failed", result, 1);
     return;
   default:
-    addon_failure(fd, argv[2], challenge.id, "operation_failed", result);
+    addon_failure(fd, argv[2], challenge.id, "operation_failed", result, 1);
     return;
   }
 }
