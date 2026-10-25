@@ -128,6 +128,8 @@ An **addon** is an ELF and a manifest, and it runs in a process of its own ([ADR
 - The process is the isolation, and it is bounded on three sides: a timeout, an output cap and a kill. An addon that crashes, hangs or floods costs a refusal, not a reboot.
 - A manifest that names another ABI version or another platform is refused before the owner is asked.
 
+The how-to, with every manifest field, the process contract and the bounds, is [docs/addons.md](docs/addons.md). Its reference addon is [`addons/sight/`](addons/sight/).
+
 The first addon is the screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)):
 
 - One capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash.
