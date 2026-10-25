@@ -12540,7 +12540,7 @@ SCENARIOS.extend(ADDON_GATE_SCENARIOS)
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 FTP_OPERATIONS = {"ftp-ls": "1-1", "ftp-get": "2-2", "ftp-put": "2-2", "ftp-rm": "1-1"}
-FTP_ELF = {}
+FTP_BINARIES = {}
 
 
 class FakeFtp:
@@ -12651,9 +12651,9 @@ class FakeFtp:
         return None
 
 
-def ftp_addon_elf(server):
+def ftp_addon_binary(server):
     """The ftp addon built with the host compiler for this server's root."""
-    if server.root not in FTP_ELF:
+    if server.root not in FTP_BINARIES:
         workdir = tempfile.mkdtemp(prefix="ariel-ftp-")
         binary = os.path.join(workdir, "ftp")
         subprocess.run(
@@ -12662,9 +12662,19 @@ def ftp_addon_elf(server):
              os.path.join(REPO, "addons", "ftp", "ftp.c"),
              os.path.join(REPO, "protected.c"), "-o", binary],
             check=True)
-        with open(binary, "rb") as handle:
-            FTP_ELF[server.root] = handle.read()
-    return FTP_ELF[server.root]
+        FTP_BINARIES[server.root] = binary
+    return FTP_BINARIES[server.root]
+
+
+def ftp_addon_elf(server):
+    with open(ftp_addon_binary(server), "rb") as handle:
+        return handle.read()
+
+
+def ftp_direct(server, name, args):
+    """Run the ftp addon's own binary as name, outside Ariel's gate, and return its exit status."""
+    return subprocess.run([name] + args, executable=ftp_addon_binary(server),
+                          capture_output=True, timeout=10, env={}).returncode
 
 
 def install_ftp_addon(server, name, port):
@@ -12678,12 +12688,19 @@ def install_ftp_addon(server, name, port):
     return hashlib.sha256(manifest.encode("ascii")).hexdigest()
 
 
+def ftp_option(index, arg):
+    """The canonical option for one argument: its text, or its SHA-256 when it is longer than a value."""
+    if len(arg) > 64:
+        return "option.arg%d_sha256=%s" % (index, hashlib.sha256(arg.encode("ascii")).hexdigest())
+    return "option.arg%d=%s" % (index, arg)
+
+
 def ftp_request(server, name, sha, args, port):
     """Request one ftp addon run and check the owner's question names its paths and server."""
     command = "addon run %s %s" % (name, " ".join("'%s'" % arg for arg in args))
     expected = (["command=addon", "target=%s" % name, "sha256=%s" % sha,
                  "option.argc=%d" % len(args), "option.server=127.0.0.1:%d" % port]
-                + ["option.arg%d=%s" % (i, arg) for i, arg in enumerate(args)])
+                + [ftp_option(i, arg) for i, arg in enumerate(args)])
     approval, challenge = gated_request(server, command, expected,
                                         "addon %s will run" % name)
     return command, approval, challenge
@@ -12713,10 +12730,28 @@ FTP_ASKS_TITLE = ("an ftp addon asks the owner with its remote path, local path 
                   "server, runs once after the signature, and is not run again")
 FTP_ROUND_TRIP_TITLE = ("ftp put, get, ls and rm move a file with a space in its name "
                         "through the one gate, and the bytes come back identical")
-FTP_PROTECTED_TITLE = ("an ftp addon refuses a remote or local path that names Ariel's "
-                       "state, through a link too, and does not ask the owner")
-FTP_LINK_TITLE = ("an ftp addon refuses a path that a link came to name after the "
-                  "owner was asked, and creates no local file")
+FTP_PROTECTED_TITLE = ("Ariel's pre-gate check refuses a remote or local path that names "
+                       "Ariel's state, through a link too, and does not ask the owner")
+FTP_LINK_TITLE = ("Ariel's pre-gate check refuses a path that a link came to name after "
+                  "the owner was asked, and creates no local file")
+FTP_ADDON_CHECK_TITLE = ("the ftp addon's own check refuses a remote or local path that "
+                         "names Ariel's state with exit 87, and reaches no server")
+FTP_SYMLINK_TITLE = ("the ftp addon refuses a local path through a linked directory that "
+                     "leaves /data, /user and /mnt/usb*, and creates no file outside them")
+FTP_SERVER_TITLE = ("the ftp addon refuses a server argument that its server file does "
+                    "not name, and connects to neither server")
+FTP_LONG_TITLE = ("ftp put and get carry a 198-byte path through hashed arguments, and "
+                  "the bytes come back identical")
+FTP_TOO_LONG_TITLE = ("an addon argument over 255 bytes is refused as bad_path before "
+                      "the owner is asked")
+FTP_LITERAL_TITLE = ("a literal 64-hex argument does not match a signed hashed argument "
+                     "with the same digest, and the owner is asked again")
+ADDON_EXIT_PROTECTED_TITLE = ("an addon that exits 87 answers protected with exit 87 and "
+                              "is audited as addon.failed")
+FTP_LONG_REMOTE = "/up/" + "r" * 190 + ".bin"
+FTP_LONG_LOCAL = "/data/" + "l" * 190 + ".bin"
+PROTECTED_EXIT_SOURCE = ("int main(int argc, char **argv) "
+                         "{ (void)argc; (void)argv; return 87; }")
 FTP_ROOTS_TITLE = ("an ftp addon refuses a local path outside /data, /user and "
                    "/mnt/usb*, and never overwrites a local file")
 FTP_STALL_TITLE = ("an ftp addon whose server never answers is cut by the loader's "
@@ -12891,11 +12926,158 @@ def scenario_ftp_stalled_server_is_cut(server):
         cleanup_addon(server, "ftp-ls")
 
 
+def scenario_ftp_addon_checks_its_own_paths(server):
+    fake = FakeFtp()
+    fake.files["/up/x"] = b"remote"
+    server_arg = "127.0.0.1:%d" % fake.port
+    token = ftp_local(server, "/data/ariel/token")
+    with open(token, "rb") as handle:
+        token_before = handle.read()
+    try:
+        assert ftp_direct(server, "ftp-get", [server_arg, "/data/ariel/token",
+                                              "/data/direct-out.txt"]) == 87, (
+            "a remote path that names Ariel's state must exit 87 from the addon's own check")
+        assert ftp_direct(server, "ftp-get", [server_arg, "/up/x",
+                                              "/data/ariel/token"]) == 87, (
+            "a local path that names Ariel's state must exit 87 from the addon's own check")
+        assert not os.path.lexists(ftp_local(server, "/data/direct-out.txt")), (
+            "a remote path refused by the addon must create no local file")
+        with open(token, "rb") as handle:
+            assert handle.read() == token_before, (
+                "a local path refused by the addon must leave Ariel's state as it was")
+        assert fake.log == [] and not fake.accepted.is_set(), (
+            "a path refused by the addon must not reach the server")
+    finally:
+        fake.close()
+
+
+def scenario_ftp_addon_refuses_a_linked_local_directory(server):
+    fake = FakeFtp()
+    fake.files["/up/x"] = b"x"
+    outside = tempfile.mkdtemp(prefix="ariel-ftp-escape-")
+    link = ftp_local(server, "/data/escape-dir")
+    leak = os.path.join(outside, "leak.txt")
+    try:
+        make_link(link, outside, hard=False)
+        assert ftp_direct(server, "ftp-get", ["127.0.0.1:%d" % fake.port, "/up/x",
+                                              "/data/escape-dir/leak.txt"]) == 3, (
+            "a local path through a linked directory must exit 3, bad_path")
+        assert not os.path.lexists(leak), (
+            "a local path through a link must create no file outside the roots")
+        assert fake.log == [], "a local path refused by the addon must not reach the server"
+    finally:
+        fake.close()
+        if os.path.lexists(link):
+            os.remove(link)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def scenario_ftp_addon_refuses_a_server_its_file_does_not_name(server):
+    fake = FakeFtp()
+    other = FakeFtp()
+    try:
+        install_ftp_addon(server, "ftp-ls", fake.port)
+        assert ftp_direct(server, "ftp-ls", ["127.0.0.1:%d" % other.port, "/up"]) == 1, (
+            "a server argument that the server file does not name must exit 1")
+        assert not fake.accepted.is_set() and not other.accepted.is_set(), (
+            "a disagreeing server must not be connected to")
+    finally:
+        fake.close()
+        other.close()
+        cleanup_addon(server, "ftp-ls")
+
+
+def scenario_ftp_carries_a_long_path_through_hashed_arguments(server):
+    fake = FakeFtp()
+    names = ["ftp-put", "ftp-get"]
+    payload = b"long path bytes\n"
+    try:
+        sha = {name: install_ftp_addon(server, name, fake.port) for name in names}
+        with open(ftp_local(server, "/data/long src.bin"), "wb") as handle:
+            handle.write(payload)
+        put = ftp_grant(server, "ftp-put", sha["ftp-put"],
+                        [FTP_LONG_REMOTE, "/data/long src.bin"], fake.port)
+        ftp_result(server, run_command(server, put))
+        assert fake.files.get(FTP_LONG_REMOTE) == payload, (
+            "ftp-put must store the bytes under the long remote path")
+        get = ftp_grant(server, "ftp-get", sha["ftp-get"], [FTP_LONG_REMOTE, FTP_LONG_LOCAL],
+                        fake.port)
+        ftp_result(server, run_command(server, get))
+        with open(ftp_local(server, FTP_LONG_LOCAL), "rb") as handle:
+            assert handle.read() == payload, "ftp-get must return the bytes byte for byte"
+    finally:
+        fake.close()
+        for name in names:
+            cleanup_addon(server, name)
+        for leftover in ("/data/long src.bin", FTP_LONG_LOCAL):
+            if os.path.lexists(ftp_local(server, leftover)):
+                os.remove(ftp_local(server, leftover))
+
+
+def scenario_ftp_refuses_an_argument_longer_than_the_addon_takes(server):
+    fake = FakeFtp()
+    try:
+        install_ftp_addon(server, "ftp-get", fake.port)
+        too_long = "/up/" + "x" * 252
+        assert run_command(server, "addon run ftp-get '%s' '/data/long-out.txt'" % too_long) == [
+            "bad_path", "exit 1"], "an argument of 256 bytes must answer bad_path and exit 1"
+        line = server.next_line(timeout=0.2)
+        assert not (line or "").startswith("prompt"), (
+            "an argument the addon cannot take must not ask the owner, got %r" % line)
+        assert fake.log == [], "a refused argument must not reach the server"
+    finally:
+        fake.close()
+        cleanup_addon(server, "ftp-get")
+
+
+def scenario_ftp_keeps_a_literal_digest_apart_from_a_hashed_argument(server):
+    fake = FakeFtp()
+    try:
+        sha = install_ftp_addon(server, "ftp-get", fake.port)
+        digest = hashlib.sha256(FTP_LONG_REMOTE.encode("ascii")).hexdigest()
+        _command, approval, challenge = ftp_request(
+            server, "ftp-get", sha, [FTP_LONG_REMOTE, "/data/lit-out.txt"], fake.port)
+        sign_and_grant(server, approval, challenge)
+        assert_asks_again(server, "addon run ftp-get '%s' '/data/lit-out.txt'" % digest)
+        assert fake.log == [], "a literal digest must not run the signed hashed argument"
+        assert not os.path.lexists(ftp_local(server, "/data/lit-out.txt")), (
+            "a run the owner did not sign must create no local file")
+    finally:
+        fake.close()
+        cleanup_addon(server, "ftp-get")
+
+
+def scenario_addon_exit_87_is_protected(server):
+    manifest_sha = addon_runner(server, "guarded", PROTECTED_EXIT_SOURCE)
+    try:
+        approval, challenge = addon_run_request(server, "guarded", manifest_sha, ["one"])
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, "addon run guarded one")
+        assert lines == ["protected", "exit 87"], (
+            "an addon that exits 87 must answer protected with exit 87, got %r" % lines)
+        assert ("addon.failed", "guarded") in addon_events(server, "guarded"), (
+            "an addon that exits 87 must be audited as addon.failed, got %r"
+            % addon_events(server, "guarded"))
+    finally:
+        cleanup_addon(server, "guarded")
+
+
 FTP_SCENARIOS = [
     (FTP_ASKS_TITLE, scenario_ftp_asks_then_runs_once, HOST_ROOT_REASON),
     (FTP_ROUND_TRIP_TITLE, scenario_ftp_round_trip_keeps_bytes, HOST_ROOT_REASON),
     (FTP_PROTECTED_TITLE, scenario_ftp_refuses_ariel_state_before_asking, HOST_ROOT_REASON),
     (FTP_LINK_TITLE, scenario_ftp_refuses_a_link_swapped_after_the_ask, HOST_ROOT_REASON),
+    (FTP_ADDON_CHECK_TITLE, scenario_ftp_addon_checks_its_own_paths, HOST_ROOT_REASON),
+    (FTP_SYMLINK_TITLE, scenario_ftp_addon_refuses_a_linked_local_directory, HOST_ROOT_REASON),
+    (FTP_SERVER_TITLE, scenario_ftp_addon_refuses_a_server_its_file_does_not_name,
+     HOST_ROOT_REASON),
+    (FTP_LONG_TITLE, scenario_ftp_carries_a_long_path_through_hashed_arguments,
+     HOST_ROOT_REASON),
+    (FTP_TOO_LONG_TITLE, scenario_ftp_refuses_an_argument_longer_than_the_addon_takes,
+     HOST_ROOT_REASON),
+    (FTP_LITERAL_TITLE, scenario_ftp_keeps_a_literal_digest_apart_from_a_hashed_argument,
+     HOST_ROOT_REASON),
+    (ADDON_EXIT_PROTECTED_TITLE, scenario_addon_exit_87_is_protected, HOST_ROOT_REASON),
     (FTP_ROOTS_TITLE, scenario_ftp_refuses_local_paths_outside_roots, HOST_ROOT_REASON),
     (FTP_STALL_TITLE, scenario_ftp_stalled_server_is_cut, HOST_ROOT_REASON),
 ]
