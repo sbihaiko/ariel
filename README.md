@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** Stages 1 to 3 are done, with their console runs on firmware 11.20. Stage 4 is in progress; Stages 5 and 6 have not started. See [Progress](#progress).
+> **Status:** Stages 1 to 3 are done, with their console runs on firmware 11.20. Stage 4 is delivered, except the two parts that need a console in hand: the screenshot addon ([#53](https://github.com/sbihaiko/ariel/issues/53)) and the ftp round trip ([#89](https://github.com/sbihaiko/ariel/issues/89)). Stages 5 and 6 have not started. See [Progress](#progress).
 >
 > **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have. The decision is [ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md).
 
@@ -29,8 +29,8 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 |---|---|---|
 | 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Console suite 10/10; the quick start and the telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
 | 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done on 2026-10-24. 37 sub-issues closed; console suite 36/36 and the telnet boundary check passed ([#46](https://github.com/sbihaiko/ariel/issues/46)). |
-| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done. Nine sub-issues closed; 356 host scenarios. |
-| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | In progress on `dev`. |
+| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done. Nine sub-issues closed; the host acceptance suite covers it. |
+| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | ✅ Delivered on `dev` and `master`, except the two parts that need a console in hand: the screenshot addon ([#53](https://github.com/sbihaiko/ariel/issues/53)) and the ftp round trip ([#89](https://github.com/sbihaiko/ariel/issues/89)). |
 | 5. Sessions (optional) | | Not started. |
 | 6. MCP (optional) | | Not started. |
 | 7. Network sight (optional) | [#94](https://github.com/sbihaiko/ariel/issues/94) | Not started; one command, and a console spike gates it. |
@@ -131,7 +131,7 @@ An **addon** is an ELF and a manifest, and it runs in a process of its own ([ADR
 
 The how-to, with every manifest field, the process contract and the bounds, is [docs/addons.md](docs/addons.md). The repository holds two addons. [`addons/sight/`](addons/sight/) is the reference: it is the worked example every section of the how-to points at, and `make addon-sight` builds it once the capture path exists. [`addons/ftp/`](addons/ftp/) is the first addon that does work rather than refuse: one program built once and installed under four names, which moves files through the console's ftpsrv behind the one gate ([its page](addons/ftp/README.md)). Neither is part of `make all`.
 
-The first addon is the screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)):
+The first addon the stage planned is the screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)), which is not built and waits on a console in hand:
 
 - One capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash.
 - The shot lands under `/data`, never in Ariel's protected state directory, and Stage 3's reader returns it under its size limit.
