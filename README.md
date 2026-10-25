@@ -116,7 +116,7 @@ New and extended commands in this stage:
 - Writing files without redirection: `write <path>`, which reads the content from stdin.
 - Missing flags on existing commands: `ls -l -a`, `grep -r -l -c`, more `find` predicates, `rm -r` and `cp -r`.
 - Diagnostics: `date`, `dmesg`, `du`, and a `sysinfo` command that aggregates `uname`, `uptime` and memory. `timeout` was planned here and is not built: the 60 s connection deadline answers `timed_out`, and a health check carries its own bound through `payload config`.
-- Optional, not built: `diff` (`cmp` answers same-or-differ and `hexdump` shows the bytes; a finer comparison is the agent's own work on its own machine), and `ifconfig` and `ping` (the console's address is the one the agent connected to, and a download that fails already answers reachability). `netstat` moved to [Stage 7](#stage-7-optional-network-sight), where it waits on a console spike.
+- Optional, not built: `diff` (`cmp` answers same-or-differ and `hexdump` shows the bytes; a finer comparison is the agent's own work on its own machine), and `ifconfig` and `ping` (the console's address is the one the agent connected to, and a download that fails already answers reachability). `netstat` moved to [Stage 6](#stage-6-optional-network-sight), where it waits on a console spike.
 
 ### Stage 4: addons, and sight as the first one
 
@@ -312,7 +312,7 @@ That is exactly the role of this project. Ariel is the servant that lives on Pro
 
 **Protocols**
 
-- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 6.
+- [Model Context Protocol](https://modelcontextprotocol.io): the standard Ariel will implement in Stage 7.
 
 ## Legal
 
