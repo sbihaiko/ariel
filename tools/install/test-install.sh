@@ -17,6 +17,9 @@ trap 'rm -rf "$work"' EXIT
 
 repo=$work/repo
 mkdir -p "$repo/tools/install" "$repo/hostbuild" "$work/bin"
+# A Makefile and hostbuild/ are how the script knows it is inside the
+# repository and needs no fetch.
+: > "$repo/Makefile"
 cp "$here/ariel.sh" "$repo/tools/install/ariel.sh"
 chmod +x "$repo/tools/install/ariel.sh"
 

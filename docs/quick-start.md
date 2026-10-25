@@ -6,8 +6,17 @@ The headless acceptance suite runs the section "Install and run it" below exactl
 
 ## What you need
 
-- A PS5 running a jailbreak with [elfldr](https://github.com/ps5-payload-dev/elfldr) listening on port 9021.
-- A computer on the same network, with `git`, `make`, `curl`, `nc` and `openssl` (macOS ships `nc` and `openssl`).
+On the console, before anything else:
+
+- **A jailbroken PS5 on firmware 11.20.** Ariel claims no other firmware: every run in this repository happened on a CFI-2014 on 11.20.
+- **[elfldr](https://github.com/ps5-payload-dev/elfldr) running and listening on port 9021 — required.** It is how any payload reaches the console, Ariel included. With 9021 closed there is nothing to send to, and every step below stops there.
+- **[ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) on port 2121 — optional, strongly recommended.** The installer and the tutorial read `/data/ariel/token` through it; without it you read the token on the console's screen and type it in.
+- **[klogsrv](https://github.com/ps5-payload-dev/klogsrv) on port 3232 — optional.** It shows the payload's own output, which is where a start that fails says why.
+
+On the computer:
+
+- `git`, `sh`, `curl` and `nc`. macOS ships `nc` and `curl`; Linux has them or installs them in one line.
+- Either **Docker** (Desktop on macOS and Windows, the daemon on Linux) or the **PS5 payload SDK** with `PS5_PAYLOAD_SDK` set. Docker is the path that installs nothing else; the SDK is the path that builds locally.
 - The console's IP address. The examples put it in `PS5_HOST`; replace it with yours.
 
 ## The fast path: one script

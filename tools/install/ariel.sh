@@ -18,6 +18,34 @@
 set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
+
+# Downloaded on its own, this script is not inside the repository: fetch the
+# source it builds, once, and run from there.
+if [ ! -f "$root/Makefile" ] || [ ! -d "$root/hostbuild" ]; then
+  src=${ARIEL_SRC:-$HOME/.cache/ariel/src}
+  ref=${ARIEL_REF:-master}
+  command -v git >/dev/null 2>&1 || {
+    printf 'ariel: git is needed to fetch the source of Ariel\n' >&2
+    exit 1
+  }
+  if [ -d "$src/.git" ]; then
+    git -C "$src" fetch --quiet --tags origin || {
+      printf 'ariel: cannot fetch %s\n' "$ref" >&2
+      exit 1
+    }
+  else
+    mkdir -p "$(dirname "$src")"
+    git clone --quiet https://github.com/sbihaiko/ariel "$src" || {
+      printf 'ariel: cannot clone the source of Ariel\n' >&2
+      exit 1
+    }
+  fi
+  git -C "$src" checkout --quiet "$ref" || {
+    printf 'ariel: cannot check out %s\n' "$ref" >&2
+    exit 1
+  }
+  exec sh "$src/tools/install/ariel.sh" "$@"
+fi
 keydir=${ARIEL_KEY_DIR:-$HOME/.config/ariel}
 docker=${DOCKER:-docker}
 image=${ARIEL_SDK_IMAGE:-ariel-ps5-sdk}
