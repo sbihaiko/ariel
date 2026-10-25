@@ -12535,6 +12535,43 @@ ADDON_GATE_SCENARIOS = [
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_GATE_SCENARIOS)
 SCENARIOS.extend(ADDON_GATE_SCENARIOS)
 
+SIGHT_REFUSED_TITLE = ("the reference addon's shipped manifest is refused by this build "
+                       "before the owner is asked, and an unknown ABI is named first")
+SIGHT_ADDON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                               "addons", "sight")
+
+
+def scenario_sight_manifest_is_refused_here(server):
+    """The shipped sight manifest names PS5, so this host build refuses it by platform."""
+    with open(os.path.join(SIGHT_ADDON_DIR, "manifest")) as handle:
+        shipped = handle.read()
+    make_addon(server, "sight", shipped)
+    try:
+        assert run_command(server, "addon check sight") == [
+            "addon_refused sight platform", "exit 1"], (
+            "the shipped sight manifest must be refused by platform")
+        assert run_command(server, "addon run sight") == [
+            "addon_refused sight platform", "exit 1"], (
+            "a platform refusal must be answered before the owner is asked")
+        make_addon(server, "sight", shipped.replace("abi 1", "abi 2"))
+        assert run_command(server, "addon run sight") == [
+            "addon_refused sight abi", "exit 1"], (
+            "an addon for another ABI must name abi before platform")
+        server.assert_no_line()
+        assert addon_events(server, "sight") == [
+            ("addon.refused", "sight"), ("addon.refused", "sight")], (
+            "a refused sight run must audit addon.refused and no addon.request, got %r"
+            % addon_events(server, "sight"))
+    finally:
+        drop_addon(server, "sight")
+
+
+SIGHT_SCENARIOS = [
+    (SIGHT_REFUSED_TITLE, scenario_sight_manifest_is_refused_here, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in SIGHT_SCENARIOS)
+SCENARIOS.extend(SIGHT_SCENARIOS)
+
 
 def main():
     argv = sys.argv[1:]
