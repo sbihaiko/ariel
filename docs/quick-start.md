@@ -1,6 +1,6 @@
 # Quick start: a working Ariel in ten minutes
 
-By the end of this you have Ariel running on a jailbroken console, its agent port answering, a payload installed and run end to end, one approval signed offline by the key you hold, and the newest image the console's Create button saved copied out of its gallery. This is the state of the **Stage 4** release: the gate, the store, the readers and `shots` all work. Sessions and the MCP server are later stages and are not part of this build.
+By the end of this you have Ariel running on a jailbroken console, its agent port answering, a payload installed and run end to end, one approval signed offline by the key you hold, and the newest image the console's Create button saved copied out of its gallery. This is the state of the **Stage 5** release: the gate, the store, the readers, `shots` and sessions all work. The MCP server is a later stage and is not part of this build.
 
 The headless acceptance suite runs the section "Install and run it" below exactly as written, against a host build instead of a console: it substitutes the token and the console's address, signs with a test key where you would, and treats IDs and hashes as placeholders. The rest of this page needs a console.
 
@@ -9,6 +9,19 @@ The headless acceptance suite runs the section "Install and run it" below exactl
 - A PS5 running a jailbreak with [elfldr](https://github.com/ps5-payload-dev/elfldr) listening on port 9021.
 - A computer on the same network, with `git`, `make`, `curl`, `nc` and `openssl` (macOS ships `nc` and `openssl`).
 - The console's IP address. The examples put it in `PS5_HOST`; replace it with yours.
+
+## The fast path: one script
+
+Steps 1 to 4 below are what `tools/install/ariel.sh` does for you, and it does them with the two keys you already have or makes them for you:
+
+```console
+$ sh tools/install/ariel.sh <console address> --check   # what it would do, nothing sent
+$ sh tools/install/ariel.sh <console address>           # build and send
+```
+
+On macOS, `tools/install/ariel.command` is the same thing on a double-click; on Windows, run `tools/install/ariel.bat`, which asks for the address and does the same work through PowerShell. With no PS5 SDK on the machine the build runs in a container built from `tools/install/Dockerfile.sdk`, so nothing needs installing by hand; with `PS5_PAYLOAD_SDK` set it builds locally instead.
+
+The script writes `ariel.env` with `PS5_HOST` and `ARIEL_TOKEN` when it finishes, so the rest of this page is copy and paste after `. ./ariel.env`. The steps below stay here because they say what the script does, and because a build you do by hand is one you can read.
 
 ## 1. Install the PS5 payload SDK
 

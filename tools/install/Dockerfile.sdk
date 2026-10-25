@@ -1,0 +1,18 @@
+# The PS5 payload SDK, so an owner needs no toolchain on the machine.
+#
+# tools/install/ariel.sh builds this once and runs the repository's `make`
+# inside it with the owner's two keys in the environment. It stays a build
+# image: nothing here talks to a console.
+FROM ubuntu:24.04
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates clang-18 curl git lld-18 make python3 xxd \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ps5-payload-dev/sdk /tmp/sdk \
+ && make -C /tmp/sdk DESTDIR=/opt/ps5-payload-sdk install \
+ && rm -rf /tmp/sdk
+
+ENV PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+WORKDIR /src

@@ -244,9 +244,17 @@ From Stage 7, MCP tools are also marked as destructive, so the MCP client asks a
 
 ## Quick start
 
-The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a payload installed and run on a console, through the gate, with the owner's key:
+The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a payload installed and run on a console, through the gate, with the owner's key. The short way is one script:
 
-1. Clone the `stage-4` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
+```console
+$ sh tools/install/ariel.sh <console address>
+```
+
+It makes the two keys if they are not there, builds the payload with them pinned (in a container when no PS5 SDK is installed), sends it to port 9021, waits for the agent port, and leaves `ariel.env` holding `PS5_HOST` and `ARIEL_TOKEN`. `tools/install/ariel.command` is the same on a double-click on macOS and `tools/install/ariel.bat` on Windows; `--check` says what it would do and sends nothing.
+
+By hand, it is four steps:
+
+1. Clone the `stage-5` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
 2. Make two keys with `./hostbuild/ariel-sign keygen`: the primary that signs everyday approvals, and a recovery key kept offline.
 3. Build the payload with both public keys pinned: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`.
 4. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
