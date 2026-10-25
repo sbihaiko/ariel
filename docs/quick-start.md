@@ -30,7 +30,7 @@ $ sh tools/install/ariel.sh <console address> --check   # what it would do, noth
 $ sh tools/install/ariel.sh <console address>           # build and send
 ```
 
-On macOS, `tools/install/ariel.command` is the same thing on a double-click; on Windows, run `tools/install/ariel.bat`, which asks for the address and does the same work through PowerShell.
+On macOS, `tools/install/ariel.command` is the same thing on a double-click; on Windows, run `tools/install/ariel.bat`, which asks for the address and does the same work through PowerShell, with the build in Docker Desktop — which must be installed and running there, since the local LLVM route is the one for macOS and Linux.
 
 Where the build happens depends on what the machine has: a local LLVM means a local build (the SDK is fetched for you), otherwise Docker builds it in a container from `tools/install/Dockerfile.sdk`, and with `PS5_PAYLOAD_SDK` already set the SDK is used as it is. `--build` stops after the payload exists, so you can send it yourself; `ARIEL_BUILD=local` or `ARIEL_BUILD=docker` forces one route.
 
