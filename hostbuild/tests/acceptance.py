@@ -9329,17 +9329,40 @@ def nested_path(root, depth, leaf):
     return os.path.join(*parts)
 
 
+def tree_depth_promise():
+    """The depth every walk promises: TREE_DEPTH_MAX in fileops.c and runner.c.
+
+    The guard asserts the figure and reads it from the product, so a walk
+    whose limit moves without this test moving fails the suite: the root is
+    depth 0, so a tree this deep is still walked and one deeper is not.
+    """
+    depths = {}
+    for name in ("fileops.c", "runner.c"):
+        with open(os.path.join(repo_dir(), name)) as handle:
+            found = re.search(r"^#define TREE_DEPTH_MAX +(\d+)$", handle.read(),
+                              re.MULTILINE)
+        assert found, "%s must define TREE_DEPTH_MAX" % name
+        depths[name] = int(found.group(1))
+    assert depths == {"fileops.c": 64, "runner.c": 64}, (
+        "cp -r, rm -r and grep -r must promise the same 64 levels, got %r"
+        % depths)
+    return depths["fileops.c"]
+
+
 def scenario_deep_tree_fits_the_connection_stack(server):
-    """cp -r and rm -r hold a tree as deep as the walk promises, on the thread's stack."""
-    # The depth the walk accepts, mirroring TREE_DEPTH_MAX in fileops.c: the
-    # root is depth 0, so a tree this deep is still walked and one deeper is not.
-    limit = 64
+    """cp -r, rm -r and grep -r hold a tree as deep as the walks promise."""
+    limit = tree_depth_promise()
     ladder = os.path.join(*["d%02d" % i for i in range(limit - 1)])
     deep = make_tree(server, "deep-src", {}, dirs=[ladder])
     leaf = nested_path(os.path.join(server.root, "data", "deep-src"), limit - 1,
                        "bottom.txt")
     with open(leaf, "wb") as handle:
         handle.write(TRANSFER_BYTES)
+    # grep -r walks the same ladder on the same thread's stack, and reaches
+    # the leaf at the bottom of it.
+    assert run_exit_zero(server, "grep -r transfer " + deep) == [
+        leaf + ":transfer bytes"], (
+        "grep -r must find the leaf at the bottom of a deep tree")
     dst = os.path.join(server.root, "data", "deep-dst")
     line = "cp -r %s %s" % (deep, dst)
     approval, challenge = transfer_request(server, line)
