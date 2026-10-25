@@ -33,4 +33,4 @@ Three shapes were on the table, and the first two were rejected on the trust mod
 
 ## Guard
 
-None yet. This rule is a draft until a named guard test exists. The test to write with the first addon: the agent port offers no path that installs, replaces or removes an addon, and an addon's command answers 75, audits like every other gated command, and answers with a code from `docs/exit-codes.md`.
+`ADR-0010 guard: the agent port has no addon install path, and an addon command is gated at 75, audited with the gate's words, and answers only words and codes docs/exit-codes.md documents`, in `hostbuild/tests/acceptance.py`, run by `make -C hostbuild test`. It asserts that the agent port offers no path that installs, replaces or removes an addon, and that an addon's command answers 75, audits like every other gated command, and answers with a code from `docs/exit-codes.md`.
