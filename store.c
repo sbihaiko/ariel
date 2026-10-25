@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "addon.h"
 #include "approval.h"
 #include "autoload.h"
 #include "protected.h"
@@ -399,6 +400,7 @@ store_init(const char *dir, platform_t *p) {
   pthread_mutex_lock(&lock);
   snprintf(state_dir, sizeof(state_dir), "%s", dir);
   protected_init(dir);
+  addon_init(dir);
   platform = p;
   staging_bytes = 0;
   notified = 0;

@@ -11769,6 +11769,122 @@ HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_SCENARIOS)
 SCENARIOS.extend(ADDON_SCENARIOS)
 
 
+MANIFEST_ACCEPTED_TITLE = ("an addon whose manifest names this build's ABI and "
+                           "platform is accepted, and the owner is not asked")
+MANIFEST_ABI_TITLE = ("an addon built for another ABI answers addon_refused with "
+                      "its abi field, and the owner is not asked")
+MANIFEST_PLATFORM_TITLE = ("an addon built for another platform answers addon_refused "
+                           "with its platform field, and the owner is not asked")
+MANIFEST_MALFORMED_TITLE = ("a malformed manifest answers manifest_malformed, and "
+                            "the listing still names every other addon")
+MANIFEST_MISSING_TITLE = ("an addon without a manifest answers manifest_missing, "
+                          "and the owner is not asked")
+
+
+def manifest_addons(server):
+    return os.path.join(server.root, "data", "ariel", "addons")
+
+
+def make_addon(server, name, manifest=None):
+    """An addon directory in the host test root, with its manifest when given."""
+    path = os.path.join(manifest_addons(server), name)
+    os.makedirs(path, exist_ok=True)
+    if manifest is not None:
+        with open(os.path.join(path, "manifest"), "w") as f:
+            f.write(manifest)
+    return path
+
+
+def drop_addon(server, name):
+    shutil.rmtree(os.path.join(manifest_addons(server), name), ignore_errors=True)
+
+
+def manifest_text(name, abi="1", platform="host", args="0-2"):
+    return "name %s\nargs %s\nabi %s\nplatform %s\n" % (name, args, abi, platform)
+
+
+def scenario_manifest_accepted(server):
+    """A manifest that matches this build is accepted, and the owner is not asked."""
+    make_addon(server, "accepted", manifest_text("accepted"))
+    try:
+        lines = run_command(server, "addon check accepted")
+        assert lines == ["addon accepted ok", "exit 0"], (
+            "a matching manifest must be accepted, got %r" % lines)
+        server.assert_no_line()
+    finally:
+        drop_addon(server, "accepted")
+
+
+def scenario_manifest_wrong_abi(server):
+    """A manifest naming another ABI is refused by name, before the owner is asked."""
+    make_addon(server, "newer", manifest_text("newer", abi="2"))
+    try:
+        lines = run_command(server, "addon check newer")
+        assert lines == ["addon_refused newer abi", "exit 1"], (
+            "an addon for another ABI must answer addon_refused, got %r" % lines)
+        server.assert_no_line()
+    finally:
+        drop_addon(server, "newer")
+
+
+def scenario_manifest_wrong_platform(server):
+    """A manifest naming another platform is refused by name, before the owner is asked."""
+    make_addon(server, "elsewhere", manifest_text("elsewhere", platform="ps5"))
+    try:
+        lines = run_command(server, "addon check elsewhere")
+        assert lines == ["addon_refused elsewhere platform", "exit 1"], (
+            "an addon for another platform must answer addon_refused, got %r"
+            % lines)
+        server.assert_no_line()
+    finally:
+        drop_addon(server, "elsewhere")
+
+
+def scenario_manifest_malformed(server):
+    """A malformed manifest names itself, and the listing names the good addon too."""
+    make_addon(server, "fine", manifest_text("fine"))
+    make_addon(server, "broken", "name broken\nargs 0-2\nabi one\nplatform host\n")
+    try:
+        lines = run_command(server, "addon check broken")
+        assert lines == ["manifest_malformed broken", "exit 92"], (
+            "a malformed manifest must answer manifest_malformed, got %r" % lines)
+        listing = run_command(server, "addon list")
+        assert listing[-1] == "exit 0", (
+            "the listing must end exit 0, got %r" % listing)
+        assert "addon fine ok" in listing, (
+            "the listing must still name the good addon, got %r" % listing)
+        assert "manifest_malformed broken" in listing, (
+            "the listing must name the malformed addon, got %r" % listing)
+        server.assert_no_line()
+    finally:
+        drop_addon(server, "fine")
+        drop_addon(server, "broken")
+
+
+def scenario_manifest_missing(server):
+    """An addon directory without a manifest is named, and the owner is not asked."""
+    make_addon(server, "bare")
+    try:
+        lines = run_command(server, "addon check bare")
+        assert lines == ["manifest_missing bare", "exit 91"], (
+            "an addon without a manifest must answer manifest_missing, got %r"
+            % lines)
+        server.assert_no_line()
+    finally:
+        drop_addon(server, "bare")
+
+
+MANIFEST_SCENARIOS = [
+    (MANIFEST_ACCEPTED_TITLE, scenario_manifest_accepted, HOST_ROOT_REASON),
+    (MANIFEST_ABI_TITLE, scenario_manifest_wrong_abi, HOST_ROOT_REASON),
+    (MANIFEST_PLATFORM_TITLE, scenario_manifest_wrong_platform, HOST_ROOT_REASON),
+    (MANIFEST_MALFORMED_TITLE, scenario_manifest_malformed, HOST_ROOT_REASON),
+    (MANIFEST_MISSING_TITLE, scenario_manifest_missing, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in MANIFEST_SCENARIOS)
+SCENARIOS.extend(MANIFEST_SCENARIOS)
+
+
 def main():
     argv = sys.argv[1:]
 

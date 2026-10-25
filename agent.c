@@ -28,6 +28,7 @@ along with this program; see the file COPYING. If not, see
 #include <time.h>
 #include <unistd.h>
 
+#include "addon.h"
 #include "agent.h"
 #include "allowlist.h"
 #include "approval.h"
@@ -4447,6 +4448,17 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "logs")) {
     payload_logs(fd, argv[2]);
+    return;
+  }
+
+  // addon check <name> and addon list: the manifest verdicts, asked of nobody.
+  if(argc == 3 && !strcmp(argv[0], "addon") && !strcmp(argv[1], "check")) {
+    addon_check(fd, argv[2]);
+    return;
+  }
+
+  if(argc == 2 && !strcmp(argv[0], "addon") && !strcmp(argv[1], "list")) {
+    addon_list(fd);
     return;
   }
 
