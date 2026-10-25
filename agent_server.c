@@ -39,15 +39,24 @@ along with this program; see the file COPYING. If not, see
 /**
  * Every connection thread gets this stack, on the PS5 and on the host alike,
  * and the host build runs this same size so its suite finds an overflow here
- * first. The size is a budget the deepest command has to fit inside: the
- * handlers' own frames, plus one frame for each of the TREE_DEPTH_MAX levels
- * a recursive walk opens (cp -r, rm -r and grep -r all walk that deep), plus
- * the 8 KiB read buffer copy_entry holds at the bottom of a cp -r. At 64 KiB
- * a tree near the limit overflowed it, and under GCC's larger frames a
- * two-level tree did too (#96), so each walk frame was cut to the device and
- * inode it re-opens and the stack was doubled. The scenario "cp -r and rm -r
- * hold a tree as deep as the walk promises" copies a tree one level short of
- * the limit, and is what keeps this constant honest.
+ * first. The size is a budget the deepest command fits inside, and every
+ * figure below is a frame the host build reports with -fstack-usage. The
+ * handlers above a walk cost serve_connection's 64 bytes, agent_serve's 4240,
+ * handle_command's 6528, and, for cp -r, transfer_command's 5872 and
+ * fileops_tree_transfer_act's 8752: 25456 bytes. One level costs 224 bytes in
+ * tree_copy, 208 in tree_remove, 336 in the tree_scan a cp -r or rm -r checks
+ * the tree with, and 416 in grep_walk, so TREE_DEPTH_MAX 64 of them is 14336,
+ * 13312, 21504 and 26624. copy_entry holds the 8 KiB read buffer at the
+ * bottom of a cp -r in an 8432 byte frame. The deepest chain is cp -r:
+ * 25456 + 14336 + 8432 = 48224 bytes, 47 KiB of the 128 KiB; rm -r peaks at
+ * 39120 and grep -r at 38208. That leaves 82848 bytes, 80 KiB, of headroom
+ * for a record that grows and for a compiler whose frames are larger than
+ * these (the PS5 build measures every chain smaller). At 64 KiB a tree near
+ * the limit overflowed it, and under GCC's larger frames a two-level tree did
+ * too (#96), so each walk frame was cut to the device and inode it re-opens
+ * and the stack was doubled. The scenario "cp -r and rm -r hold a tree as
+ * deep as the walk promises" copies, removes and greps a tree one level short
+ * of the limit, and is what keeps this constant honest.
  **/
 #define CONNECTION_STACK (128 * 1024)
 
