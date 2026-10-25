@@ -394,3 +394,32 @@ and for the removal, `command=rmdir` with `option.kind=dir`, `option.dev=6879311
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.
 - **`erickdavestech/ps5-dualsense-overlay`**: attaches with `ptrace` to the foreground title and calls the same two pad exports. It works, with the cost described above.
 - **`a-ddr/PoorDS4`**: injects into `SceShellUI` and creates a virtual device. Untested here; it produces synthetic input rather than reading the real pad.
+
+## Network spike: the three probes on firmware 11.20
+
+The runbook is [network-spike.md](network-spike.md). `network-spike.elf` runs three probes in order, from the least to the most risky: the interface list, the socket tables, and one ICMP echo to the loopback address. Each probe is run alone with the selector, or all three together.
+
+**Every cell below that needs a console is pending owner-present execution.** No run of this payload has been made on a console, and nothing in these tables was measured. The owner fills them from `/data/network-spike.log` at the console, following section 6 of the runbook.
+
+Each outcome is one of: `read` (the call returned the fact), `refused` (the call returned an error, with the errno it set), or `froze` (the log's last line is an `intent` line with no `result` line after it, and the console stopped responding).
+
+| probe | call | socket family | effective user | outcome | error codes seen |
+| --- | --- | --- | --- | --- | --- |
+| 1 interfaces | `sysctl` with mib `CTL_NET`, `PF_ROUTE`, `0`, `0`, `NET_RT_IFLIST`, `0`: a size query, then a read | `PF_ROUTE` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
+| 2 sockets, TCP | `sysctlbyname("net.inet.tcp.pcblist")`: a size query, then a read | `AF_INET` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
+| 2 sockets, UDP | `sysctlbyname("net.inet.udp.pcblist")`: a size query, then a read | `AF_INET` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
+| 3 echo | `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`, `sendto` to `127.0.0.1`, `recvfrom` with a 2-second deadline and up to 8 reads | `AF_INET` | pending owner-present execution | pending owner-present execution | pending owner-present execution |
+
+### Transcripts
+
+Each probe's transcript is the set of its lines from `/data/network-spike.log`, copied from the console, from the probe's `effective user` line to its `result` line or its last `intent` line.
+
+- **Probe 1, interfaces:** pending owner-present execution.
+- **Probe 2, sockets:** pending owner-present execution.
+- **Probe 3, echo:** pending owner-present execution.
+
+### Run record
+
+| firmware | model | selector used | console survived the run | last line of the log | owner |
+| --- | --- | --- | --- | --- | --- |
+| 11.20 | pending owner-present execution | pending owner-present execution | pending owner-present execution | pending owner-present execution | pending owner-present execution |

@@ -75,7 +75,7 @@ $(SUBDIRS):
 
 .NOTPARALLEL:
 
-all: ariel-ps5.elf sh.elf controller-spike.elf primitives-probe.elf
+all: ariel-ps5.elf sh.elf controller-spike.elf primitives-probe.elf network-spike.elf
 
 # The agent protocol, the store and the token are shared with the host
 # build, which compiles the same sources from hostbuild/.
@@ -123,6 +123,11 @@ capture-spike.elf: capture_spike.o notify.o
 # The share spike is a separate payload, answering issue #100. It is never
 # linked into ariel-ps5.elf; the operator sends it to elfldr on its own.
 share-spike.elf: share_spike.o notify.o
+	$(CC) -lkernel_sys -o $@ $^
+
+# The network spike is a separate payload, answering issue #112. It is never
+# linked into ariel-ps5.elf; the operator sends it to elfldr on its own.
+network-spike.elf: network_spike.o notify.o
 	$(CC) -lkernel_sys -o $@ $^
 
 # The primitives probe is a separate payload. It is never linked into
