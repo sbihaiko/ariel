@@ -277,27 +277,34 @@ status_of(addon_verdict_t verdict) {
 
 
 static void
+verdict_line(char *line, size_t size, const char *addon,
+             addon_verdict_t verdict, const char *field) {
+  switch(verdict) {
+  case ADDON_OK:
+    snprintf(line, size, "addon %s ok", addon);
+    break;
+  case ADDON_REFUSED:
+    snprintf(line, size, "addon_refused %s %s", addon, field);
+    break;
+  case ADDON_MISSING:
+    snprintf(line, size, "manifest_missing %s", addon);
+    break;
+  case ADDON_MALFORMED:
+    snprintf(line, size, "manifest_malformed %s", addon);
+    break;
+  case ADDON_UNREADABLE:
+    snprintf(line, size, "operation_failed");
+    break;
+  }
+}
+
+
+static void
 say_verdict(answer_t *answer, const char *addon, addon_verdict_t verdict,
             const char *field) {
   char line[128];
 
-  switch(verdict) {
-  case ADDON_OK:
-    snprintf(line, sizeof(line), "addon %s ok", addon);
-    break;
-  case ADDON_REFUSED:
-    snprintf(line, sizeof(line), "addon_refused %s %s", addon, field);
-    break;
-  case ADDON_MISSING:
-    snprintf(line, sizeof(line), "manifest_missing %s", addon);
-    break;
-  case ADDON_MALFORMED:
-    snprintf(line, sizeof(line), "manifest_malformed %s", addon);
-    break;
-  case ADDON_UNREADABLE:
-    snprintf(line, sizeof(line), "operation_failed");
-    break;
-  }
+  verdict_line(line, sizeof(line), addon, verdict, field);
   answer_line(answer, line, strlen(line));
 }
 
@@ -550,19 +557,17 @@ watch(platform_t *platform, pid_t pid, uint64_t deadline, int from, int to) {
 
 
 int
-addon_accept(int fd, const char *name, int argc, char hex[65]) {
+addon_accept(const char *name, int argc, char hex[65], char *refusal,
+             size_t size) {
   addon_manifest_t manifest;
   addon_verdict_t verdict;
-  answer_t answer;
   const char *field = "";
-  char exit_line[16];
-  size_t size;
+  char line[128];
+  size_t elf_size;
   int elf;
 
-  answer_init(&answer, fd, SIZE_MAX);
   if(!store_name_valid(name)) {
-    answer_line(&answer, "bad_name", strlen("bad_name"));
-    answer_line(&answer, "exit 1", strlen("exit 1"));
+    snprintf(refusal, size, "bad_name\nexit 1\n");
     return 0;
   }
 
@@ -572,7 +577,7 @@ addon_accept(int fd, const char *name, int argc, char hex[65]) {
     field = "args";
   }
   if(verdict == ADDON_OK) {
-    elf = elf_open(name, &size);
+    elf = elf_open(name, &elf_size);
     if(elf < 0) {
       verdict = ADDON_UNREADABLE;
     } else {
@@ -582,9 +587,8 @@ addon_accept(int fd, const char *name, int argc, char hex[65]) {
     }
   }
 
-  say_verdict(&answer, name, verdict, field);
-  snprintf(exit_line, sizeof(exit_line), "exit %d", status_of(verdict));
-  answer_line(&answer, exit_line, strlen(exit_line));
+  verdict_line(line, sizeof(line), name, verdict, field);
+  snprintf(refusal, size, "%s\nexit %d\n", line, status_of(verdict));
   return 0;
 }
 

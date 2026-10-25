@@ -12177,14 +12177,14 @@ def addon_runner(server, name, source):
     return hashlib.sha256(manifest.encode("ascii")).hexdigest()
 
 
-def addon_run_request(server, name, manifest_sha, args):
+def addon_run_request(server, name, manifest_sha, args, wait_ms=120000):
     """Ask for addon run of name with args and check the challenge names the addon."""
     command = " ".join(["addon", "run", name] + list(args))
     return gated_request(
         server, command,
         ["command=addon", "target=%s" % name, "sha256=%s" % manifest_sha,
          "option.argc=%d" % len(args), "option.args=%s" % args_hash(*args)],
-        "addon %s will run" % name)
+        "addon %s will run" % name, wait_ms=wait_ms)
 
 
 def addon_results(server, name):
@@ -12314,6 +12314,147 @@ ADDON_RUN_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_RUN_SCENARIOS)
 SCENARIOS.extend(ADDON_RUN_SCENARIOS)
+
+ADDON_AUDIT_TITLE = ("an addon run is audited with the gate's words, and a refused "
+                     "addon is audited as refused")
+ADDON_SIGNATURE_TITLE = ("an addon signature runs its addon once: a replayed signature "
+                         "and another addon's signature do not run it")
+ADDON_SURFACE_TITLE = ("the agent port has no command that installs, replaces or "
+                       "removes an addon, and the addon directory is left as it was")
+
+
+def addon_events(server, name):
+    """The addon.* audit events of name as (kind, subject) pairs, oldest first."""
+    return [(event[0], event[1]) for event in audit_events(server)
+            if len(event) > 1 and event[0].startswith("addon.") and event[1] == name]
+
+
+def addon_tree(path):
+    """Every file under path, by its relative name, with its bytes."""
+    tree = {}
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            full = os.path.join(root, name)
+            with open(full, "rb") as handle:
+                tree[os.path.relpath(full, path)] = handle.read()
+    return tree
+
+
+def scenario_addon_run_is_audited(server):
+    """Each outcome of an addon run is audited with the gate's words."""
+    manifest_sha = addon_runner(server, "audited", RUNNER_SOURCE)
+    make_addon(server, "refusedaudit", manifest_text("refusedaudit", abi="2"))
+    try:
+        assert run_command(server, "addon run refusedaudit one") == [
+            "addon_refused refusedaudit abi", "exit 1"], (
+            "a refused addon must answer addon_refused")
+        assert ("addon.refused", "refusedaudit") in addon_events(
+            server, "refusedaudit"), (
+            "a refused addon must be audited as addon.refused, got %r"
+            % addon_events(server, "refusedaudit"))
+
+        approval, challenge = addon_run_request(server, "audited", manifest_sha, ["one"])
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "addon run audited one")[-1] == "exit 0", (
+            "a granted addon run must exit 0")
+
+        approval, challenge = addon_run_request(server, "audited", manifest_sha, ["one"])
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, "addon run audited two") == [
+            "approval_stale", "exit 78"], (
+            "a run with other arguments than were signed must answer approval_stale")
+
+        approval, challenge = addon_run_request(server, "audited", manifest_sha, ["three"])
+        server.controller("deny %s" % approval, "denied %s" % approval)
+        assert run_command(server, "addon run audited three") == [
+            "approval_denied", "exit 77"], (
+            "a denied addon run must answer approval_denied")
+
+        kinds = {kind for kind, _ in addon_events(server, "audited")}
+        assert {"addon.request", "addon.done", "addon.stale", "addon.denied"} <= kinds, (
+            "the addon's audit events must include request, done, stale and denied, "
+            "got %r" % sorted(kinds))
+    finally:
+        cleanup_addon(server, "audited")
+        drop_addon(server, "refusedaudit")
+
+
+# Past the 10 s notification gap, and well inside the 120 s approval expiry.
+NOTIFICATION_WAIT_MS = 11_000
+
+
+def scenario_addon_signature_runs_once(server):
+    """A signature runs its addon once; a replayed one, or another addon's, does not."""
+    sha_a = addon_runner(server, "once-a", RUNNER_SOURCE)
+    sha_b = addon_runner(server, "once-b", RUNNER_SOURCE)
+    try:
+        approval_a, challenge_a = addon_run_request(server, "once-a", sha_a, [])
+        signature_a = sign_challenge(server, challenge_a)
+        granted = grant(server, approval_a, signature_a)
+        assert granted == ["approval_granted %s" % approval_a, "exit 0"], (
+            "the owner's signature must grant the approval, got %r" % granted)
+        assert run_command(server, "addon run once-a")[-1] == "exit 0", (
+            "a granted addon must run")
+        assert len(addon_results(server, "once-a")) == 1, (
+            "the granted run must leave its one result")
+
+        replayed = grant(server, approval_a, signature_a)
+        assert replayed[-1] != "exit 0", (
+            "a replayed signature must not grant again, got %r" % replayed)
+
+        approval_a2, challenge_a2 = addon_run_request(server, "once-a", sha_a, [])
+        approval_b, _challenge_b = addon_run_request(
+            server, "once-b", sha_b, [], wait_ms=NOTIFICATION_WAIT_MS)
+        mismatched = grant(server, approval_b, sign_challenge(server, challenge_a2))
+        assert mismatched == ["signature_action_mismatch", "exit 85"], (
+            "another addon's signature must answer signature_action_mismatch, got %r"
+            % mismatched)
+        assert run_command(server, "addon run once-b")[-1] == "exit 75", (
+            "an addon whose signature was refused must still wait for the owner")
+        assert addon_results(server, "once-b") == [], (
+            "an addon whose signature was refused must not run")
+
+        sign_and_grant(server, approval_a2, challenge_a2)
+        assert run_command(server, "addon run once-a")[-1] == "exit 0", (
+            "the owner's own signature for once-a must still run it")
+        assert len(addon_results(server, "once-a")) == 2, (
+            "each granted run leaves its own result")
+    finally:
+        cleanup_addon(server, "once-a")
+        cleanup_addon(server, "once-b")
+
+
+def scenario_addon_surface_has_no_install(server):
+    """install, replace and remove of an addon answer unknown_command and change nothing."""
+    addon_runner(server, "held", RUNNER_SOURCE)
+    directory = os.path.join(manifest_addons(server), "held")
+    before_tree = addon_tree(directory)
+    before_root = sorted(os.listdir(manifest_addons(server)))
+    try:
+        for command in ("addon install held", "addon replace held", "addon remove held"):
+            server.advance(120000)
+            lines = run_command(server, command)
+            if lines[-1] == "exit 75":
+                approval = APPROVAL_LINE.match(lines[0]).group(1)
+                server.next_line()
+                sign_and_grant(server, approval, lines[1])
+            assert run_command(server, command) == ["unknown_command", "exit 1"], (
+                "%r must answer unknown_command once signed" % command)
+        assert addon_tree(directory) == before_tree, (
+            "no addon command may change an addon's files")
+        assert sorted(os.listdir(manifest_addons(server))) == before_root, (
+            "no addon command may add or remove an addon")
+    finally:
+        drop_addon(server, "held")
+
+
+ADDON_GATE_SCENARIOS = [
+    (ADDON_AUDIT_TITLE, scenario_addon_run_is_audited, HOST_ROOT_REASON),
+    (ADDON_SIGNATURE_TITLE, scenario_addon_signature_runs_once, HOST_ROOT_REASON),
+    (ADDON_SURFACE_TITLE, scenario_addon_surface_has_no_install, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_GATE_SCENARIOS)
+SCENARIOS.extend(ADDON_GATE_SCENARIOS)
 
 
 def main():

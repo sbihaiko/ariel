@@ -40,10 +40,11 @@ void addon_list(int fd);
 
 /**
  * Judge the addon named name for a run with argc arguments. Returns 1 and its
- * manifest digest in hex when it may be asked for. Otherwise answers the
- * refusal and exit line on fd and returns 0.
+ * manifest digest in hex when it may be asked for. Otherwise returns 0 and
+ * puts the refusal and its exit line in refusal, for the caller to audit.
  **/
-int addon_accept(int fd, const char *name, int argc, char hex[65]);
+int addon_accept(const char *name, int argc, char hex[65], char *refusal,
+                 size_t size);
 
 /**
  * Run the addon named name with args in a process of its own, bounded. On

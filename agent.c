@@ -1982,11 +1982,13 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   char result[PATH_MAX];
   char text[PATH_MAX + 32];
   char hex[SHA256_HEX_LEN + 1];
+  char refusal[128];
   addon_run_t outcome;
   int args = argc - 3;
   int len;
 
-  if(!addon_accept(fd, argv[2], args, hex)) {
+  if(!addon_accept(argv[2], args, hex, refusal, sizeof(refusal))) {
+    audit_reply(fd, "addon", "refused", argv[2], "-", refusal);
     return;
   }
 
