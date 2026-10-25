@@ -94,6 +94,27 @@ check_remote(const char *remote) {
 
 
 static int
+plain_directories(const char *local) {
+  char path[PATH_MAX];
+  const char *slash;
+  int fd;
+
+  for(slash=strchr(local + 1, '/'); slash; slash=strchr(slash + 1, '/')) {
+    if(snprintf(path, sizeof(path), "%s%.*s", FS_ROOT, (int)(slash - local),
+                local) >= (int)sizeof(path)) {
+      return 0;
+    }
+    fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if(fd < 0) {
+      return 0;
+    }
+    close(fd);
+  }
+  return 1;
+}
+
+
+static int
 check_local(const char *local, char *full, size_t size) {
   int inside = !strncmp(local, "/data/", 6) || !strncmp(local, "/user/", 6) ||
                !strncmp(local, "/mnt/usb", 8);
@@ -104,12 +125,16 @@ check_local(const char *local, char *full, size_t size) {
   if(!resolve(full, size, "", local) || protected_path(full)) {
     return FTP_PROTECTED;
   }
+  if(!plain_directories(local)) {
+    return FTP_BAD_PATH;
+  }
   return 0;
 }
 
 
 static int
-server_address(const char *name, struct sockaddr_in *peer) {
+server_address(const char *name, const char *signed_server,
+               struct sockaddr_in *peer) {
   char path[PATH_MAX];
   char text[SERVER_TEXT + 1];
   char host[SERVER_TEXT];
@@ -136,6 +161,9 @@ server_address(const char *name, struct sockaddr_in *peer) {
     n--;
   }
   text[n] = '\0';
+  if(strcmp(text, signed_server)) {
+    return -1;
+  }
 
   colon = strrchr(text, ':');
   if(!colon || (size_t)(colon - text) >= sizeof(host)) {
@@ -363,8 +391,8 @@ copy_fd(int from, int to) {
 
 
 static int
-run_transfer(const char *name, const char *verb, const char *remote, int local,
-             int download) {
+run_transfer(const char *name, const char *server, const char *verb,
+             const char *remote, int local, int download) {
   struct sockaddr_in peer;
   char line[LINE_TEXT];
   int copied;
@@ -372,7 +400,7 @@ run_transfer(const char *name, const char *verb, const char *remote, int local,
   int data;
   int ctrl;
 
-  if(server_address(name, &peer)) {
+  if(server_address(name, server, &peer)) {
     return FTP_FAILED;
   }
   ctrl = open_session(&peer, line, sizeof(line));
@@ -394,18 +422,19 @@ run_transfer(const char *name, const char *verb, const char *remote, int local,
 
 
 static int
-do_ls(const char *name, const char *remote) {
+do_ls(const char *name, const char *server, const char *remote) {
   int rc = check_remote(remote);
 
   if(rc) {
     return rc;
   }
-  return run_transfer(name, "LIST", remote, STDOUT_FILENO, 1);
+  return run_transfer(name, server, "LIST", remote, STDOUT_FILENO, 1);
 }
 
 
 static int
-do_get(const char *name, const char *remote, const char *local) {
+do_get(const char *name, const char *server, const char *remote,
+       const char *local) {
   char full[PATH_MAX];
   int rc;
   int fd;
@@ -421,7 +450,7 @@ do_get(const char *name, const char *remote, const char *local) {
   if(fd < 0) {
     return FTP_FAILED;
   }
-  rc = run_transfer(name, "RETR", remote, fd, 1);
+  rc = run_transfer(name, server, "RETR", remote, fd, 1);
   close(fd);
   if(rc) {
     unlink(full);
@@ -431,7 +460,8 @@ do_get(const char *name, const char *remote, const char *local) {
 
 
 static int
-do_put(const char *name, const char *remote, const char *local) {
+do_put(const char *name, const char *server, const char *remote,
+       const char *local) {
   char full[PATH_MAX];
   struct stat st;
   int rc;
@@ -457,14 +487,14 @@ do_put(const char *name, const char *remote, const char *local) {
     close(fd);
     return rc < 0 ? FTP_FAILED : FTP_PROTECTED;
   }
-  rc = run_transfer(name, "STOR", remote, fd, 0);
+  rc = run_transfer(name, server, "STOR", remote, fd, 0);
   close(fd);
   return rc;
 }
 
 
 static int
-do_rm(const char *name, const char *remote) {
+do_rm(const char *name, const char *server, const char *remote) {
   struct sockaddr_in peer;
   char line[LINE_TEXT];
   char text[LINE_TEXT];
@@ -474,7 +504,7 @@ do_rm(const char *name, const char *remote) {
   if(rc) {
     return rc;
   }
-  if(server_address(name, &peer)) {
+  if(server_address(name, server, &peer)) {
     return FTP_FAILED;
   }
   ctrl = open_session(&peer, line, sizeof(line));
@@ -497,17 +527,20 @@ int
 main(int argc, char *argv[]) {
   protected_init(FS_ROOT STATE_DIR);
 
-  if(argc == 2 && !strcmp(argv[0], "ftp-ls")) {
-    return do_ls(argv[0], argv[1]);
+  if(argc < 3) {
+    return FTP_FAILED;
   }
-  if(argc == 2 && !strcmp(argv[0], "ftp-rm")) {
-    return do_rm(argv[0], argv[1]);
+  if(argc == 3 && !strcmp(argv[0], "ftp-ls")) {
+    return do_ls(argv[0], argv[1], argv[2]);
   }
-  if(argc == 3 && !strcmp(argv[0], "ftp-get")) {
-    return do_get(argv[0], argv[1], argv[2]);
+  if(argc == 3 && !strcmp(argv[0], "ftp-rm")) {
+    return do_rm(argv[0], argv[1], argv[2]);
   }
-  if(argc == 3 && !strcmp(argv[0], "ftp-put")) {
-    return do_put(argv[0], argv[1], argv[2]);
+  if(argc == 4 && !strcmp(argv[0], "ftp-get")) {
+    return do_get(argv[0], argv[1], argv[2], argv[3]);
+  }
+  if(argc == 4 && !strcmp(argv[0], "ftp-put")) {
+    return do_put(argv[0], argv[1], argv[2], argv[3]);
   }
   return FTP_FAILED;
 }
