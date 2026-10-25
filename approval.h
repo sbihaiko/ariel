@@ -103,6 +103,9 @@ int approval_target_valid(const char *target);
 /** Whether value is an option value the encoder accepts. Returns 1 when it is. **/
 int approval_value_valid(const char *value);
 
+/** Whether value is one to max bytes of printable ASCII. Returns 1 when it is. **/
+int approval_text_valid(const char *value, size_t max);
+
 /**
  * Build the message a signature covers: a domain tag, the console
  * identity, the canonical action bytes, the keyring generation, the nonce,

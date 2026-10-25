@@ -662,9 +662,9 @@ addon_accept(const char *name, int argc, char hex[65], char server[65],
 
 
 addon_run_t
-addon_run(platform_t *platform, const char *name, int argc,
+addon_run(platform_t *platform, const char *name, const char *server, int argc,
           char *const args[], char *result, size_t size) {
-  char *argv[ADDON_ARGS_MAX + 2];
+  char *argv[ADDON_ARGS_MAX + 3];
   approval_facts_t facts;
   char file[PATH_MAX];
   addon_run_t outcome = ADDON_FAILED;
@@ -675,6 +675,7 @@ addon_run(platform_t *platform, const char *name, int argc,
   int opened = -1;
   int created = 0;
   pid_t pid = 0;
+  int next = 1;
   int i;
 
   if(read_elf(name, &elf, &elf_size)) {
@@ -704,10 +705,13 @@ addon_run(platform_t *platform, const char *name, int argc,
   }
 
   argv[0] = (char*)name;
-  for(i=0; i<argc; i++) {
-    argv[i + 1] = args[i];
+  if(server[0]) {
+    argv[next++] = (char*)server;
   }
-  argv[argc + 1] = NULL;
+  for(i=0; i<argc; i++) {
+    argv[next++] = args[i];
+  }
+  argv[next] = NULL;
 
   deadline = platform_ms(platform) + ADDON_TIMEOUT_MS;
   if(platform->spawn_start_isolated(platform, elf, elf_size, argv, pipefd[1],

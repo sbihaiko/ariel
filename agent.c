@@ -1996,6 +1996,43 @@ addon_path_protected(const char *root, const char *path) {
 }
 
 
+/**
+ * Copy an addon's arguments, after its name, into facts. One of up to
+ * APPROVAL_VALUE_MAX bytes is copied as the text the owner reads. A longer one,
+ * up to ADDON_ARG_MAX, is carried by its SHA-256 instead, under its own key.
+ * Returns -1 when there are more than RUN_ARGS_MAX, and -2 when one is empty,
+ * longer than ADDON_ARG_MAX or carries a byte outside printable ASCII.
+ **/
+static int
+addon_arguments(approval_facts_t *facts, int argc, char *argv[]) {
+  sha256_t ctx;
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char hex[SHA256_HEX_LEN + 1];
+  int i;
+
+  if(argc - 1 > RUN_ARGS_MAX) {
+    return -1;
+  }
+  facts->argc = (uint64_t)(argc - 1);
+  for(i=1; i<argc; i++) {
+    if(!approval_text_valid(argv[i], ADDON_ARG_MAX)) {
+      return -2;
+    }
+    if(strlen(argv[i]) <= APPROVAL_VALUE_MAX) {
+      snprintf(facts->arg[i - 1], sizeof(facts->arg[i - 1]), "%s", argv[i]);
+      continue;
+    }
+    sha256_init(&ctx);
+    sha256_update(&ctx, argv[i], strlen(argv[i]));
+    sha256_final(&ctx, digest);
+    sha256_hex(digest, hex);
+    snprintf(facts->arg[i - 1], sizeof(facts->arg[i - 1]), "%s", hex);
+    facts->arg_hashed[i - 1] = 1;
+  }
+  return 0;
+}
+
+
 static void
 addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   platform_t *platform = agent->platform;
@@ -2008,6 +2045,7 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   char refusal[128];
   addon_run_t outcome;
   int args = argc - 3;
+  int arg_error;
   int len;
   int i;
 
@@ -2021,8 +2059,10 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   snprintf(facts.target, sizeof(facts.target), "%s", argv[2]);
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
   snprintf(facts.server, sizeof(facts.server), "%s", server);
-  if(run_arguments(&facts, argc - 2, &argv[2])) {
-    audit_reply(fd, "addon", "refused", argv[2], "-", bad_path);
+  arg_error = addon_arguments(&facts, argc - 2, &argv[2]);
+  if(arg_error) {
+    audit_reply(fd, "addon", "refused", argv[2], "-",
+                arg_error == -1 ? too_many_arguments_reply : bad_path);
     return;
   }
   for(i=0; i<args; i++) {
@@ -2041,7 +2081,8 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     return;
   }
 
-  outcome = addon_run(platform, argv[2], args, &argv[3], result, sizeof(result));
+  outcome = addon_run(platform, argv[2], server, args, &argv[3], result,
+                      sizeof(result));
   switch(outcome) {
   case ADDON_RAN:
     len = snprintf(text, sizeof(text), "result %s\nstatus 0\nexit 0\n", result);

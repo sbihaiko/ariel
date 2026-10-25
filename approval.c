@@ -159,12 +159,17 @@ approval_target_valid(const char *target) {
 }
 
 
-static int
-value_ok(const char *value) {
+int
+approval_text_valid(const char *value, size_t max) {
   size_t len;
 
-  return value && (len=strlen(value)) >= 1 && len <= APPROVAL_VALUE_MAX &&
-         printable(value);
+  return value && (len=strlen(value)) >= 1 && len <= max && printable(value);
+}
+
+
+static int
+value_ok(const char *value) {
+  return approval_text_valid(value, APPROVAL_VALUE_MAX);
 }
 
 

@@ -21,6 +21,8 @@ along with this program; see the file COPYING. If not, see
 
 #include "platform.h"
 
+#define ADDON_ARG_MAX 255
+
 typedef enum {
   ADDON_RAN,
   ADDON_TIMED_OUT,
@@ -50,12 +52,14 @@ int addon_accept(const char *name, int argc, char hex[65], char server[65],
                  char *refusal, size_t size);
 
 /**
- * Run the addon named name with args in a process of its own, bounded. On
+ * Run the addon named name with args in a process of its own, bounded. Its
+ * argv is name, then server when the addon has a server file, then args. On
  * ADDON_RAN its output is in the file named by result; any other outcome
  * leaves no file. An addon that exits 3 refused a path, and one that exits 87
  * named protected state.
  **/
-addon_run_t addon_run(platform_t *platform, const char *name, int argc,
-                      char *const args[], char *result, size_t size);
+addon_run_t addon_run(platform_t *platform, const char *name,
+                      const char *server, int argc, char *const args[],
+                      char *result, size_t size);
 
 #endif /* ARIEL_ADDON_H */

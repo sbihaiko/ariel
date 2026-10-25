@@ -938,6 +938,10 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
   static const char *const run_arg[RUN_ARGS_MAX] = {
     "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7"
   };
+  static const char *const run_arg_hashed[RUN_ARGS_MAX] = {
+    "arg0_sha256", "arg1_sha256", "arg2_sha256", "arg3_sha256",
+    "arg4_sha256", "arg5_sha256", "arg6_sha256", "arg7_sha256"
+  };
   uint64_t i;
 
   if(!strcmp(facts->command, "payload.install")) {
@@ -1036,7 +1040,7 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[n].key = "argc";
       options[n++].value = text[0];
       for(i=0; i<facts->argc && i<RUN_ARGS_MAX; i++) {
-        options[n].key = run_arg[i];
+        options[n].key = facts->arg_hashed[i] ? run_arg_hashed[i] : run_arg[i];
         options[n++].value = facts->arg[i];
       }
       if(facts->server[0]) {
@@ -1343,7 +1347,7 @@ same_args(const approval_facts_t *a, const approval_facts_t *b) {
     return 0;
   }
   for(i=0; i<a->argc && i<RUN_ARGS_MAX; i++) {
-    if(strcmp(a->arg[i], b->arg[i])) {
+    if(strcmp(a->arg[i], b->arg[i]) || a->arg_hashed[i] != b->arg_hashed[i]) {
       return 0;
     }
   }

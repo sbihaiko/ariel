@@ -92,6 +92,7 @@ typedef struct {
   uint64_t asset;  /** install: the asset ID. **/
   char args[ARGS_HASH_MAX + 1];
   char arg[RUN_ARGS_MAX][BUILTIN_ARG_MAX + 1];  /** A built-in's or a run's. **/
+  int arg_hashed[RUN_ARGS_MAX];  /** An addon's argument too long for arg: arg holds its SHA-256. **/
   char server[APPROVAL_VALUE_MAX + 1];  /** An addon's server, from its server file. **/
 } approval_facts_t;
 
