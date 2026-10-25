@@ -42,8 +42,8 @@ canonical action the owner signs. The addon reads it again itself.
 | `addon run ftp-put REMOTE LOCAL` | 2 | Upload LOCAL to REMOTE |
 | `addon run ftp-rm REMOTE` | 1 | Delete REMOTE |
 
-REMOTE is absolute on the server. LOCAL must be absolute and begin with `/data/`,
-`/user/` or `/mnt/usb`. It may not contain `..`.
+REMOTE is absolute on the server. LOCAL must be absolute and resolve under
+`/data/`, `/user/` or `/mnt/usbN`. It may not contain `..`.
 
 ## Exit codes
 
@@ -65,13 +65,23 @@ timeout (10 seconds), the 64 KiB output cap and the kill apply to every run.
   so the first check is the one that fires; the second stays as a guard,
   because the root belongs to ftpsrv and the addon must not depend on it.
 - Every local path is resolved through every link before it is checked, and the
-  resolved path must lie under `/data`, `/user` or `/mnt/usb`, a `/mnt/usb<name>`
-  mount included. A path that leaves the roots through a link answers
-  `bad_path` and nothing is created. A link that stays inside the roots works.
+  resolved path must lie under `/data`, `/user` or `/mnt/usbN`, where N names a
+  mount the way fileops.c does: the first segment after `/mnt` starts with `usb`,
+  is longer than `usb`, and has something below it. A path that leaves the roots
+  through a link, including a mount link, answers `bad_path` and nothing is
+  created. A link that stays inside the roots works.
+- A link target that begins with `/` is a console path, as every other absolute
+  path in this addon: it is resolved under the same root as the local path.
+- A local path whose last component is a link is followed like any other link.
+  The bytes move to the link's target, which must itself resolve inside the
+  roots, and the target is the object `ftp-put` reads or `ftp-get` creates. A
+  link whose target is missing is created at that target.
+- A link target of `PATH_MAX` bytes or more is refused with `ENAMETOOLONG`
+  rather than read as a shorter path.
 - `ftp-put` checks the open source file with `protected_object`, so a hard link
   to protected state is refused.
-- `ftp-get` creates its local file with `O_EXCL | O_NOFOLLOW`. A failed download
-  removes the partial file.
+- `ftp-get` creates its local file with `O_EXCL | O_NOFOLLOW`, after the links
+  are resolved. A failed download removes the partial file.
 - Remote paths may not contain CR, LF or other control bytes.
 
 ## Residual risks

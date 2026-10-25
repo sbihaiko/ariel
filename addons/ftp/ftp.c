@@ -140,15 +140,21 @@ real_path(const char *path, char *out, size_t size) {
           errno = ELOOP;
           return -1;
         }
-        n = readlink(candidate, target, sizeof(target) - 1);
+        n = readlink(candidate, target, sizeof(target));
         if(n <= 0) {
+          return -1;
+        }
+        if((size_t)n >= sizeof(target)) {
+          errno = ENAMETOOLONG;
           return -1;
         }
         target[n] = '\0';
         if(target[0] == '/') {
           out[0] = '\0';
-        }
-        if(snprintf(next, sizeof(next), "%s/%s", target, rest) >= (int)sizeof(next)) {
+          if(snprintf(next, sizeof(next), "%s%s/%s", FS_ROOT, target, rest) >= (int)sizeof(next)) {
+            return -1;
+          }
+        } else if(snprintf(next, sizeof(next), "%s/%s", target, rest) >= (int)sizeof(next)) {
           return -1;
         }
         memcpy(todo, next, strlen(next) + 1);
@@ -175,8 +181,27 @@ real_path(const char *path, char *out, size_t size) {
 
 
 static int
+usb_under(const char *full) {
+  char mnt[PATH_MAX];
+  const char *seg;
+  const char *slash;
+
+  if(snprintf(mnt, sizeof(mnt), "%s/mnt/", FS_ROOT) >= (int)sizeof(mnt) ||
+     strncmp(full, mnt, strlen(mnt))) {
+    return 0;
+  }
+  seg = full + strlen(mnt);
+  if(strncmp(seg, "usb", 3)) {
+    return 0;
+  }
+  slash = strchr(seg, '/');
+  return slash && slash - seg > 3 && slash[1] != '\0';
+}
+
+
+static int
 under_root(const char *full) {
-  static const char *const roots[] = {"/data", "/user", "/mnt/usb"};
+  static const char *const roots[] = {"/data", "/user"};
   char path[PATH_MAX];
   char root[PATH_MAX];
   size_t len;
@@ -192,7 +217,7 @@ under_root(const char *full) {
       return 1;
     }
   }
-  return 0;
+  return usb_under(full);
 }
 
 

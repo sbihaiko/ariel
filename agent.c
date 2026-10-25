@@ -2023,6 +2023,7 @@ addon_failure(int fd, const char *root, const char *name, const char *id,
     return;
   }
   reply(fd, text);
+}
 
 
 /** Whether an addon run's signed action fits, each argument escaped at worst. **/
