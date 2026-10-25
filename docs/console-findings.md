@@ -291,11 +291,21 @@ Run on 2026-10-25 with the owner on hand, on the same console, after the capture
 | `ShareFeaturePermit(1)` | `0x8196000C` |
 | `ShareGetCurrentStatus(1, …)` and the capture again, after the permit | `0x8196000C` both |
 
-**What this settles.** The calls run: a null parameter block is rejected by the export's own validation (`0x81960002`), so the library is executing and not failing before it looks. What it then answers is `0x8196000C` for every shape — the share feature is unavailable to this process, and the library's own permit for that feature is refused with the same error, so the refusal is above the library, not something the caller can grant itself. No file is produced and no request id is handed back. Unlike the screenshot client, **the console survives every share attempt**: 9021, 2121 and 2324 answered after each one, and nothing had to be reset.
+**The second run, the same day, after the error codes were named.** The psdevwiki error list names `0x8196000C` as `SCE_SHARE_LIBRARY_ERROR_NOT_INITIALIZED` and `0x81960001` as `SCE_SHARE_LIBRARY_ERROR_INTERNAL`, and the public bindings name an init the first run never called: `sceShareInitialize(size_t heap, int priority, uint64_t affinity)`, NID `nBDD66kiFW8`, with the defaults a title passes (a 128 KiB heap, priority 700, affinity 0). They also name the feature flags: `0x1` is video recording and `0x2` is the screenshot, so the first run asked about the wrong feature. The spike was rebuilt with the init and the corrected flag and sent again. The console had gone to rest; a magic packet woke it.
 
-**Not measured.** Whether a foreground title, or the share process's own identity, changes the feature's availability; what the extended capture's parameter block wants beyond the zeroed 0x40 bytes its validation accepts; and whether the permit needs a second flag or a token the payload does not have.
+| Attempt | Reply |
+| --- | --- |
+| `sceShareInitialize(0x20000, 700, 0)` | `0x81960001` (`INTERNAL`), and the call returns |
+| `ShareGetCurrentStatus(0x2, status)`, before and after the permit | `0x8196000C`, status untouched |
+| `ShareCaptureScreenshot(NULL, &req)` and the extended form | `0x81960002`, as before |
+| `ShareCaptureScreenshot(&zeroed 0x40, &req)`, before and after `FeaturePermit(0x2)` | `0x8196000C` |
+| `ShareFeaturePermit(0x2)` | `0x8196000C` |
 
-**Where the route ends.** Two doors, two answers: `libSceScreenShot` accepts the request and never completes it, then wedges the console; `libSceShare.native` refuses with a feature error and leaves it running. Neither hands a payload an image, so a screenshot addon has no path on firmware 11.20 that this project can build on.
+**The heap the init checks first.** Read back through the kernel, the export starts with `cmp $0x20000, %rdi; jb <reject>`: a heap below 128 KiB is answered `0x81960002` by the library itself, before any call leaves the process. The 128 KiB a published binding uses is exactly that floor. Sent again with `0x20000`, the call passes the check and the service behind it — every export is a stub that forwards to an IPC client, command `0x1236000C` for the init — still answers `0x81960001`. The export also treats `0x8196000D` (`ALREADY_INITIALIZED`) as success, and this run did not get that either, so no earlier init is held. The `INTERNAL` is the service's answer, not the library rejecting the arguments.
+
+**Not measured.** Why the share service answers `INTERNAL` to an init whose arguments passed the library's own check. The heap, the priority and the affinity are within what the export accepts, the function returns rather than hanging, and it does not report an init already held. The code of the service is not in this library. Also not measured: whether a foreground title, or the share process's own identity, lets the init succeed; what the extended capture's parameter block wants beyond the zeroed 0x40 bytes its validation accepts; and whether the permit needs a second flag or a token the payload does not have.
+
+**Where the route ends.** Two doors, two answers: `libSceScreenShot` accepts the request and never completes it, then wedges the console; `libSceShare.native` loads and its init fails with an internal error, so every capture answers not-initialized, and the console keeps running. Neither hands a payload an image, so a screenshot addon has no path on firmware 11.20 that this project can build on. The homebrew that does move screenshots reads the file the Create button already wrote under `/user/av_contents/photo/`; it does not take the shot.
 
 ## Issue #72 and #81: the console suite after the state directory closed
 

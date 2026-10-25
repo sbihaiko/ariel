@@ -48,8 +48,21 @@ along with this program; see the file COPYING. If not, see
 /** The request id the capture calls answer with, when they answer. **/
 #define SHARE_REQUEST_ID_INVALID (-1)
 
+/** sceShareInitialize(heap, priority, affinity). The export rejects a heap
+    below 0x20000 with INVALID_PARAM before it calls anyone, and treats
+    ALREADY_INITIALIZED (0x8196000D) as success. **/
+#define SHARE_HEAP_SIZE     0x20000u
+#define SHARE_THREAD_PRIO   700
+#define SHARE_AFFINITY_NONE 0ull
+
+/** The feature flags sceShareGetCurrentStatus and sceShareFeaturePermit take.
+    0x1 is video recording; a screenshot is 0x2. **/
+#define SHARE_FEATURE_SCREENSHOT 0x2u
+
 /** The exports this spike asks for, by the NID the library carries. **/
 static const char *nids[] = {
+  "nBDD66kiFW8",  /* ShareInitialize **/
+  "0IL1keINExQ",  /* ShareTerminate **/
   "QNop2YAtIDE",  /* ShareGetCurrentStatus **/
   "crFxyW3HdK0",  /* ShareGetRunningStatus **/
   "kCurUZVFqcI",  /* ShareSetCaptureSource **/
@@ -207,13 +220,30 @@ main(void) {
     resolve_logged(handle, nids[i]);
   }
 
+  // Every call made before this one answered NOT_INITIALIZED (0x8196000C),
+  // which is the library saying it was never started, not that the feature
+  // is denied. The heap, the priority and the affinity are the defaults a
+  // title passes.
+  fn = resolve_logged(handle, "nBDD66kiFW8");
+  if(fn) {
+    log_line("call Initialize(heap %#x, prio %d, affinity 0)",
+             (unsigned)SHARE_HEAP_SIZE, SHARE_THREAD_PRIO);
+    rc = ((int (*)(size_t, int, uint64_t))fn)(SHARE_HEAP_SIZE,
+                                              SHARE_THREAD_PRIO,
+                                              SHARE_AFFINITY_NONE);
+    log_line("Initialize() -> %d (%#x)", rc, rc);
+    log_line("survived Initialize");
+  }
+
   // A read first: the status call takes a feature flag and a status block,
-  // and a bad flag answers an error rather than touching the client.
+  // and a bad flag answers an error rather than touching the client. The
+  // screenshot feature is 0x2; 0x1 is video recording.
   memset(&status, 0, sizeof(status));
   fn = resolve_logged(handle, "QNop2YAtIDE");
   if(fn) {
-    log_line("call GetCurrentStatus(flag 1, status, 16 bytes)");
-    rc = ((int (*)(uint32_t, share_status_t*))fn)(1u, &status);
+    log_line("call GetCurrentStatus(flag 0x2, status, 16 bytes)");
+    rc = ((int (*)(uint32_t, share_status_t*))fn)(SHARE_FEATURE_SCREENSHOT,
+                                                  &status);
     log_line("GetCurrentStatus() -> %d (%#x), status %02x%02x%02x%02x",
              rc, rc, status.bytes[0], status.bytes[1], status.bytes[2],
              status.bytes[3]);
@@ -260,17 +290,18 @@ main(void) {
   // call was given, then read the status and ask for a capture once more.
   fn = resolve_logged(handle, "YBiIdcDPrxs");
   if(fn) {
-    log_line("call FeaturePermit(flag 1)");
-    rc = ((int (*)(unsigned int))fn)(1u);
-    log_line("FeaturePermit(1) -> %d (%#x)", rc, rc);
+    log_line("call FeaturePermit(flag 0x2)");
+    rc = ((int (*)(unsigned int))fn)(SHARE_FEATURE_SCREENSHOT);
+    log_line("FeaturePermit(0x2) -> %d (%#x)", rc, rc);
     log_line("survived FeaturePermit");
   }
 
   memset(&status, 0, sizeof(status));
   fn = resolve_logged(handle, "QNop2YAtIDE");
   if(fn) {
-    log_line("call GetCurrentStatus(flag 1) after the permit");
-    rc = ((int (*)(uint32_t, share_status_t*))fn)(1u, &status);
+    log_line("call GetCurrentStatus(flag 0x2) after the permit");
+    rc = ((int (*)(uint32_t, share_status_t*))fn)(SHARE_FEATURE_SCREENSHOT,
+                                                  &status);
     log_line("GetCurrentStatus() -> %d (%#x), status %02x%02x%02x%02x",
              rc, rc, status.bytes[0], status.bytes[1], status.bytes[2],
              status.bytes[3]);
