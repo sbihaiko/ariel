@@ -919,7 +919,7 @@ def doc_path(name="quick-start.md"):
 
 
 def run_quick_start(server, doc):
-    """Run the quick start's 'After Stage 1' section against one server."""
+    """Run the quick start's 'Install and run it' section against one server."""
     import quickstart
 
     workdir = tempfile.mkdtemp(prefix="ariel-quickstart-")
@@ -970,11 +970,11 @@ def scenario_quick_start_doc_drift(server):
 
     with open(doc_path()) as handle:
         text = handle.read()
-    section = quickstart.after_stage1(text)
+    section = quickstart.section_text(text)
     drifted = section.replace(
         "Hello, world from Ariel!", "Goodbye from Ariel!", 1)
     assert drifted != section, (
-        "the 'After Stage 1' section must show the payload's output")
+        "the section must show the payload's output")
     fixture_fails(server, text.replace(section, drifted, 1),
                   "a quick start changed without Ariel")
 
@@ -984,7 +984,7 @@ def scenario_quick_start_broken_setup(server):
 
     with open(doc_path()) as handle:
         text = handle.read()
-    section = quickstart.after_stage1(text)
+    section = quickstart.section_text(text)
     export = "$ export ARIEL_TOKEN=%s" % quickstart.TOKEN_PLACEHOLDER
     assert export in section, "the section must export the token"
 
@@ -1008,7 +1008,7 @@ def scenario_quick_start_unlabeled_block(server):
 
     with open(doc_path()) as handle:
         text = handle.read()
-    section = quickstart.after_stage1(text)
+    section = quickstart.section_text(text)
 
     for label in ("sh", "bash", "shell", ""):
         extra = "\n```%s\n$ no-such-ariel-command\n```\n" % label
@@ -10214,9 +10214,9 @@ SCENARIOS = [
      "exit 1", scenario_run_exec_failure, None),
     ("a finished connection reaches end of stream while a payload runs",
      scenario_run_does_not_leak_connections, None),
-    ("the quick start's 'After Stage 1' section passes headless",
+    ("the quick start's 'Install and run it' section passes headless",
      scenario_quick_start, None),
-    ("a change to the 'After Stage 1' section without a change to Ariel "
+    ("a change to the quick start's runnable section without a change to Ariel "
      "makes the fixture fail", scenario_quick_start_doc_drift, None),
     ("a broken setup command or a wrong exported token makes the fixture "
      "fail", scenario_quick_start_broken_setup, None),

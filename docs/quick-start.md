@@ -2,13 +2,13 @@
 
 By the end of this you have Ariel running on a jailbroken console, its agent port answering, a payload installed and run end to end, one approval signed offline by the key you hold, and the newest image the console's Create button saved copied out of its gallery. This is the state of the **Stage 4** release: the gate, the store, the readers and `shots` all work. Sessions and the MCP server are later stages and are not part of this build.
 
-The screenshots in this repository are not from this tutorial; the gallery step copies what the console itself saved.
+The headless acceptance suite runs the section "Install and run it" below exactly as written, against a host build instead of a console: it substitutes the token and the console's address, signs with a test key where you would, and treats IDs and hashes as placeholders. The rest of this page needs a console.
 
 ## What you need
 
 - A PS5 running a jailbreak with [elfldr](https://github.com/ps5-payload-dev/elfldr) listening on port 9021.
 - A computer on the same network, with `git`, `make`, `curl`, `nc` and `openssl` (macOS ships `nc` and `openssl`).
-- The console's IP address. The examples use `export PS5_HOST=192.168.0.10`; replace it with yours.
+- The console's IP address. The examples put it in `PS5_HOST`; replace it with yours.
 
 ## 1. Install the PS5 payload SDK
 
@@ -24,7 +24,7 @@ $ export PS5_PAYLOAD_SDK=~/.local/share/ps5-payload-sdk
 The SDK uses the host's LLVM toolchain:
 
 - **Debian or Ubuntu:** `sudo apt install xxd clang-18 lld-18`
-- **macOS:** `brew install llvm lld`, then `export LLVM_PATH=/opt/homebrew/opt/llvm/bin` and put it on `PATH`. The SDK finds `lld` through Homebrew on its own.
+- **macOS:** `brew install llvm lld`, then put `/opt/homebrew/opt/llvm/bin` on `PATH`. The SDK finds `lld` through Homebrew on its own.
 
 ## 2. Make the two keys that will approve everything
 
@@ -55,32 +55,13 @@ The release ships the source, not a ready-made ELF, and this is why: a build wit
 ## 4. Send it to the console
 
 ```console
+$ export PS5_HOST=<the console's address>
 $ cat shsrv-ps5.elf | nc -q0 $PS5_HOST 9021
 ```
 
 The console shows two notifications: the telnet shell is serving on `2323`, and Ariel's agent port is listening on `2324` with the access token. The same token is in `/data/ariel/token` on the console, which the agent port refuses to read back through any command.
 
-```console
-$ export ARIEL_TOKEN=<the token shown on the console>
-```
-
-## 5. Your first command on the agent port
-
-The agent port is plain text: one `auth` line, then exactly one command, then the reply, which always ends with an `exit <status>` line. A read-only command asks nobody.
-
-```console
-$ printf 'auth %s\nsysinfo\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324
-uname FreeBSD 11.00 ...
-uptime 12345
-memory 12345678 4567890
-exit 0
-```
-
-`ps`, `ls`, `stat`, `cat`, `read`, `head`, `tail`, `grep`, `find`, `du`, `date`, `dmesg` and the rest answer the same way. Every reply is capped at 64 KiB and a reader that cuts its answer says so with a `truncated <shown> of <total>` line.
-
-## 6. Install and run a payload end to end
-
-Build a payload with the SDK's compiler wrapper:
+## 5. Build a payload to install
 
 ```c
 /* hello.c */
@@ -100,7 +81,15 @@ main(int argc, char* argv[]) {
 $ $PS5_PAYLOAD_SDK/bin/prospero-clang -Wall -Werror -o helloworld.elf hello.c
 ```
 
-Push it. The command declares the size and the SHA-256, and the bytes follow on the same connection. macOS `nc` closes its sending side at the end of input by default; on Linux use `nc -N`.
+## 6. Install and run it
+
+The agent port is plain text: one `auth` line, then exactly one command, then the reply, which always ends with an `exit <status>` line. The token comes from the console. A read-only command asks nobody; one that changes the console answers `approval_required` and `exit 75`.
+
+```console
+$ export ARIEL_TOKEN=<token shown on the console>
+```
+
+Push the build. The command declares the size and the SHA-256, and the bytes follow on the same connection. macOS `nc` closes its sending side at the end of input by default; on Linux use `nc -N`.
 
 ```console
 $ { printf 'auth %s\npayload push helloworld %s %s\n' "$ARIEL_TOKEN" \
@@ -112,26 +101,31 @@ challenge a-81d0e3 ps5-living-room 0c5e9d1a7b3f4e62a8d0c1b9e7f35a24 120000 24000
 exit 75
 ```
 
-Exit 75 means the console is waiting for your signature. The `challenge` line is what the owner signs: copy it to the signer, which is offline and holds the key file. It prints the action it is about to sign, asks for confirmation, and writes one line on standard output:
+Approve it. The `challenge` line is what the owner signs: the approval ID, the console, a nonce, the window in milliseconds, the canonical action as hex, and the keyring generation the approval is made under. Copy it to the owner's signer, which is offline and holds the key file. It prints the action exactly as it signs it, asks for confirmation, and writes one line: the signature, the console and the action's SHA-256.
 
-```console
-$ printf '%s\n' '<the whole challenge line>' | ./hostbuild/ariel-sign sign ~/.config/ariel/owner.key
+```text
+./hostbuild/ariel-sign sign ~/.config/ariel/owner.key <<< '<the whole challenge line>'
 <signature> <console> <action-sha256>
 ```
 
-Grant it on the agent port, then commit the staged upload:
+Submit that line on the agent port, after the approval ID:
 
-```console
-$ printf 'auth %s\napproval grant a-81d0e3 <signature> <console> <action-sha256>\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324
+```text
+auth <token>
+approval grant a-81d0e3 <signature> <console> <action-sha256>
 approval_granted a-81d0e3
 exit 0
+```
 
+Each refusal has its own word and runs nothing: a signature that does not verify (`signature_invalid`), one made for another action (`signature_action_mismatch`) or another console (`signature_console_mismatch`), one that arrives after the window (`approval_expired`, `exit 88`), a malformed one (`signature_malformed`) and a second use (`approval_replayed`). A grant that arrives within ten seconds of the notification answers `approval_busy` (`exit 76`) and is worth retrying. Then commit the staged upload:
+
+```console
 $ printf 'auth %s\npayload commit s-4f2a9c\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324
 installed helloworld 3b1f0c...
 exit 0
 ```
 
-Run it. Approving the commit approved running this exact build, so no second approval is needed:
+Run it. Approving the commit approved running this exact build, so no new approval is needed:
 
 ```console
 $ printf 'auth %s\npayload run --wait helloworld one two\n' "$ARIEL_TOKEN" | nc $PS5_HOST 2324
@@ -142,9 +136,7 @@ status 0
 exit 0
 ```
 
-`status` is the payload's own exit status and `exit` is Ariel's, so a payload that exits 75 is never mistaken for an approval request. A rebuilt payload is a new hash, so pushing it asks again.
-
-If the challenge expires before the grant arrives, the grant answers `approval_expired` (exit 88) and nothing runs: push again. A grant within ten seconds of the notification answers `approval_busy` (76); a signature for another action or another console is refused with its own word and runs nothing.
+`status` is the payload's own exit status and `exit` is Ariel's, so a payload that exits 75 is never mistaken for an approval request. A rebuilt payload is a new hash, so pushing it asks again. If the challenge expires before the grant arrives, nothing runs: push again and sign the fresh challenge.
 
 ## 7. See what the console shows
 
@@ -172,4 +164,4 @@ An addon is an ELF and a manifest in a directory of its own. Only the owner inst
 - **`exit 75` and no notification appears:** the console shows it on screen for ten seconds per request; ask again rather than signing blind.
 - **`approval_expired` (88):** the window closed before the grant arrived. Push the action again and sign the fresh challenge.
 - **`protected` (87):** the command names Ariel's own state, or writes outside `/data`, `/user` and `/mnt/usb*`. That refusal never asks the owner and never can be approved.
-- **A red test after a change:** `make -C hostbuild test` is the headless suite and needs no console. Never run the top-level `make test`: it deploys to the console at `PS5_HOST` and refuses unless you name it with `ARIEL_DEPLOY=yes`.
+- **A red test after a change:** `make -C hostbuild test` is the headless suite and needs no console. Never run the top-level `make test`: it deploys to the console and refuses unless you name it with `ARIEL_DEPLOY=yes`.

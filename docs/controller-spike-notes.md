@@ -112,7 +112,7 @@ Checked against `sbihaiko/ariel` on 2026-10-23. Three issues are open. Nine are 
 
 #3 was closed when `fix/3-spike-login-users` landed on `dev` as `a1782a1` (2026-10-23). That close records the home-screen runs, which never opened the pad. It does not record the later foreground-title runs in this file. Those runs are the result ADR-0006 asked the spike for, and the ADR has not been rewritten since.
 
-#11 is the ticket that still needs a console. Its acceptance criteria are unmet: the console suite has not passed on a PS5, and the quick start's "After Stage 1" section has not been checked there. The blocker list is stale. The real gap was the approval source. This console showed that the payload process cannot read the controller while a title is in front, and that reading it by attaching to the title stops the game. ADR-0006 was rewritten for that result, so the source #11 waits on now matches the console.
+#11 is the ticket that still needs a console. Its acceptance criteria are unmet: the console suite has not passed on a PS5, and the quick start's runnable section has not been checked there. The blocker list is stale. The real gap was the approval source. This console showed that the payload process cannot read the controller while a title is in front, and that reading it by attaching to the title stops the game. ADR-0006 was rewritten for that result, so the source #11 waits on now matches the console.
 
 What follows from that, and what does not:
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the 'After Stage 1' section of docs/quick-start.md as an acceptance fixture.
+"""Run the 'Install and run it' section of docs/quick-start.md as an acceptance fixture.
 
 The fixture reads the section, not a copy of it: every `$` block is sent as
 written after substituting the access token, the host, the port and the
@@ -42,7 +42,7 @@ PROMPT = re.compile(
 )
 ERROR = re.compile(r"(invalid|illegal|unknown) option", re.I)
 
-SECTION = "## After Stage 1"
+SECTION = "## 6. Install and run it"
 DOCUMENTED_PORT = 2324
 APPROVE_STEP = "Approve it"
 TOKEN_PLACEHOLDER = "<token shown on the console>"
@@ -59,8 +59,8 @@ class FixtureError(AssertionError):
     """The quick start and the server disagree, or the section is malformed."""
 
 
-def after_stage1(text):
-    """Return the text of the 'After Stage 1' section, without its heading."""
+def section_text(text):
+    """Return the text of the section the fixture runs, without its heading."""
     lines = text.split("\n")
     for index, line in enumerate(lines):
         if line.strip() == SECTION:
@@ -346,7 +346,7 @@ def run_quick_start(doc_path, workdir, host, port, token, next_line, approve,
     with open(doc_path) as handle:
         text = handle.read()
 
-    section = after_stage1(text)
+    section = section_text(text)
     build_hello(text, workdir, cc)
 
     with open(os.path.join(workdir, "helloworld.elf"), "rb") as handle:

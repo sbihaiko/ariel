@@ -1143,7 +1143,7 @@ CHECKS = [
      check_run_refusals),
     ("a background run or logs of an unknown payload, and a run of a bad "
      "name, answer their word and exit 1", check_background_refusals),
-    ("the quick start's 'After Stage 1' section passes against the console",
+    ("the quick start's 'Install and run it' section passes against the console",
      check_quick_start),
     ("the inspection commands run with no approval and answer their output",
      check_inspection_commands),
