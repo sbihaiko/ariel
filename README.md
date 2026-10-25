@@ -54,51 +54,27 @@ The agent port is 2324, raw TCP with no telnet negotiation, so a binary upload a
 
 **Sight.** `shots` copies out of the gallery the console's own Create button writes at `/user/av_contents/photo`: `--last` the newest image, `--count <n>` the newest `n`, `--minutes <n>` the images of the last `n` minutes, `n` from 1 to 64. It captures nothing and writes nothing in the gallery. It is gated with the selector in the signed action (`option.select`); each copy lands under `/data/shots`, the reply names path, size and SHA-256, and an empty gallery answers `no_shots` before the owner is asked. Why it is a copy and not a capture is in [Standing limits](#standing-limits).
 
-### Command coverage
+### What the agent can do
 
-Which bash commands an agent can expect on Ariel. Each row is an Ariel command, and the **bash equivalent** column is filled in only when the name differs from bash. **shsrv** is what upstream offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan** names the stage, S1 to S7, and "gated" means the owner's approval ([Safety model](#safety-model)).
+The port offers one command per connection, and the set is chosen so that an agent can see the console, move files, install and run payloads, keep its place between connections and recover from a bad payload — while nothing that changes the console happens without the owner's signature. Every answer is lines of text ending in `exit <status>`, with a word on its own channel when it fails ([docs/exit-codes.md](docs/exit-codes.md)), so an agent branches on a word and never parses prose. Where a shell would need a pipe, a flag stands in: `grep -c` for `| wc -l`, `--json` for a parser, `--limit` and the 64 KiB cap for a pager.
 
-| Ariel | bash equivalent | shsrv | Plan |
-|---|---|---|---|
-| `pwd` | | ✅ | S5: `@<sid> pwd` answers the session's directory, and `/` on a connection with no session. The sessions themselves are `session new`, `session close <sid>` and `session list` |
-| `cd` | | ✅ | S5: `@<sid> cd PATH` moves the session, and a connection with no session answers `no_working_directory` |
-| `ls` | | ⚠️ no `-l` or `-a` | S3: `-l`, `-a`, `--limit` and `--json`, cut at 64 KiB |
-| `stat`, `file` | | ✅ | |
-| `cat` | | ✅ | S3: `--limit`, and a file over 64 KiB is cut |
-| `read <path>` | `dd`, `head -c` | ❌ | S3: the binary frame of ADR-0012, `bytes <size> <sha256>`, with `--offset` and `--limit` |
-| `head`, `tail`, `wc` | | ✅ | |
-| `grep` | | ⚠️ only `-i`, `-n` | S3: `-r`, `-l`, `-c`, `-e`, `--`, `--limit` |
-| `find` | | ⚠️ only `-name`, `-type` | S3: `-name`, `-type f\|d\|l`, `--limit`, `--json` |
-| `cmp`, `hexdump` | | ✅ | |
-| `diff` | | ❌ | Not built: `cmp` answers same-or-differ with the first offset and `hexdump` shows the bytes; a finer diff is the agent's own work on its own machine |
-| `df` | | ✅ | |
-| `du` | | ✅ | |
-| `mkdir`, `rmdir`, `touch`, `ln` | | ✅ | S2: gated |
-| `cp`, `mv` | | ⚠️ no `-r` | S2: gated. S3: `cp -r`, which asks once for the whole tree |
-| `rm` | | ⚠️ one file, no `-r` | S2: gated. S3: `rm -r`, which asks once for the whole tree |
-| `chmod`, `chown`, `chgrp` | | ✅ | S2: gated |
-| `write <path>` | `echo > file`, `tee` | ✅ | S3: gated, one frame |
-| `tar`, `unzip` | | ❌ | S2 |
-| `ps` | | ✅ | |
-| `procstat` | `/proc/<pid>/*` | ✅ | |
-| `kill` | | ✅ | S2: gated, critical processes protected |
-| `payload run` | `cmd &`, `nohup` | ❌ | S1: `--wait` runs an approved build in the foreground. S2: background runs with a log |
-| `payload push`, `payload commit` | `scp`, `curl -T` | ❌ | S1, hash approved by the owner |
-| `timeout` | | ❌ | Not built: the 60 s connection deadline answers `timed_out`, and a health check carries its own bound through `payload config` |
-| `sleep`, `id`, `sync` | | ✅ | |
-| `env`, `export`, `exec` | | ✅ | S2: gated |
-| `sysinfo` | `uname`, `uptime`, `free` | ✅ | |
-| `date` | | ✅ | |
-| `dmesg` | | ✅ | |
-| `mount`, `umount`, `chroot`, `mknod` | | ✅ | S2: gated |
-| `reboot` | | ❌ | S2: gated; the host build simulates it |
-| `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
-| `sha256sum` | | ❌ (`sum` is a BSD checksum) | Not built: `read <path> --limit 0` answers `bytes 0 <sha256>`, the whole file's hash, in one read-only call |
-| `netstat` | | ❌ | S6 (optional): not built; waits on its own console probe, see [Stage 6](#stage-6-optional-network-sight) |
-| `ifconfig` | | ❌ | S6 (optional): not built; waits on its own console probe |
-| `ping` | | ❌ | S6 (optional): not built; waits on its own console probe |
+| What it is for | Commands | Asks the owner |
+|---|---|---|
+| Looking around the file system | `ls`, `stat`, `file`, `df`, `du`, `find`, `cat`, `head`, `tail`, `wc`, `grep`, `cmp`, `hexdump` | no |
+| Pulling a binary back | `read`, which answers a byte range with the file's size and SHA-256, and `sha256sum` | no |
+| Reading the machine | `ps`, `procstat`, `dmesg`, `sysinfo`, `date`, `sysctl` for a parameter, `id`, `authid`, `sfoinfo`, `sum`, `sync` | no |
+| Changing files | `mkdir`, `rmdir`, `touch`, `ln`, `cp`, `mv`, `rm`, `chmod`, `chown`, `chgrp`, `write`, `unzip`, `tar` | yes |
+| Installing and running payloads | `payload push`, `payload commit`, `payload install`, `payload config`, `payload rollback`, `payload run`, `payload list`, `payload logs` | push, commit, install, config and rollback; `run`, `list` and `logs` ask nobody |
+| Keeping a place between connections | `session new`, `session close`, `session list`, the `@<sid>` prefix, `pwd`, `cd`, `export`, `env` | `export` and `env` |
+| Following an approval | `approval status`, `audit tail` | no |
+| Managing the keys | `key rotate`, `key rotate-recovery`, `key revoke`, `key unfreeze` | yes |
+| Surviving a reboot | `autoload show`, `autoload edit`, `autoload safe-boot` | `edit` and `safe-boot` |
+| Changing the system | `kill`, `mount`, `umount`, `chroot`, `mknod`, `reboot`, `exec`, `sysctl` for a write, `http2_get` | yes |
+| Seeing the screen | `shots` | yes |
+| Running an addon | `addon list`, `addon check`, `addon run` | `run` |
+| The console's own built-ins | `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `sfocreate` | yes |
 
-PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated, and `sfocreate` joined them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2), `shots` (Stage 4) and `session` (Stage 5).
+`authid` and `sfoinfo` are the two PS5 commands that read only, and `sfocreate` joined the gated set in Stage 3 ([#49](https://github.com/sbihaiko/ariel/issues/49)). `netstat`, `ifconfig` and `ping` are not on the port yet, because each waits on its own console probe ([Stage 6](#stage-6-optional-network-sight)), and `diff` and `timeout` are deliberately absent: what covers each is in [What is missing](#commands-deliberately-not-built).
 
 ### Safety model
 
@@ -120,7 +96,7 @@ No current command says which ports the console listens on or which peers it is 
 
 The stage is three read-only, ungated commands over numeric addresses only, each bounded so none can hold the console, and each built only if its own console probe passes on 11.20. `netstat` lists the sockets — protocol, local address and port, peer and state, one line each — with `-l`, `-t` and `-u` to filter and `--limit` and `--json` as everywhere else. `ifconfig` lists every interface with its address, mask and administrative state. `ping ADDRESS` answers whether a literal IPv4 address replies and how long it took, with the count capped at ten and each wait at five seconds, so the worst case is 50 s, inside the connection deadline; it sends a fixed probe and never returns the reply's bytes. The line formats, the JSON keys and every refusal word are fixed in the spec, so a ticket never has to invent one.
 
-The probe comes first and is a payload of its own, as the controller, capture and share spikes were: never linked into Ariel, run with the owner present, three probes from least to most risky (the interface list, the socket tables, the echo), a selector to run one alone, and a log under `/data` so a freeze is attributable. A failed probe is a result: the findings record the transcript, the coverage row keeps "not built" and gains the reason, and the stage closes either way. The console build answers from system calls, never a shell-out, and the host build reports its own machine, as `ps` and `sysinfo` do. There is no new exit status and no change to the approval design: `bad_option`, `bad_argument`, `missing_operand`, `operation_failed`, the platform refusal and `no_reply` carry every failure.
+The probe comes first and is a payload of its own, as the controller, capture and share spikes were: never linked into Ariel, run with the owner present, three probes from least to most risky (the interface list, the socket tables, the echo), a selector to run one alone, and a log under `/data` so a freeze is attributable. A failed probe is a result: the findings record the transcript, the command list keeps saying it is not on the port and gains the reason, and the stage closes either way. The console build answers from system calls, never a shell-out, and the host build reports its own machine, as `ps` and `sysinfo` do. There is no new exit status and no change to the approval design: `bad_option`, `bad_argument`, `missing_operand`, `operation_failed`, the platform refusal and `no_reply` carry every failure.
 
 ### The installer and release stage-5.1
 
@@ -134,7 +110,7 @@ Not started. The plan is to expose the same capabilities as an [MCP](https://mod
 
 ### Commands deliberately not built
 
-Three commands were planned and dropped because another mechanism already covers each, and their rows in the [coverage table](#command-coverage) name it: `diff`, covered by `cmp` and `hexdump`; `timeout`, covered by the connection deadline and the health check's own bound; and `sha256sum`, covered by `read <path> --limit 0`, so a separate command would add a word and no capability. `netstat`, `ifconfig` and `ping` are missing for a different reason: each waits on a console probe that has not run ([Stage 6](#stage-6-optional-network-sight)), and until one passes the console's address is the one the agent connected to and a failed download is the only reachability answer.
+Two commands were planned and dropped because another mechanism already covers each: `diff`, which `cmp` (same-or-differ with the first differing offset) and `hexdump` cover, a finer comparison being the agent's own work on its own machine; and `timeout`, which the 60 s connection deadline covers with `timed_out`, and a health check with the bound `payload config` gives it. `netstat`, `ifconfig` and `ping` are missing for a different reason: each waits on a console probe that has not run ([Stage 6](#stage-6-optional-network-sight)), and until one passes the console's address is the one the agent connected to and a failed download is the only reachability answer.
 
 ### Standing limits
 
