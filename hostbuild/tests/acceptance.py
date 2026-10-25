@@ -12219,16 +12219,17 @@ def assert_addon_survives(server):
         "Ariel must answer after an addon run ends badly, got %r" % lines)
 
 
-def assert_failed_run_keeps_output(server, name, lines, word):
-    """A failed run answers its word, the result it kept, and exit 1; that file is on disk."""
+def assert_failed_run_keeps_output(server, name, lines, word, code=1):
+    """A failed run answers its word, the result it kept, and code; that file is on disk."""
     match = (re.match(r"^result (/data/addon-%s-\d+)$" % re.escape(name), lines[1])
              if len(lines) == 3 else None)
-    assert match and lines[0] == word and lines[2] == "exit 1", (
+    assert match and lines[0] == word and lines[2] == "exit %d" % code, (
         "an addon run that ends with %s must answer that word, its result and "
-        "exit 1, got %r" % (word, lines))
+        "exit %d, got %r" % (word, code, lines))
     kept = match.group(1).rsplit("/", 1)[1]
     assert kept in addon_results(server, name), (
         "a failed addon run must keep its output in the file it names, %r" % kept)
+    return kept
 
 
 def scenario_addon_run_is_granted_and_bare(server):
@@ -12372,16 +12373,25 @@ main(void) {
 
 
 def scenario_addon_refusal_outside_keeps_output(server):
-    """An addon that refuses a path itself keeps and names its output, like every failure."""
-    for name, source, word in (
-            ("badpath", REFUSING_PATH_SOURCE, "bad_path"),
-            ("statepath", REFUSING_STATE_SOURCE, "protected")):
+    """An addon that refuses a path itself keeps its output, and the file its reply names holds its line."""
+    for name, source, word, code, line in (
+            ("badpath", REFUSING_PATH_SOURCE, "bad_path", 1,
+             "refused: a path outside the allowed roots"),
+            ("statepath", REFUSING_STATE_SOURCE, "protected", 87,
+             "refused: that path names Ariel's state")):
         manifest_sha = addon_runner(server, name, source)
         try:
             approval, challenge = addon_run_request(server, name, manifest_sha, [])
             sign_and_grant(server, approval, challenge)
-            assert_failed_run_keeps_output(
-                server, name, run_command(server, "addon run %s" % name), word)
+            kept = assert_failed_run_keeps_output(
+                server, name, run_command(server, "addon run %s" % name), word, code)
+            # The host build's readers take paths under the test root, as the
+            # failure-line scenario does.
+            host_path = os.path.join(server.root, "data", kept)
+            shown = run_command(server, "cat " + host_path)
+            assert shown == [line, "exit 0"], (
+                "the addon's own line must be in the file the reply names, got %r"
+                % shown)
         finally:
             cleanup_addon(server, name)
 
