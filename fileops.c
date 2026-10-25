@@ -51,6 +51,18 @@ along with this program; see the file COPYING. If not, see
 #endif
 
 
+/**
+ * What a copy or move expects to open again: the device and inode the scan
+ * saw. It is deliberately not the whole approval record: tree_copy carries
+ * one of these on every frame of its walk, and the connection thread's stack
+ * has to hold TREE_DEPTH_MAX of them.
+ **/
+typedef struct {
+  uint64_t dev;
+  uint64_t ino;
+} expected_object_t;
+
+
 /** The part of path below root, starting with '/', or NULL when path is not
     under root. **/
 static const char *
@@ -852,7 +864,7 @@ write_full(int fd, const char *buf, size_t n) {
  * made exclusively, and removed again when the copy fails.
  **/
 static int
-copy_entry(int sdir, const char *sleaf, const approval_facts_t *expected,
+copy_entry(int sdir, const char *sleaf, const expected_object_t *expected,
            int ddir, const char *dleaf) {
   char buf[8192];
   struct stat st;
@@ -915,7 +927,7 @@ copy_entry(int sdir, const char *sleaf, const approval_facts_t *expected,
  * is taken back out of the destination.
  **/
 static int
-move_entry(int sdir, const char *sleaf, const approval_facts_t *expected,
+move_entry(int sdir, const char *sleaf, const expected_object_t *expected,
            int ddir, const char *dleaf) {
   struct stat st;
   int rc = FILEOPS_OK;
@@ -978,11 +990,15 @@ fileops_transfer_act(const char *root, const char *command,
                      const approval_facts_t *expected) {
   approval_facts_t now;
   approval_facts_t into;
+  expected_object_t object;
   char sleaf[PATH_MAX];
   char dleaf[PATH_MAX];
   int sdir;
   int ddir;
   int rc;
+
+  object.dev = expected->dev;
+  object.ino = expected->ino;
 
   memset(&now, 0, sizeof(now));
   rc = transfer_inspect(root, source, &now, &sdir, sleaf, sizeof(sleaf));
@@ -1006,9 +1022,9 @@ fileops_transfer_act(const char *root, const char *command,
   if(strcmp(into.kind, "absent")) {
     rc = FILEOPS_EXISTS;
   } else if(!strcmp(command, "cp")) {
-    rc = copy_entry(sdir, sleaf, expected, ddir, dleaf);
+    rc = copy_entry(sdir, sleaf, &object, ddir, dleaf);
   } else if(!strcmp(command, "mv")) {
-    rc = move_entry(sdir, sleaf, expected, ddir, dleaf);
+    rc = move_entry(sdir, sleaf, &object, ddir, dleaf);
   } else {
     rc = linkat(sdir, sleaf, ddir, dleaf, 0) ?
          (errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED) : FILEOPS_OK;
@@ -1202,7 +1218,7 @@ tree_remove(int parent, const char *leaf, int depth) {
 static int
 tree_copy(int from, const char *sleaf, int to, const char *dleaf, int depth,
           int *created) {
-  approval_facts_t expected;
+  expected_object_t expected;
   struct dirent *ent;
   struct stat st;
   DIR *dir;

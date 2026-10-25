@@ -37,12 +37,19 @@ along with this program; see the file COPYING. If not, see
 #define DRAIN_MAX 16
 
 /**
- * Every connection thread gets this stack, on the PS5 and on the host alike.
- * It is the PS5's default thread stack: a frame that overflows it crashed
- * Ariel on a console while the host's larger default hid it, so the host
- * build runs with the same limit and its suite finds such a frame first.
+ * Every connection thread gets this stack, on the PS5 and on the host alike,
+ * and the host build runs this same size so its suite finds an overflow here
+ * first. The size is a budget the deepest command has to fit inside: the
+ * handlers' own frames, plus one frame for each of the TREE_DEPTH_MAX levels
+ * a recursive walk opens (cp -r, rm -r and grep -r all walk that deep), plus
+ * the 8 KiB read buffer copy_entry holds at the bottom of a cp -r. At 64 KiB
+ * a tree near the limit overflowed it, and under GCC's larger frames a
+ * two-level tree did too (#96), so each walk frame was cut to the device and
+ * inode it re-opens and the stack was doubled. The scenario "cp -r and rm -r
+ * hold a tree as deep as the walk promises" copies a tree one level short of
+ * the limit, and is what keeps this constant honest.
  **/
-#define CONNECTION_STACK (64 * 1024)
+#define CONNECTION_STACK (128 * 1024)
 
 
 struct connection {

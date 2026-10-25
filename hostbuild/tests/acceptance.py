@@ -9295,6 +9295,20 @@ def scenario_deep_tree_fits_the_connection_stack(server):
     assert run_command(server, remove) == ["exit 0"], (
         "rm -r must remove a tree the depth limit allows without killing the thread")
     assert not os.path.lexists(dst), "a signed rm -r must remove the whole copy"
+    # One level past the limit the walk stops rather than the thread: the
+    # command answers its word, asks nobody and leaves nothing behind.
+    past = make_tree(server, "too-deep", {},
+                     dirs=[ladder + os.sep + "d%02d" % (limit - 1)])
+    beyond = os.path.join(server.root, "data", "too-deep-dst")
+    assert run_command(server, "cp -r %s %s" % (past, beyond)) == [
+        "operation_failed", "exit 1"], (
+        "cp -r past the depth limit must answer operation_failed")
+    assert not os.path.lexists(beyond), "a refused deep cp -r must create nothing"
+    assert run_command(server, "rm -r %s" % past) == [
+        "operation_failed", "exit 1"], (
+        "rm -r past the depth limit must answer operation_failed")
+    assert os.path.isdir(past), "a refused deep rm -r must remove nothing"
+    server.assert_no_line()
 
 
 def scenario_unsupported_options_answer_bad_option(server):
@@ -9330,6 +9344,8 @@ HOST_ROOT_SCENARIOS.update({
     "rm -r refuses protected objects and links before anything is removed",
     "cp -r copies a tree after the owner signs, and refuses an existing destination",
     "cp -r refuses a tree into itself, a link, a protected alias and bad_option",
+    "cp -r and rm -r hold a tree as deep as the walk promises, on the "
+    "connection thread's stack",
     "an option a command does not take answers bad_option and asks nobody",
 })
 
