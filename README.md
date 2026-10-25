@@ -2,184 +2,78 @@
 
 **A PS5 payload shell built for AI agents.**
 
-Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
+Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent can inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** Stages 1 to 5 are done, and Stages 6 and 7 have not started. All five have their console runs on firmware 11.20; Stage 5's session round trip ran on the `stage-5` build on 2026-10-25 ([#107](https://github.com/sbihaiko/ariel/issues/107)). Stage 4's sight is `shots`, a copy of the image the Create button wrote: the owner accepted it because no capture route a payload can reach has produced an image ([#53](https://github.com/sbihaiko/ariel/issues/53), [#100](https://github.com/sbihaiko/ariel/issues/100)), so [`addons/sight/`](addons/sight/) stays a reference that refuses. See [Progress](#progress).
+> **Status:** Stages 1 to 5 are delivered and run on firmware 11.20; the current release is [`stage-5.1`](https://github.com/sbihaiko/ariel/releases/tag/stage-5.1). Stage 6, network sight, is specified ([#111](https://github.com/sbihaiko/ariel/issues/111)) and not started. Stage 7, the MCP server, is not started. See [Progress](#progress), [What is being done](#what-is-being-done) and [What is missing](#what-is-missing).
 >
-> **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have. The decision is [ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md).
+> **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, a CFI-2014 on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. Supporting several firmware versions costs a lab this project does not have. The decision is [ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md).
 
 ---
 
 ## Why Ariel exists
 
-Coding agents like Claude Code are good at diagnosing systems: they run a command, read the output, form a hypothesis and run the next command. A jailbroken PS5 is a system worth diagnosing, but it is a hostile place for an agent:
+Coding agents diagnose a system by running a command, reading the output and running the next one. A jailbroken PS5 is a hostile place for that: there is no real Unix shell to run the agent on; shsrv was built for humans typing into telnet, with whitespace splitting, free-form output, no exit status and no pagination; getting a payload onto the console is manual and a bad one can crash or hang the system; and everything lives in RAM, so a reboot wipes the jailbreak and every running payload. Ariel gives the agent one endpoint with a predictable, safe, recoverable interface.
 
-- There is no real Unix shell. Agents cannot run Claude Code or Node.js on the console itself.
-- The existing shell (shsrv) was built for humans typing into telnet. Arguments are split on whitespace with no quoting, output is free-form text, there is no exit status and no pagination.
-- Getting a new payload onto the console is a manual process (download, FTP, send to the ELF loader), and a bad payload can crash or hang the system.
-- Everything lives in RAM. A reboot wipes the jailbreak and every running payload.
+## How it is today
 
-Ariel closes that gap. The idea is that an agent connects to one endpoint on the console and gets a predictable, safe, recoverable interface to it.
-
-## Progress
+### Progress
 
 Work happens on the `dev` branch; `master` follows it at milestones. Each stage is a spec issue whose sub-issues are the work. Every console run is on a CFI-2014 on firmware 11.20.
 
-| Stage | Spec | Status |
+| Stage | Spec | Delivered |
 |---|---|---|
-| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | ✅ Done. Console suite 10/10; the quick start and the telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
-| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done on 2026-10-24. 37 sub-issues closed; console suite 36/36 and the telnet boundary check passed ([#46](https://github.com/sbihaiko/ariel/issues/46)). |
-| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done. Nine sub-issues closed; the host acceptance suite covers it. |
-| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | ✅ Done on 2026-10-25. The loader, the reference addon and `addons/ftp/` are done; sight is `shots`, a copy of the image the Create button wrote, which the owner accepted because no capture route returns an image ([#53](https://github.com/sbihaiko/ariel/issues/53), [#100](https://github.com/sbihaiko/ariel/issues/100)). |
-| 5. Sessions (optional) | [#101](https://github.com/sbihaiko/ariel/issues/101) | ✅ Done on 2026-10-25. Six sub-issues closed; the host acceptance suite covers the prefix, the directory, the relative paths, the environment and the limits, and the console round trip ran on the `stage-5` build ([#107](https://github.com/sbihaiko/ariel/issues/107)). |
-| 6. Network sight (optional) | [#94](https://github.com/sbihaiko/ariel/issues/94) | Not started; `netstat`, `ifconfig` and `ping`, each gated by its own console spike. |
-| 7. MCP (optional) | | Not started. |
+| 1. Hello world, end to end | [#1](https://github.com/sbihaiko/ariel/issues/1) | Console suite 10/10; the quick start and the telnet boundary check passed ([#11](https://github.com/sbihaiko/ariel/issues/11)). |
+| 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | 2026-10-24. 37 sub-issues closed; console suite 36/36 and the telnet boundary check passed ([#46](https://github.com/sbihaiko/ariel/issues/46)). The key run rotated, revoked, froze, unfroze, started without the keyring and restored it ([console findings](docs/console-findings.md#issue-48-keys-on-the-console)). |
+| 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | Nine sub-issues closed; the host acceptance suite covers it, and the console evidence (read ranges, `cp -r`/`rm -r`, `sfocreate`/`sfoinfo`) is in [console findings](docs/console-findings.md#issue-61-64-and-49-stage-3-on-the-console). |
+| 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | 2026-10-25. The loader, the reference addon and `addons/ftp/` are done; sight is `shots`, accepted by the owner because no capture route returns an image ([#53](https://github.com/sbihaiko/ariel/issues/53), [#100](https://github.com/sbihaiko/ariel/issues/100)). |
+| 5. Sessions (optional) | [#101](https://github.com/sbihaiko/ariel/issues/101) | 2026-10-25. Six sub-issues closed; the host acceptance suite covers the prefix, the directory, the relative paths, the environment and the limits, and the console round trip ran on the `stage-5` build ([#107](https://github.com/sbihaiko/ariel/issues/107)). |
 
-**Stage 2** built everything [its goals](#stage-2-persist-and-recover) name, and `unzip` and `tar` refuse a member that escapes. The key work is the hierarchy and rotation ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)), the freeze ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)). The key run on the console rotated, revoked, froze, unfroze, started without the keyring and restored it ([console findings](docs/console-findings.md#issue-48-keys-on-the-console)).
+Stage 3's nine pieces, issue and commit: the grammar, ADR-0012 ([#58](https://github.com/sbihaiko/ariel/issues/58), `8e87996`); one parser with quotes, the escaped canonical action and the 60 s deadline ([#59](https://github.com/sbihaiko/ariel/issues/59), `02e9f0e`); bounded readers and the `truncated` marker ([#60](https://github.com/sbihaiko/ariel/issues/60), `cadf9ec`); the binary `read` ([#61](https://github.com/sbihaiko/ariel/issues/61), `641f2f9`); `write`, gated ([#62](https://github.com/sbihaiko/ariel/issues/62), `9c2380e`); `--json` on `ps`, `ls`, `stat`, `df` and `find` ([#63](https://github.com/sbihaiko/ariel/issues/63), `cd62866`); `ls -l -a`, `grep -r -l -c -e`, `find -name -type`, `rm -r` and `cp -r` ([#64](https://github.com/sbihaiko/ariel/issues/64), `03eef1c`); `date`, `du`, `dmesg` and `sysinfo` ([#65](https://github.com/sbihaiko/ariel/issues/65), `e99af35`); `sfocreate`, gated ([#49](https://github.com/sbihaiko/ariel/issues/49), `5afbb06`).
 
-**Stage 3** implements the grammar of [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md):
+### Installing and running it
 
-| Issue | Delivered | Commit |
-|---|---|---|
-| [#58](https://github.com/sbihaiko/ariel/issues/58) | The grammar, ADR-0012 | `8e87996` |
-| [#59](https://github.com/sbihaiko/ariel/issues/59) | One parser: quotes, the escaped canonical action the owner signs, the 60 s connection deadline | `02e9f0e` |
-| [#60](https://github.com/sbihaiko/ariel/issues/60) | Bounded readers and the `truncated` marker | `cadf9ec` |
-| [#61](https://github.com/sbihaiko/ariel/issues/61) | The binary `read` | `641f2f9` |
-| [#62](https://github.com/sbihaiko/ariel/issues/62) | `write`, gated | `9c2380e` |
-| [#63](https://github.com/sbihaiko/ariel/issues/63) | `--json` on `ps`, `ls`, `stat`, `df` and `find` | `cd62866` |
-| [#64](https://github.com/sbihaiko/ariel/issues/64) | Missing flags: `ls -l -a`, `grep -r -l -c -e`, `find -name -type`, `rm -r` and `cp -r` | `03eef1c` |
-| [#65](https://github.com/sbihaiko/ariel/issues/65) | Diagnostics: `date`, `du`, `dmesg` and `sysinfo` | `e99af35` |
-| [#49](https://github.com/sbihaiko/ariel/issues/49) | `sfocreate`, gated | `5afbb06` |
+The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a payload installed and run on a console, through the gate, with the owner's key. The short way is one script:
 
-The tokenizer refuses `bad_quoting` and a line over 64 tokens, and a word a command does not take answers `bad_option`. The deadline answers `timed_out`, so there is no separate `timeout`. No answer carries more than 64 KiB. A cut answer ends with `truncated <shown> of <total>`, and `read` answers `bytes <size> <sha256>`, then exactly that many bytes. Every command has its own error channel and an exit status from [docs/exit-codes.md](docs/exit-codes.md). The JSON commands and `sysinfo` answer one object per line ([docs/json-output.md](docs/json-output.md)), and `--limit` caps every listing that can flood. `cp -r` and `rm -r` are gated like every other file command. The optional `diff` and the network diagnostics were not built. The console evidence (read ranges, `cp -r`/`rm -r`, `sfocreate`/`sfoinfo`) is in [console findings](docs/console-findings.md#issue-61-64-and-49-stage-3-on-the-console).
+```console
+$ sh tools/install/ariel.sh <console address>
+```
 
-## Goals
+It makes the two keys if they are not there, builds the payload with them pinned, sends it to port 9021, waits for the agent port, and leaves `ariel.env` holding `PS5_HOST` and `ARIEL_TOKEN`. `tools/install/ariel.command` is the same on a double-click on macOS and `tools/install/ariel.bat` on Windows; `--check` says what it would do and sends nothing. The build routes are in [the release notes below](#the-installer-and-release-stage-51).
 
-### Stage 1: hello world, end to end
+By hand, it is four steps:
 
-The first milestone is the smallest loop that proves the whole idea: an agent builds a payload on a computer, pushes it to the console, the owner approves it with a key they hold, and the agent runs it and reads its output. The [quick start](docs/quick-start.md#after-stage-1) is this stage's acceptance test, and it runs headless in CI against a host build of Ariel.
+1. Clone the `stage-5.1` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
+2. Make two keys with `./hostbuild/ariel-sign keygen`: the primary that signs everyday approvals, and a recovery key kept offline.
+3. Build the payload with both public keys pinned: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`, 64 hex digits each. The two must differ, and setting `ARIEL_PUBKEY` without `ARIEL_RECOVERY_PUBKEY` stops the build, because the console would otherwise refuse every grant. The host build's own test key is not one a console accepts.
+4. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
 
-- **An agent port (2324)** next to the telnet shell: raw TCP with no telnet negotiation, so a binary upload arrives intact. One command per connection after `auth`, no prompts, and every reply ends with an `exit <status>` line ([exit codes](docs/exit-codes.md)).
-- **An access token** on the agent port. Every connection starts with `auth <token>`; Ariel shows the token on the console at first start.
-- **`payload push <name> <size> <sha256>`** uploads a locally built ELF over the same connection, so no FTP server is needed. Ariel stages it and the console shows its hash.
-- **Approval by the owner's key.** A push answers `approval_required <id>`; the owner signs the exact action with a key the agent does not hold. Approving a pushed build also approves running that exact build.
-- **`payload commit <staging-id>`** moves an approved upload into Ariel's store. The bytes are sent once.
-- **`payload list`** reads the state file and answers one `payload <name> ...` line per installed payload, with its source, version identifiers, hash, path, whether it is running, whether it is marked failed (`failed=yes|no`, always present, before `previous`) and `previous=<sha256|->`, the build the last commit replaced (`-` when there is none). It changes nothing.
-- **`payload run --wait <name>`** runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports the payload's exit status on a `status <n>` line, apart from the protocol's `exit` line.
-- **A host build** of Ariel behind a platform port, with a test clock and a virtual controller that can only deny, for tests. It never ships in the PS5 build.
+The release ships source only, and it has to: a build with no key pinned refuses every grant, and one pinned to someone else's keys could only be approved by them. The console carries the public half of **your** pair.
 
-The agent port offers only these commands. Every command that changes the system stays on the telnet shell, exactly as in upstream shsrv, until Stage 2 gates it on the agent port.
+Ariel builds like shsrv, with the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) on a Debian-based system: install `xxd`, point `PS5_PAYLOAD_SDK` at the SDK and run `make`. `make test ARIEL_DEPLOY=yes PS5_HOST=<console>` sends `ariel-ps5.elf` to the console, and refuses without the explicit `ARIEL_DEPLOY`. The headless acceptance suite is `make -C hostbuild test`; it needs no console. The host build sits behind the same platform port, with a test clock and a test key that signs the approvals a scenario asks for, and none of it ships in the PS5 build.
 
-**What protects the telnet shell is the [trusted-network rule](#safety-model) and nothing else.** It listens on port 2323 on every interface, asks for no token and no approval, and is the owner's escape hatch: the approval gate does not cover it. The decision is [ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) decision 10, and [docs/telnet-boundary.md](docs/telnet-boundary.md) holds the manual check for this boundary. The headless suite covers the other half: the agent port refuses every command that changes the system, and a push waits for an approval.
+On the console, [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) must be running on 9021. Ariel stops any running shsrv and takes its place. The telnet shell still answers on port 2323 exactly like upstream: `help` lists its commands. Payloads in a folder on the `PATH` (`/user/homebrew/bin` and `/mnt/usb0/homebrew/bin`) run directly; homebrew that needs audio or video is launched through `hbldr`, and `hbdbg` starts it under gdb. Inherited from shsrv: the shell is not attached to a TTY, so homebrew that changes terminal properties will not work.
 
-### Stage 2: persist and recover
+### The agent port
 
-Make the console safe to leave in an agent's hands:
+The agent port is 2324, raw TCP with no telnet negotiation, so a binary upload arrives intact. Every connection starts with `auth <token>`, the token Ariel shows on the console at first start; then one command per connection, no prompts, and every reply ends with an `exit <status>` line. Agents usually reach it one shot at a time, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`.
 
-1. **Download a payload from a GitHub release**, by repository name, following the latest release or a pinned tag, and only from an allowlist of sources. Ariel records the immutable identifiers of what it downloaded (release ID, asset ID), since tags can be moved.
-2. **Verify it** with SHA-256 before anything is executed. A hash published in the same release only detects corruption, not tampering, so the expected hash must come from somewhere Ariel trusts: either it is pinned in the allowlist, or the owner approves the new hash with their key (see [Safety model](#safety-model)), after which it is pinned.
-3. **Run it in the background** through the ELF loader, tracking its PID and capturing its output to a log the agent can read later.
-4. **Persist it**: record what is installed (source, identifiers, hash, path) in a state file under `/data`, and keep the autoload configuration up to date so payloads come back after a reboot. Approving an installation explicitly includes approving that the payload runs on every boot. `autoload safe-boot` skips autoload on the next boot, so a payload that crashes the console at startup can always be removed.
-5. **Roll back on failure**: keep the previous version of every payload and a snapshot of the autoload configuration before each change. Changes are atomic and recorded in a journal, so a change interrupted by a crash or power loss is completed or undone the next time Ariel starts. A new version that crashes or fails its health check (explicit criteria and a timeout, defined per payload) is replaced by the last known good version automatically.
-6. **Gate everything that changes the system on the agent port**: every existing command that changes the system, starts code or reveals the environment, including running an ELF by path (the full list is in [Command coverage](#command-coverage)). The telnet shell stays outside the gate, as [Stage 1](#stage-1-hello-world-end-to-end) says. Gating it needs a designed recovery path for a lost key first ([ADR-0008](docs/adr/0008-the-telnet-shell-stays-outside-the-gate.md), [the telnet boundary](docs/telnet-boundary.md)), and that path is the key hierarchy in item 7.
-7. **Survive a leaked or lost key.** The build pins two keys: a primary that signs everyday approvals and an offline recovery key that is never on the agent's machine. A keyring on the console tracks the active keys and a generation, so the owner can rotate either key without a rebuild, and a signature made under one generation never verifies under another. A leaked key can be stopped: the owner freezes the console over the telnet shell, and only the recovery key can lift the freeze or revoke the compromised keys, suspending every grant they made. Damaged key state fails closed.
+**The grammar** ([ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md)). Arguments are quoted; the tokenizer refuses `bad_quoting` and a line over 64 tokens, and a word a command does not take answers `bad_option`. One 60 s connection deadline answers `timed_out`. No answer carries more than 64 KiB; a cut answer ends with `truncated <shown> of <total>`, and `--limit` caps every listing that can flood. `read` answers `bytes <size> <sha256>`, then exactly that many bytes, with `--offset` and `--limit`. `write <path>` takes one frame of content. Every command has its own error channel and an exit status from [docs/exit-codes.md](docs/exit-codes.md); `ps`, `ls`, `stat`, `df`, `find` and `sysinfo` answer `--json` as one object per line ([docs/json-output.md](docs/json-output.md)). There are no pipes, redirection, `&&`, shell variables, scripts, editors, `ssh`, `top` or package managers; a command that would need a pipe gets a flag instead, such as `grep -c` for `| wc -l`, and the agent composes logic on its own machine.
 
-Ariel itself is never overwritten while it is running, so the agent can never lock itself out.
+**Payloads.** `payload push <name> <size> <sha256>` uploads a locally built ELF over the same connection, so no FTP server is needed; Ariel stages it and the console shows its hash. `payload install` downloads one from a GitHub release, by repository name, latest or a pinned tag, only from an allowlist of sources, recording the immutable release and asset IDs since tags can be moved, and verifying SHA-256 before anything runs; the expected hash is pinned in the allowlist or approved by the owner's key, after which it is pinned. `payload commit <staging-id>` moves an approved upload into the store; the bytes are sent once. `payload run --wait <name>` runs a committed payload in the foreground through the ELF loader (no `chmod`), streams its output and reports its exit on a `status <n>` line apart from the protocol's `exit`; without `--wait` it runs in the background, tracking the PID and capturing output to a log `payload logs` reads. `payload list` answers one `payload <name> ...` line per installed payload with source, version identifiers, hash, path, whether it is running, `failed=yes|no` and `previous=<sha256|->`, and changes nothing. `payload config` sets the health check (explicit criteria and a timeout); `payload rollback` returns to the previous version. `unzip` and `tar` unpack the archives releases ship, and refuse a member that escapes.
 
-Ariel is not the boot loader: autoload is run at boot by another loader, and Ariel manages its configuration and keeps itself in it. So Ariel cannot re-check a payload's hash at boot; making Ariel the boot-time autoloader is a later decision.
+**Persistence and recovery.** What is installed is recorded in a state file under `/data`, and the autoload configuration is kept up to date so payloads come back after a reboot; approving an installation includes approving that it runs on every boot. `autoload show | edit | safe-boot` inspect it, edit it, and skip autoload on the next boot, so a payload that crashes the console at startup can always be removed. Every payload keeps its previous version and every change snapshots the autoload configuration first; changes are atomic and journaled, so one interrupted by a crash or power loss is completed or undone when Ariel next starts, and a new version that crashes or fails its health check is replaced by the last known good one. Ariel is never overwritten while it is running, so the agent can never lock itself out. Ariel is not the boot loader: another loader runs autoload at boot, so Ariel cannot re-check a payload's hash then; making it the boot-time autoloader is a later decision. `reboot`, gated, tests that installed payloads survive a restart.
 
-New commands in this stage (see [Command coverage](#command-coverage)):
+**Keys.** The build pins a primary key that signs everyday approvals and an offline recovery key never on the agent's machine ([ADR-0009](docs/adr/0009-the-key-hierarchy-has-a-primary-and-a-recovery-key.md)). A keyring on the console tracks the active keys and a generation, so `key rotate | rotate-recovery` work without a rebuild and a signature under one generation never verifies under another. A leaked key can be stopped: the owner freezes the console over the telnet shell, and only the recovery key can `key unfreeze` or `key revoke` the compromised keys, suspending every grant they made. Damaged key state fails closed. [docs/key-recovery.md](docs/key-recovery.md) covers each case and where a rebuild is still needed. `approval status <id>` polls a pending approval; `audit tail [n]` reads the newest `n` audit lines, at most 64.
 
-- `payload install | run | list | logs | rollback | config`. `run` without `--wait` starts a payload in the background and captures its output to a log; `config` sets a payload's health check.
-- `autoload show | edit | safe-boot`, to inspect the autoload configuration and to boot without it when a payload keeps crashing.
-- `sha256sum` was planned here and is not built: `read <path> --limit 0` answers `bytes 0 <sha256>`, the whole file's hash, in one read-only call, so a separate command would add a word and no capability.
-- `unzip` and `tar`, because many GitHub releases ship payloads inside an archive.
-- `reboot`, gated, to test that installed payloads survive a restart.
-- `approval status <id>`, to poll a pending approval.
-- `audit tail [n]`, to read the audit log: the newest `n` lines, at most 64.
-- `key rotate | rotate-recovery | unfreeze | revoke`, to manage the owner's keys.
+**Sessions** ([ADR-0014](docs/adr/0014-the-session-prefix-and-the-resolved-path.md)). Without a session every path is absolute, `pwd` answers `/`, `cd` answers `no_working_directory` and a relative path `relative_path`. `session new` mints a 32-hex-character (128-bit) ID from the platform's cryptographic random source and answers `session <sid> ttl 600`; `session close <sid>` answers `session_closed <sid>`; `session list` answers one `session <sid> idle <seconds> cwd <path> env <n>` line per live session. A first token `@<sid>` runs the line in that session: it starts at `/`, `cd PATH` moves it and judges the path as `ls` does, and the shell commands, the gated file commands and transfers, `write`, `unzip` and `tar` resolve a relative operand against its directory lexically, with a `..` that would leave `/` answering `bad_path`. Resolution happens before the gate, so the owner signs the absolute path, the session ID never enters the canonical action, and every gated command still asks for its own approval. `@<sid> export NAME=VALUE` is gated with `option.scope=session` in its challenge; `@<sid> env NAME` reads the session's value over the process environment, which a payload started there receives, copied at the spawn, so a later `export` never reaches a running payload and ending the session leaves its payloads running. An addon never sees a session. Limits: eight sessions (`session_full`, exit 1), 10 idle minutes, 16 names of at most 32 bytes and one assignment of at most 1024 bytes (`export_failed`, `bad_name`, `value_too_long`). A malformed, unknown or expired prefix answers `session_expired` (exit 93) before the rest of the line and before any gate. Sessions share the file system, the payload store and the global locks, live in process memory, and expire on restart. A session ID is sniffable like the token and `session list` shows every live ID to any token holder, but it authorizes nothing; the audit log records `session.new` and `session.close` with `-` as the target.
 
-### Stage 3: an interface agents can rely on
+**Addons** ([ADR-0010](docs/adr/0010-an-addon-is-a-process-of-its-own.md), [docs/addons.md](docs/addons.md)). An addon is an ELF and a manifest that runs in a process of its own, through the one gate every other command uses, with the same audit words and exit codes. The agent cannot install, replace or remove one: addons live in a protected directory the file commands refuse like the token, and enter only by the owner, out of band. The process is bounded by a timeout, an output cap and a kill, so one that crashes, hangs or floods costs a refusal, not a reboot; a manifest that names another ABI version or platform is refused before the owner is asked. The repository holds two: [`addons/sight/`](addons/sight/), the reference the how-to points at, built by `make addon-sight`, which refuses because no capture route exists; and [`addons/ftp/`](addons/ftp/), one program installed under four names that moves files through the console's ftpsrv behind the gate ([its page](addons/ftp/README.md)). Neither is part of `make all`.
 
-Once the agent can operate the console safely, make the shell easy for it to use correctly. The grammar every command shares — quoting, the escaped canonical action, one frame for bytes, one output cap and one deadline — is [ADR-0012](docs/adr/0012-the-agent-port-line-grammar.md); this stage is where it is implemented.
+**Sight.** `shots` copies out of the gallery the console's own Create button writes at `/user/av_contents/photo`: `--last` the newest image, `--count <n>` the newest `n`, `--minutes <n>` the images of the last `n` minutes, `n` from 1 to 64. It captures nothing and writes nothing in the gallery. It is gated with the selector in the signed action (`option.select`); each copy lands under `/data/shots`, the reply names path, size and SHA-256, and an empty gallery answers `no_shots` before the owner is asked. Why it is a copy and not a capture is in [What is missing](#standing-limits).
 
-- Proper argument parsing with quotes.
-- Exit status and a separate error channel for every command, extending the Stage 1 grammar to all of them.
-- Optional JSON output for `ps`, `ls`, `stat` and similar commands.
-- Pagination and size limits, so a large directory or log does not flood the agent's context.
-- Strictly non-interactive commands: no prompts in the middle of a connection.
-- No pipes or redirection. Commands that would need them get their own flags instead, such as `grep -c` for `| wc -l` and `--limit` for `| head`.
+### Command coverage
 
-New and extended commands in this stage:
-
-- Reading logs and large files: `head`, `tail`, `wc`, and a size limit on `cat`, including a way to pull a binary file back for Stage 4's screenshot.
-- Writing files without redirection: `write <path>`, which reads the content from stdin.
-- Missing flags on existing commands: `ls -l -a`, `grep -r -l -c`, more `find` predicates, `rm -r` and `cp -r`.
-- Diagnostics: `date`, `dmesg`, `du`, and a `sysinfo` command that aggregates `uname`, `uptime` and memory. `timeout` was planned here and is not built: the 60 s connection deadline answers `timed_out`, and a health check carries its own bound through `payload config`.
-- Optional, not built: `diff` (`cmp` answers same-or-differ and `hexdump` shows the bytes; a finer comparison is the agent's own work on its own machine), and `ifconfig` and `ping` (the console's address is the one the agent connected to, and a download that fails already answers reachability). `netstat` moved to [Stage 6](#stage-6-optional-network-sight), where it waits on a console spike.
-
-### Stage 4: addons, and sight as the first one
-
-An agent can read text all day and still be blind to what the console is doing: a game stuck on a menu, a system dialog waiting for an answer, a crash screen. This stage gives it sight, and it gives the console a way to gain capabilities that were not built into the payload.
-
-An **addon** is an ELF and a manifest, and it runs in a process of its own ([ADR-0010](docs/adr/0010-an-addon-is-a-process-of-its-own.md)):
-
-- Ariel is the gate and the router. An addon's command goes through the one gate every other command uses: a single-use approval of the canonical action, the audit words of the same shape, and codes from `docs/exit-codes.md`. There is no second gate.
-- The agent cannot install, replace or remove an addon. Addons live in a protected directory that the file commands refuse like the token, and they enter only by the owner, out of band.
-- The process is the isolation, and it is bounded on three sides: a timeout, an output cap and a kill. An addon that crashes, hangs or floods costs a refusal, not a reboot.
-- A manifest that names another ABI version or another platform is refused before the owner is asked.
-
-The how-to, with every manifest field, the process contract and the bounds, is [docs/addons.md](docs/addons.md). The repository holds two addons. [`addons/sight/`](addons/sight/) is the reference: it is the worked example every section of the how-to points at, and `make addon-sight` builds it once the capture path exists. [`addons/ftp/`](addons/ftp/) is the first addon that does work rather than refuse: one program built once and installed under four names, which moves files through the console's ftpsrv behind the one gate ([its page](addons/ftp/README.md)). Neither is part of `make all`.
-
-The pilot addon the stage promised is the screenshot ([#53](https://github.com/sbihaiko/ariel/issues/53)), and it is what keeps the stage open: `addons/sight/` builds and installs once a capture path exists, and neither route a payload can reach has answered with an image yet. What the stage asks of it:
-
-- One capture, one signature. The screen can show personal content, so the owner signs the action itself and not a bare path, and the audit log carries the path, the size and the hash.
-- The shot lands under `/data`, never in Ariel's protected state directory, and Stage 3's reader returns it under its size limit.
-- The capture API was measured on a real console ([#55](https://github.com/sbihaiko/ariel/issues/55)) before anything was built on it. It is the system screenshot daemon's IPC client: a payload loads it and sets its parameters, but `Capture` never completes, and **the console freezes until the owner resets it by hand** ([#79](https://github.com/sbihaiko/ariel/issues/79)). A screenshot therefore needs a path that does not hang the console, and **no capture attempt runs unless the owner is present and willing to reset it** ([console findings](docs/console-findings.md#issue-55-the-capture-api-on-the-console)).
-- The other route was measured too ([#100](https://github.com/sbihaiko/ariel/issues/100)): the share library, `libSceShare.native.sprx`, loads in a payload and every export resolves, but `sceShareInitialize` answers `0x81960001` (an internal error) and every call made without a finished init answers `0x8196000C` (the library was not initialized). The init connects to the service `SceShareLibIpmiService` and only marks the client initialized when that service answers with a non-negative value; it answered `0x81960001`, so the mark stays unset and every later call returns `0x8196000C` without asking the service again. The library compares no authid, so the payload's identity is not what the service refuses. It never wedges the console and it never produces a file ([console findings](docs/console-findings.md#issue-100-the-share-route-and-the-error-it-stops-at)).
-
-Both routes a payload can reach are exhausted, and neither returns an image, so `addons/sight/` still has nothing to call and the stage stays open. What does produce an image is the console's own Create button, which writes the gallery at `/user/av_contents/photo`. `shots` reads that gallery and copies out of it: `shots --last` takes the newest image, `shots --count <n>` the newest `n`, and `shots --minutes <n>` the images written in the last `n` minutes, with `n` from 1 to 64. It captures nothing and writes nothing in the gallery. It is gated like every other command that moves bytes, and the selector is part of the signed action (`option.select`), so a grant for one selection does not fetch another. Each copy lands under `/data/shots` and the reply names its path, size and SHA-256; an empty gallery answers `no_shots` before the owner is asked ([exit codes](docs/exit-codes.md)).
-
-### Stage 5 (optional): sessions, the working directory and the environment
-
-Stages 1 to 4 are enough for an agent to operate the console and to see it; Stages 6 and 7 are conveniences on top of them.
-
-Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so a command cannot depend on the one before it: every path is absolute, `cd` is refused and `pwd` answers `/`. A **session** is optional state the console side keeps between connections, so that a sequence of commands can share one working directory and one small environment:
-
-- `session new` mints a session ID, 32 lowercase hex characters (128 bits) from the platform's cryptographic random source, and answers `session <sid> ttl 600`: the ID and the idle window in seconds, with `exit 0`. `session close <sid>` ends it and answers `session_closed <sid>`; `session list` answers one `session <sid> idle <seconds> cwd <path> env <n>` line per live session, bounded by the eight-slot table.
-- A first token `@<sid>` runs the rest of the line inside that session. A session starts at `/`; `cd PATH` moves it and `pwd` reads it back, and `cd` judges its path exactly as `ls` judges one, so `no_such_file`, `not_a_directory`, `symbolic_link` and `protected` answer for themselves and leave the session where it was. The shell commands, the gated file commands and transfers, `write`, `unzip` and `tar` resolve a relative operand against the session's directory before they judge it: the join is lexical, `.` and `..` are normalized, and a `..` that would leave `/` answers `bad_path`, so `@<sid> ls bin` reads `/data/pkg/bin` when the session is in `/data/pkg`.
-- Resolution happens before the gate, so the owner signs the absolute path the command will act on, with no `.` or `..` segment, and the session ID never enters the canonical action. Every gated command inside a session still asks the owner for its own approval ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) is untouched): a session is state, never authority.
-- A session carries an environment of its own. `@<sid> export NAME=VALUE` writes its map, gated, and its challenge gains `option.scope=session` so the owner signs where the value lands; `@<sid> env NAME` reads the session's value over the process environment, which is the view a payload started there receives. A foreground run, a background run and an `exec` started from a session all get that layer copied at the moment of the spawn, so a later `export` in the session never reaches a payload that is already running, and ending the session leaves its payloads running. An addon keeps its empty environment and never sees a session.
-- Limits: at most eight sessions live at once and the ninth answers `session_full` (exit 1); a session nobody uses for 10 minutes leaves the table; a session holds at most 16 names, a name of at most 32 bytes and one `NAME=VALUE` assignment of at most 1024 bytes, and a seventeenth name answers `export_failed`, a longer name `bad_name` and a longer assignment `value_too_long`.
-- One word for a dead ID. A prefix that is malformed, unknown or expired answers `session_expired` (exit 93) before the rest of the line runs and before any gate, so a typo costs one reply and not an approval prompt; the same word answers `session close` for an ID that is not live. A client that lost its ID after a reboot learns to mint a new one instead of acting in the wrong directory.
-- A session is isolated state, not isolation of access. Sessions share the file system, the payload store and the global locks of the Stage 2 operations; only the directory, the environment and the timestamps are per session. They live in the process's memory beside the approval table and never on the console's disk, so a restart expires every one of them.
-- Every command also works without a session, with absolute paths: `pwd` answers `/`, `cd` answers `no_working_directory` and a relative path answers `relative_path`, byte for byte as before this stage.
-- A session ID is not a secret the way the token is. It is sniffable on a plain-text network like the token, and `session list` shows every live ID to any token holder, but it authorizes nothing; it is kept out of the audit log, which records `session.new` and `session.close` with `-` as the target, so a log shared for diagnosis never hands over a live handle.
-
-The one grammar change and the resolve-before-the-gate rule are [ADR-0014](docs/adr/0014-the-session-prefix-and-the-resolved-path.md). The host acceptance suite drives every part of this through the agent port; the one console round trip is [recorded from the console](docs/console-findings.md#issue-107-the-stage-5-round-trip).
-
-### Stage 6 (optional): network sight
-
-Stage 4 gave the agent sight of the screen. This one gives it sight of the console's own network state, which no current command exposes: which ports the console listens on and which peers it is connected to. Today an agent can only infer that by trying to connect ([#94](https://github.com/sbihaiko/ariel/issues/94)).
-
-- Three commands, all read-only and ungated like `ps` and `sysinfo`, numeric addresses only, each bounded so none can hang the console:
-  - `netstat [-l] [-t] [-u] [--limit N] [--json]` lists the sockets, bounded by the readers' 64 KiB cap and its `truncated` marker. It answers which payload is serving and which is not, the question an agent asks right after it launches one.
-  - `ifconfig` lists the interfaces with their address, mask and state. The address the agent connected to says nothing about a second interface or one that is down.
-  - `ping [-c N] [-W MS] HOST` says whether an address answers and how long it takes, which a failed download cannot separate from a refusal. The count and the deadline are capped, because an unbounded ping is the easiest way to hang the console.
-- A console spike comes first, one per command: prove on firmware 11.20 that a payload can read the socket table, read the interface list and send a bounded ping without freezing the console or needing privileges it lacks, and record the interface each one used in [console findings](docs/console-findings.md). A command is built only if its own spike passes, and the stage closes either way. A failed spike is a result, as the capture spike was for sight.
-- It deliberately builds no `diff`, `timeout` or `sha256sum`: each is already covered by another mechanism, and the coverage table below says which.
-- No new exit code and no change to the approval design: a read-only command is not gated, and `operation_failed` and the platform refusal carry its failures.
-
-### Stage 7 (optional): MCP
-
-Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information, logs and network sight, so `netstat` is a tool from the start rather than a family added later. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
-
-
-## Command coverage
-
-Which bash commands an agent can expect on Ariel. Each row is an Ariel command. The **bash equivalent** column is filled in only when the name differs from bash; an empty cell means the command has the same name in bash.
-
-**shsrv:** what upstream shsrv offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S7 are Stages 1 to 7; S1 to S3 items are on `dev` and `master` (see [Progress](#progress)). "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
+Which bash commands an agent can expect on Ariel. Each row is an Ariel command; the **bash equivalent** column is filled in only when the name differs from bash. **shsrv:** what upstream offers, the baseline Ariel started from: ✅ complete · ⚠️ partial · ❌ missing. **Plan:** S1 to S7 are Stages 1 to 7. "Gated" commands need the owner's approval before they run (see [Safety model](#safety-model)).
 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
@@ -217,88 +111,85 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `reboot` | | ❌ | S2: gated; the host build simulates it |
 | `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | Not built: `read <path> --limit 0` answers `bytes 0 <sha256>`, the whole file's hash, in one read-only call |
-| `netstat` | | ❌ | S6 (optional): built only if the console spike proves the socket table is readable; see [Stage 6](#stage-6-optional-network-sight) |
-| `ifconfig` | | ❌ | S6 (optional): the interfaces, with address, mask and state; built only if its spike passes, see [Stage 6](#stage-6-optional-network-sight) |
-| `ping` | | ❌ | S6 (optional): whether an address answers, with a capped count and deadline; built only if its spike passes |
+| `netstat` | | ❌ | S6 (optional): built only if its console probe proves the socket table is readable; see [Stage 6](#stage-6-optional-network-sight) |
+| `ifconfig` | | ❌ | S6 (optional): the interfaces, with address, mask and state; built only if its probe passes |
+| `ping` | | ❌ | S6 (optional): whether an address answers, with a capped count and deadline; built only if its probe passes |
 
-PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated, and `sfocreate` joined them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) `session` (Stage 5) and `screenshot` (Stage 4).
+PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated, and `sfocreate` joined them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2), `shots` (Stage 4) and `session` (Stage 5).
 
-Out of scope: pipes, redirection, `&&`, shell variables and scripts, editors, `ssh`, `top` and package managers. The agent composes logic on its own side, on the computer it runs on.
+### Safety model
 
-## Safety model
+An agent that can download, write and execute code on a console with kernel privileges needs firm limits. These are Ariel's:
 
-An agent that can download, write and execute code on a console with kernel privileges needs firm limits. Ariel is designed around these rules:
-
-- **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token. Output is size-limited. `env` is gated, and Ariel's own secrets (its token and approval state) cannot be read through any gated command. The telnet shell is not gated and can still read them (see below).
-- **Change is approved by the owner's signature.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated. Approving a payload version (at install or commit) also approves running that exact version, so a build is approved once, not once per run. A gated command does not run; Ariel answers with an `approval_required` error and an approval ID, and the owner's signer shows the exact action (command, target, hash, console, expiry) before they confirm. The action runs only after that signature verifies on the console. The approval is bound to that exact action, can be used once and expires after a short time. The agent cannot forge it, because it never holds the key. A flag such as `--confirm` would not be enough, since the agent could simply pass it. The alternative was measured on a real console and ruled out: a payload cannot read the pad, and borrowing it from the foreground title freezes the game ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md), [console findings](docs/console-findings.md)).
+- **Reading is allowed, within limits.** Inspecting processes, files and logs needs only the access token, and output is size-limited. `env` is gated, and Ariel's own secrets (its token and approval state) cannot be read through any gated command.
+- **Change is approved by the owner's signature.** Writing files, killing processes, mounting, rebooting, downloading and executing payloads are gated: Ariel answers `approval_required <id>` instead of running, the owner's signer shows the exact action (command, target, hash, console, expiry), and the action runs only after that signature verifies on the console. The approval is bound to that action, used once and short-lived. The agent cannot forge it because it never holds the key; a flag such as `--confirm` would not do, since the agent could pass it. Approving a payload version, at install or commit, also approves running that exact version, so a build is approved once, not once per run. The controller was measured as the alternative and ruled out: a payload cannot read the pad, and borrowing it from the foreground title freezes the game ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md), [console findings](docs/console-findings.md)).
 - **Allowlisted sources and trusted hashes.** Downloads come only from approved hosts and repositories, and a payload runs only if its hash is pinned in the allowlist or was approved by the owner.
 - **Protected areas.** System partitions stay read-only. Critical system processes (such as SceShellCore) cannot be killed.
-- **Designed to recover.** Every change is atomic and journaled, every payload has a previous version to fall back to, and `autoload safe-boot` disables autoload for one boot. This covers crashes, failed health checks and interrupted updates, but not every possible failure.
-- **The telnet shell is outside the gate.** Approvals cover the agent port. The telnet shell on port 2323 is the owner's escape hatch: it listens on every interface, asks for no token and no approval, and can write files, kill processes, mount and run programs. Only the trusted-network rule below protects it. [docs/telnet-boundary.md](docs/telnet-boundary.md) has the manual check and the decision on its copies of the commands that move to the agent port.
-- **Trusted network only.** The shell protocol is plain text, so the access token and session IDs can be sniffed by anyone on the same network. Ariel is meant for a trusted home network. On any other network, use an encrypted tunnel. On the agent port, the owner's signature keeps destructive actions safe even if the token leaks; it does not protect the telnet shell.
-- **Key rotation and recovery.** The primary and recovery keys can be rotated, and a lost or leaked key has a recovery path. [docs/key-recovery.md](docs/key-recovery.md) covers each case and the trust boundary, and says where the procedure still needs a rebuild.
-- **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. Approval by a key the agent does not hold ensures that injected instructions cannot silently turn into code execution.
+- **Designed to recover.** Atomic journaled changes, a previous version of every payload and `autoload safe-boot` cover crashes, failed health checks and interrupted updates, but not every possible failure.
+- **The telnet shell is outside the gate.** Approvals cover the agent port. The telnet shell on port 2323 is the owner's escape hatch: it listens on every interface, asks for no token and no approval, can write, kill, mount and run, and can read the secrets the gated commands refuse ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) decision 10, [ADR-0008](docs/adr/0008-the-telnet-shell-stays-outside-the-gate.md)). [docs/telnet-boundary.md](docs/telnet-boundary.md) holds the manual check; the headless suite covers the other half, that the agent port refuses every command that changes the system and a push waits for an approval.
+- **Trusted network only.** The protocol is plain text, so the access token and session IDs can be sniffed by anyone on the same network. Ariel is meant for a trusted home network; on any other, use an encrypted tunnel. On the agent port the owner's signature keeps destructive actions safe even if the token leaks; nothing but the network protects the telnet shell.
+- **Untrusted content is data.** README files, web pages and logs an agent reads may contain instructions; approval by a key the agent does not hold means injected instructions cannot silently turn into code execution.
 - **Auditable.** Ariel is open source and every action it takes is logged on the console.
 
-From Stage 7, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
+## What is being done
 
-## Quick start
+### Stage 6 (optional): network sight
 
-The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a payload installed and run on a console, through the gate, with the owner's key. The short way is one script:
+The spec is [#111](https://github.com/sbihaiko/ariel/issues/111), which replaces [#94](https://github.com/sbihaiko/ariel/issues/94) (a spec for `netstat` alone, under the number 7 the stage carried then; its spike never ran). Nothing of it is built yet.
 
-```console
-$ sh tools/install/ariel.sh <console address>
-```
+No current command says which ports the console listens on or which peers it is connected to: the only way to learn whether a payload is serving is to try to connect, where a refusal and a slow accept read the same. The address the agent connected to says nothing about a second interface or one that is down, and a failed download cannot separate an address that never answered from one that refused. The console answers ping while asleep and running no payload ([#71](https://github.com/sbihaiko/ariel/issues/71)), so a reply says the network stack is alive, never that a payload is.
 
-It makes the two keys if they are not there, builds the payload with them pinned — locally when the machine has an LLVM, in a container otherwise, with the PS5 payload SDK downloaded on the way — sends it to port 9021, waits for the agent port, and leaves `ariel.env` holding `PS5_HOST` and `ARIEL_TOKEN`. `tools/install/ariel.command` is the same on a double-click on macOS and `tools/install/ariel.bat` on Windows; `--check` says what it would do and sends nothing, and `ARIEL_BUILD=local` or `ARIEL_BUILD=docker` forces one route.
+The stage is three read-only, ungated commands, numeric addresses only, each bounded so none can hold the console, and each built only if its own console probe passes on 11.20:
 
-By hand, it is four steps:
+- `netstat [-l] [-t] [-u] [--limit N] [--json]`: one line per socket, `<proto> <local-address>:<port> <peer-address>:<port|-> <state>`, TCP first then UDP, sorted by local port then address, under the readers' 64 KiB cap and `truncated` marker; `-l` selects listening TCP sockets and every UDP endpoint. JSON keys: `proto`, `local_address`, `local_port`, `peer_address`, `peer_port`, `state`.
+- `ifconfig [--json]`: one line per interface address, `<name> <state> <address> <mask>`, state `up` or `down` by administrative state, `-` for a missing IPv4 address. JSON keys: `name`, `state`, `address`, `mask`.
+- `ping [-c N] [-W MS] ADDRESS`: one line, `ping <address> <sent> <received> <min> <avg> <max>` in whole milliseconds, exit 0 when at least one reply arrived, `no_reply` and exit 1 otherwise. `-c` is 1 to 10 (default 4), `-W` 1 to 5000 ms (default 1000), so the worst case is 50 s, inside the connection deadline. A literal IPv4 address only; a fixed probe whose reply bytes are never returned. No `--json`.
 
-1. Clone the `stage-5.1` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
-2. Make two keys with `./hostbuild/ariel-sign keygen`: the primary that signs everyday approvals, and a recovery key kept offline.
-3. Build the payload with both public keys pinned: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`.
-4. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
+The probe comes first and is a payload of its own, as the controller, capture and share spikes were: never linked into Ariel, run with the owner present, three probes from least to most risky (the interface list, the socket tables, the echo), a selector to run one alone, and a log under `/data` so a freeze is attributable. A failed probe is a result: the findings record the transcript, the coverage row keeps "not built" and gains the reason, and the stage closes either way. The console build answers from system calls, never a shell-out; the host build reports its own machine, as `ps` and `sysinfo` do. No new exit status and no change to the approval design: `bad_option`, `bad_argument`, `missing_operand`, `operation_failed`, the platform refusal and `no_reply` carry every failure. Out of scope: IPv6 and names, MAC addresses, speeds, counters and carrier state, any change to the network, and ports probed in bulk.
 
-The release ships source only, and it has to: a build with no key pinned refuses every grant, and a build pinned to someone else's keys could only be approved by them. The console carries the public half of **your** pair, so the ELF is built once, by you.
+### The installer and release stage-5.1
 
-## Using it today
+[`stage-5.1`](https://github.com/sbihaiko/ariel/releases/tag/stage-5.1) is the same payload as `stage-5` plus a smaller install ([#110](https://github.com/sbihaiko/ariel/issues/110)). `tools/install/ariel.sh` now builds with a local LLVM when the machine has one, downloading the PS5 payload SDK itself on the way, and falls back to a container with the SDK inside when it does not; an SDK already on the machine (`PS5_PAYLOAD_SDK` set) is used as it is, and `ARIEL_BUILD=local` or `ARIEL_BUILD=docker` forces one route. On Windows the local route does not exist yet: `ariel.bat` runs `ariel.ps1`, which builds in Docker Desktop, so that must be installed and running there. The release's assets are the four installer scripts; the payload is still built by you, with your keys.
 
-Make sure [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) is running and send `ariel-ps5.elf` to port 9021. Ariel stops any running shsrv and takes its place. An agent connects to the agent port, 2324, with the token Ariel shows on the console at first start (the [quick start](docs/quick-start.md) walks through it). The telnet shell still answers on port 2323 exactly like upstream shsrv: type `help` once connected to see its commands (`cd`, `ls`, `mkdir`, `stat`, `ps` and others).
+## What is missing
 
-Payloads placed in a folder on the `PATH` (initialized to `/user/homebrew/bin` and `/mnt/usb0/homebrew/bin`) can be run directly. Homebrew that needs audio or video is launched through `hbldr`, and `hbdbg` starts it under gdb.
+### Stage 7 (optional): MCP
 
-### Building
+Not started. The plan is to expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information, logs and network sight, so `netstat` is a tool from the start. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles. MCP tools that change the console would be marked destructive, so the client asks a human before even requesting approval.
 
-Ariel builds exactly like shsrv, with the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) installed on a Debian-based system: install `xxd`, point `PS5_PAYLOAD_SDK` at the SDK and run `make`.
+### Commands deliberately not built
 
-To pin the owner's keys into the build, set both `ARIEL_PUBKEY` (the primary key that signs everyday approvals) and `ARIEL_RECOVERY_PUBKEY` (the offline recovery key), as 64 hex digits each: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`. The two must differ, and setting `ARIEL_PUBKEY` without `ARIEL_RECOVERY_PUBKEY` stops the build, because the console would otherwise refuse every grant. The host build's test key is refused on the PS5 build.
+Three commands were planned and dropped because another mechanism already covers each, and the [coverage table](#command-coverage) says so on their rows: `diff`, covered by `cmp` (same-or-differ with the first offset) and `hexdump`, a finer comparison being the agent's own work on its own machine; `timeout`, covered by the 60 s connection deadline that answers `timed_out` and by the bound a health check carries through `payload config`; and `sha256sum`, covered by `read <path> --limit 0`, which answers `bytes 0 <sha256>` in one read-only call, so a separate command would add a word and no capability.
 
-`make test` sends `ariel-ps5.elf` to the console at `PS5_HOST` and refuses unless you ask for it by name: `make test ARIEL_DEPLOY=yes PS5_HOST=<console>`. The headless acceptance suite is `make -C hostbuild test`; it needs no console.
+### Network sight, until a probe passes
 
-### Known limitations (inherited from shsrv)
+`netstat`, `ifconfig` and `ping` are not on the agent port. Each waits on its own console probe, none of which has run; what each will answer when built is in [Stage 6](#stage-6-optional-network-sight). Until then the console's address is the one the agent connected to, and a failed download is the only reachability answer.
 
-The shell is not attached to a TTY, so homebrew that changes terminal properties will not work, and most commands are only partially implemented. Stage 3 addresses the limitations that matter most to agents.
+### Standing limits
+
+- **No screen capture on 11.20.** Both routes a payload can reach were measured and neither returns an image. The system screenshot daemon's IPC client loads and takes its parameters, but `Capture` never completes and the console freezes until the owner resets it by hand, so no capture attempt runs unless the owner is present and willing to reset it ([#55](https://github.com/sbihaiko/ariel/issues/55), [#79](https://github.com/sbihaiko/ariel/issues/79), [console findings](docs/console-findings.md#issue-55-the-capture-api-on-the-console)). The share library `libSceShare.native.sprx` loads and every export resolves, but `sceShareInitialize` answers `0x81960001` because `SceShareLibIpmiService` never answers a non-negative value, every later call answers `0x8196000C` (not initialized), and the library compares no authid, so the payload's identity is not what is refused; it never wedges the console and never produces a file ([#100](https://github.com/sbihaiko/ariel/issues/100), [console findings](docs/console-findings.md#issue-100-the-share-route-and-the-error-it-stops-at)). So `addons/sight/` has nothing to call and stays a reference that refuses, and sight is `shots`, which copies what the Create button wrote.
+- **The telnet shell is outside the gate.** Port 2323 asks for no token and no approval, and the only thing that protects it is the network ([Safety model](#safety-model)).
+- **Trusted network only.** Plain text, sniffable token and session IDs; an encrypted tunnel anywhere but a trusted home network.
+- **One firmware.** 11.20 only ([ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md)), and Ariel does not re-check a payload's hash at boot, because another loader runs autoload.
 
 ## Why "Ariel"
 
-The PS5's internal codename is **Prospero**, the sorcerer of Shakespeare's *The Tempest*. Prospero rules his island through **Ariel**, a spirit who carries out his orders, reports back what it sees, and does nothing on its own initiative. Ariel is also the one who longs to be trusted with freedom, and earns it by serving faithfully.
-
-That is exactly the role of this project. Ariel is the servant that lives on Prospero's island (the console), takes orders from whoever is in charge (you, through an AI agent), reports what it finds, and never acts beyond what it was told. The name also fits the ecosystem's tradition of Prospero-themed projects, such as prospero-win.
+The PS5's internal codename is **Prospero**, the sorcerer of Shakespeare's *The Tempest*. Prospero rules his island through **Ariel**, a spirit who carries out his orders, reports back what it sees, and does nothing on its own initiative. That is the role of this project: the servant on Prospero's island (the console) that takes orders from whoever is in charge (you, through an AI agent), reports what it finds, and never acts beyond what it was told. The name also fits the ecosystem's tradition of Prospero-themed projects, such as prospero-win.
 
 ## References and related projects
 
 **Project documents**
 
-- [Console findings](docs/console-findings.md): what the console allows the payload, the foreground title and the shell to do with the pad, with the error codes and addresses measured.
-- [Controller spike](docs/controller-spike.md): the payload that produced those measurements.
-- [Decisions](docs/adr/README.md): the architecture decision records, including [ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) on the approval source.
+- [Console findings](docs/console-findings.md): what the console allows, with the error codes and addresses measured.
+- [Controller spike](docs/controller-spike.md): the payload that produced the pad measurements.
+- [Decisions](docs/adr/README.md): the architecture decision records.
 
 **Upstream and core tooling** (ps5-payload-dev, GPLv3+)
 
 - [shsrv](https://github.com/ps5-payload-dev/shsrv): the shell server Ariel is forked from.
 - [elfldr](https://github.com/ps5-payload-dev/elfldr): the ELF loader that runs each payload as its own process, so a crashing payload does not take the loader down.
 - [sdk](https://github.com/ps5-payload-dev/sdk): the payload SDK used to build Ariel.
-- [websrv](https://github.com/ps5-payload-dev/websrv): web server with a homebrew launcher, ELF launcher and file system browser over HTTP.
+- [websrv](https://github.com/ps5-payload-dev/websrv): homebrew launcher, ELF launcher and file browser over HTTP.
 - [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) and [klogsrv](https://github.com/ps5-payload-dev/klogsrv): FTP server and kernel log server, the usual companions for diagnostics.
 
 **Payload management (design references)**
