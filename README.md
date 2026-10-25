@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv already does and grows it in one direction: letting an AI agent, such as Claude, talk to the console safely. The agent should be able to inspect the system, download payloads from GitHub, run them, and recover on its own when something crashes, without ever being able to leave the console in a broken state.
 
-> **Status:** Stages 1 to 4 are done, with their console runs on firmware 11.20. Stage 4's sight is `shots`, a copy of the image the Create button wrote: the owner accepted it because no capture route a payload can reach has produced an image ([#53](https://github.com/sbihaiko/ariel/issues/53), [#100](https://github.com/sbihaiko/ariel/issues/100)), so [`addons/sight/`](addons/sight/) stays a reference that refuses. Stages 5 to 7 have not started. See [Progress](#progress).
+> **Status:** Stages 1 to 5 are done, and Stages 6 and 7 have not started. Stages 1 to 4 have their console runs on firmware 11.20; Stage 5's sessions are proven by the host acceptance suite, and its one console round trip is still pending ([#107](https://github.com/sbihaiko/ariel/issues/107)). Stage 4's sight is `shots`, a copy of the image the Create button wrote: the owner accepted it because no capture route a payload can reach has produced an image ([#53](https://github.com/sbihaiko/ariel/issues/53), [#100](https://github.com/sbihaiko/ariel/issues/100)), so [`addons/sight/`](addons/sight/) stays a reference that refuses. See [Progress](#progress).
 >
 > **Target firmware: 11.20, and only 11.20 for now.** Ariel makes no claim about another firmware. One console is in hand, on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted. Adopting one is a decision with its own console run, not a patch. This is deliberately selfish while the shell is young: supporting several firmware versions costs a lab this project does not have. The decision is [ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md).
 
@@ -31,7 +31,7 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 | 2. Persist and recover | [#2](https://github.com/sbihaiko/ariel/issues/2) | ✅ Done on 2026-10-24. 37 sub-issues closed; console suite 36/36 and the telnet boundary check passed ([#46](https://github.com/sbihaiko/ariel/issues/46)). |
 | 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done. Nine sub-issues closed; the host acceptance suite covers it. |
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | ✅ Done on 2026-10-25. The loader, the reference addon and `addons/ftp/` are done; sight is `shots`, a copy of the image the Create button wrote, which the owner accepted because no capture route returns an image ([#53](https://github.com/sbihaiko/ariel/issues/53), [#100](https://github.com/sbihaiko/ariel/issues/100)). |
-| 5. Sessions (optional) | | Not started. |
+| 5. Sessions (optional) | [#101](https://github.com/sbihaiko/ariel/issues/101) | ✅ Done on 2026-10-25. Six sub-issues closed; the host acceptance suite covers the prefix, the directory, the relative paths, the environment and the limits. The one console round trip is pending ([#107](https://github.com/sbihaiko/ariel/issues/107)). |
 | 6. Network sight (optional) | [#94](https://github.com/sbihaiko/ariel/issues/94) | Not started; `netstat`, `ifconfig` and `ping`, each gated by its own console spike. |
 | 7. MCP (optional) | | Not started. |
 
@@ -107,7 +107,7 @@ Once the agent can operate the console safely, make the shell easy for it to use
 - Exit status and a separate error channel for every command, extending the Stage 1 grammar to all of them.
 - Optional JSON output for `ps`, `ls`, `stat` and similar commands.
 - Pagination and size limits, so a large directory or log does not flood the agent's context.
-- Strictly non-interactive commands: no prompts in the middle of a session.
+- Strictly non-interactive commands: no prompts in the middle of a connection.
 - No pipes or redirection. Commands that would need them get their own flags instead, such as `grep -c` for `| wc -l` and `--limit` for `| head`.
 
 New and extended commands in this stage:
@@ -140,19 +140,23 @@ The pilot addon the stage promised is the screenshot ([#53](https://github.com/s
 
 Both routes a payload can reach are exhausted, and neither returns an image, so `addons/sight/` still has nothing to call and the stage stays open. What does produce an image is the console's own Create button, which writes the gallery at `/user/av_contents/photo`. `shots` reads that gallery and copies out of it: `shots --last` takes the newest image, `shots --count <n>` the newest `n`, and `shots --minutes <n>` the images written in the last `n` minutes, with `n` from 1 to 64. It captures nothing and writes nothing in the gallery. It is gated like every other command that moves bytes, and the selector is part of the signed action (`option.select`), so a grant for one selection does not fetch another. Each copy lands under `/data/shots` and the reply names its path, size and SHA-256; an empty gallery answers `no_shots` before the owner is asked ([exit codes](docs/exit-codes.md)).
 
-### Stage 5 (optional): sessions
+### Stage 5 (optional): sessions, the working directory and the environment
 
-Stages 1 to 4 are enough for an agent to operate the console and to see it; the two below are conveniences on top of them.
+Stages 1 to 4 are enough for an agent to operate the console and to see it; Stages 6 and 7 are conveniences on top of them.
 
-Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so state such as the working directory would otherwise be lost between commands. Ariel keeps optional sessions on the console side:
+Agents usually reach the console through one-shot connections (one command per connection, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`), so a command cannot depend on the one before it: every path is absolute, `cd` is refused and `pwd` answers `/`. A **session** is optional state the console side keeps between connections, so that a sequence of commands can share one working directory and one small environment:
 
-- `session new` returns a random 128-bit session ID and its TTL. Prefixing a command with `@<sid>` runs it inside that session, and `session close` ends it.
-- A session holds only minimal state: working directory, environment and timestamps. It carries no authorization. Creating a session requires the access token, and every gated command still needs its own approval. Payloads started from a session are not tied to it and keep running after it ends.
-- Sessions expire after a period of inactivity, and the number of concurrent sessions is capped, so a client that forgets to close them cannot exhaust the console's RAM.
-- An unknown or expired ID returns an explicit `session_expired` error instead of silently falling back, so the agent knows to open a new session (for example after a reboot).
-- Session IDs are generated by a cryptographically secure random number generator and treated as secrets. Over plain-text connections they can still be sniffed, which is why they never authorize anything on their own.
-- Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 2 operations such as installing and rolling back take a global lock.
-- Sessions are a convenience, not a requirement. Every command also works without one, using absolute paths.
+- `session new` mints a session ID, 32 lowercase hex characters (128 bits) from the platform's cryptographic random source, and answers `session <sid> ttl 600`: the ID and the idle window in seconds, with `exit 0`. `session close <sid>` ends it and answers `session_closed <sid>`; `session list` answers one `session <sid> idle <seconds> cwd <path> env <n>` line per live session, bounded by the eight-slot table.
+- A first token `@<sid>` runs the rest of the line inside that session. A session starts at `/`; `cd PATH` moves it and `pwd` reads it back, and `cd` judges its path exactly as `ls` judges one, so `no_such_file`, `not_a_directory`, `symbolic_link` and `protected` answer for themselves and leave the session where it was. The shell commands, the gated file commands and transfers, `write`, `unzip` and `tar` resolve a relative operand against the session's directory before they judge it: the join is lexical, `.` and `..` are normalized, and a `..` that would leave `/` answers `bad_path`, so `@<sid> ls bin` reads `/data/pkg/bin` when the session is in `/data/pkg`.
+- Resolution happens before the gate, so the owner signs the absolute path the command will act on, with no `.` or `..` segment, and the session ID never enters the canonical action. Every gated command inside a session still asks the owner for its own approval ([ADR-0006](docs/adr/0006-the-controller-is-the-approval-source.md) is untouched): a session is state, never authority.
+- A session carries an environment of its own. `@<sid> export NAME=VALUE` writes its map, gated, and its challenge gains `option.scope=session` so the owner signs where the value lands; `@<sid> env NAME` reads the session's value over the process environment, which is the view a payload started there receives. A foreground run, a background run and an `exec` started from a session all get that layer copied at the moment of the spawn, so a later `export` in the session never reaches a payload that is already running, and ending the session leaves its payloads running. An addon keeps its empty environment and never sees a session.
+- Limits: at most eight sessions live at once and the ninth answers `session_full` (exit 1); a session nobody uses for 10 minutes leaves the table; a session holds at most 16 names, a name of at most 32 bytes and one `NAME=VALUE` assignment of at most 1024 bytes, and a seventeenth name answers `export_failed`, a longer name `bad_name` and a longer assignment `value_too_long`.
+- One word for a dead ID. A prefix that is malformed, unknown or expired answers `session_expired` (exit 93) before the rest of the line runs and before any gate, so a typo costs one reply and not an approval prompt; the same word answers `session close` for an ID that is not live. A client that lost its ID after a reboot learns to mint a new one instead of acting in the wrong directory.
+- A session is isolated state, not isolation of access. Sessions share the file system, the payload store and the global locks of the Stage 2 operations; only the directory, the environment and the timestamps are per session. They live in the process's memory beside the approval table and never on the console's disk, so a restart expires every one of them.
+- Every command also works without a session, with absolute paths: `pwd` answers `/`, `cd` answers `no_working_directory` and a relative path answers `relative_path`, byte for byte as before this stage.
+- A session ID is not a secret the way the token is. It is sniffable on a plain-text network like the token, and `session list` shows every live ID to any token holder, but it authorizes nothing; it is kept out of the audit log, which records `session.new` and `session.close` with `-` as the target, so a log shared for diagnosis never hands over a live handle.
+
+The one grammar change and the resolve-before-the-gate rule are [ADR-0014](docs/adr/0014-the-session-prefix-and-the-resolved-path.md). The host acceptance suite drives every part of this through the agent port; the one console round trip is [pending](docs/console-findings.md#issue-107-the-stage-5-round-trip-pending).
 
 ### Stage 6 (optional): network sight
 
@@ -179,7 +183,8 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 
 | Ariel | bash equivalent | shsrv | Plan |
 |---|---|---|---|
-| `pwd`, `cd` | | ✅ | S5: working directory kept across connections with sessions |
+| `pwd` | | ✅ | S5: `@<sid> pwd` answers the session's directory, and `/` on a connection with no session. The sessions themselves are `session new`, `session close <sid>` and `session list` |
+| `cd` | | ✅ | S5: `@<sid> cd PATH` moves the session, and a connection with no session answers `no_working_directory` |
 | `ls` | | ⚠️ no `-l` or `-a` | S3: `-l`, `-a`, `--limit` and `--json`, cut at 64 KiB |
 | `stat`, `file` | | ✅ | |
 | `cat` | | ✅ | S3: `--limit`, and a file over 64 KiB is cut |
@@ -264,7 +269,7 @@ To pin the owner's keys into the build, set both `ARIEL_PUBKEY` (the primary key
 
 ### Known limitations (inherited from shsrv)
 
-The session is not attached to a TTY, so homebrew that changes terminal properties will not work, and most commands are only partially implemented. Stage 3 addresses the limitations that matter most to agents.
+The shell is not attached to a TTY, so homebrew that changes terminal properties will not work, and most commands are only partially implemented. Stage 3 addresses the limitations that matter most to agents.
 
 ## Why "Ariel"
 

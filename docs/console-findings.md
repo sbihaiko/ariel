@@ -1,6 +1,6 @@
 # What the console showed: the pad, the title and the payload
 
-A reference page. Every value here was measured on a real console on 2026-10-23 and is written down so the next change does not rediscover it. The run-by-run evidence, including the transcripts, is in [controller-spike-notes.md](controller-spike-notes.md); the runbook is [controller-spike.md](controller-spike.md); the decision it forced is [ADR-0006](adr/0006-the-controller-is-the-approval-source.md).
+A reference page. Every value here was measured on a real console — the first measurements on 2026-10-23 — and is written down so the next change does not rediscover it. The one exception is the entry marked **PENDING**, which records a round trip still to run and labels its replies host-expected, not console-observed. The run-by-run evidence, including the transcripts, is in [controller-spike-notes.md](controller-spike-notes.md); the runbook is [controller-spike.md](controller-spike.md); the decision it forced is [ADR-0006](adr/0006-the-controller-is-the-approval-source.md).
 
 ## The answer
 
@@ -353,6 +353,29 @@ Measured on 2026-10-25, read-only, on the console at firmware 11.200.005 (CFI-20
 The remote operands were the console's own absolute paths, so the same run measures the root: ftpsrv served `/data/ftp-up/my file.bin` for that path, which makes the root `/` and not `/data`.
 
 The console's state is not what it was: `/data/ariel` is now a fresh generation-0 directory anchored to `owner.key`, and the key-run state recorded after #48 is gone. The token is the one the payload printed at start, and a rebuild with another anchor would strand this directory.
+
+## Issue #107: the Stage 5 round trip (PENDING)
+
+**Not measured on a console.** No build in this change touched a PS5. What follows is the round trip to run and the replies the host acceptance scenarios expect: they are labeled **host-expected** and are not console observations. The owner runs it, replaces this section with the console's answers, and the last acceptance criterion of [#107](https://github.com/sbihaiko/ariel/issues/107) closes.
+
+**What it proves.** A session minted on the console, a directory the session keeps across connections, that directory read back, a gated command that asks the owner inside the session and signs the resolved absolute path, a close, and the one word a dead ID answers.
+
+**Setup.** Firmware 11.20 (CFI-2014), an Ariel build anchored with the owner's primary key (`ARIEL_PUBKEY` = `~/.config/ariel/owner.key`) sent to the ELF loader on 9021, and the same key on the signer's machine. Every line below goes to the agent port 2324 after `auth <token>`, and each line is its own connection. The gated step creates `/data/session-round-trip`, which the last step removes, so the console is left as it was.
+
+| Step | Command | Host-expected reply |
+|---|---|---|
+| 1 | `session new` | `session <sid> ttl 600`, then `exit 0`; `<sid>` is 32 lowercase hex characters |
+| 2 | `@<sid> cd /data` | `exit 0` |
+| 3 | `@<sid> pwd` | `/data`, then `exit 0` |
+| 4 | `@<sid> mkdir session-round-trip` | `approval_required <id>`, the `challenge` line for that ID, then `exit 75`; the signer decodes the action to `command=mkdir` and `target=/data/session-round-trip`, the resolved path, with no session ID in it |
+| 5 | `approval grant <id> <signature>` with what the signer printed, then step 4 again | `exit 0`; `/data/session-round-trip` now exists |
+| 6 | `session close <sid>` | `session_closed <sid>`, then `exit 0` |
+| 7 | `@<sid> pwd` with the closed ID | `session_expired`, then `exit 93` |
+| 8 | `rmdir /data/session-round-trip`, signed | `approval_required <id>`, the challenge line, `exit 75`, then after the grant and the same line again, `exit 0`; nothing is left behind |
+
+**The words the round trip checks.** The `challenge` line is `challenge <id> <console> <nonce> <issued-ms> <expires-ms> <action-hex> <generation>`. The `<seconds>` on the mint line is the idle window, 600 here. The mint, the close and the list ask nobody; the directory change and the `pwd` are ordinary shell commands inside the session. The gated step asks the owner exactly as it would outside a session, and what the owner signs is the absolute path the command acts on, so a `mkdir` of a relative name with the session in `/data` signs `/data/session-round-trip`. The audit log records `session.new` and `session.close` with `-` as the target and never the ID. A closed ID answers `session_expired` (93), the one word for a malformed, unknown or expired session.
+
+**Why it waits.** The run needs the owner at the console with the signer, a writable `/data` and a build anchored to the key they hold; no part of the repository can stand in for that, and this change runs no console step.
 
 ## What other projects say
 

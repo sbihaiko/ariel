@@ -22,7 +22,7 @@ Domain terms of Ariel. Use these words, in this sense, in code, tests, issues an
 - **Gated command**: a command that does not run until the owner approves it. It answers `approval_required` (75) with a challenge.
 - **Approval**: a single-use, short-lived permission for one exact action, bound to its facts. Pending, granted, expired or consumed.
 - **Facts**: what an approval is bound to (name, size, hash, staging ID, path, release IDs, and so on). Ariel checks them again before it acts and answers `approval_stale` (78) if one changed.
-- **Challenge**: the line `challenge <id> <console> <nonce> <issued-ms> <expires-ms> <action-hex>` the owner signs.
+- **Challenge**: the line `challenge <id> <console> <nonce> <issued-ms> <expires-ms> <action-hex> <generation>` the owner signs.
 - **Canonical action**: the one byte encoding of an action, built by one function. The signer shows it and the signature covers it (ADR-0006).
 - **Owner key**: the Ed25519 key pair whose public half is pinned into the build (`ARIEL_PUBKEY`). The approval source on the console.
 - **Signer**: the owner's tool that shows a challenge's action and signs it (`ariel-sign`).
@@ -41,6 +41,12 @@ Domain terms of Ariel. Use these words, in this sense, in code, tests, issues an
 - **Journal** (Stage 2): the log that makes each change to the store or autoload atomic: prepared, committed, done or rolled back.
 - **Previous version** (Stage 2): the version a rollback returns to.
 - **Health check** (Stage 2): what makes an activated version healthy: one-shot (exits 0 in time) or service (still running after its grace period, optionally with a port open).
+
+## Sessions (Stage 5)
+
+- **Session**: optional state on the console side, named by its ID, that holds a working directory and a small environment between connections. It carries no authority and it dies with the process. A connection that names no session keeps the older behaviour: `pwd` at `/`, `cd` refused, every path absolute.
+- **Session ID**: 32 lowercase hex characters (128 bits) that `session new` mints. A malformed, unknown or expired one answers `session_expired` (93).
+- **Session prefix**: `@<id>` as the first token of a command line; the rest of the line runs inside that session.
 
 ## Sources
 
