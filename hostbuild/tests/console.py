@@ -469,10 +469,12 @@ def check_approval_then_install(session, context):
     lines = session.commit(staging)
     assert lines == ["installed consoleapprove %s" % digest, "exit 0"], (
         "an approved commit must install the build, got %r" % lines)
-    lines = session.link.exchange(
-        "sha256sum %s/store/objects/%s" % (CONSOLE_STATE_DIR, digest))
-    assert lines[-1] == "exit 0" and lines[0].split()[0] == digest, (
-        "the installed object must hash to its digest, got %r" % lines)
+    # The store is under the state directory, which answers protected, so the
+    # installed bytes are named through payload list instead of being opened.
+    listing = [line for line in session.link.exchange("payload list")
+               if line.startswith("payload consoleapprove ")]
+    assert len(listing) == 1 and ("sha256=%s" % digest) in listing[0], (
+        "the installed build must be listed with its digest, got %r" % listing)
 
 
 def check_unsigned_commit(session, context):
@@ -529,8 +531,7 @@ def check_read_only_relative(session, context):
 def check_read_only_on_console(session, context):
     del context
     for command in ("ls /", "stat /", "file /", "df /",
-                    "ls %s" % CONSOLE_STATE_DIR,
-                    "find %s" % CONSOLE_STATE_DIR):
+                    "ls /data", "stat /data"):
         lines = session.link.exchange(command)
         assert lines and lines[-1] == "exit 0", (
             "%s must exit 0, got %r" % (command, lines))
@@ -853,32 +854,45 @@ def cat_printed(reply):
     return reply[:-len(EXIT_0)]
 
 
+READ_PROBE = (b"Ariel read check: one line long enough that a range of it "
+              b"and the whole file differ.\n")
+
+
 def check_read_matches_cat(session, context):
-    """read answers a whole build and a range of it as cat does, with a matching header."""
-    data = context.build("read")
-    digest = install_build(session, "consoleread", data)
-    path = "%s/store/objects/%s" % (CONSOLE_STATE_DIR, digest)
-    cat = cat_printed(session.link.exchange_bytes("cat " + path))
-    # cat ends a file that lacks a final newline with one, so the file's own
-    # bytes are compared through that rule.
-    printed = data if data.endswith(b"\n") else data + b"\n"
-    assert cat == printed, (
-        "cat must print the installed build's bytes, got %d bytes" % len(cat))
+    """read answers a throwaway file whole and in range as cat does, header included."""
+    del context
+    path = "/data/read-%s" % os.urandom(4).hex()
+    digest = hashlib.sha256(READ_PROBE).hexdigest()
+    command = "write %s %d %s" % (path, len(READ_PROBE), digest)
+    try:
+        run_gated_file_command(session, command)
+        lines = session.link.exchange(command, body=READ_PROBE)
+        assert lines == ["exit 0"], (
+            "a signed write must run, got %r" % (lines,))
+        cat = cat_printed(session.link.exchange_bytes("cat " + path))
+        assert cat == READ_PROBE, (
+            "cat must print the file's bytes, got %r" % cat[:64])
 
-    size, whole_hash, body = split_read(session.link.exchange_bytes(
-        "read " + path))
-    assert (size, whole_hash, body) == (len(data), digest, data), (
-        "a whole read must answer the build's size, SHA-256 and bytes, got "
-        "%d bytes and %s" % (size, whole_hash))
+        size, whole_hash, body = split_read(session.link.exchange_bytes(
+            "read " + path))
+        assert (size, whole_hash, body) == (
+            len(READ_PROBE), digest, READ_PROBE), (
+            "a whole read must answer the file's size, SHA-256 and bytes, got "
+            "%d bytes and %s" % (size, whole_hash))
 
-    shown = data[READ_OFFSET:READ_OFFSET + READ_LIMIT]
-    size, whole_hash, body = split_read(session.link.exchange_bytes(
-        "read %s --offset %d --limit %d" % (path, READ_OFFSET, READ_LIMIT)))
-    assert (size, whole_hash) == (len(shown), digest), (
-        "a range read must answer the range's size and the whole file's "
-        "SHA-256, got %d bytes and %s" % (size, whole_hash))
-    assert body == shown == cat[READ_OFFSET:READ_OFFSET + READ_LIMIT], (
-        "a range read must return the bytes cat returns at that offset")
+        shown = READ_PROBE[READ_OFFSET:READ_OFFSET + READ_LIMIT]
+        size, whole_hash, body = split_read(session.link.exchange_bytes(
+            "read %s --offset %d --limit %d" % (path, READ_OFFSET, READ_LIMIT)))
+        assert (size, whole_hash) == (len(shown), digest), (
+            "a range read must answer the range's size and the whole file's "
+            "SHA-256, got %d bytes and %s" % (size, whole_hash))
+        assert body == shown == cat[READ_OFFSET:READ_OFFSET + READ_LIMIT], (
+            "a range read must return the bytes cat returns at that offset")
+    finally:
+        if session.link.exchange("stat " + path)[-1:] == ["exit 0"]:
+            run_gated_file_command(session, "rm " + path)
+            assert session.link.exchange("rm " + path) == ["exit 0"], (
+                "the check must remove its own file")
 
 
 def check_rollback_restores_previous(session, context):
@@ -1060,8 +1074,8 @@ CHECKS = [
     ("cp -r copies a throwaway tree after the owner signs, the copy lists the "
      "source's entries, rm -r removes the copy, and both paths are removed",
      check_recursive_copy_and_remove),
-    ("read answers a whole build and a range of it as cat does, with the "
-     "header's size and SHA-256", check_read_matches_cat),
+    ("read answers a throwaway file whole and in range as cat does, with the "
+     "header's size and SHA-256, and removes it", check_read_matches_cat),
     ("a truncated upload answers upload_mismatch and exit 81",
      check_truncated_upload),
     ("a hash mismatch answers upload_mismatch and exit 81",

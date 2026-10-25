@@ -1639,7 +1639,7 @@ def scenario_console_checks_push_runnable_builds(server):
                 console.check_bad_name, console.check_install_bad_name_is_audited,
                 console.check_unsigned_commit}
     activating = {console.check_approval_then_install, console.check_audit_tail,
-                  console.check_approval_status, console.check_read_matches_cat,
+                  console.check_approval_status,
                   console.check_rollback_restores_previous,
                   console.check_rollback_refusals,
                   console.check_autoload_edit_asks_before_it_applies,
@@ -1757,38 +1757,60 @@ class FakeFileTree:
         raise StopCheck(" ".join(words))
 
 
-class FakeBuildConsole:
-    """A fake agent port that installs builds and answers read and cat from them.
+class FakeReadConsole:
+    """A fake agent port over the throwaway file the read check writes.
 
-    bad_header answers a whole-file hash that is not the file's; bad_range
-    changes the first byte of a range read. Each must fail the read check.
+    write and rm are gated: each answers 75 with a challenge until the owner's
+    grant is recorded, then runs once when it is sent again. bad_header answers
+    a whole-file hash that is not the file's; bad_range changes the first byte
+    of a range read. Each must fail the read check.
     """
+
+    GATED = ("write", "rm")
 
     def __init__(self, bad_header=False, bad_range=False):
         self.bad_header = bad_header
         self.bad_range = bad_range
-        self.staged = {}
-        self.objects = {}
+        self.files = {}
+        self.pending = {}
+        self.granted = set()
+        self.asked = 0
 
     def exchange(self, command, body=None, token=None):
         words = command.split()
-        if words[:2] == ["payload", "push"]:
-            index = len(self.staged) + 1
-            staging = "s-%d" % index
-            self.staged[staging] = (words[2], words[4], body)
-            return ["staged %s" % staging, "approval_required a-%d" % index,
-                    "challenge a-%d 00" % index, "exit 75"]
         if words[:2] == ["approval", "grant"]:
+            self.granted.add(self.pending.pop(words[2]))
             return ["approval_granted %s" % words[2], "exit 0"]
-        if words[:2] == ["payload", "commit"]:
-            name, digest, data = self.staged[words[2]]
-            self.objects[digest] = data
-            return ["installed %s %s" % (name, digest), "exit 0"]
-        raise StopCheck(command)
+        if command in self.granted:
+            self.granted.discard(command)
+            return self.run(words, body)
+        if words[0] in self.GATED:
+            self.asked += 1
+            approval = "a-%d" % self.asked
+            self.pending[approval] = command
+            return ["approval_required %s" % approval,
+                    "challenge %s 00" % approval, "exit 75"]
+        return self.run(words, body)
 
-    def exchange_bytes(self, command):
+    def run(self, words, body):
+        if words[0] == "stat":
+            if words[1] in self.files:
+                return ["%s: %d bytes" % (words[1], len(self.files[words[1]])),
+                        "exit 0"]
+            return ["no_such_file", "exit 1"]
+        if words[0] == "write":
+            assert len(body) == int(words[2]), (
+                "write must carry the declared %s bytes, got %r" % (words[2], body))
+            self.files[words[1]] = body
+            return ["exit 0"]
+        if words[0] == "rm" and words[1] in self.files:
+            del self.files[words[1]]
+            return ["exit 0"]
+        raise StopCheck(" ".join(words))
+
+    def exchange_bytes(self, command, body=None, token=None):
         words = command.split()
-        data = self.objects[words[1].rsplit("/", 1)[1]]
+        data = self.files[words[1]]
         if words[0] == "cat":
             return cat_printed(data) + b"exit 0\n"
         if words[0] == "read":
@@ -1842,7 +1864,7 @@ def scenario_console_recursive_copy_check_cleans_up(server):
 
 
 def scenario_console_read_check_matches_cat(server):
-    """read's whole and range answers match cat and the header's size and hash."""
+    """read's whole and range answers match the file the check writes and cat."""
     del server  # the fake console stands in for the agent port
 
     import console
@@ -1851,27 +1873,24 @@ def scenario_console_read_check_matches_cat(server):
     assert "check_read_matches_cat" in names, (
         "console mode must check that read answers the bytes cat returns")
 
-    def context_for(data):
-        context = console.Context(host="192.0.2.1", port=console.PORT,
-                                  token="0" * 32, workdir="/nonexistent",
-                                  cc=["prospero-clang"],
-                                  document="quick-start.md")
-        context.build = lambda label: data
-        return context
+    fake = FakeReadConsole()
+    console.check_read_matches_cat(fake_console_session(console, fake), None)
+    assert fake.files == {}, (
+        "a passing check must remove its own file, left %r" % sorted(fake.files))
 
-    data = b"\x7fELF runnable " + b"read" * 8
-    console.check_read_matches_cat(
-        fake_console_session(console, FakeBuildConsole()), context_for(data))
-
-    for faulty in (FakeBuildConsole(bad_header=True),
-                   FakeBuildConsole(bad_range=True)):
+    for faulty in (FakeReadConsole(bad_header=True),
+                   FakeReadConsole(bad_range=True)):
         try:
             console.check_read_matches_cat(
-                fake_console_session(console, faulty), context_for(data))
+                fake_console_session(console, faulty), None)
         except AssertionError:
-            continue
-        raise AssertionError(
-            "a read that does not match cat must fail the check")
+            pass
+        else:
+            raise AssertionError(
+                "a read that does not match the file must fail the check")
+        assert faulty.files == {}, (
+            "a failed check must still remove its own file, left %r"
+            % sorted(faulty.files))
 
 
 def scenario_console_gated_asks_wait_out_busy(server):
