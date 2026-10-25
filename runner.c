@@ -1930,9 +1930,7 @@ run_id(int outfd) {
 
 
 static int
-run_sleep(int argc, char *const argv[], int errfd) {
-  struct timespec want;
-  struct timespec rest;
+run_sleep(platform_t *platform, int argc, char *const argv[], int errfd) {
   unsigned long seconds;
   char *end;
 
@@ -1949,10 +1947,20 @@ run_sleep(int argc, char *const argv[], int errfd) {
     return 1;
   }
 
-  want.tv_sec = (time_t)seconds;
-  want.tv_nsec = 0;
-  while(nanosleep(&want, &rest) < 0 && errno == EINTR) {
-    want = rest;
+  // A sleep ends on the platform's clock, so a build whose clock moves only
+  // when something moves it does not sleep on real time: the host build's
+  // test clock ends this sleep, and no scenario waits for the machine.
+  if(platform && platform->sleep_ms) {
+    platform->sleep_ms(platform, (long)seconds * 1000L);
+  } else {
+    struct timespec want;
+    struct timespec rest;
+
+    want.tv_sec = (time_t)seconds;
+    want.tv_nsec = 0;
+    while(nanosleep(&want, &rest) < 0 && errno == EINTR) {
+      want = rest;
+    }
   }
   return 0;
 }
@@ -2298,7 +2306,8 @@ run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
 
 
 int
-runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
+runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
+           int errfd, int *status) {
   size_t i;
 
   if(argc < 1) {
@@ -2348,7 +2357,7 @@ runner_run(int argc, char *const argv[], int outfd, int errfd, int *status) {
   }
 
   if(!strcmp(argv[0], "sleep")) {
-    *status = run_sleep(argc, argv, errfd);
+    *status = run_sleep(platform, argc, argv, errfd);
     return 0;
   }
 

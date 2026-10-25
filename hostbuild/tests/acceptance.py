@@ -37,6 +37,7 @@ import time
 import zipfile
 
 HOST = "127.0.0.1"
+PORT_LINE = re.compile(r"^port ([0-9]+)$")
 TOKEN_LINE = re.compile(r"^token ([0-9a-f]{32})$")
 STAGED_LINE = re.compile(r"^staged (s-[0-9a-f]+)$")
 APPROVAL_LINE = re.compile(r"^approval_required (a-[0-9a-f]+)$")
@@ -53,6 +54,10 @@ EXPIRY_WAITERS = 1
 # The server reads a closing connection for this long (agent_close).
 CLOSE_DRAIN_MS = 200
 
+# How long the harness waits for a start to say something, or for one that said
+# nothing to end. It bounds a hang; it never decides that a start ended.
+START_TIMEOUT = 60.0
+
 results = []
 
 
@@ -65,12 +70,6 @@ def check(name, fn):
     else:
         results.append((name, True, ""))
         print("PASS %s" % name)
-
-
-def free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((HOST, 0))
-        return sock.getsockname()[1]
 
 
 class Server:
@@ -91,10 +90,13 @@ class Server:
         self._start()
 
     def _spawn(self):
-        self.port_requested = free_port()
-        self.port = self.port_requested
+        # The server asks the OS for a port when it binds and names it, so the
+        # harness never holds a port of its own: one it released can be taken
+        # before the child binds, and two children can be handed the same one.
+        self.port_requested = 0
+        self.port = None
         self.proc = subprocess.Popen(
-            [self.binary, "--port", str(self.port_requested), "--root", self.root],
+            [self.binary, "--port", "0", "--root", self.root],
             env=dict(os.environ, **(self.env or {})),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -108,21 +110,35 @@ class Server:
     def start_until_exit(self, env=None):
         """Start Ariel with env and return its exit status once it has ended.
 
-        Ariel that cannot recover its store ends before it prints a token, so
-        this waits for the exit instead of reading one.
+        Ariel that cannot recover its store ends before it prints a port line,
+        so this waits for the end of its output instead of reading a line. The
+        stream is the signal: a line means Ariel started, and the end of the
+        stream means it ended before it could. No fixed number of seconds
+        decides that: a start that takes longer on a busy machine is still a
+        start that ends.
         """
         self.env = env
         self._spawn()
         try:
-            return self.proc.wait(timeout=5.0)
+            line = self.lines.get(timeout=START_TIMEOUT)
+        except queue.Empty:
+            self.stop()
+            raise AssertionError("Ariel printed nothing and kept running")
+        if line is not None:
+            self.stop()
+            raise AssertionError(
+                "Ariel started instead of ending on its own: it printed %r"
+                % line)
+        try:
+            return self.proc.wait(timeout=START_TIMEOUT)
         except subprocess.TimeoutExpired:
             self.stop()
-            raise AssertionError("Ariel started instead of ending on its own")
+            raise AssertionError("Ariel closed its output but did not end")
 
     def _start(self):
         self._spawn()
         try:
-            token = self._read_token()
+            token = self._read_startup()
         except Exception:
             self.stop()
             raise
@@ -173,8 +189,16 @@ class Server:
         line = self.next_line(timeout=timeout)
         assert line is None, "expected no output, got %r" % line
 
-    def _read_token(self):
-        line = self.next_line(timeout=10.0)
+    def _read_startup(self):
+        """Read the port Ariel bound and its token, in the order it prints them."""
+        line = self.next_line(timeout=START_TIMEOUT)
+        assert line is not None, "server printed no port line"
+        match = PORT_LINE.match(line)
+        assert match, "unexpected startup line %r" % line
+        self.port = int(match.group(1))
+        assert self.port > 0, "the server must name the port it bound"
+
+        line = self.next_line(timeout=START_TIMEOUT)
         assert line is not None, "server printed no token line"
         match = TOKEN_LINE.match(line)
         assert match, "unexpected startup line %r" % line
@@ -2240,6 +2264,7 @@ def scenario_state_survives_restart(server):
 
 
 FAKE_SERVER = """#!/bin/sh
+printf 'port 2324\\n'
 printf 'token 00112233445566778899aabbccddeeff\\n'
 sleep 1 &
 exec sleep 100
@@ -8548,9 +8573,17 @@ def reboot_approve(server):
 
 
 def reboot_and_wait(server):
-    """Send the granted reboot and check the restarted Ariel prints its token again."""
+    """Send the granted reboot and read the restarted Ariel's port and token.
+
+    The rebooted process binds a port of its own, so the harness takes the
+    number from the port line before it connects again.
+    """
     assert send_command(server, "reboot") == [
         "rebooting", "exit 0"], "a granted reboot must answer rebooting"
+    line = server.next_line()
+    match = PORT_LINE.match(line or "")
+    assert match, "the restarted Ariel must print its port line, got %r" % line
+    server.port = int(match.group(1))
     line = server.next_line()
     assert line == "token %s" % server.token, (
         "the restarted Ariel must print its token line, got %r" % line)

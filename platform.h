@@ -138,6 +138,15 @@ struct platform {
   void (*clock)(platform_t *self, struct timespec *now);
 
   /**
+   * Block until ms milliseconds have passed on the clock above. The host
+   * build's clock moves only when a scenario moves it, so its sleep ends
+   * then and no waiter depends on how fast the machine is. A platform
+   * without such a clock may leave it NULL: the caller then sleeps on real
+   * time.
+   **/
+  void (*sleep_ms)(platform_t *self, long ms);
+
+  /**
    * Create the wake pipe of one connection and return its read end, or -1
    * when this platform has none. A wait polls the pipe together with its
    * socket, so moving the clock wakes it to recompute its deadline. On a

@@ -2,7 +2,7 @@
 
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -Werror -O2 -std=c11 -D_POSIX_C_SOURCE=200809L
-CFLAGS += -pthread -I.. -DARIEL_HOST_BUILD=1
+CFLAGS += -pthread -I.. -I. -DARIEL_HOST_BUILD=1
 LDLIBS += -pthread
 
 BIN  := ariel-host

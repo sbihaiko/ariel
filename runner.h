@@ -17,6 +17,8 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_RUNNER_H
 #define ARIEL_RUNNER_H
 
+#include "platform.h"
+
 /** The most bytes of output one answer carries, the cut marker included
     (ADR-0012). A reader cuts past it. **/
 #define OUTPUT_CAP (64UL * 1024)
@@ -26,9 +28,10 @@ along with this program; see the file COPYING. If not, see
  * NULL. Output goes to outfd and diagnostics to errfd. A connection has no
  * working directory, so every path is absolute and cd is an error. Returns
  * 0 and the command's status in status when the command is known, or -1
- * when it is not a runner command.
+ * when it is not a runner command. platform is the port a command that waits
+ * runs on, such as sleep.
  **/
-int runner_run(int argc, char *const argv[], int outfd, int errfd,
-               int *status);
+int runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
+               int errfd, int *status);
 
 #endif /* ARIEL_RUNNER_H */

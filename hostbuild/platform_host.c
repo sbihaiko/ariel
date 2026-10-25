@@ -86,7 +86,6 @@ set_cloexec(int fd) {
 }
 
 
-static uint16_t listen_port;
 static char exe_path[PATH_MAX];
 
 static int
@@ -96,7 +95,6 @@ host_listen(platform_t *self, uint16_t port) {
   int srvfd;
 
   (void)self;
-  listen_port = port;
 
   if((srvfd=socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     perror("socket");
@@ -160,6 +158,14 @@ host_clock(platform_t *self, struct timespec *now) {
   (void)self;
 
   testclock_now(now);
+}
+
+
+static void
+host_sleep_ms(platform_t *self, long ms) {
+  (void)self;
+
+  testclock_sleep_ms(ms);
 }
 
 
@@ -801,9 +807,7 @@ host_spawn_kill(platform_t *self, pid_t pid) {
 static int
 host_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
          int *status) {
-  (void)self;
-
-  return runner_run(argc, argv, outfd, errfd, status);
+  return runner_run(self, argc, argv, outfd, errfd, status);
 }
 
 
@@ -833,14 +837,15 @@ host_fault(platform_t *self, const char *step) {
 }
 
 
-// execv keeps the pid, stdout and stdin, so the harness reads the new token
-// line from the same pipe; the listener and the agent's sockets are CLOEXEC.
+// execv keeps the pid, stdout and stdin, so the harness reads the new port
+// and token lines from the same pipe; the listener and the agent's sockets
+// are CLOEXEC. The new process asks the OS for a port of its own rather than
+// binding the one this process had: no other holder sits between the two, and
+// the port line names the new one.
 static int
 host_reboot(platform_t *self) {
-  char port[8];
-  char *args[] = {exe_path, "--port", port, "--root", NULL, "--boot", NULL};
+  char *args[] = {exe_path, "--port", "0", "--root", NULL, "--boot", NULL};
 
-  snprintf(port, sizeof(port), "%u", (unsigned)listen_port);
   args[4] = (char *)self->fs_root;
   fflush(stdout);
   fflush(stderr);
@@ -861,6 +866,7 @@ static platform_t host_platform = {
   .listen = host_listen,
   .accept = host_accept,
   .clock = host_clock,
+  .sleep_ms = host_sleep_ms,
   .wake_new = host_wake_new,
   .wake_close = host_wake_close,
   .wake_idle = host_wake_idle,

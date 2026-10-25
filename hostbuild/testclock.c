@@ -210,6 +210,35 @@ testclock_wake_idle(int wake, int fd, int idle) {
 }
 
 
+/**
+ * Unlock the clock for a cancelled sleeper. A thread cancelled inside
+ * pthread_cond_wait holds the mutex when its cleanup handlers run, so the
+ * handler pushed around the wait is what keeps the clock usable.
+ **/
+static void
+unlock_cleanup(void *arg) {
+  pthread_mutex_unlock((pthread_mutex_t *)arg);
+}
+
+
+void
+testclock_sleep_ms(long ms) {
+  uint64_t target;
+
+  if(ms <= 0) {
+    return;
+  }
+
+  pthread_mutex_lock(&lock);
+  target = clock_ms + (uint64_t)ms;
+  pthread_cleanup_push(unlock_cleanup, &lock);
+  while(clock_ms < target) {
+    pthread_cond_wait(&idle_changed, &lock);
+  }
+  pthread_cleanup_pop(1);
+}
+
+
 /** Count the wake pipes and the idle waiters. The caller holds the lock. **/
 static void
 wake_count(int *pipes, int *idle) {

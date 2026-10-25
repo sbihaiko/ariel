@@ -63,6 +63,14 @@ void testclock_wake_close(int fd);
 void testclock_wake_idle(int wake, int fd, int idle);
 
 /**
+ * Wait until the test clock has moved ms past where it is now. Only an
+ * advance ends it, so a builtin that sleeps blocks on the clock a scenario
+ * moves instead of on real time. It is a cancellation point: the connection
+ * deadline cancels a thread that is asleep. ms <= 0 returns at once.
+ **/
+void testclock_sleep_ms(long ms);
+
+/**
  * Handle one line of the host build's control input and write the line to
  * answer into reply. Returns 1 for a clock line and 0 for any other line.
  * "clock advance <ms>" answers "clock <now>". "clock settle <n>" waits until

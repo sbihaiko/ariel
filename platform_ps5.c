@@ -374,9 +374,7 @@ ps5_spawn_kill(platform_t *self, pid_t pid) {
 static int
 ps5_run(platform_t *self, int argc, char *const argv[], int outfd, int errfd,
         int *status) {
-  (void)self;
-
-  return runner_run(argc, argv, outfd, errfd, status);
+  return runner_run(self, argc, argv, outfd, errfd, status);
 }
 
 
@@ -610,6 +608,7 @@ static platform_t ps5_platform = {
   .listen = ps5_listen,
   .accept = ps5_accept,
   .clock = ps5_clock,
+  .sleep_ms = NULL,
   .wake_new = NULL,
   .wake_close = NULL,
   .wake_idle = NULL,

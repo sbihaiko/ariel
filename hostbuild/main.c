@@ -14,12 +14,15 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -87,7 +90,9 @@ parse_args(int argc, char **argv, uint16_t *port, const char **root,
       char *end = NULL;
       long value = strtol(argv[++i], &end, 10);
 
-      if(!end || *end || value < 1 || value > 65535) {
+      // Port 0 is a request, not a port: the OS picks a free one at bind
+      // time, and the port line below names it.
+      if(!end || *end || value < 0 || value > 65535) {
         fprintf(stderr, "invalid port: %s\n", argv[i]);
         return -1;
       }
@@ -115,6 +120,8 @@ main(int argc, char **argv) {
   agent_t agent;
   platform_t *platform;
   const char *root;
+  struct sockaddr_in bound;
+  socklen_t bound_len = sizeof(bound);
   uint16_t port = DEFAULT_PORT;
   int boot = 0;
   int srvfd;
@@ -180,8 +187,15 @@ main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  // The harness reads the token from standard output. Print it only once
-  // the listener is ready, so the line also announces that the port is up.
+  // The harness reads the port it may connect to and the token from standard
+  // output. Both lines are printed once the listener is ready, so they also
+  // announce that the port is up. The port comes from the bound socket, not
+  // from the request: with --port 0 the OS chose it.
+  if(getsockname(srvfd, (struct sockaddr *)&bound, &bound_len)) {
+    perror("getsockname");
+    return EXIT_FAILURE;
+  }
+  printf("port %u\n", (unsigned)ntohs(bound.sin_port));
   printf("token %s\n", agent_token);
   fflush(stdout);
 
