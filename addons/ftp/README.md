@@ -64,8 +64,12 @@ timeout (10 seconds), the 64 KiB output cap and the kill apply to every run.
   console on 2026-10-25 ([console findings](../../docs/console-findings.md)),
   so the first check is the one that fires; the second stays as a guard,
   because the root belongs to ftpsrv and the addon must not depend on it.
-- Every local path is checked the same way. `ftp-put` checks the open source
-  file with `protected_object`, so a hard link to protected state is refused.
+- Every local path is resolved through every link before it is checked, and the
+  resolved path must lie under `/data`, `/user` or `/mnt/usb`, a `/mnt/usb<name>`
+  mount included. A path that leaves the roots through a link answers
+  `bad_path` and nothing is created. A link that stays inside the roots works.
+- `ftp-put` checks the open source file with `protected_object`, so a hard link
+  to protected state is refused.
 - `ftp-get` creates its local file with `O_EXCL | O_NOFOLLOW`. A failed download
   removes the partial file.
 - Remote paths may not contain CR, LF or other control bytes.
@@ -74,9 +78,10 @@ timeout (10 seconds), the 64 KiB output cap and the kill apply to every run.
 
 - Ariel reads the `server` file for the canonical action, and the addon reads
   it again to connect. A change between the two reads is not detected.
-- The path checks are string checks on the local path. A symbolic link to a
-  directory under `/data` is followed by the check, but a directory that is
-  renamed between the check and the open is not.
+- The local path is resolved once, before the open. A link or directory that is
+  swapped between that resolution and the open is not detected: `openat` is not
+  usable on the PS5 (ADR-0007), so the open cannot be tied to the directory the
+  check saw.
 - Passive mode uses the address from the `server` file, not the one in the
   PASV reply.
 - The addon sets no socket timeout. The only time bound is the loader's

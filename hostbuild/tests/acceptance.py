@@ -13010,6 +13010,10 @@ FTP_LINK_TITLE = ("an ftp addon refuses a path that a link came to name after th
                   "owner was asked, and creates no local file")
 FTP_ROOTS_TITLE = ("an ftp addon refuses a local path outside /data, /user and "
                    "/mnt/usb*, and never overwrites a local file")
+FTP_ESCAPE_TITLE = ("an ftp addon refuses a local path whose directory is a link out of "
+                    "/data, /user and /mnt/usb, for put and get, and creates nothing")
+FTP_INNER_LINK_TITLE = ("an ftp addon still moves bytes through a link whose target stays "
+                        "inside /data, /user and /mnt/usb")
 FTP_STALL_TITLE = ("an ftp addon whose server never answers is cut by the loader's "
                    "timeout and keeps what it wrote")
 
@@ -13159,6 +13163,76 @@ def scenario_ftp_refuses_local_paths_outside_roots(server):
         cleanup_addon(server, "ftp-get")
 
 
+def scenario_ftp_refuses_a_directory_link_out_of_the_roots(server):
+    fake = FakeFtp()
+    fake.files["/up/secret.bin"] = b"remote"
+    link = ftp_local(server, "/data/escape")
+    outside = ftp_local(server, "/tmp/ariel-ftp-escape-dir")
+    secret = os.path.join(outside, "secret.bin")
+    try:
+        sha = {name: install_ftp_addon(server, name, fake.port) for name in ("ftp-put", "ftp-get")}
+        os.makedirs(outside, exist_ok=True)
+        with open(secret, "wb") as handle:
+            handle.write(b"outside")
+        make_link(link, outside, hard=False)
+
+        put = ftp_grant(server, "ftp-put", sha["ftp-put"],
+                        ["/up/escaped.bin", "/data/escape/secret.bin"], fake.port)
+        assert run_command(server, put) == ["bad_path", "exit 1"], (
+            "an ftp-put through a link out of the roots must answer bad_path and exit 1")
+        assert "STOR" not in [verb for verb, _ in fake.log], "a refused ftp-put must not send"
+        assert "/up/escaped.bin" not in fake.files, "a refused ftp-put must write nothing remotely"
+        with open(secret, "rb") as handle:
+            assert handle.read() == b"outside", "a refused ftp-put must leave the outside file alone"
+
+        get = ftp_grant(server, "ftp-get", sha["ftp-get"],
+                        ["/up/secret.bin", "/data/escape/fetched.bin"], fake.port)
+        assert run_command(server, get) == ["bad_path", "exit 1"], (
+            "an ftp-get through a link out of the roots must answer bad_path and exit 1")
+        assert not os.path.lexists(os.path.join(outside, "fetched.bin")), (
+            "a refused ftp-get must create no file outside the roots")
+        assert "RETR" not in [verb for verb, _ in fake.log], "a refused ftp-get must not receive"
+    finally:
+        fake.close()
+        if os.path.lexists(link):
+            os.remove(link)
+        shutil.rmtree(outside, ignore_errors=True)
+        for name in ("ftp-put", "ftp-get"):
+            cleanup_addon(server, name)
+
+
+def scenario_ftp_link_inside_the_roots_still_works(server):
+    fake = FakeFtp()
+    real = ftp_local(server, "/data/real-dir")
+    link = ftp_local(server, "/data/inner")
+    try:
+        sha = {name: install_ftp_addon(server, name, fake.port) for name in ("ftp-put", "ftp-get")}
+        os.makedirs(real, exist_ok=True)
+        with open(os.path.join(real, "src.bin"), "wb") as handle:
+            handle.write(b"inner")
+        make_link(link, real, hard=False)
+
+        put = ftp_grant(server, "ftp-put", sha["ftp-put"],
+                        ["/up/inner.bin", "/data/inner/src.bin"], fake.port)
+        ftp_result(server, run_command(server, put))
+        assert fake.files.get("/up/inner.bin") == b"inner", (
+            "an ftp-put through a link that stays inside the roots must send the bytes")
+
+        get = ftp_grant(server, "ftp-get", sha["ftp-get"],
+                        ["/up/inner.bin", "/data/inner/back.bin"], fake.port)
+        ftp_result(server, run_command(server, get))
+        with open(os.path.join(real, "back.bin"), "rb") as handle:
+            assert handle.read() == b"inner", (
+                "an ftp-get through a link that stays inside the roots must write the bytes")
+    finally:
+        fake.close()
+        if os.path.lexists(link):
+            os.remove(link)
+        shutil.rmtree(real, ignore_errors=True)
+        for name in ("ftp-put", "ftp-get"):
+            cleanup_addon(server, name)
+
+
 def scenario_ftp_stalled_server_is_cut(server):
     fake = FakeFtp(stall=True)
     try:
@@ -13188,6 +13262,8 @@ FTP_SCENARIOS = [
     (FTP_PROTECTED_TITLE, scenario_ftp_refuses_ariel_state_before_asking, HOST_ROOT_REASON),
     (FTP_LINK_TITLE, scenario_ftp_refuses_a_link_swapped_after_the_ask, HOST_ROOT_REASON),
     (FTP_ROOTS_TITLE, scenario_ftp_refuses_local_paths_outside_roots, HOST_ROOT_REASON),
+    (FTP_ESCAPE_TITLE, scenario_ftp_refuses_a_directory_link_out_of_the_roots, HOST_ROOT_REASON),
+    (FTP_INNER_LINK_TITLE, scenario_ftp_link_inside_the_roots_still_works, HOST_ROOT_REASON),
     (FTP_STALL_TITLE, scenario_ftp_stalled_server_is_cut, HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in FTP_SCENARIOS)

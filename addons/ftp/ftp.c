@@ -41,6 +41,7 @@ along with this program; see the file COPYING. If not, see
 #define FTP_FAILED 1
 #define FTP_BAD_PATH 3
 #define FTP_PROTECTED 87
+#define RESOLVE_LINKS 40
 
 static int
 resolve(char *full, size_t size, const char *prefix, const char *path) {
@@ -93,15 +94,124 @@ check_remote(const char *remote) {
 }
 
 
+/* Resolves every link in path into out; the last component may be missing. */
+static int
+real_path(const char *path, char *out, size_t size) {
+  char todo[PATH_MAX];
+  char candidate[PATH_MAX];
+  char target[PATH_MAX];
+  char next[PATH_MAX];
+  struct stat st;
+  char *name;
+  char *end;
+  char *rest;
+  char *up;
+  size_t depth = 0;
+  size_t len;
+  ssize_t n;
+
+  if(snprintf(todo, sizeof(todo), "%s", path) >= (int)sizeof(todo)) {
+    return -1;
+  }
+  out[0] = '\0';
+  for(;;) {
+    name = todo + strspn(todo, "/");
+    end = name + strcspn(name, "/");
+    rest = end + strspn(end, "/");
+    len = (size_t)(end - name);
+    if(len == 0) {
+      break;
+    }
+    if(len == 2 && !strncmp(name, "..", 2)) {
+      if((up = strrchr(out, '/')) != NULL) {
+        *up = '\0';
+      }
+    } else if(!(len == 1 && name[0] == '.')) {
+      if(snprintf(candidate, sizeof(candidate), "%s/%.*s", out, (int)len, name)
+         >= (int)sizeof(candidate)) {
+        return -1;
+      }
+      if(lstat(candidate, &st)) {
+        if(errno != ENOENT || *rest != '\0') {
+          return -1;
+        }
+      } else if(S_ISLNK(st.st_mode)) {
+        if(++depth > RESOLVE_LINKS) {
+          errno = ELOOP;
+          return -1;
+        }
+        n = readlink(candidate, target, sizeof(target) - 1);
+        if(n <= 0) {
+          return -1;
+        }
+        target[n] = '\0';
+        if(target[0] == '/') {
+          out[0] = '\0';
+        }
+        if(snprintf(next, sizeof(next), "%s/%s", target, rest) >= (int)sizeof(next)) {
+          return -1;
+        }
+        memcpy(todo, next, strlen(next) + 1);
+        continue;
+      } else if(*rest != '\0' && !S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+      }
+      if(snprintf(out, size, "%s", candidate) >= (int)size) {
+        return -1;
+      }
+    }
+    memmove(todo, rest, strlen(rest) + 1);
+  }
+  if(out[0] == '\0') {
+    if(size < 2) {
+      return -1;
+    }
+    out[0] = '/';
+    out[1] = '\0';
+  }
+  return 0;
+}
+
+
+static int
+under_root(const char *full) {
+  static const char *const roots[] = {"/data", "/user", "/mnt/usb"};
+  char path[PATH_MAX];
+  char root[PATH_MAX];
+  size_t len;
+  size_t i;
+
+  for(i=0; i<sizeof(roots)/sizeof(roots[0]); i++) {
+    if(snprintf(path, sizeof(path), "%s%s", FS_ROOT, roots[i]) >= (int)sizeof(path) ||
+       real_path(path, root, sizeof(root))) {
+      continue;
+    }
+    len = strlen(root);
+    if(!strncmp(full, root, len) && (full[len] == '\0' || full[len] == '/')) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
 static int
 check_local(const char *local, char *full, size_t size) {
+  char path[PATH_MAX];
   int inside = !strncmp(local, "/data/", 6) || !strncmp(local, "/user/", 6) ||
                !strncmp(local, "/mnt/usb", 8);
 
   if(!inside || !printable(local) || dotdot(local)) {
     return FTP_BAD_PATH;
   }
-  if(!resolve(full, size, "", local) || protected_path(full)) {
+  if(!resolve(path, sizeof(path), "", local) || real_path(path, full, size)) {
+    return FTP_FAILED;
+  }
+  if(!under_root(full)) {
+    return FTP_BAD_PATH;
+  }
+  if(protected_path(full)) {
     return FTP_PROTECTED;
   }
   return 0;
