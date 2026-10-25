@@ -20,3 +20,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0011](0011-the-target-firmware-is-11-20.md) | The target firmware is 11.20, and only 11.20 for now |
 | [0012](0012-the-agent-port-line-grammar.md) | The agent port's line grammar: quoting, escaped actions, one frame and one cap |
 | [0013](0013-the-connection-stack-is-a-budget.md) | The connection stack is a budget every recursive walk fits inside |
+| [0014](0014-the-session-prefix-and-the-resolved-path.md) | The `@` prefix names a session, and a path resolves before the gate |
