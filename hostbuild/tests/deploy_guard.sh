@@ -1,5 +1,5 @@
 #!/bin/sh
-# `make test` at the repository root sends shsrv-ps5.elf to a console. It must
+# `make test` at the repository root sends ariel-ps5.elf to a console. It must
 # refuse unless ARIEL_DEPLOY=yes is given on purpose, and refuse before the
 # SDK is read or anything is built, so an agent that runs it by habit touches
 # nothing.

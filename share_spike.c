@@ -24,7 +24,7 @@ along with this program; see the file COPYING. If not, see
  * this process, resolves its exports and asks for one screenshot, writing the
  * outcome to /data/share-spike.log after every step so a wedge still says
  * where it died. It changes no product code and is never linked into
- * shsrv-ps5.elf.
+ * ariel-ps5.elf.
  **/
 
 #include <dlfcn.h>

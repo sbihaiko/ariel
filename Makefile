@@ -45,11 +45,11 @@ ifeq ($(ARIEL_RECOVERY_PUBKEY),$(ARIEL_PUBKEY))
 endif
 endif
 
-# `make test` sends shsrv-ps5.elf to a console. It runs only when the owner
+# `make test` sends ariel-ps5.elf to a console. It runs only when the owner
 # asks for it by name, and refuses before the SDK is read or anything is built.
 ifneq ($(filter test,$(MAKECMDGOALS)),)
 ifneq ($(ARIEL_DEPLOY),yes)
-    $(error make test sends shsrv-ps5.elf to the console at $(PS5_HOST); run it with ARIEL_DEPLOY=yes to deploy on purpose)
+    $(error make test sends ariel-ps5.elf to the console at $(PS5_HOST); run it with ARIEL_DEPLOY=yes to deploy on purpose)
 endif
 endif
 
@@ -75,7 +75,7 @@ $(SUBDIRS):
 
 .NOTPARALLEL:
 
-all: shsrv-ps5.elf sh.elf controller-spike.elf primitives-probe.elf
+all: ariel-ps5.elf sh.elf controller-spike.elf primitives-probe.elf
 
 # The agent protocol, the store and the token are shared with the host
 # build, which compiles the same sources from hostbuild/.
@@ -93,7 +93,7 @@ platform_ps5.o: CFLAGS += -DARIEL_PUBKEY_HEX=\"$(ARIEL_PUBKEY)\" \
                           -DARIEL_RECOVERY_PUBKEY_HEX=\"$(ARIEL_RECOVERY_PUBKEY)\" \
                           -DARIEL_CONSOLE_ID=\"$(ARIEL_CONSOLE_ID)\"
 
-shsrv-ps5.elf: shsrv.o platform_ps5.o readers_ps5.o $(ARIEL_OBJS) elfldr.o \
+ariel-ps5.elf: shsrv.o platform_ps5.o readers_ps5.o $(ARIEL_OBJS) elfldr.o \
                pt.o notify.o sha256.o
 	$(CC) -lkernel_sys -o $@ $^
 
@@ -110,23 +110,23 @@ sh.elf.inc: sh.elf
 	xxd -i $^ > $@
 
 # The controller spike is a separate payload. It is never linked into
-# shsrv-ps5.elf; the operator sends it to elfldr on its own.
+# ariel-ps5.elf; the operator sends it to elfldr on its own.
 controller-spike.elf: controller_spike.o notify.o pt.o
 	$(CC) -lkernel_sys -lScePad -lSceUserService -lSceSystemService \
 	      -lSceRegMgr -o $@ $^
 
 # The capture spike is a separate payload, answering issue #55. It is never
-# linked into shsrv-ps5.elf; the operator sends it to elfldr on its own.
+# linked into ariel-ps5.elf; the operator sends it to elfldr on its own.
 capture-spike.elf: capture_spike.o notify.o
 	$(CC) -lkernel_sys -o $@ $^
 
 # The share spike is a separate payload, answering issue #100. It is never
-# linked into shsrv-ps5.elf; the operator sends it to elfldr on its own.
+# linked into ariel-ps5.elf; the operator sends it to elfldr on its own.
 share-spike.elf: share_spike.o notify.o
 	$(CC) -lkernel_sys -o $@ $^
 
 # The primitives probe is a separate payload. It is never linked into
-# shsrv-ps5.elf; the operator sends it to elfldr on its own. ps5_at.h is a
+# ariel-ps5.elf; the operator sends it to elfldr on its own. ps5_at.h is a
 # header, so the probe needs no extra object.
 primitives-probe.elf: primitives_probe.o
 	$(CC) -lkernel_sys -o $@ $^
@@ -153,6 +153,6 @@ addons/ftp/ftp.elf: addons/ftp/ftp.c protected.c protected.h
 clean:
 	rm -f *.o *.elf addons/sight/*.elf addons/ftp/*.elf
 
-test: shsrv-ps5.elf
+test: ariel-ps5.elf
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
 

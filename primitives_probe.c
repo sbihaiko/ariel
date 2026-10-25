@@ -17,7 +17,7 @@ along with this program; see the file COPYING. If not, see
 /**
  * Console primitives probe (issue #18).
  *
- * A separate payload. It is never linked into shsrv-ps5.elf. The operator
+ * A separate payload. It is never linked into ariel-ps5.elf. The operator
  * sends it to the ELF loader, which copies this process's standard output
  * back over the deploy connection.
  *

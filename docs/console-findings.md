@@ -130,7 +130,7 @@ The safe call is a `syscall` instruction whose carry flag is checked: carry set 
 
 ## Issue #18 probe: openat, renameat, unlinkat, fsync
 
-`primitives-probe.elf` is a separate payload. It is not linked into `shsrv-ps5.elf`. It calls `openat`, `renameat`, `unlinkat` and `fsync` the way the store does, and prints each call, its `rc` and `errno`, and a `PASS` or `FAIL` line for whether the POSIX behavior held.
+`primitives-probe.elf` is a separate payload. It is not linked into `ariel-ps5.elf`. It calls `openat`, `renameat`, `unlinkat` and `fsync` the way the store does, and prints each call, its `rc` and `errno`, and a `PASS` or `FAIL` line for whether the POSIX behavior held.
 
 `renameat` is probed as an atomic replace of a file that already exists: the destination must hold the new content, and the temporary name must be gone. `fsync` is probed twice, once on a file descriptor and once on a directory descriptor. `fsync` is the libkernel symbol, which already returns -1 and sets `errno`, so `ps5_at.h` does not wrap it. The other three go through `ps5_at.h`.
 
@@ -138,7 +138,7 @@ Measured on 2026-10-24 on a CFI-2014 on firmware 11.200.005: every primitive hel
 
 ### Run procedure
 
-1. Build with the PS5 SDK set, as in the [quick start](quick-start.md). `make clean all` writes `primitives-probe.elf`. To build only the probe, run `make primitives-probe.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console, and refuses unless `ARIEL_DEPLOY=yes` is given.
+1. Build with the PS5 SDK set, as in the [quick start](quick-start.md). `make clean all` writes `primitives-probe.elf`. To build only the probe, run `make primitives-probe.elf`. Do not run `make test`; it sends `ariel-ps5.elf` to the console, and refuses unless `ARIEL_DEPLOY=yes` is given.
 2. Send the probe to the ELF loader. The loader copies the payload's standard output back over this connection, so leave it open:
 
 ```console
@@ -226,7 +226,7 @@ One more, from the deploy rather than the commands: sending the ELF with a plain
 
 ## Issue #55: the capture API on the console
 
-Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014). The spike is `capture_spike.c` and the `capture-spike.elf` target in the `Makefile`; it is not part of `all`, is never linked into `shsrv-ps5.elf`, and the operator sends it to the loader on 9021 on its own, as the controller spike is sent. It writes every step to `/data/capture-spike.log` before taking it, so a crash still says where it died. A copy of `/system/common/lib/libSceScreenShot.sprx` fetched over FTP was read on the workstation to name the exports.
+Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014). The spike is `capture_spike.c` and the `capture-spike.elf` target in the `Makefile`; it is not part of `all`, is never linked into `ariel-ps5.elf`, and the operator sends it to the loader on 9021 on its own, as the controller spike is sent. It writes every step to `/data/capture-spike.log` before taking it, so a crash still says where it died. A copy of `/system/common/lib/libSceScreenShot.sprx` fetched over FTP was read on the workstation to name the exports.
 
 **What the library is.** `/system/common/lib/libSceScreenShot.sprx` is the VSH build: an IPC client (`SceScreenShotIpcClient`, command `0x34560000`) in front of a system daemon, not a capture implementation of its own. It carries 13 exported functions. The public PS5 3.20 export dump and the PS4 map agree on these names, and the disassembly agrees with the ones the spike called:
 
@@ -273,7 +273,7 @@ Four things this run settled:
 
 ## Issue #100: the share route, and the error it stops at
 
-Run on 2026-10-25 with the owner on hand, on the same console, after the capture attempts above had already been reset away. The spike is `share_spike.c` and the `share-spike.elf` target in the `Makefile`; like the capture spike it is not part of `all`, is never linked into `shsrv-ps5.elf`, and writes each step to `/data/share-spike.log` before taking it. The question it asks is the owner's: the screenshot client in `libSceScreenShot` is the VSH's own IPC client and wedges the console, so is the system's share feature a second door a payload can open?
+Run on 2026-10-25 with the owner on hand, on the same console, after the capture attempts above had already been reset away. The spike is `share_spike.c` and the `share-spike.elf` target in the `Makefile`; like the capture spike it is not part of `all`, is never linked into `ariel-ps5.elf`, and writes each step to `/data/share-spike.log` before taking it. The question it asks is the owner's: the screenshot client in `libSceScreenShot` is the VSH's own IPC client and wedges the console, so is the system's share feature a second door a payload can open?
 
 **What the library is.** `/system/common/lib/libSceShare.native.sprx` is the share implementation, not a client of one: the file the loader wants by that exact name (`libSceShare.sprx` answers `0x80020002`, no such module). Its exports carry the capture the share menu offers — `ShareCaptureScreenshot`, `ShareCaptureScreenshotExtended`, `ShareGetCurrentStatus`, `ShareSetCaptureSource`, and a `ShareFeaturePermit`/`ShareFeatureProhibit` pair — so a capture through it would be the system's own, not a daemon round trip.
 

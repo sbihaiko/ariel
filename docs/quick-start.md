@@ -56,7 +56,7 @@ The release ships the source, not a ready-made ELF, and this is why: a build wit
 
 ```console
 $ export PS5_HOST=<the console's address>
-$ cat shsrv-ps5.elf | nc -q0 $PS5_HOST 9021
+$ cat ariel-ps5.elf | nc -q0 $PS5_HOST 9021
 ```
 
 The console shows two notifications: the telnet shell is serving on `2323`, and Ariel's agent port is listening on `2324` with the access token. The same token is in `/data/ariel/token` on the console, which the agent port refuses to read back through any command.

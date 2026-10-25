@@ -20,7 +20,7 @@ along with this program; see the file COPYING. If not, see
  * Loads the system's screen-shot client library into this process, resolves
  * its exported functions and tries one capture, writing the outcome to
  * /data/capture-spike.log after every step so a crash still says where it
- * died. It changes no product code and is never linked into shsrv-ps5.elf.
+ * died. It changes no product code and is never linked into ariel-ps5.elf.
  **/
 
 #include <dlfcn.h>

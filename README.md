@@ -244,13 +244,13 @@ The [quick start tutorial](docs/quick-start.md) goes from an empty checkout to a
 1. Clone the `stage-4` tag and run `make -C hostbuild`, which builds the signer as well as the host target.
 2. Make two keys with `./hostbuild/ariel-sign keygen`: the primary that signs everyday approvals, and a recovery key kept offline.
 3. Build the payload with both public keys pinned: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`.
-4. Send `shsrv-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
+4. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324.
 
 The release ships source only, and it has to: a build with no key pinned refuses every grant, and a build pinned to someone else's keys could only be approved by them. The console carries the public half of **your** pair, so the ELF is built once, by you.
 
 ## Using it today
 
-Make sure [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) is running and send `shsrv-ps5.elf` to port 9021. Ariel stops any running shsrv and takes its place. An agent connects to the agent port, 2324, with the token Ariel shows on the console at first start (the [quick start](docs/quick-start.md) walks through it). The telnet shell still answers on port 2323 exactly like upstream shsrv: type `help` once connected to see its commands (`cd`, `ls`, `mkdir`, `stat`, `ps` and others).
+Make sure [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) is running and send `ariel-ps5.elf` to port 9021. Ariel stops any running shsrv and takes its place. An agent connects to the agent port, 2324, with the token Ariel shows on the console at first start (the [quick start](docs/quick-start.md) walks through it). The telnet shell still answers on port 2323 exactly like upstream shsrv: type `help` once connected to see its commands (`cd`, `ls`, `mkdir`, `stat`, `ps` and others).
 
 Payloads placed in a folder on the `PATH` (initialized to `/user/homebrew/bin` and `/mnt/usb0/homebrew/bin`) can be run directly. Homebrew that needs audio or video is launched through `hbldr`, and `hbdbg` starts it under gdb.
 
@@ -260,7 +260,7 @@ Ariel builds exactly like shsrv, with the [ps5-payload-sdk](https://github.com/p
 
 To pin the owner's keys into the build, set both `ARIEL_PUBKEY` (the primary key that signs everyday approvals) and `ARIEL_RECOVERY_PUBKEY` (the offline recovery key), as 64 hex digits each: `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`. The two must differ, and setting `ARIEL_PUBKEY` without `ARIEL_RECOVERY_PUBKEY` stops the build, because the console would otherwise refuse every grant. The host build's test key is refused on the PS5 build.
 
-`make test` sends `shsrv-ps5.elf` to the console at `PS5_HOST` and refuses unless you ask for it by name: `make test ARIEL_DEPLOY=yes PS5_HOST=<console>`. The headless acceptance suite is `make -C hostbuild test`; it needs no console.
+`make test` sends `ariel-ps5.elf` to the console at `PS5_HOST` and refuses unless you ask for it by name: `make test ARIEL_DEPLOY=yes PS5_HOST=<console>`. The headless acceptance suite is `make -C hostbuild test`; it needs no console.
 
 ### Known limitations (inherited from shsrv)
 

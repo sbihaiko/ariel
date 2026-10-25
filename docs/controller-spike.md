@@ -14,7 +14,7 @@ The run showed that the payload cannot read the pad, and that borrowing the read
 
 ## What the payload does
 
-- It builds as its own ELF, `controller-spike.elf`, next to `shsrv-ps5.elf`. It is never linked into `shsrv-ps5.elf`.
+- It builds as its own ELF, `controller-spike.elf`, next to `ariel-ps5.elf`. It is never linked into `ariel-ps5.elf`.
 - It runs as a process started through the ELF loader, the same way Ariel runs.
 - It opens the controller with `scePadOpen`, for the console's initial user (or the foreground user when there is no initial user).
 - For 120 seconds it reads `scePadReadState` every 16 ms.
@@ -32,7 +32,7 @@ Set the SDK as in the [quick start](quick-start.md#1-install-the-ps5-payload-sdk
 $ make clean all
 ```
 
-The build writes `controller-spike.elf` next to `shsrv-ps5.elf`. To build only the spike, run `make controller-spike.elf`. Do not run `make test`; it sends `shsrv-ps5.elf` to the console, and refuses unless `ARIEL_DEPLOY=yes` is given.
+The build writes `controller-spike.elf` next to `ariel-ps5.elf`. To build only the spike, run `make controller-spike.elf`. Do not run `make test`; it sends `ariel-ps5.elf` to the console, and refuses unless `ARIEL_DEPLOY=yes` is given.
 
 ## 2. Send it to elfldr on port 9021
 
