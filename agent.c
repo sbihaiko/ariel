@@ -14,6 +14,12 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+#if defined(__APPLE__)
+/* macOS hides O_NOFOLLOW and AT_* behind _DARWIN_C_SOURCE once
+   _POSIX_C_SOURCE is defined. The gallery walk opens nothing through a link. */
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -28,6 +34,9 @@ along with this program; see the file COPYING. If not, see
 #include <time.h>
 #include <unistd.h>
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include "addon.h"
 #include "agent.h"
 #include "allowlist.h"
@@ -145,6 +154,14 @@ static const char frozen_reply[] =
 static const char suspended_reply[] =
   "suspended\n"
   "exit 90\n";
+static const char no_shots[] =
+  "no_shots\n"
+  "exit 1\n";
+static const char shots_done[] =
+  "exit 0\n";
+static const char shots_failed[] =
+  "shots_failed\n"
+  "exit 1\n";
 
 /** The answer to an approval that could not be requested: a frozen console says so. **/
 static const char *
@@ -4391,7 +4408,379 @@ builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
 }
 
 
-/** pkg_install, hbldr and hbdbg: a file the built-in reads. **/
+/** The gallery the console's Create button writes, and where a copy lands. **/
+#define SHOTS_GALLERY "/user/av_contents/photo"
+#define SHOTS_DIR     "/data/shots"
+/** One copy is named shots-<ms>-<n>.jpg, so a selector never asks for more. **/
+#define SHOTS_MAX     64
+
+/**
+ * One image the Create button wrote. path is the name the owner reads, below
+ * the gallery. mtime is the time it was written, on the platform clock: the
+ * host build's files carry wall-clock times, and the test clock starts
+ * at zero, so the walk records the file's own time and `shots --minutes`
+ * compares against the wall clock too.
+ **/
+typedef struct {
+  char   path[PATH_MAX];
+  time_t mtime;
+} shot_t;
+
+
+/** The part of path below root, starting with '/', or NULL when it is not. **/
+static const char *
+shots_below(const char *root, const char *path) {
+  size_t n = strlen(root);
+
+  if(strncmp(path, root, n) || path[n] != '/') {
+    return NULL;
+  }
+  return path + n;
+}
+
+
+/**
+ * Open the directory at the absolute console path, walking down from the
+ * platform root without following a symbolic link. On a console the root is
+ * empty and the walk starts at the file system root.
+ **/
+static int
+shots_dir_open(const char *root, const char *path) {
+  const char *rel = shots_below(root, path);
+  char walk[PATH_MAX];
+  char *part;
+  char *slash;
+  int fd;
+  int next;
+
+  if(!rel) {
+    return -1;
+  }
+  if(snprintf(walk, sizeof(walk), "%s", rel + 1) >= (int)sizeof(walk)) {
+    return -1;
+  }
+
+  fd = open(*root ? root : "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if(fd < 0) {
+    return -1;
+  }
+
+  part = walk;
+  while((slash = strchr(part, '/'))) {
+    *slash = '\0';
+    next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    close(fd);
+    if(next < 0) {
+      return -1;
+    }
+    fd = next;
+    part = slash + 1;
+  }
+
+  next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  close(fd);
+  return next;
+}
+
+
+/**
+ * Record every regular file under the directory open at dirfd. rel is that
+ * directory's path as the owner reads it. A subdirectory is walked into; a
+ * symbolic link is skipped, so the walk never leaves the gallery. count
+ * stops the walk at SHOTS_MAX, which is a refusal.
+ **/
+static int
+shots_collect(int dirfd, const char *rel, shot_t *shots, int *count) {
+  int copy = dup(dirfd);
+  DIR *handle;
+  struct dirent *entry;
+
+  if(copy < 0) {
+    return -1;
+  }
+  if(!(handle = fdopendir(copy))) {
+    close(copy);
+    return -1;
+  }
+
+  while((entry = readdir(handle))) {
+    struct stat st;
+    char child[PATH_MAX];
+    int sub;
+
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
+      continue;
+    }
+    if(fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW)) {
+      continue;
+    }
+    if(S_ISLNK(st.st_mode)) {
+      continue;
+    }
+    if(snprintf(child, sizeof(child), "%s/%s", rel, entry->d_name)
+       >= (int)sizeof(child)) {
+      continue;
+    }
+    if(S_ISDIR(st.st_mode)) {
+      sub = openat(dirfd, entry->d_name,
+                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if(sub < 0 || shots_collect(sub, child, shots, count)) {
+        if(sub >= 0) {
+          close(sub);
+        }
+        closedir(handle);
+        return -1;
+      }
+      close(sub);
+      continue;
+    }
+    if(!S_ISREG(st.st_mode)) {
+      continue;
+    }
+    if(*count >= SHOTS_MAX) {
+      closedir(handle);
+      return -1;
+    }
+    snprintf(shots[*count].path, sizeof(shots[*count].path), "%s", child);
+    shots[*count].mtime = st.st_mtime;
+    (*count)++;
+  }
+
+  closedir(handle);
+  return 0;
+}
+
+
+/** Newest first, so --last is the first and --count takes a prefix. **/
+static int
+shot_newer(const void *a, const void *b) {
+  time_t left = ((const shot_t *)a)->mtime;
+  time_t right = ((const shot_t *)b)->mtime;
+
+  if(left != right) {
+    return left > right ? -1 : 1;
+  }
+  return strcmp(((const shot_t *)a)->path, ((const shot_t *)b)->path);
+}
+
+
+/**
+ * The directory a copy lands in, made below the platform root. On a console
+ * the root is empty and the path is the console's own.
+ **/
+static int
+shots_mkdir(const char *root) {
+  char path[PATH_MAX];
+
+  if(snprintf(path, sizeof(path), "%s%s", root, SHOTS_DIR)
+     >= (int)sizeof(path)) {
+    return -1;
+  }
+  if(mkdir(path, 0755) && errno != EEXIST) {
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * Copy one image to /data/shots and answer its path, size and sha256. The
+ * name carries the clock and the position, so two copies never collide. Both
+ * files are opened by walking down from the platform root, so a symbolic
+ * link is never followed.
+ **/
+static int
+shot_copy(agent_t *agent, int fd, const shot_t *shot, int index) {
+  const char *root = agent->platform->fs_root;
+  char source[PATH_MAX];
+  char dest[PATH_MAX];
+  char line[PATH_MAX + 96];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char hex[SHA256_HEX_LEN + 1];
+  unsigned char buf[8192];
+  sha256_t ctx;
+  struct stat st;
+  ssize_t n;
+  off_t total = 0;
+  int64_t stamp = now_ms(agent->platform);
+  int in;
+  int out;
+
+  if(snprintf(source, sizeof(source), "%s%s", root, shot->path)
+     >= (int)sizeof(source)) {
+    return -1;
+  }
+  if(snprintf(dest, sizeof(dest), "%s%s/shots-%lld-%d.jpg", root, SHOTS_DIR,
+              (long long)stamp, index) >= (int)sizeof(dest)) {
+    return -1;
+  }
+
+  if((in = open(source, O_RDONLY | O_NOFOLLOW)) < 0) {
+    return -1;
+  }
+  if(fstat(in, &st) || !S_ISREG(st.st_mode)) {
+    close(in);
+    return -1;
+  }
+  if((out = open(dest, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644)) < 0) {
+    close(in);
+    return -1;
+  }
+
+  sha256_init(&ctx);
+  while((n = read(in, buf, sizeof(buf))) > 0) {
+    if(write(out, buf, (size_t)n) != n) {
+      n = -1;
+      break;
+    }
+    sha256_update(&ctx, buf, (size_t)n);
+    total += n;
+  }
+  sha256_final(&ctx, digest);
+  close(in);
+  if(close(out) || n < 0) {
+    unlink(dest);
+    return -1;
+  }
+
+  sha256_hex(digest, hex);
+  snprintf(line, sizeof(line), "shot %s/shots-%lld-%d.jpg %lld %s\n",
+           SHOTS_DIR, (long long)stamp, index, (long long)total, hex);
+  if(write(fd, line, strlen(line)) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * shots --last, shots --count <n> or shots --minutes <n>: copy the Create
+ * button's images out of the gallery into /data/shots.
+ *
+ * The gallery is the system's, so the command never captures and never writes
+ * there. The selector is bound into the approval as the select fact, so a
+ * grant for one selection does not run another. The copies are the agent's to
+ * read and to delete with the gated rm.
+ **/
+static void
+shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  shot_t shots[SHOTS_MAX];
+  int count = 0;
+  int kept = 0;
+  int i;
+  long number = 0;
+  int by_count = 0;
+  int by_minutes = 0;
+  time_t cutoff = 0;
+
+  if(argc != 2 && argc != 3) {
+    audit_reply(fd, "shots", "refused", "-", "-", bad_option);
+    return;
+  }
+  if(argc == 2 && !strcmp(argv[1], "--last")) {
+    number = 1;
+    by_count = 1;
+  } else if(argc == 3 && (!strcmp(argv[1], "--count") ||
+                          !strcmp(argv[1], "--minutes"))) {
+    char *end = NULL;
+    errno = 0;
+    number = strtol(argv[2], &end, 10);
+    if(errno || end == argv[2] || *end || number < 1 || number > SHOTS_MAX) {
+      audit_reply(fd, "shots", "refused", "-", "-", bad_argument);
+      return;
+    }
+    by_minutes = !strcmp(argv[1], "--minutes");
+    by_count = !by_minutes;
+  } else {
+    audit_reply(fd, "shots", "refused", "-", "-", bad_option);
+    return;
+  }
+
+  if(protected_path(SHOTS_GALLERY) || protected_path(SHOTS_DIR)) {
+    audit_reply(fd, "shots", "protected", "-", "-", protected_process);
+    return;
+  }
+
+  {
+    const char *root = agent->platform->fs_root;
+    char gallery[PATH_MAX];
+    int dirfd;
+
+    if(snprintf(gallery, sizeof(gallery), "%s%s", root, SHOTS_GALLERY)
+       >= (int)sizeof(gallery)) {
+      audit_reply(fd, "shots", "refused", "-", "-", shots_failed);
+      return;
+    }
+    if((dirfd = shots_dir_open(root, gallery)) < 0) {
+      /* No gallery is no image: the Create button has written nothing. */
+      audit_reply(fd, "shots", "refused", "-", "-", no_shots);
+      return;
+    }
+    if(shots_collect(dirfd, SHOTS_GALLERY, shots, &count)) {
+      close(dirfd);
+      audit_reply(fd, "shots", "refused", "-", "-", shots_failed);
+      return;
+    }
+    close(dirfd);
+  }
+  qsort(shots, (size_t)count, sizeof(shots[0]), shot_newer);
+
+  if(by_minutes) {
+    time_t now = time(NULL);
+    cutoff = now - (time_t)number * 60;
+  }
+
+  for(i = 0, kept = 0; i < count; i++) {
+    if(by_minutes && shots[i].mtime < cutoff) {
+      continue;
+    }
+    kept++;
+    if(by_count && kept >= number) {
+      break;
+    }
+  }
+  if(!kept) {
+    audit_reply(fd, "shots", "refused", "-", "-", no_shots);
+    return;
+  }
+  kept = 0;
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "shots");
+  snprintf(facts.target, sizeof(facts.target), "%s", SHOTS_DIR);
+  snprintf(facts.value, sizeof(facts.value), "%s:%ld",
+           by_minutes ? "minutes" : "count", number);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  if(shots_mkdir(agent->platform->fs_root)) {
+    audit_reply(fd, "shots", "failed", SHOTS_DIR, challenge.id, shots_failed);
+    return;
+  }
+
+  for(i = 0; i < count && kept < SHOTS_MAX; i++) {
+    if(by_minutes && shots[i].mtime < cutoff) {
+      continue;
+    }
+    if(by_count && kept >= number) {
+      break;
+    }
+    if(shot_copy(agent, fd, &shots[i], kept)) {
+      audit_reply(fd, "shots", "failed", SHOTS_DIR, challenge.id, shots_failed);
+      return;
+    }
+    kept++;
+  }
+
+  if(audit_line("shots", "done", SHOTS_DIR, challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  reply(fd, shots_done);
+}
 static void
 builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
   approval_facts_t facts;
@@ -4719,6 +5108,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     } else {
       unzip_command(agent, fd, argv[1], argv[2]);
     }
+    return;
+  }
+
+  if(argc >= 1 && !strcmp(argv[0], "shots")) {
+    shots_command(agent, fd, argc, argv);
     return;
   }
 

@@ -9237,6 +9237,93 @@ def scenario_find_predicates(server):
         "relative_path", "exit 1"], "find of a relative path must refuse it"
 
 
+def gallery(server, files, fresh=False):
+    """Images the Create button would have written, under the host test root.
+
+    fresh drops whatever an earlier scenario left there: the gallery is one
+    directory the whole server shares.
+    """
+    photo = os.path.join(server.root, "user", "av_contents", "photo")
+    if fresh and os.path.isdir(photo):
+        shutil.rmtree(photo)
+    for rel, data in files.items():
+        path = os.path.join(photo, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+    return photo
+
+
+def shot_lines(lines):
+    """The shot lines of one answer, each split into path, size and sha256."""
+    return [line.split() for line in lines if line.startswith("shot ")]
+
+
+def scenario_shots_copy_the_newest(server):
+    """shots copies the newest images into /data/shots after the owner signs."""
+    photo = gallery(server, {
+        "older/a.jpg": b"aaa",
+        "newer.jpg": b"bbbb",
+        "note.txt": b"ccccc",
+    }, fresh=True)
+    now = time.time()
+    os.utime(os.path.join(photo, "older", "a.jpg"), (now - 30, now - 30))
+    os.utime(os.path.join(photo, "newer.jpg"), (now - 10, now - 10))
+    os.utime(os.path.join(photo, "note.txt"), (now, now))
+    shots = os.path.join(server.root, "data", "shots")
+
+    approval, challenge = gate_request(server, "shots --count 2")
+    assert not os.path.isdir(shots), "an unsigned shots must copy nothing"
+    action = decoded_action(challenge_action(challenge))
+    assert "\noption.select=count:2\n" in action, action
+
+    sign_and_grant(server, approval, challenge)
+    lines = run_command(server, "shots --count 2")
+    copied = shot_lines(lines)
+    assert lines[-1] == "exit 0" and len(copied) == 2, lines
+    assert [int(row[2]) for row in copied] == [5, 4], (
+        "the newest two must come first, got %r" % copied)
+    for row in copied:
+        assert row[1].startswith("/data/shots/shots-"), row
+        with open(os.path.join(server.root, row[1].lstrip("/")), "rb") as handle:
+            data = handle.read()
+        assert len(data) == int(row[2]), row
+        assert hashlib.sha256(data).hexdigest() == row[3], row
+
+    spent, _ = gate_request(server, "shots --count 2")
+    assert spent != approval, "a spent shots approval must not be reused"
+
+    approval, challenge = gate_request(server, "shots --last")
+    sign_and_grant(server, approval, challenge)
+    last = run_command(server, "shots --last")
+    assert shot_lines(last)[0][2] == "5" and last[-1] == "exit 0", last
+
+
+def scenario_shots_minutes_keeps_the_recent(server):
+    """shots --minutes keeps the images written inside the window."""
+    photo = gallery(server, {"old.jpg": b"old", "new.jpg": b"new"}, fresh=True)
+    os.utime(os.path.join(photo, "old.jpg"), (0, 0))
+
+    approval, challenge = gate_request(server, "shots --minutes 1")
+    sign_and_grant(server, approval, challenge)
+    lines = run_command(server, "shots --minutes 1")
+    copied = shot_lines(lines)
+    assert lines[-1] == "exit 0" and len(copied) == 1, lines
+    assert copied[0][2] == "3", "only the image inside the minute must be copied"
+
+    assert run_command(server, "shots --minutes 0") == ["bad_argument", "exit 1"]
+    assert run_command(server, "shots --hours 1") == ["bad_option", "exit 1"]
+
+
+def scenario_shots_empty_gallery_needs_no_owner(server):
+    """An empty gallery answers no_shots before the owner is asked."""
+    gallery(server, {}, fresh=True)
+    assert run_command(server, "shots --last") == ["no_shots", "exit 1"], (
+        "an empty gallery must answer no_shots without asking")
+    assert run_command(server, "shots") == ["bad_option", "exit 1"]
+    server.assert_no_line()
+
+
 def scenario_rm_recursive_needs_the_owner(server):
     """rm -r asks once for the whole tree, removes it after the signature, and binds -r."""
     tree = make_tree(server, "rm-tree", {"a.txt": b"x", "sub/b.txt": b"y"})
@@ -9429,6 +9516,9 @@ HOST_ROOT_SCENARIOS.update({
     "cp -r and rm -r hold a tree as deep as the walk promises, on the "
     "connection thread's stack",
     "an option a command does not take answers bad_option and asks nobody",
+    "shots copies the newest images after the owner signs, and binds the selector",
+    "shots --minutes keeps the images written inside the window",
+    "an empty gallery answers no_shots before the owner is asked",
 })
 
 
@@ -9630,6 +9720,12 @@ SCENARIOS = [
      scenario_find_predicates, HOST_ROOT_REASON),
     ("rm -r asks once for the tree, removes it after the signature, and binds -r",
      scenario_rm_recursive_needs_the_owner, HOST_ROOT_REASON),
+    ("shots copies the newest images after the owner signs, and binds the selector",
+     scenario_shots_copy_the_newest, HOST_ROOT_REASON),
+    ("shots --minutes keeps the images written inside the window",
+     scenario_shots_minutes_keeps_the_recent, HOST_ROOT_REASON),
+    ("an empty gallery answers no_shots before the owner is asked",
+     scenario_shots_empty_gallery_needs_no_owner, HOST_ROOT_REASON),
     ("rm -r refuses protected objects and links before anything is removed",
      scenario_rm_recursive_refusals, HOST_ROOT_REASON),
     ("cp -r copies a tree after the owner signs, and refuses an existing destination",

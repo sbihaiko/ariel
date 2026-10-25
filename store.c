@@ -907,6 +907,9 @@ value_key(const char *command) {
   if(!strcmp(command, "chmod")) {
     return "mode";
   }
+  if(!strcmp(command, "shots")) {
+    return "select";
+  }
   return !strcmp(command, "chown") ? "owner" : "group";
 }
 
