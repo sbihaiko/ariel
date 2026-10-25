@@ -9264,6 +9264,39 @@ def scenario_cp_recursive_refusals(server):
     server.assert_no_line()
 
 
+def nested_path(root, depth, leaf):
+    """The path of leaf below root, with depth directories between them."""
+    parts = [root] + ["d%02d" % i for i in range(depth)] + [leaf]
+    return os.path.join(*parts)
+
+
+def scenario_deep_tree_fits_the_connection_stack(server):
+    """cp -r and rm -r hold a tree as deep as the walk promises, on the thread's stack."""
+    # The depth the walk accepts, mirroring TREE_DEPTH_MAX in fileops.c: the
+    # root is depth 0, so a tree this deep is still walked and one deeper is not.
+    limit = 64
+    ladder = os.path.join(*["d%02d" % i for i in range(limit - 1)])
+    deep = make_tree(server, "deep-src", {}, dirs=[ladder])
+    leaf = nested_path(os.path.join(server.root, "data", "deep-src"), limit - 1,
+                       "bottom.txt")
+    with open(leaf, "wb") as handle:
+        handle.write(TRANSFER_BYTES)
+    dst = os.path.join(server.root, "data", "deep-dst")
+    line = "cp -r %s %s" % (deep, dst)
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], (
+        "cp -r must copy a tree the depth limit allows without killing the thread")
+    assert read_bytes(nested_path(dst, limit - 1, "bottom.txt")) == TRANSFER_BYTES, (
+        "cp -r must copy the leaf at the bottom of a deep tree")
+    remove = "rm -r %s" % dst
+    approval, challenge = gate_request(server, remove)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, remove) == ["exit 0"], (
+        "rm -r must remove a tree the depth limit allows without killing the thread")
+    assert not os.path.lexists(dst), "a signed rm -r must remove the whole copy"
+
+
 def scenario_unsupported_options_answer_bad_option(server):
     """An option a command does not take answers bad_option and asks nobody."""
     scratch = write_scratch(server, "bad-option.txt", b"x\n")
@@ -9408,6 +9441,9 @@ SCENARIOS = [
      scenario_cp_recursive, HOST_ROOT_REASON),
     ("cp -r refuses a tree into itself, a link, a protected alias and bad_option",
      scenario_cp_recursive_refusals, HOST_ROOT_REASON),
+    ("cp -r and rm -r hold a tree as deep as the walk promises, on the "
+     "connection thread's stack",
+     scenario_deep_tree_fits_the_connection_stack, HOST_ROOT_REASON),
     ("an option a command does not take answers bad_option and asks nobody",
      scenario_unsupported_options_answer_bad_option, HOST_ROOT_REASON),
     ("mount, umount, chroot and mknod ask the owner, and once signed answer "
