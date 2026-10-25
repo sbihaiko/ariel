@@ -76,19 +76,25 @@ def free_port():
 class Server:
     """The host build of Ariel, started against a temporary root."""
 
-    def __init__(self, binary, env=None, setup=None):
+    def __init__(self, binary, env=None, setup=None, start=True):
         self.binary = binary
         self.env = env
         self.root = tempfile.mkdtemp(prefix="ariel-host-", dir=os.path.realpath("/tmp"))
         self.token = None
         if setup is not None:
             setup(self.root)
+        if start:
+            self._start()
+
+    def start(self):
+        """Start a server built with start=False against its root."""
         self._start()
 
     def _spawn(self):
-        self.port = free_port()
+        self.port_requested = free_port()
+        self.port = self.port_requested
         self.proc = subprocess.Popen(
-            [self.binary, "--port", str(self.port), "--root", self.root],
+            [self.binary, "--port", str(self.port_requested), "--root", self.root],
             env=dict(os.environ, **(self.env or {})),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1240,6 +1246,7 @@ CLOCK_SCENARIOS = {
     "a file replaced after a built-in grant answers approval_stale and exit 78",
     "missing auth after 5 s of test clock closes with exit 70",
     "a command still running at the 60 s deadline answers timed_out",
+    "a sleep runs on the test clock and ends only when that clock moves",
     "a quoted path is escaped in the signed action and decoded by the "
     "signer",
     "a stalled upload does not block another connection",
@@ -3409,8 +3416,10 @@ def scenario_a_slow_command_times_out(server):
         sock.sendall(b"sleep 60\n")
         server.settle(1)
         server.advance(30000)
-        assert reply_lines(read_reply(sock)) == ["timed_out", "exit 1"], (
-            "a command past the connection deadline must answer timed_out")
+        reply = reply_lines(read_reply(sock))
+        assert reply == ["timed_out", "exit 1"], (
+            "a command past the connection deadline must answer timed_out, "
+            "got %r" % (reply,))
     finally:
         sock.close()
 
@@ -4201,9 +4210,8 @@ def scenario_inspection_runs_at_once(server):
     # than one reply's usual 5 s.
     assert run_command(server, "sync", timeout=SYNC_TIMEOUT) == ["exit 0"]
     assert run_command(server, "sleep 0") == ["exit 0"]
-    started = time.monotonic()
-    assert run_command(server, "sleep 1") == ["exit 0"]
-    assert time.monotonic() - started >= 0.9, "sleep 1 must pause a second"
+    # A sleep ends on the test clock, so sleep 1 belongs to the clock scenario:
+    # on this clock it ends only when a scenario advances the clock.
     assert run_command(server, "sleep") == ["missing_operand", "exit 1"]
     assert run_command(server, "sleep soon") == ["bad_duration", "exit 1"]
     assert run_command(server, "sleep 61") == ["bad_duration", "exit 1"]
@@ -9350,6 +9358,83 @@ HOST_ROOT_SCENARIOS.update({
 })
 
 
+SLOW_START = """#!/bin/sh
+# A start that is slow to end: the harness must see where the stream ends,
+# not decide from a fixed number of seconds that the server kept running.
+sleep 6
+exit 3
+"""
+
+
+def scenario_a_server_names_the_port_it_bound(server):
+    """A test server asks the OS for a port at bind time and prints the port.
+
+    A port the harness reserved and released is not held until the child binds
+    it: another process can take it in between, and two servers can be handed
+    the same one. Asking for port 0 binds a free port with no window, and the
+    port line tells the harness where to connect.
+    """
+    del server  # this start is the scenario's own
+    probe = Server(SERVER_BINARY, start=False)
+    try:
+        probe.start()
+        assert probe.port_requested == 0, (
+            "the harness must ask the OS for a port, it asked for %d"
+            % probe.port_requested)
+        assert probe.port > 0, "the server must name the port it bound"
+        assert run_command(probe, "echo bound") == ["bound", "exit 0"], (
+            "the port the server names must be the one it serves on")
+    finally:
+        probe.stop()
+
+
+def scenario_a_start_that_is_slow_to_end_still_ends(server):
+    """A start that ends later than the harness expects still ended on its own."""
+    del server  # this start is the scenario's own
+    folder = tempfile.mkdtemp(prefix="ariel-slow-start-")
+    binary = os.path.join(folder, "slow-start")
+    try:
+        with open(binary, "w") as handle:
+            handle.write(SLOW_START)
+        os.chmod(binary, 0o755)
+        slow = Server(binary, start=False)
+        try:
+            assert slow.start_until_exit() == 3, (
+                "a start that ends after a while must be seen ending")
+        finally:
+            slow.stop()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def scenario_sleep_runs_on_the_test_clock(server):
+    """A sleep ends when the test clock moves, not when the machine's clock does."""
+    sock = server.connect(timeout=10.0)
+    try:
+        sock.sendall(("auth %s\nsleep 1\n" % server.token).encode("ascii"))
+        server.settle(1)
+        # The machine's clock passes here and the test clock does not. A sleep
+        # that ends on the machine ignores the clock every deadline scenario
+        # moves, so a slow runner decides the answer instead of the clock.
+        time.sleep(1.2)
+        assert_open(sock, "sleep 1 before the test clock moved")
+        server.advance(1000)
+        assert reply_lines(read_reply(sock)) == ["exit 0"], (
+            "sleep 1 must end once the test clock has moved a second")
+    finally:
+        sock.close()
+
+
+HARNESS_SCENARIOS = [
+    ("a test server asks the OS for a port at bind time and names it",
+     scenario_a_server_names_the_port_it_bound, None),
+    ("a start that is slow to end still ends, with no wall-clock ceiling",
+     scenario_a_start_that_is_slow_to_end_still_ends, None),
+    ("a sleep runs on the test clock and ends only when that clock moves",
+     scenario_sleep_runs_on_the_test_clock, CLOCK_REASON),
+]
+
+
 SCENARIOS = [
     ("missing auth closes with exit 70", scenario_missing_auth, None),
     ("missing auth after 5 s of test clock closes with exit 70",
@@ -12841,6 +12926,7 @@ ADDON_GATE_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_GATE_SCENARIOS)
 SCENARIOS.extend(ADDON_GATE_SCENARIOS)
+SCENARIOS.extend(HARNESS_SCENARIOS)
 
 SIGHT_REFUSED_TITLE = ("the reference addon's shipped manifest is refused by this build "
                        "before the owner is asked, and an unknown ABI is named first")
