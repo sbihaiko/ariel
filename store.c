@@ -1022,14 +1022,28 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[1].key = "start";
       options[1].value = facts->start;
       action->noptions = 2;
-    } else if(!strcmp(facts->command, "exec") ||
-              !strcmp(facts->command, "addon")) {
+    } else if(!strcmp(facts->command, "exec")) {
       decimal(facts->argc, text[0], sizeof(text[0]));
       options[0].key = "argc";
       options[0].value = text[0];
       options[1].key = "args";
       options[1].value = facts->args;
       action->noptions = 2;
+    } else if(!strcmp(facts->command, "addon")) {
+      size_t n = 0;
+
+      decimal(facts->argc, text[0], sizeof(text[0]));
+      options[n].key = "argc";
+      options[n++].value = text[0];
+      for(i=0; i<facts->argc && i<RUN_ARGS_MAX; i++) {
+        options[n].key = run_arg[i];
+        options[n++].value = facts->arg[i];
+      }
+      if(facts->server[0]) {
+        options[n].key = "server";
+        options[n++].value = facts->server;
+      }
+      action->noptions = n;
     } else if(!strcmp(facts->command, "env") ||
               !strcmp(facts->command, "export")) {
       action->noptions = 0;
@@ -1108,7 +1122,7 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[action->noptions].value = facts->value;
       action->noptions++;
     }
-    for(i=0; strcmp(facts->command, "run") &&
+    for(i=0; strcmp(facts->command, "run") && strcmp(facts->command, "addon") &&
              i<BUILTIN_ARGS_MAX && facts->arg[i][0]; i++) {
       options[action->noptions].key = arg_keys[i];
       options[action->noptions].value = facts->arg[i];
@@ -1341,13 +1355,15 @@ same_args(const approval_facts_t *a, const approval_facts_t *b) {
  * Whether two targets are the same action on the same object: the same
  * kind, device and inode, the same requested value and destination, the same
  * mount or mknod options, the same signal and process start for a kill, and
- * the same content hash, argument count, argument hash and run arguments.
+ * the same content hash, argument count, argument hash, run arguments and
+ * addon server.
  **/
 static int
 same_identity(const approval_facts_t *a, const approval_facts_t *b) {
   return !strcmp(a->kind, b->kind) && a->dev == b->dev && a->ino == b->ino &&
          a->recursive == b->recursive &&
          a->argc == b->argc && !strcmp(a->args, b->args) &&
+         !strcmp(a->server, b->server) &&
          !strcmp(a->url, b->url) &&
          !strcmp(a->signal, b->signal) && !strcmp(a->start, b->start) &&
          !strcmp(a->value, b->value) && !strcmp(a->dest, b->dest) &&

@@ -46,7 +46,10 @@ along with this program; see the file COPYING. If not, see
 #define MANIFEST_MAX 512
 #define MANIFEST_FILE "manifest"
 #define ADDON_ELF_FILE "elf"
+#define ADDON_SERVER_FILE "server"
 #define ADDON_RESULT_PREFIX "/data/addon-"
+#define ADDON_EXIT_BAD_PATH 3
+#define ADDON_EXIT_PROTECTED 87
 
 #ifdef ARIEL_HOST_BUILD
 #define PLATFORM_TAG "host"
@@ -376,8 +379,7 @@ addon_list(int fd) {
 
 
 static int
-elf_open(const char *addon, size_t *size) {
-  struct stat st;
+addon_open(const char *addon, const char *file) {
   int addons;
   int adir;
   int fd;
@@ -391,8 +393,18 @@ elf_open(const char *addon, size_t *size) {
   if(adir < 0) {
     return -1;
   }
-  fd = openat(adir, ADDON_ELF_FILE, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  fd = openat(adir, file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   close(adir);
+  return fd;
+}
+
+
+static int
+elf_open(const char *addon, size_t *size) {
+  struct stat st;
+  int fd;
+
+  fd = addon_open(addon, ADDON_ELF_FILE);
   if(fd < 0) {
     return -1;
   }
@@ -549,16 +561,66 @@ watch(platform_t *platform, pid_t pid, uint64_t deadline, int from, int to) {
   if(pumped == PUMP_BIG) {
     return ADDON_TOO_LARGE;
   }
-  if(pumped == PUMP_FAILED || status != 0) {
+  if(pumped == PUMP_FAILED) {
+    return ADDON_FAILED;
+  }
+  if(status == ADDON_EXIT_BAD_PATH) {
+    return ADDON_BAD_PATH;
+  }
+  if(status == ADDON_EXIT_PROTECTED) {
+    return ADDON_PROTECTED;
+  }
+  if(status != 0) {
     return ADDON_FAILED;
   }
   return ADDON_RAN;
 }
 
 
+/**
+ * The server the owner set for the addon: one line of printable text, or
+ * empty when the addon has no server file. Returns -1 when the file is there
+ * but unreadable or not one such line.
+ **/
+static int
+addon_server(const char *addon, char server[65]) {
+  char text[66];
+  ssize_t n;
+  size_t len;
+  size_t i;
+  int fd;
+
+  server[0] = '\0';
+  fd = addon_open(addon, ADDON_SERVER_FILE);
+  if(fd < 0) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  n = read(fd, text, sizeof(text));
+  close(fd);
+  if(n < 0) {
+    return -1;
+  }
+  len = (size_t)n;
+  if(len > 0 && text[len - 1] == '\n') {
+    len--;
+  }
+  if(len == 0 || len > 64) {
+    return -1;
+  }
+  for(i=0; i<len; i++) {
+    if(text[i] <= ' ' || text[i] > '~') {
+      return -1;
+    }
+  }
+  memcpy(server, text, len);
+  server[len] = '\0';
+  return 0;
+}
+
+
 int
-addon_accept(const char *name, int argc, char hex[65], char *refusal,
-             size_t size) {
+addon_accept(const char *name, int argc, char hex[65], char server[65],
+             char *refusal, size_t size) {
   addon_manifest_t manifest;
   addon_verdict_t verdict;
   const char *field = "";
@@ -582,9 +644,15 @@ addon_accept(const char *name, int argc, char hex[65], char *refusal,
       verdict = ADDON_UNREADABLE;
     } else {
       close(elf);
-      memcpy(hex, manifest.sha256, sizeof(manifest.sha256));
-      return 1;
     }
+  }
+  if(verdict == ADDON_OK && addon_server(name, server)) {
+    verdict = ADDON_REFUSED;
+    field = "server";
+  }
+  if(verdict == ADDON_OK) {
+    memcpy(hex, manifest.sha256, sizeof(manifest.sha256));
+    return 1;
   }
 
   verdict_line(line, sizeof(line), name, verdict, field);

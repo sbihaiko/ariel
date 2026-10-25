@@ -36,6 +36,7 @@ along with this program; see the file COPYING. If not, see
 #include "builtins.h"
 #include "fileops.h"
 #include "http.h"
+#include "protected.h"
 #include "release.h"
 #include "runs.h"
 #include "sha256.h"
@@ -1974,6 +1975,27 @@ exec_command(agent_t *agent, int fd, int argc, char *argv[]) {
 }
 
 
+/** Whether an addon's path argument names protected state, under the root or under /data. **/
+static int
+addon_path_protected(const char *root, const char *path) {
+  char full[PATH_MAX];
+
+  if(path[0] != '/') {
+    return 0;
+  }
+  if(snprintf(full, sizeof(full), "%s%s", root, path) >= (int)sizeof(full)) {
+    return 1;
+  }
+  if(protected_path(full)) {
+    return 1;
+  }
+  if(snprintf(full, sizeof(full), "%s/data%s", root, path) >= (int)sizeof(full)) {
+    return 1;
+  }
+  return protected_path(full);
+}
+
+
 static void
 addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   platform_t *platform = agent->platform;
@@ -1982,12 +2004,14 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   char result[PATH_MAX];
   char text[PATH_MAX + 32];
   char hex[SHA256_HEX_LEN + 1];
+  char server[65];
   char refusal[128];
   addon_run_t outcome;
   int args = argc - 3;
   int len;
+  int i;
 
-  if(!addon_accept(argv[2], args, hex, refusal, sizeof(refusal))) {
+  if(!addon_accept(argv[2], args, hex, server, refusal, sizeof(refusal))) {
     audit_reply(fd, "addon", "refused", argv[2], "-", refusal);
     return;
   }
@@ -1996,8 +2020,17 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   snprintf(facts.command, sizeof(facts.command), "%s", "addon");
   snprintf(facts.target, sizeof(facts.target), "%s", argv[2]);
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
-  facts.argc = (uint64_t)args;
-  args_hash(args, &argv[3], facts.args);
+  snprintf(facts.server, sizeof(facts.server), "%s", server);
+  if(run_arguments(&facts, argc - 2, &argv[2])) {
+    audit_reply(fd, "addon", "refused", argv[2], "-", bad_path);
+    return;
+  }
+  for(i=0; i<args; i++) {
+    if(addon_path_protected(platform->fs_root, argv[3 + i])) {
+      audit_reply(fd, "addon", "refused", argv[2], "-", protected_process);
+      return;
+    }
+  }
 
   if(!gate_pass(agent, fd, &facts, &challenge)) {
     return;
@@ -2019,6 +2052,12 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
     return;
   case ADDON_TOO_LARGE:
     audit_reply(fd, "addon", "failed", argv[2], challenge.id, too_large);
+    return;
+  case ADDON_PROTECTED:
+    audit_reply(fd, "addon", "failed", argv[2], challenge.id, protected_process);
+    return;
+  case ADDON_BAD_PATH:
+    audit_reply(fd, "addon", "failed", argv[2], challenge.id, bad_path);
     return;
   case ADDON_SPAWN_FAILED:
     audit_reply(fd, "addon", "failed", argv[2], challenge.id, spawn_failed);

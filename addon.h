@@ -26,6 +26,8 @@ typedef enum {
   ADDON_TIMED_OUT,
   ADDON_TOO_LARGE,
   ADDON_SPAWN_FAILED,
+  ADDON_PROTECTED,
+  ADDON_BAD_PATH,
   ADDON_FAILED
 } addon_run_t;
 
@@ -40,16 +42,18 @@ void addon_list(int fd);
 
 /**
  * Judge the addon named name for a run with argc arguments. Returns 1 and its
- * manifest digest in hex when it may be asked for. Otherwise returns 0 and
- * puts the refusal and its exit line in refusal, for the caller to audit.
+ * manifest digest in hex and its server in server when it may be asked for.
+ * Otherwise returns 0 and puts the refusal and its exit line in refusal, for
+ * the caller to audit.
  **/
-int addon_accept(const char *name, int argc, char hex[65], char *refusal,
-                 size_t size);
+int addon_accept(const char *name, int argc, char hex[65], char server[65],
+                 char *refusal, size_t size);
 
 /**
  * Run the addon named name with args in a process of its own, bounded. On
  * ADDON_RAN its output is in the file named by result; any other outcome
- * leaves no file.
+ * leaves no file. An addon that exits 3 refused a path, and one that exits 87
+ * named protected state.
  **/
 addon_run_t addon_run(platform_t *platform, const char *name, int argc,
                       char *const args[], char *result, size_t size);
