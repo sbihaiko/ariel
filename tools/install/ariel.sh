@@ -3,7 +3,10 @@
 # them, send it to the console, and leave the token where the next command can
 # read it.
 #
-#   ./tools/install/ariel.sh <console-address> [--check]
+#   ./tools/install/ariel.sh <console-address> [--check] [--build]
+#
+# --check names the keys and the route and sends nothing; --build stops after
+# the payload is built, so the owner can send it by hand.
 #
 # The payload pins the owner's own two keys, which is why a published build is
 # useless: this script builds one that approves on this owner's console and
@@ -61,15 +64,63 @@ open_port() {
   nc -z -w 2 "$host" "$1" >/dev/null 2>&1
 }
 
+# The SDK ships the target toolchain but not the host compiler: it drives the
+# machine's own LLVM, so this asks for an llvm-config the SDK can find.
+have_llvm() {
+  command -v llvm-config >/dev/null 2>&1 && return 0
+  for n in 23 22 21 20 19 18 17 16 15; do
+    command -v "llvm-config-$n" >/dev/null 2>&1 && return 0
+  done
+  # Homebrew keeps LLVM out of the PATH on purpose; the SDK looks here too.
+  for dir in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+    if [ -x "$dir/llvm-config" ]; then
+      PATH=$dir:$PATH
+      export PATH
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Fetch the payload SDK once, into ~/.local/share unless PS5_PAYLOAD_SDK says
+# otherwise, and point the build at it. It is the small part of a local build.
+fetch_sdk() {
+  sdk=${PS5_PAYLOAD_SDK:-$HOME/.local/share/ps5-payload-sdk}
+  if [ ! -x "$sdk/bin/prospero-clang" ]; then
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v unzip >/dev/null 2>&1 || return 1
+    say "downloading the PS5 payload SDK into $sdk (about 60 MB)"
+    tmp=$(mktemp -d) || return 1
+    if ! curl -fL --max-time 600 -o "$tmp/sdk.zip" \
+        "https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip"
+    then
+      rm -rf "$tmp"
+      return 1
+    fi
+    mkdir -p "$(dirname "$sdk")"
+    if ! unzip -q -o "$tmp/sdk.zip" -d "$(dirname "$sdk")"; then
+      rm -rf "$tmp"
+      return 1
+    fi
+    rm -rf "$tmp"
+  fi
+  [ -x "$sdk/bin/prospero-clang" ] || return 1
+  PS5_PAYLOAD_SDK=$sdk
+  export PS5_PAYLOAD_SDK
+  return 0
+}
+
 usage() {
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 host=""
 check=0
+build_only=0
 for arg in "$@"; do
   case $arg in
     --check) check=1 ;;
+    --build) build_only=1 ;;
     -h|--help) usage; exit 0 ;;
     -*) fail "unknown option: $arg" ;;
     *) [ -z "$host" ] || fail "one console address, not two"; host=$arg ;;
@@ -113,26 +164,73 @@ say "  owner key:    $owner"
 say "  recovery key: $recovery"
 
 if [ "$check" = 1 ]; then
-  say "check: the console answers, the keys are in $keydir, and the build would pin them"
+  if [ -n "${PS5_PAYLOAD_SDK:-}" ] && [ -x "${PS5_PAYLOAD_SDK}/bin/prospero-clang" ]
+  then
+    route="the SDK at $PS5_PAYLOAD_SDK"
+  elif have_llvm; then
+    route="a local build, with the SDK downloaded on the way"
+  elif command -v "$docker" >/dev/null 2>&1; then
+    route="a container built from tools/install/Dockerfile.sdk"
+  else
+    route="nothing yet: install Docker, or install LLVM and run this again"
+  fi
+  say "check: the console answers, the keys are in $keydir, and the build would use $route"
   exit 0
 fi
 
-if [ -n "${PS5_PAYLOAD_SDK:-}" ] && [ -x "${PS5_PAYLOAD_SDK}/bin/prospero-clang" ]
-then
-  say "building with the SDK at $PS5_PAYLOAD_SDK"
-  ( cd "$root" && ARIEL_PUBKEY=$owner ARIEL_RECOVERY_PUBKEY=$recovery make ) ||
-    fail "the build failed"
-else
-  command -v "$docker" >/dev/null 2>&1 ||
-    fail "no PS5 SDK here and no docker: set PS5_PAYLOAD_SDK, or install Docker"
-  say "building in a container (the first run builds the image, some minutes)"
-  "$docker" build -q -t "$image" -f "$root/tools/install/Dockerfile.sdk" "$root" >/dev/null ||
-    fail "cannot build the SDK image"
-  "$docker" run --rm -u "$(id -u):$(id -g)" -v "$root":/src -w /src \
-      -e ARIEL_PUBKEY="$owner" -e ARIEL_RECOVERY_PUBKEY="$recovery" "$image" \
-      make >/dev/null || fail "the build failed"
+# ARIEL_BUILD forces the route (local, sdk or docker); by default the cheapest
+# that works is taken: a local build needs no daemon, and a container needs no
+# toolchain.
+build=${ARIEL_BUILD:-}
+if [ -z "$build" ]; then
+  if have_llvm; then
+    build=local
+  elif command -v "$docker" >/dev/null 2>&1; then
+    build=docker
+  elif command -v curl >/dev/null 2>&1; then
+    build=sdk
+  fi
 fi
+
+case $build in
+  local)
+    fetch_sdk || fail "cannot fetch the PS5 payload SDK"
+    say "building with the SDK at $PS5_PAYLOAD_SDK"
+    ( cd "$root" && ARIEL_PUBKEY=$owner ARIEL_RECOVERY_PUBKEY=$recovery make ) ||
+      fail "the build failed"
+    ;;
+  sdk)
+    fetch_sdk || fail "cannot fetch the PS5 payload SDK"
+    have_llvm || fail "the PS5 payload SDK drives the machine's own LLVM:
+         macOS:         brew install llvm lld
+         Debian/Ubuntu: sudo apt install xxd clang-18 lld-18"
+    say "building with the SDK at $PS5_PAYLOAD_SDK"
+    ( cd "$root" && ARIEL_PUBKEY=$owner ARIEL_RECOVERY_PUBKEY=$recovery make ) ||
+      fail "the build failed"
+    ;;
+  docker)
+    command -v "$docker" >/dev/null 2>&1 ||
+      fail "ARIEL_BUILD=docker but there is no $docker on this machine"
+    say "building in a container (the first run builds the image, some minutes)"
+    "$docker" build -q -t "$image" -f "$root/tools/install/Dockerfile.sdk" "$root" >/dev/null ||
+      fail "cannot build the SDK image"
+    "$docker" run --rm -u "$(id -u):$(id -g)" -v "$root":/src -w /src \
+        -e ARIEL_PUBKEY="$owner" -e ARIEL_RECOVERY_PUBKEY="$recovery" "$image" \
+        make >/dev/null || fail "the build failed"
+    ;;
+  *)
+    fail "nothing here can build the payload: install Docker, or install the
+       LLVM this machine is missing and run this again:
+         macOS:         brew install llvm lld
+         Debian/Ubuntu: sudo apt install xxd clang-18 lld-18"
+    ;;
+esac
 [ -f "$payload" ] || fail "the build wrote no $payload"
+
+if [ "$build_only" = 1 ]; then
+  say "built $payload; nothing was sent"
+  exit 0
+fi
 
 say "sending $payload to $host:$loader_port"
 cat "$payload" | nc -w 5 "$host" "$loader_port" || fail "the send failed"

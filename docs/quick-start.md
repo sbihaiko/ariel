@@ -16,7 +16,9 @@ On the console, before anything else:
 On the computer:
 
 - `git`, `sh`, `curl` and `nc`. macOS ships `nc` and `curl`; Linux has them or installs them in one line.
-- Either **Docker** (Desktop on macOS and Windows, the daemon on Linux) or the **PS5 payload SDK** with `PS5_PAYLOAD_SDK` set. Docker is the path that installs nothing else; the SDK is the path that builds locally.
+- **One of two ways to compile the payload**, and the script picks whichever is there:
+  - **a local LLVM** — `brew install llvm lld` on macOS, `sudo apt install xxd clang-18 lld-18` on Debian and Ubuntu. The script downloads the PS5 payload SDK itself (about 60 MB) and builds on the machine; this is the smaller install and the faster build.
+  - **Docker** — Desktop on macOS and Windows, the daemon on Linux. Nothing else is installed, and the first run builds an image with the SDK inside; that image is the bigger download.
 - The console's IP address. The examples put it in `PS5_HOST`; replace it with yours.
 
 ## The fast path: one script
@@ -28,7 +30,9 @@ $ sh tools/install/ariel.sh <console address> --check   # what it would do, noth
 $ sh tools/install/ariel.sh <console address>           # build and send
 ```
 
-On macOS, `tools/install/ariel.command` is the same thing on a double-click; on Windows, run `tools/install/ariel.bat`, which asks for the address and does the same work through PowerShell. With no PS5 SDK on the machine the build runs in a container built from `tools/install/Dockerfile.sdk`, so nothing needs installing by hand; with `PS5_PAYLOAD_SDK` set it builds locally instead.
+On macOS, `tools/install/ariel.command` is the same thing on a double-click; on Windows, run `tools/install/ariel.bat`, which asks for the address and does the same work through PowerShell.
+
+Where the build happens depends on what the machine has: a local LLVM means a local build (the SDK is fetched for you), otherwise Docker builds it in a container from `tools/install/Dockerfile.sdk`, and with `PS5_PAYLOAD_SDK` already set the SDK is used as it is. `--build` stops after the payload exists, so you can send it yourself; `ARIEL_BUILD=local` or `ARIEL_BUILD=docker` forces one route.
 
 The script writes `ariel.env` with `PS5_HOST` and `ARIEL_TOKEN` when it finishes, so the rest of this page is copy and paste after `. ./ariel.env`. The steps below stay here because they say what the script does, and because a build you do by hand is one you can read.
 
