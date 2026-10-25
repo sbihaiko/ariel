@@ -806,7 +806,7 @@ static void
 challenge_reply(int fd, const approval_challenge_t *challenge) {
   char action_hex[2 * APPROVAL_ACTION_MAX + 1];
   char nonce_hex[2 * APPROVAL_NONCE_LEN + 1];
-  char answer[2048];
+  char answer[2 * APPROVAL_ACTION_MAX + 512];
   int len;
 
   approval_hex_encode((const unsigned char*)challenge->action,
@@ -1383,11 +1383,11 @@ elf_lookup(const char *root, const char *name, char *path, size_t size,
 
 /**
  * Copy a run's arguments, after its name, into facts. Returns -1 when there
- * are more than RUN_ARGS_MAX or one is longer than an option value, and -2
- * when one carries a byte outside printable ASCII.
+ * are more than RUN_ARGS_MAX or one is longer than max, and -2 when one
+ * carries a byte outside printable ASCII.
  **/
 static int
-run_arguments(approval_facts_t *facts, int argc, char *argv[]) {
+run_arguments(approval_facts_t *facts, int argc, char *argv[], size_t max) {
   int i;
 
   if(argc - 1 > RUN_ARGS_MAX) {
@@ -1395,10 +1395,10 @@ run_arguments(approval_facts_t *facts, int argc, char *argv[]) {
   }
   facts->argc = (uint64_t)(argc - 1);
   for(i=1; i<argc; i++) {
-    if(strlen(argv[i]) > APPROVAL_VALUE_MAX) {
+    if(strlen(argv[i]) > max) {
       return -1;
     }
-    if(!approval_value_valid(argv[i])) {
+    if(!approval_arg_valid(argv[i])) {
       return -2;
     }
     snprintf(facts->arg[i - 1], sizeof(facts->arg[i - 1]), "%s", argv[i]);
@@ -1467,7 +1467,7 @@ elf_command(agent_t *agent, int fd, int argc, char *argv[]) {
     return 1;
   }
   {
-    int arg_error = run_arguments(&facts, argc, argv);
+    int arg_error = run_arguments(&facts, argc, argv, APPROVAL_VALUE_MAX);
 
     if(arg_error) {
       free(bytes);
@@ -2023,6 +2023,18 @@ addon_failure(int fd, const char *root, const char *name, const char *id,
     return;
   }
   reply(fd, text);
+
+
+/** Whether an addon run's signed action fits, each argument escaped at worst. **/
+static int
+addon_action_fits(const approval_facts_t *facts) {
+  size_t size = 400;
+  uint64_t i;
+
+  for(i=0; i<facts->argc; i++) {
+    size += 13 + 3 * strlen(facts->arg[i]);
+  }
+  return size <= APPROVAL_ACTION_MAX;
 }
 
 
@@ -2038,9 +2050,14 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   char refusal[128];
   addon_run_t outcome;
   int args = argc - 3;
+  int arg_error;
   int len;
   int i;
 
+  if(args > RUN_ARGS_MAX) {
+    audit_reply(fd, "addon", "refused", argv[2], "-", too_many_arguments_reply);
+    return;
+  }
   if(!addon_accept(argv[2], args, hex, server, refusal, sizeof(refusal))) {
     audit_reply(fd, "addon", "refused", argv[2], "-", refusal);
     return;
@@ -2051,8 +2068,14 @@ addon_run_command(agent_t *agent, int fd, int argc, char *argv[]) {
   snprintf(facts.target, sizeof(facts.target), "%s", argv[2]);
   snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
   snprintf(facts.server, sizeof(facts.server), "%s", server);
-  if(run_arguments(&facts, argc - 2, &argv[2])) {
-    audit_reply(fd, "addon", "refused", argv[2], "-", bad_path);
+  arg_error = run_arguments(&facts, argc - 2, &argv[2], APPROVAL_ARG_MAX);
+  if(arg_error) {
+    audit_reply(fd, "addon", "refused", argv[2], "-",
+                arg_error == -2 ? bad_path : bad_argument);
+    return;
+  }
+  if(!addon_action_fits(&facts)) {
+    audit_reply(fd, "addon", "refused", argv[2], "-", too_large);
     return;
   }
   for(i=0; i<args; i++) {

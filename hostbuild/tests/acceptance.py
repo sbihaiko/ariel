@@ -12477,8 +12477,80 @@ def scenario_failed_run_whose_audit_fails_keeps_nothing(server):
             % addon_results(fresh, "unlogged"))
     finally:
         fresh.stop()
+ADDON_LONG_ARG_TITLE = ("an addon run with arguments of 200 and 255 bytes is signed as "
+                        "text, starts, and reaches the addon")
+ADDON_TOO_MANY_TITLE = ("an addon run with more than eight arguments answers "
+                        "too_many_arguments and the owner is not asked")
+ADDON_ARG_TOO_LONG_TITLE = ("an addon run with an argument over 255 bytes answers "
+                            "bad_argument and the owner is not asked")
+ADDON_ARGS_TOO_LARGE_TITLE = ("an addon run whose arguments cannot be signed together "
+                              "answers too_large and the owner is not asked")
 
 
+def scenario_addon_long_argument_starts(server):
+    manifest_sha = addon_runner(server, "longrun", RUNNER_SOURCE)
+    args = ["d" * 200, "e" * 255]
+    try:
+        approval, challenge = addon_run_request(server, "longrun", manifest_sha, args)
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, "addon run longrun " + " ".join(args))
+        match = re.match(r"^result (/data/addon-longrun-\d+)$", lines[0]) if lines else None
+        assert match and lines[1:] == ["status 0", "exit 0"], (
+            "a granted addon run with long arguments must start, got %r" % lines)
+        with open(os.path.join(server.root, match.group(1).lstrip("/")), "r") as handle:
+            output = handle.read()
+        assert output == "argc 3\narg 1 = %s\narg 2 = %s\nenv 0\n" % tuple(args), (
+            "the addon must receive each long argument whole, got %r" % output[:120])
+    finally:
+        cleanup_addon(server, "longrun")
+
+
+def scenario_addon_too_many_arguments_say_so(server):
+    manifest_sha = addon_runner(server, "crowded", RUNNER_SOURCE)
+    try:
+        lines = run_command(server, "addon run crowded a b c d e f g h i")
+        assert lines == ["too_many_arguments", "exit 1"], (
+            "nine arguments must answer too_many_arguments, got %r" % lines)
+        server.assert_no_line()
+        assert addon_events(server, "crowded") == [("addon.refused", "crowded")], (
+            "nine arguments must be audited as refused, got %r"
+            % addon_events(server, "crowded"))
+    finally:
+        drop_addon(server, "crowded")
+
+
+def scenario_addon_argument_over_255_is_bad_argument(server):
+    addon_runner(server, "wordy", RUNNER_SOURCE)
+    try:
+        lines = run_command(server, "addon run wordy " + "f" * 256)
+        assert lines == ["bad_argument", "exit 1"], (
+            "a 256-byte argument must answer bad_argument, got %r" % lines)
+        server.assert_no_line()
+    finally:
+        cleanup_addon(server, "wordy")
+
+
+def scenario_addon_arguments_too_large_to_sign(server):
+    manifest_sha = addon_runner(server, "bulky", RUNNER_SOURCE)
+    try:
+        lines = run_command(server, "addon run bulky " + " ".join(["e" * 255] * 3))
+        assert lines == ["too_large", "exit 1"], (
+            "three 255-byte arguments must answer too_large, got %r" % lines)
+        server.assert_no_line()
+    finally:
+        cleanup_addon(server, "bulky")
+
+
+ADDON_ARGUMENT_SCENARIOS = [
+    (ADDON_LONG_ARG_TITLE, scenario_addon_long_argument_starts, HOST_ROOT_REASON),
+    (ADDON_TOO_MANY_TITLE, scenario_addon_too_many_arguments_say_so, HOST_ROOT_REASON),
+    (ADDON_ARG_TOO_LONG_TITLE, scenario_addon_argument_over_255_is_bad_argument,
+     HOST_ROOT_REASON),
+    (ADDON_ARGS_TOO_LARGE_TITLE, scenario_addon_arguments_too_large_to_sign,
+     HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_ARGUMENT_SCENARIOS)
+SCENARIOS.extend(ADDON_ARGUMENT_SCENARIOS)
 ADDON_RUN_SCENARIOS = [
     (ADDON_RUN_CLEAN_TITLE, scenario_addon_run_is_granted_and_bare, HOST_ROOT_REASON),
     (ADDON_RUN_REFUSED_TITLE, scenario_addon_run_refused_is_not_asked, HOST_ROOT_REASON),
