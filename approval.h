@@ -34,20 +34,22 @@ along with this program; see the file COPYING. If not, see
 #define APPROVAL_SEED_LEN    32
 
 /** The longest canonical action text, and the longest console identity. **/
-#define APPROVAL_ACTION_MAX  512
+#define APPROVAL_ACTION_MAX  2048
 #define APPROVAL_CONSOLE_MAX 64
 
 /** The longest command name an action can carry. **/
 #define APPROVAL_COMMAND_MAX 32
 
 /** The longest message a signature covers. **/
-#define APPROVAL_MESSAGE_MAX 1024
+#define APPROVAL_MESSAGE_MAX 2176
 
 /** At most this many options belong to one action. **/
 #define APPROVAL_OPTIONS_MAX 12
 
 /** The longest option value the encoder carries. **/
 #define APPROVAL_VALUE_MAX   64
+/** The longest argument an option named argN carries: the FTP addon's path. **/
+#define APPROVAL_ARG_MAX     255
 #define APPROVAL_URL_MAX     256
 
 /** The hash of an action with no content behind it. **/
@@ -102,6 +104,9 @@ int approval_target_valid(const char *target);
 
 /** Whether value is an option value the encoder accepts. Returns 1 when it is. **/
 int approval_value_valid(const char *value);
+
+/** Whether value is a run or addon argument the encoder accepts. Returns 1 when it is. **/
+int approval_arg_valid(const char *value);
 
 /**
  * Build the message a signature covers: a domain tag, the console

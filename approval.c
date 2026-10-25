@@ -160,17 +160,34 @@ approval_target_valid(const char *target) {
 
 
 static int
-value_ok(const char *value) {
+text_ok(const char *value, size_t max) {
   size_t len;
 
-  return value && (len=strlen(value)) >= 1 && len <= APPROVAL_VALUE_MAX &&
-         printable(value);
+  return value && (len=strlen(value)) >= 1 && len <= max && printable(value);
+}
+
+
+static int
+value_ok(const char *value) {
+  return text_ok(value, APPROVAL_VALUE_MAX);
 }
 
 
 int
 approval_value_valid(const char *value) {
   return value_ok(value);
+}
+
+
+int
+approval_arg_valid(const char *value) {
+  return text_ok(value, APPROVAL_ARG_MAX);
+}
+
+
+static int
+is_argument_key(const char *key) {
+  return !strncmp(key, "arg", 3) && strlen(key) == 4 && is_digit(key[3]);
 }
 
 
@@ -236,6 +253,9 @@ option_value_ok(const approval_option_t *option) {
   }
   if(!strcmp(option->key, "url")) {
     return url_ok(option->value);
+  }
+  if(is_argument_key(option->key)) {
+    return approval_arg_valid(option->value);
   }
   return value_ok(option->value);
 }

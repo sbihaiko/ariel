@@ -38,9 +38,8 @@ along with this program; see the file COPYING. If not, see
 #define PROCESS_START_MAX 31
 /** The hash of an exec's arguments, in hex. **/
 #define ARGS_HASH_MAX 64
-/** The arguments a gated built-in binds after its target, and their bytes. **/
+/** The arguments a gated built-in binds after its target. **/
 #define BUILTIN_ARGS_MAX 5
-#define BUILTIN_ARG_MAX  64
 
 /**
  * The immutable fact record an approval is bound to: what exactly the
@@ -91,7 +90,7 @@ typedef struct {
   uint64_t release;  /** install: the release ID; 0 for any other action. **/
   uint64_t asset;  /** install: the asset ID. **/
   char args[ARGS_HASH_MAX + 1];
-  char arg[RUN_ARGS_MAX][BUILTIN_ARG_MAX + 1];  /** A built-in's or a run's. **/
+  char arg[RUN_ARGS_MAX][APPROVAL_ARG_MAX + 1];  /** A built-in's or a run's. **/
   char server[APPROVAL_VALUE_MAX + 1];  /** An addon's server, from its server file. **/
 } approval_facts_t;
 

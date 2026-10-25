@@ -188,6 +188,32 @@ main(void) {
   refused(&other, "an option key outside the grammar is refused");
   other.options = no_value;
   refused(&other, "an option with no value is refused");
+
+  // An argument option carries up to 255 bytes; any other option keeps 64.
+  {
+    char arg[APPROVAL_ARG_MAX + 2];
+    char out_arg[APPROVAL_ACTION_MAX];
+    approval_option_t argument[1];
+
+    memset(arg, 'a', APPROVAL_ARG_MAX);
+    arg[APPROVAL_ARG_MAX] = '\0';
+    argument[0].key = "arg0";
+    argument[0].value = arg;
+    other = action;
+    other.options = argument;
+    other.noptions = 1;
+    expect(encode(&other, out_arg, sizeof(out_arg)) > 0,
+           "an argument of 255 bytes is encoded");
+
+    arg[APPROVAL_ARG_MAX] = 'a';
+    arg[APPROVAL_ARG_MAX + 1] = '\0';
+    refused(&other, "an argument of 256 bytes is refused");
+
+    arg[APPROVAL_ARG_MAX] = '\0';
+    argument[0].key = "run";
+    refused(&other, "a 255-byte value under a key other than argN is refused");
+  }
+
   other = action;
   other.target = "hello\nworld";
   refused(&other, "a newline in a target is refused");
