@@ -12533,14 +12533,14 @@ def scenario_addon_guard(server):
             "a refused addon must audit addon.refused and no addon.request, got %r"
             % addon_events(server, "guardrefused"))
 
-        for name, source, expected in (
-                ("guardflood", FLOOD_SOURCE, ["too_large", "exit 1"]),
-                ("guardkill", KILLED_SOURCE, ["operation_failed", "exit 1"])):
+        for name, source, word in (
+                ("guardflood", FLOOD_SOURCE, "too_large"),
+                ("guardkill", KILLED_SOURCE, "operation_failed")):
             sha = addon_runner(server, name, source)
             approval, challenge = addon_run_request(server, name, sha, [])
             sign_and_grant(server, approval, challenge)
-            assert run_command(server, "addon run %s" % name) == expected, (
-                "%s must answer %r" % (name, expected))
+            assert_failed_run_keeps_output(
+                server, name, run_command(server, "addon run %s" % name), word)
             assert addon_events(server, name) == [
                 ("addon.request", name), ("addon.done", name),
                 ("addon.failed", name)], (
@@ -12557,8 +12557,8 @@ def scenario_addon_guard(server):
         wait_for_addon_output(server, "guardstuck", "started\n")
         server.advance(ADDON_RUN_TIMEOUT_MS)
         worker.join(30.0)
-        assert reply.get("lines") == ["timed_out", "exit 1"], (
-            "a timed out addon run must answer timed_out, got %r" % reply.get("lines"))
+        assert_failed_run_keeps_output(
+            server, "guardstuck", reply.get("lines") or [], "timed_out")
         assert addon_events(server, "guardstuck") == [
             ("addon.request", "guardstuck"), ("addon.done", "guardstuck"),
             ("addon.failed", "guardstuck")], (
@@ -12800,7 +12800,7 @@ FTP_LINK_TITLE = ("an ftp addon refuses a path that a link came to name after th
 FTP_ROOTS_TITLE = ("an ftp addon refuses a local path outside /data, /user and "
                    "/mnt/usb*, and never overwrites a local file")
 FTP_STALL_TITLE = ("an ftp addon whose server never answers is cut by the loader's "
-                   "timeout and keeps no output")
+                   "timeout and keeps what it wrote")
 
 
 def scenario_ftp_asks_then_runs_once(server):
@@ -12936,8 +12936,8 @@ def scenario_ftp_refuses_local_paths_outside_roots(server):
         assert not os.path.lexists(outside), "a refused local path must create no file"
 
         command = ftp_grant(server, "ftp-get", sha, ["/up/x", "/data/keep.txt"], fake.port)
-        assert run_command(server, command) == ["operation_failed", "exit 1"], (
-            "a get onto an existing local file must fail, not overwrite it")
+        assert_failed_run_keeps_output(
+            server, "ftp-get", run_command(server, command), "operation_failed")
         with open(keep, "rb") as handle:
             assert handle.read() == b"keep", "an existing local file must be left as it was"
     finally:
@@ -12963,9 +12963,9 @@ def scenario_ftp_stalled_server_is_cut(server):
         assert worker.is_alive(), "an ftp addon must not be cut before its timeout"
         server.advance(1)
         worker.join(30.0)
-        assert not worker.is_alive() and reply.get("lines") == ["timed_out", "exit 1"], (
-            "a stalled ftp addon must be cut at its timeout, got %r" % reply.get("lines"))
-        assert addon_results(server, "ftp-ls") == [], "a cut ftp addon must keep no output"
+        assert not worker.is_alive(), "a stalled ftp addon must be cut at its timeout"
+        assert_failed_run_keeps_output(
+            server, "ftp-ls", reply.get("lines") or [], "timed_out")
     finally:
         fake.close()
         cleanup_addon(server, "ftp-ls")
