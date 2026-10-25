@@ -58,6 +58,11 @@ CLOSE_DRAIN_MS = 200
 # nothing to end. It bounds a hang; it never decides that a start ended.
 START_TIMEOUT = 60.0
 
+# How long a scenario waits for a reply it has already caused on the test
+# clock. Like START_TIMEOUT, it bounds a hang: a machine that is slow to
+# deliver the bytes does not turn the answer into a different one.
+REPLY_HANG_TIMEOUT = 120.0
+
 results = []
 
 
@@ -93,7 +98,6 @@ class Server:
         # The server asks the OS for a port when it binds and names it, so the
         # harness never holds a port of its own: one it released can be taken
         # before the child binds, and two children can be handed the same one.
-        self.port_requested = 0
         self.port = None
         self.proc = subprocess.Popen(
             [self.binary, "--port", "0", "--root", self.root],
@@ -107,18 +111,28 @@ class Server:
             target=self._pump, args=(self.proc, self.lines), daemon=True)
         self.reader.start()
 
-    def start_until_exit(self, env=None):
+    def start_until_exit(self, env=None, release=None):
         """Start Ariel with env and return its exit status once it has ended.
 
         Ariel that cannot recover its store ends before it prints a port line,
         so this waits for the end of its output instead of reading a line. The
         stream is the signal: a line means Ariel started, and the end of the
-        stream means it ended before it could. No fixed number of seconds
-        decides that: a start that takes longer on a busy machine is still a
-        start that ends.
+        stream means it ended before it could. A slow machine delays that end
+        but never turns it into a start. START_TIMEOUT bounds a hang on either
+        wait; it never decides that a start ended.
+
+        release, when given, is called with this Server once it has started.
+        A stub that waits on its input ends then without the scenario sleeping
+        on the machine's clock.
         """
         self.env = env
         self._spawn()
+        if release is not None:
+            try:
+                release(self)
+            except Exception:
+                self.stop()
+                raise
         try:
             line = self.lines.get(timeout=START_TIMEOUT)
         except queue.Empty:
@@ -3441,6 +3455,10 @@ def scenario_a_slow_command_times_out(server):
         sock.sendall(b"sleep 60\n")
         server.settle(1)
         server.advance(30000)
+        # The deadline has fired on the test clock, so the answer is already
+        # on its way: this wait only bounds a hang. A slow machine cannot
+        # turn it into a different answer.
+        sock.settimeout(REPLY_HANG_TIMEOUT)
         reply = reply_lines(read_reply(sock))
         assert reply == ["timed_out", "exit 1"], (
             "a command past the connection deadline must answer timed_out, "
@@ -9392,9 +9410,10 @@ HOST_ROOT_SCENARIOS.update({
 
 
 SLOW_START = """#!/bin/sh
-# A start that is slow to end: the harness must see where the stream ends,
-# not decide from a fixed number of seconds that the server kept running.
-sleep 6
+# A start that ends later than a fixed number of seconds would allow: it
+# ends only when the harness lets it, so the harness must see where the
+# stream ends instead of deciding that the server kept running.
+read line
 exit 3
 """
 
@@ -9411,18 +9430,31 @@ def scenario_a_server_names_the_port_it_bound(server):
     probe = Server(SERVER_BINARY, start=False)
     try:
         probe.start()
-        assert probe.port_requested == 0, (
-            "the harness must ask the OS for a port, it asked for %d"
-            % probe.port_requested)
+        # The request the child actually got, not a field the harness keeps
+        # beside it: a mirror could say 0 while the argv named a port.
+        args = probe.proc.args
+        requested = args[args.index("--port") + 1]
+        assert requested == "0", (
+            "the harness must ask the OS for a port, it asked for %s"
+            % requested)
         assert probe.port > 0, "the server must name the port it bound"
-        assert run_command(probe, "echo bound") == ["bound", "exit 0"], (
-            "the port the server names must be the one it serves on")
+        sock = socket.create_connection((HOST, probe.port), timeout=5.0)
+        try:
+            assert sock.getpeername()[1] == probe.port, (
+                "the server must answer on the port it named (%d), it "
+                "answered on %d" % (probe.port, sock.getpeername()[1]))
+            sock.sendall(
+                ("auth %s\necho bound\n" % probe.token).encode("ascii"))
+            assert reply_lines(read_reply(sock)) == ["bound", "exit 0"], (
+                "the port the server names must be the one it serves on")
+        finally:
+            sock.close()
     finally:
         probe.stop()
 
 
 def scenario_a_start_that_is_slow_to_end_still_ends(server):
-    """A start that ends later than the harness expects still ended on its own."""
+    """A start that ends late is still seen ending, not called a start."""
     del server  # this start is the scenario's own
     folder = tempfile.mkdtemp(prefix="ariel-slow-start-")
     binary = os.path.join(folder, "slow-start")
@@ -9432,7 +9464,12 @@ def scenario_a_start_that_is_slow_to_end_still_ends(server):
         os.chmod(binary, 0o755)
         slow = Server(binary, start=False)
         try:
-            assert slow.start_until_exit() == 3, (
+            def end_it(probe):
+                probe.proc.stdin.write(b"\n")
+                probe.proc.stdin.flush()
+                probe.proc.stdin.close()
+
+            assert slow.start_until_exit(release=end_it) == 3, (
                 "a start that ends after a while must be seen ending")
         finally:
             slow.stop()
@@ -9461,7 +9498,8 @@ def scenario_sleep_runs_on_the_test_clock(server):
 HARNESS_SCENARIOS = [
     ("a test server asks the OS for a port at bind time and names it",
      scenario_a_server_names_the_port_it_bound, None),
-    ("a start that is slow to end still ends, with no wall-clock ceiling",
+    ("a start that ends when the harness lets it is still seen ending, and "
+     "the wait only bounds a hang",
      scenario_a_start_that_is_slow_to_end_still_ends, None),
     ("a sleep runs on the test clock and ends only when that clock moves",
      scenario_sleep_runs_on_the_test_clock, CLOCK_REASON),
