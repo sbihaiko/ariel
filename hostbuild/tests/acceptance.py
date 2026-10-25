@@ -1781,6 +1781,11 @@ class FakeReadConsole:
         if words[:2] == ["approval", "grant"]:
             self.granted.add(self.pending.pop(words[2]))
             return ["approval_granted %s" % words[2], "exit 0"]
+        if words[0] == "write" and (body is None
+                                    or len(body) != int(words[2])):
+            # The console checks the upload before it asks, so a command
+            # without its bytes never reaches the gate.
+            return ["upload_mismatch", "exit 81"]
         if command in self.granted:
             self.granted.discard(command)
             return self.run(words, body)
@@ -1799,8 +1804,6 @@ class FakeReadConsole:
                         "exit 0"]
             return ["no_such_file", "exit 1"]
         if words[0] == "write":
-            assert len(body) == int(words[2]), (
-                "write must carry the declared %s bytes, got %r" % (words[2], body))
             self.files[words[1]] = body
             return ["exit 0"]
         if words[0] == "rm" and words[1] in self.files:

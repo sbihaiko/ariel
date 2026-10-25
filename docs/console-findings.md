@@ -269,6 +269,27 @@ Four things this run settled:
 
 **Not measured.** The time and memory a capture costs, the size and format of the file (the system's PNG/JPEG setting), what a protected scene answers (no game or video app was run), and whether a capture works while a title is in the foreground. Each needs a console that completes a capture first.
 
+## Issue #72 and #81: the console suite after the state directory closed
+
+Run on 2026-10-24 by the coordinator, on firmware 11.20 (CFI-2014), with `dev` at `93f47ee` — the build that carries #74's per-component protection — anchored with the owner's primary and recovery keys and sent to the loader on 9021. The console had gone to rest on its own; a magic packet did not wake it that time, it came back later, and every payload had to be sent again.
+
+**The state directory is closed.** `ls /data/ariel` answers `protected`, `exit 87`; `ls /data` still lists and exits 0. So the three checks the suite had written to read into that directory could no longer pass, and before the run they were rewritten (#81): the read-only check now lists `/data`, and the install check proves the installed digest through `payload list` instead of hashing the store object.
+
+**A gated `write` carries its bytes when it asks.** `write <path> <size> <sha256>` sent without its body answers `upload_mismatch`, `exit 81` — the upload is checked before the approval is asked. The first version of the new `read` check (#72) sent the bare command through the gated helper and failed on the console with exactly that answer; with the frame sent on both the asking and the running send, it passes (#83). The host fake now refuses a write frame without its bytes, so the mistake fails headlessly too.
+
+Each approval was signed offline with the owner's key and granted over the agent port. Six checks ran; the first pass had five, and the `read` check passed once its frame was fixed:
+
+| Check | Result on the console |
+| --- | --- |
+| `cp -r` copies a throwaway tree, lists the copy's entry, `rm -r` removes it | pass |
+| `read` answers a throwaway file whole and in range as `cat` does, header and both paths' removal included | pass, after the frame fix |
+| a commit before the decision asks again, then installs and is listed with its digest | pass |
+| the read-only commands over `/` and `/data` exit 0 | pass |
+| the token, approvals, nonces and keyring answer `protected`, `exit 87`, read directly | pass |
+| the inspection commands run with no approval | pass |
+
+**Not measured.** The rest of the console suite was not run in this pass; it is the next console session's job. The `write` check's own body handling was proven only through the `read` check and the host scenarios.
+
 ## What other projects say
 
 - **`jmelovich/ps5-gyroaim`**: a payload is not a registered pad client and cannot open the controller whether or not a title is running; the workaround is injecting into the game. This console agrees.

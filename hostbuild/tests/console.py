@@ -334,9 +334,15 @@ def check_tar_refusals_without_asking(session, context):
             "%s must answer %s without asking" % (command, answer[0]))
 
 
-def run_gated_file_command(session, command):
-    """Ask for command, show the owner the challenge, grant it; return the approval ID."""
-    lines = session.until_not_busy(lambda: session.link.exchange(command))
+def run_gated_file_command(session, command, body=None):
+    """Ask for command, show the owner the challenge, grant it; return the approval ID.
+
+    A command that carries a body (write) is sent with it, since the console
+    checks the upload before it asks: without the bytes it answers
+    upload_mismatch instead of approval_required.
+    """
+    lines = session.until_not_busy(
+        lambda: session.link.exchange(command, body=body))
     assert len(lines) == 3 and lines[2] == "exit 75", (
         "%s must answer approval_required and exit 75, got %r" % (command, lines))
     approval = APPROVAL_LINE.match(lines[0])
@@ -865,7 +871,7 @@ def check_read_matches_cat(session, context):
     digest = hashlib.sha256(READ_PROBE).hexdigest()
     command = "write %s %d %s" % (path, len(READ_PROBE), digest)
     try:
-        run_gated_file_command(session, command)
+        run_gated_file_command(session, command, body=READ_PROBE)
         lines = session.link.exchange(command, body=READ_PROBE)
         assert lines == ["exit 0"], (
             "a signed write must run, got %r" % (lines,))
