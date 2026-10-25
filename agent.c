@@ -4590,7 +4590,8 @@ shots_mkdir(const char *root) {
  * link is never followed.
  **/
 static int
-shot_copy(agent_t *agent, int fd, const shot_t *shot, int index) {
+shot_copy(agent_t *agent, int fd, const shot_t *shot, int index,
+          char *copied, size_t copied_size, char *hex_out) {
   const char *root = agent->platform->fs_root;
   char source[PATH_MAX];
   char dest[PATH_MAX];
@@ -4644,8 +4645,13 @@ shot_copy(agent_t *agent, int fd, const shot_t *shot, int index) {
   }
 
   sha256_hex(digest, hex);
-  snprintf(line, sizeof(line), "shot %s/shots-%lld-%d.jpg %lld %s\n",
-           SHOTS_DIR, (long long)stamp, index, (long long)total, hex);
+  if(snprintf(copied, copied_size, "%s/shots-%lld-%d.jpg", SHOTS_DIR,
+              (long long)stamp, index) >= (int)copied_size) {
+    return -1;
+  }
+  snprintf(hex_out, SHA256_HEX_LEN + 1, "%s", hex);
+  snprintf(line, sizeof(line), "shot %s %lld %s\n", copied,
+           (long long)total, hex);
   if(write(fd, line, strlen(line)) < 0) {
     return -1;
   }
@@ -4768,17 +4774,20 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
     if(by_count && kept >= number) {
       break;
     }
-    if(shot_copy(agent, fd, &shots[i], kept)) {
+    char copied[PATH_MAX];
+    char hex[SHA256_HEX_LEN + 1];
+
+    if(shot_copy(agent, fd, &shots[i], kept, copied, sizeof(copied), hex)) {
       audit_reply(fd, "shots", "failed", SHOTS_DIR, challenge.id, shots_failed);
+      return;
+    }
+    if(store_audit_append("shots.done", copied, challenge.id, hex)) {
+      reply(fd, audit_failed);
       return;
     }
     kept++;
   }
 
-  if(audit_line("shots", "done", SHOTS_DIR, challenge.id)) {
-    reply(fd, audit_failed);
-    return;
-  }
   reply(fd, shots_done);
 }
 static void

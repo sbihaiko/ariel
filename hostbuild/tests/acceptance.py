@@ -9290,6 +9290,15 @@ def scenario_shots_copy_the_newest(server):
         assert len(data) == int(row[2]), row
         assert hashlib.sha256(data).hexdigest() == row[3], row
 
+    audited = {
+        (fields[2], fields[4])
+        for fields in (
+            line.split() for line in run_exit_zero(server, "audit tail 64"))
+        if len(fields) == 5 and fields[1] == "shots.done"
+    }
+    assert audited == {(row[1], row[3]) for row in copied}, (
+        "audit must record each copy's path and sha256, got %r" % audited)
+
     spent, _ = gate_request(server, "shots --count 2")
     assert spent != approval, "a spent shots approval must not be reused"
 
