@@ -12180,10 +12180,11 @@ def addon_runner(server, name, source):
 def addon_run_request(server, name, manifest_sha, args, wait_ms=120000):
     """Ask for addon run of name with args and check the challenge names the addon."""
     command = " ".join(["addon", "run", name] + list(args))
+    options = (["option.argc=%d" % len(args)]
+               + ["option.arg%d=%s" % (i, arg) for i, arg in enumerate(args)])
     return gated_request(
         server, command,
-        ["command=addon", "target=%s" % name, "sha256=%s" % manifest_sha,
-         "option.argc=%d" % len(args), "option.args=%s" % args_hash(*args)],
+        ["command=addon", "target=%s" % name, "sha256=%s" % manifest_sha] + options,
         "addon %s will run" % name, wait_ms=wait_ms)
 
 
@@ -12534,6 +12535,372 @@ ADDON_GATE_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in ADDON_GATE_SCENARIOS)
 SCENARIOS.extend(ADDON_GATE_SCENARIOS)
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+FTP_OPERATIONS = {"ftp-ls": "1-1", "ftp-get": "2-2", "ftp-put": "2-2", "ftp-rm": "1-1"}
+FTP_ELF = {}
+
+
+class FakeFtp:
+    """A passive-mode FTP server kept in memory, for the ftp addons to talk to."""
+
+    def __init__(self, stall=False):
+        self.files = {}
+        self.log = []
+        self.stall = stall
+        self.accepted = threading.Event()
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.port = self.listener.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def close(self):
+        self.listener.close()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                return
+            self.accepted.set()
+            try:
+                if self.stall:
+                    time.sleep(60)
+                else:
+                    self._session(conn)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def _session(self, conn):
+        reader = conn.makefile("rb")
+        conn.sendall(b"220 fake ftp\r\n")
+        passive = None
+        while True:
+            line = reader.readline()
+            if not line:
+                break
+            verb, _, arg = line.decode("utf-8", "replace").rstrip("\r\n").partition(" ")
+            verb = verb.upper()
+            self.log.append((verb, arg))
+            if verb == "PASV":
+                if passive:
+                    passive.close()
+                passive = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                passive.bind(("127.0.0.1", 0))
+                passive.listen(1)
+                passive.settimeout(5)
+                port = passive.getsockname()[1]
+                conn.sendall(("227 Entering Passive Mode (127,0,0,1,%d,%d)\r\n"
+                              % (port // 256, port % 256)).encode("ascii"))
+            elif verb == "QUIT":
+                conn.sendall(b"221 bye\r\n")
+                break
+            elif verb in ("LIST", "RETR", "STOR", "DELE"):
+                passive = self._transfer(conn, verb, arg, passive)
+            elif verb == "USER":
+                conn.sendall(b"331 password\r\n")
+            elif verb == "PASS":
+                conn.sendall(b"230 logged in\r\n")
+            else:
+                conn.sendall(b"200 ok\r\n")
+        if passive:
+            passive.close()
+
+    def _transfer(self, conn, verb, arg, passive):
+        if verb == "DELE":
+            if arg in self.files:
+                del self.files[arg]
+                conn.sendall(b"250 deleted\r\n")
+            else:
+                conn.sendall(b"550 no such file\r\n")
+            return None
+        if passive is None:
+            conn.sendall(b"425 no data connection\r\n")
+            return None
+        if verb == "RETR" and arg not in self.files:
+            passive.close()
+            conn.sendall(b"550 no such file\r\n")
+            return None
+        conn.sendall(b"150 opening\r\n")
+        data, _ = passive.accept()
+        passive.close()
+        with data:
+            if verb == "LIST":
+                folder = arg.rstrip("/")
+                names = [path[len(folder) + 1:] + "\r\n" for path in sorted(self.files)
+                         if path.rsplit("/", 1)[0] == folder]
+                data.sendall("".join(names).encode("utf-8"))
+            elif verb == "RETR":
+                data.sendall(self.files[arg])
+            else:
+                buf = bytearray()
+                while True:
+                    chunk = data.recv(65536)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                self.files[arg] = bytes(buf)
+        conn.sendall(b"226 done\r\n")
+        return None
+
+
+def ftp_addon_elf(server):
+    """The ftp addon built with the host compiler for this server's root."""
+    if server.root not in FTP_ELF:
+        workdir = tempfile.mkdtemp(prefix="ariel-ftp-")
+        binary = os.path.join(workdir, "ftp")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-Wall", "-Werror", "-I", REPO,
+             '-DARIEL_FS_ROOT="%s"' % server.root,
+             os.path.join(REPO, "addons", "ftp", "ftp.c"),
+             os.path.join(REPO, "protected.c"), "-o", binary],
+            check=True)
+        with open(binary, "rb") as handle:
+            FTP_ELF[server.root] = handle.read()
+    return FTP_ELF[server.root]
+
+
+def install_ftp_addon(server, name, port):
+    """Install one ftp addon, its manifest, and the server the owner set for it."""
+    manifest = manifest_text(name, args=FTP_OPERATIONS[name])
+    path = make_addon(server, name, manifest)
+    with open(os.path.join(path, "elf"), "wb") as handle:
+        handle.write(ftp_addon_elf(server))
+    with open(os.path.join(path, "server"), "w") as handle:
+        handle.write("127.0.0.1:%d\n" % port)
+    return hashlib.sha256(manifest.encode("ascii")).hexdigest()
+
+
+def ftp_request(server, name, sha, args, port):
+    """Request one ftp addon run and check the owner's question names its paths and server."""
+    command = "addon run %s %s" % (name, " ".join("'%s'" % arg for arg in args))
+    expected = (["command=addon", "target=%s" % name, "sha256=%s" % sha,
+                 "option.argc=%d" % len(args), "option.server=127.0.0.1:%d" % port]
+                + ["option.arg%d=%s" % (i, arg) for i, arg in enumerate(args)])
+    approval, challenge = gated_request(server, command, expected,
+                                        "addon %s will run" % name)
+    return command, approval, challenge
+
+
+def ftp_grant(server, name, sha, args, port):
+    """Request one ftp addon run, sign it as the owner, and return its command."""
+    command, approval, challenge = ftp_request(server, name, sha, args, port)
+    sign_and_grant(server, approval, challenge)
+    return command
+
+
+def ftp_result(server, lines):
+    """The text one granted ftp addon run wrote to its result file."""
+    assert lines and lines[0].startswith("result ") and lines[1:] == ["status 0", "exit 0"], (
+        "a granted ftp addon run must name its result and exit 0, got %r" % lines)
+    path = os.path.join(server.root, lines[0].split(" ", 1)[1].lstrip("/"))
+    with open(path, "r") as handle:
+        return handle.read()
+
+
+def ftp_local(server, path):
+    return os.path.join(server.root, path.lstrip("/"))
+
+
+FTP_ASKS_TITLE = ("an ftp addon asks the owner with its remote path, local path and "
+                  "server, runs once after the signature, and is not run again")
+FTP_ROUND_TRIP_TITLE = ("ftp put, get, ls and rm move a file with a space in its name "
+                        "through the one gate, and the bytes come back identical")
+FTP_PROTECTED_TITLE = ("an ftp addon refuses a remote or local path that names Ariel's "
+                       "state, through a link too, and does not ask the owner")
+FTP_LINK_TITLE = ("an ftp addon refuses a path that a link came to name after the "
+                  "owner was asked, and creates no local file")
+FTP_ROOTS_TITLE = ("an ftp addon refuses a local path outside /data, /user and "
+                   "/mnt/usb*, and never overwrites a local file")
+FTP_STALL_TITLE = ("an ftp addon whose server never answers is cut by the loader's "
+                   "timeout and keeps no output")
+
+
+def scenario_ftp_asks_then_runs_once(server):
+    fake = FakeFtp()
+    try:
+        sha = install_ftp_addon(server, "ftp-get", fake.port)
+        fake.files["/up/a b.txt"] = b"bytes\n"
+        command, approval, challenge = ftp_request(
+            server, "ftp-get", sha, ["/up/a b.txt", "/data/got a.txt"], fake.port)
+        sign_and_grant(server, approval, challenge)
+        lines = run_command(server, command)
+        ftp_result(server, lines)
+        with open(ftp_local(server, "/data/got a.txt"), "rb") as handle:
+            assert handle.read() == b"bytes\n", "the granted get must write the remote bytes"
+        assert [verb for verb, _ in fake.log].count("RETR") == 1, (
+            "a granted ftp addon run must transfer exactly once, got %r" % fake.log)
+        assert_asks_again(server, command)
+    finally:
+        fake.close()
+        cleanup_addon(server, "ftp-get")
+        for leftover in ("/data/got a.txt",):
+            if os.path.lexists(ftp_local(server, leftover)):
+                os.remove(ftp_local(server, leftover))
+
+
+def scenario_ftp_round_trip_keeps_bytes(server):
+    fake = FakeFtp()
+    names = list(FTP_OPERATIONS)
+    try:
+        sha = {name: install_ftp_addon(server, name, fake.port) for name in names}
+        payload = bytes(range(256)) + b"\r\n"
+        with open(ftp_local(server, "/data/src a.bin"), "wb") as handle:
+            handle.write(payload)
+        remote = "/up/my file.bin"
+
+        put = ftp_grant(server, "ftp-put", sha["ftp-put"], [remote, "/data/src a.bin"], fake.port)
+        ftp_result(server, run_command(server, put))
+        assert fake.files.get(remote) == payload, "ftp-put must store the bytes"
+
+        get = ftp_grant(server, "ftp-get", sha["ftp-get"], [remote, "/data/back a.bin"], fake.port)
+        ftp_result(server, run_command(server, get))
+        with open(ftp_local(server, "/data/back a.bin"), "rb") as handle:
+            assert handle.read() == payload, "ftp-get must return the bytes byte for byte"
+
+        listing = ftp_grant(server, "ftp-ls", sha["ftp-ls"], ["/up"], fake.port)
+        assert "my file.bin" in ftp_result(server, run_command(server, listing)).splitlines(), (
+            "ftp-ls must list the stored file by its name")
+
+        remove = ftp_grant(server, "ftp-rm", sha["ftp-rm"], [remote], fake.port)
+        ftp_result(server, run_command(server, remove))
+        assert remote not in fake.files, "ftp-rm must remove the remote file"
+    finally:
+        fake.close()
+        for name in names:
+            cleanup_addon(server, name)
+        for leftover in ("/data/src a.bin", "/data/back a.bin"):
+            if os.path.lexists(ftp_local(server, leftover)):
+                os.remove(ftp_local(server, leftover))
+
+
+def scenario_ftp_refuses_ariel_state_before_asking(server):
+    fake = FakeFtp()
+    link = ftp_local(server, "/data/link-token")
+    try:
+        for name in FTP_OPERATIONS:
+            install_ftp_addon(server, name, fake.port)
+        make_link(link, ftp_local(server, "/data/ariel/token"), hard=False)
+        commands = (
+            "addon run ftp-get /data/ariel/token '/data/out.txt'",
+            "addon run ftp-ls /ariel",
+            "addon run ftp-rm /data/ariel/addons/ftp-get/elf",
+            "addon run ftp-get /data/link-token '/data/out2.txt'",
+            "addon run ftp-put '/up/x' /data/link-token",
+        )
+        for command in commands:
+            assert run_command(server, command) == ["protected", "exit 87"], (
+                "%s must answer protected and exit 87" % command)
+        for leftover in ("/data/out.txt", "/data/out2.txt"):
+            assert not os.path.lexists(ftp_local(server, leftover)), (
+                "a refused ftp addon run must create no local file")
+        assert fake.log == [], "a refused ftp addon run must not reach the server"
+        line = server.next_line(timeout=0.2)
+        assert not (line or "").startswith("prompt"), (
+            "a refused ftp addon run must not ask the owner, got %r" % line)
+    finally:
+        fake.close()
+        if os.path.lexists(link):
+            os.remove(link)
+        for name in FTP_OPERATIONS:
+            cleanup_addon(server, name)
+
+
+def scenario_ftp_refuses_a_link_swapped_after_the_ask(server):
+    fake = FakeFtp()
+    swap = ftp_local(server, "/data/swap-link")
+    out = ftp_local(server, "/data/swap-out.txt")
+    harmless = ftp_local(server, "/data/harmless.txt")
+    try:
+        sha = install_ftp_addon(server, "ftp-get", fake.port)
+        with open(harmless, "wb") as handle:
+            handle.write(b"ok")
+        make_link(swap, harmless, hard=False)
+        command, approval, challenge = ftp_request(
+            server, "ftp-get", sha, ["/data/swap-link", "/data/swap-out.txt"], fake.port)
+        make_link(swap, ftp_local(server, "/data/ariel/token"), hard=False)
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, command) == ["protected", "exit 87"], (
+            "a link that names Ariel's state when the owner signs must answer protected")
+        assert not os.path.lexists(out), "a refused ftp addon run must create no local file"
+        assert fake.log == [], "a refused ftp addon run must not reach the server"
+    finally:
+        fake.close()
+        for leftover in (swap, harmless):
+            if os.path.lexists(leftover):
+                os.remove(leftover)
+        cleanup_addon(server, "ftp-get")
+
+
+def scenario_ftp_refuses_local_paths_outside_roots(server):
+    fake = FakeFtp()
+    fake.files["/up/x"] = b"x"
+    keep = ftp_local(server, "/data/keep.txt")
+    outside = ftp_local(server, "/tmp/ariel-ftp-outside.bin")
+    try:
+        sha = install_ftp_addon(server, "ftp-get", fake.port)
+        with open(keep, "wb") as handle:
+            handle.write(b"keep")
+        command, approval, challenge = ftp_request(
+            server, "ftp-get", sha, ["/up/x", "/tmp/ariel-ftp-outside.bin"], fake.port)
+        sign_and_grant(server, approval, challenge)
+        assert run_command(server, command) == ["bad_path", "exit 1"], (
+            "a local path outside the allowed roots must answer bad_path and exit 1")
+        assert not os.path.lexists(outside), "a refused local path must create no file"
+
+        command = ftp_grant(server, "ftp-get", sha, ["/up/x", "/data/keep.txt"], fake.port)
+        assert run_command(server, command) == ["operation_failed", "exit 1"], (
+            "a get onto an existing local file must fail, not overwrite it")
+        with open(keep, "rb") as handle:
+            assert handle.read() == b"keep", "an existing local file must be left as it was"
+    finally:
+        fake.close()
+        for leftover in (keep, outside):
+            if os.path.lexists(leftover):
+                os.remove(leftover)
+        cleanup_addon(server, "ftp-get")
+
+
+def scenario_ftp_stalled_server_is_cut(server):
+    fake = FakeFtp(stall=True)
+    try:
+        sha = install_ftp_addon(server, "ftp-ls", fake.port)
+        command = ftp_grant(server, "ftp-ls", sha, ["/up"], fake.port)
+        reply = {}
+        worker = threading.Thread(target=lambda: reply.update(
+            lines=run_command(server, command, timeout=30.0)))
+        worker.start()
+        assert fake.accepted.wait(5.0), "the ftp addon must reach the stalled server"
+        server.advance(ADDON_RUN_TIMEOUT_MS - 1)
+        time.sleep(0.2)
+        assert worker.is_alive(), "an ftp addon must not be cut before its timeout"
+        server.advance(1)
+        worker.join(30.0)
+        assert not worker.is_alive() and reply.get("lines") == ["timed_out", "exit 1"], (
+            "a stalled ftp addon must be cut at its timeout, got %r" % reply.get("lines"))
+        assert addon_results(server, "ftp-ls") == [], "a cut ftp addon must keep no output"
+    finally:
+        fake.close()
+        cleanup_addon(server, "ftp-ls")
+
+
+FTP_SCENARIOS = [
+    (FTP_ASKS_TITLE, scenario_ftp_asks_then_runs_once, HOST_ROOT_REASON),
+    (FTP_ROUND_TRIP_TITLE, scenario_ftp_round_trip_keeps_bytes, HOST_ROOT_REASON),
+    (FTP_PROTECTED_TITLE, scenario_ftp_refuses_ariel_state_before_asking, HOST_ROOT_REASON),
+    (FTP_LINK_TITLE, scenario_ftp_refuses_a_link_swapped_after_the_ask, HOST_ROOT_REASON),
+    (FTP_ROOTS_TITLE, scenario_ftp_refuses_local_paths_outside_roots, HOST_ROOT_REASON),
+    (FTP_STALL_TITLE, scenario_ftp_stalled_server_is_cut, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in FTP_SCENARIOS)
+SCENARIOS.extend(FTP_SCENARIOS)
 
 
 def main():
