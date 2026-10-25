@@ -32,8 +32,8 @@ Work happens on the `dev` branch; `master` follows it at milestones. Each stage 
 | 3. An interface agents can rely on | [#57](https://github.com/sbihaiko/ariel/issues/57) | ✅ Done. Nine sub-issues closed; the host acceptance suite covers it. |
 | 4. Addons, and sight as the first one | [#54](https://github.com/sbihaiko/ariel/issues/54) | 🚧 In progress. Addons, their process contract and the one gate are done, and `addons/ftp/` moves bytes on a console ([#89](https://github.com/sbihaiko/ariel/issues/89)); the stage's **pilot addon is not built**, because it runs a capture ([#53](https://github.com/sbihaiko/ariel/issues/53)) and no capture route a payload can reach has answered with an image ([#100](https://github.com/sbihaiko/ariel/issues/100)). |
 | 5. Sessions (optional) | | Not started. |
-| 6. MCP (optional) | | Not started. |
-| 7. Network sight (optional) | [#94](https://github.com/sbihaiko/ariel/issues/94) | Not started; one command, and a console spike gates it. |
+| 6. Network sight (optional) | [#94](https://github.com/sbihaiko/ariel/issues/94) | Not started; `netstat`, `ifconfig` and `ping`, each gated by its own console spike. |
+| 7. MCP (optional) | | Not started. |
 
 **Stage 2** built everything [its goals](#stage-2-persist-and-recover) name, and `unzip` and `tar` refuse a member that escapes. The key work is the hierarchy and rotation ([#15](https://github.com/sbihaiko/ariel/issues/15), [#51](https://github.com/sbihaiko/ariel/issues/51)), the freeze ([#47](https://github.com/sbihaiko/ariel/issues/47)), revoking a lineage and suspending its grants ([#52](https://github.com/sbihaiko/ariel/issues/52)), and failing closed on damaged key state ([#48](https://github.com/sbihaiko/ariel/issues/48)). The key run on the console rotated, revoked, froze, unfroze, started without the keyring and restored it ([console findings](docs/console-findings.md#issue-48-keys-on-the-console)).
 
@@ -154,19 +154,22 @@ Agents usually reach the console through one-shot connections (one command per c
 - Sessions are isolated from each other, but the file system and installed payloads are shared. Stage 2 operations such as installing and rolling back take a global lock.
 - Sessions are a convenience, not a requirement. Every command also works without one, using absolute paths.
 
-### Stage 6 (optional): MCP
-
-Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information and logs. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
-
-### Stage 7 (optional): network sight
+### Stage 6 (optional): network sight
 
 Stage 4 gave the agent sight of the screen. This one gives it sight of the console's own network state, which no current command exposes: which ports the console listens on and which peers it is connected to. Today an agent can only infer that by trying to connect ([#94](https://github.com/sbihaiko/ariel/issues/94)).
 
-- One command, `netstat [-l] [-t] [-u] [--limit N] [--json]`, read-only and ungated like `ps` and `sysinfo`, numeric addresses only, bounded by the readers' 64 KiB cap and its `truncated` marker.
-- It answers which payload is serving and which is not, which is the question an agent asks right after it launches one.
-- A console spike comes first: prove on firmware 11.20 that a payload can enumerate the socket table without freezing the console or needing privileges it lacks, and record the interface it used in [console findings](docs/console-findings.md). The command is built only if the spike passes, and the stage closes either way. A failed spike is a result, as the capture spike was for sight.
-- It deliberately builds no `ping`, `ifconfig`, `diff`, `timeout` or `sha256sum`: each is already covered by another mechanism, and the coverage table below says which.
+- Three commands, all read-only and ungated like `ps` and `sysinfo`, numeric addresses only, each bounded so none can hang the console:
+  - `netstat [-l] [-t] [-u] [--limit N] [--json]` lists the sockets, bounded by the readers' 64 KiB cap and its `truncated` marker. It answers which payload is serving and which is not, the question an agent asks right after it launches one.
+  - `ifconfig` lists the interfaces with their address, mask and state. The address the agent connected to says nothing about a second interface or one that is down.
+  - `ping [-c N] [-W MS] HOST` says whether an address answers and how long it takes, which a failed download cannot separate from a refusal. The count and the deadline are capped, because an unbounded ping is the easiest way to hang the console.
+- A console spike comes first, one per command: prove on firmware 11.20 that a payload can read the socket table, read the interface list and send a bounded ping without freezing the console or needing privileges it lacks, and record the interface each one used in [console findings](docs/console-findings.md). A command is built only if its own spike passes, and the stage closes either way. A failed spike is a result, as the capture spike was for sight.
+- It deliberately builds no `diff`, `timeout` or `sha256sum`: each is already covered by another mechanism, and the coverage table below says which.
 - No new exit code and no change to the approval design: a read-only command is not gated, and `operation_failed` and the platform refusal carry its failures.
+
+### Stage 7 (optional): MCP
+
+Expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information, logs and network sight, so `netstat` is a tool from the start rather than a family added later. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles.
+
 
 ## Command coverage
 
@@ -209,8 +212,9 @@ Which bash commands an agent can expect on Ariel. Each row is an Ariel command. 
 | `reboot` | | ❌ | S2: gated; the host build simulates it |
 | `http2_get -o` | `curl -o`, `wget` | ✅ no verification | S2: gated and restricted to the download allowlist. `payload install` adds the hash check |
 | `sha256sum` | | ❌ (`sum` is a BSD checksum) | Not built: `read <path> --limit 0` answers `bytes 0 <sha256>`, the whole file's hash, in one read-only call |
-| `netstat` | | ❌ | S7 (optional): built only if the console spike proves the socket table is readable; see [Stage 7](#stage-7-optional-network-sight) |
-| `ifconfig`, `ping` | | ❌ | Not built: the console's address is the one the agent connected to, and a download that fails already answers reachability |
+| `netstat` | | ❌ | S6 (optional): built only if the console spike proves the socket table is readable; see [Stage 6](#stage-6-optional-network-sight) |
+| `ifconfig` | | ❌ | S6 (optional): the interfaces, with address, mask and state; built only if its spike passes, see [Stage 6](#stage-6-optional-network-sight) |
+| `ping` | | ❌ | S6 (optional): whether an address answers, with a capped count and deadline; built only if its spike passes |
 
 PS5-specific commands with no bash equivalent: `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `authid`, `sfoinfo` and `sfocreate` (all in shsrv; from Stage 2 all but `authid` and `sfoinfo` are gated, and `sfocreate` joined them in Stage 3, #49), plus `payload` (Stage 1), `approval` and `autoload` (Stage 2) `session` (Stage 5) and `screenshot` (Stage 4).
 
@@ -231,7 +235,7 @@ An agent that can download, write and execute code on a console with kernel priv
 - **Untrusted content is data.** README files, web pages and logs read by an agent may contain instructions. Approval by a key the agent does not hold ensures that injected instructions cannot silently turn into code execution.
 - **Auditable.** Ariel is open source and every action it takes is logged on the console.
 
-From Stage 6, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
+From Stage 7, MCP tools are also marked as destructive, so the MCP client asks a human before even requesting approval.
 
 ## Quick start
 
