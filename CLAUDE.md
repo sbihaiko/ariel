@@ -23,6 +23,7 @@ docs/agents/ issue tracker, triage labels, domain-doc rules
 - **Commits and pushes are automatic** ([ADR-0003](docs/adr/0003-commits-and-pushes-are-automatic.md)). Guard: None yet. This rule is a draft until a named guard test exists.
 - **Everything written is English** ([ADR-0004](docs/adr/0004-language-of-the-record.md)). Guard: None yet. This rule is a draft until a named guard test exists.
 - **Where decisions go** ([ADR-0005](docs/adr/0005-where-decisions-go.md)). Guard: None yet. This rule is a draft until a named guard test exists.
+- **The gate is one command: `sh tools/gate.sh`** ([ADR-0015](docs/adr/0015-the-gate-is-one-command.md)). It names `payload:` and `hostbuild:` on their own lines; never write `make clean all && …` as an acceptance command. Guard: `tools/test-gate.sh`.
 
 ## Where decisions go
 

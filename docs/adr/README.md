@@ -21,3 +21,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0012](0012-the-agent-port-line-grammar.md) | The agent port's line grammar: quoting, escaped actions, one frame and one cap |
 | [0013](0013-the-connection-stack-is-a-budget.md) | The connection stack is a budget every recursive walk fits inside |
 | [0014](0014-the-session-prefix-and-the-resolved-path.md) | The `@` prefix names a session, and a path resolves before the gate |
+| [0015](0015-the-gate-is-one-command.md) | The gate is one command, and it names each half |

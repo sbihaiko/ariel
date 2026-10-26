@@ -36,6 +36,20 @@ Where the build happens depends on what the machine has: a local LLVM means a lo
 
 The script writes `ariel.env` with `PS5_HOST` and `ARIEL_TOKEN` when it finishes, so the rest of this page is copy and paste after `. ./ariel.env`. The steps below stay here because they say what the script does, and because a build you do by hand is one you can read.
 
+## The gate: one command
+
+```console
+$ sh tools/gate.sh
+gate: payload: building with the SDK at /Users/you/.local/share/ps5-payload-sdk
+gate: payload: built
+gate: hostbuild: all 425 scenarios passed
+gate: PASS
+```
+
+`sh tools/gate.sh` is the check to run before a commit, and the one an agent reports: it builds the payload on whichever route the machine has — an exported `PS5_PAYLOAD_SDK` with LLVM, otherwise the SDK in `~/.local/share`, otherwise a container built from `tools/install/Dockerfile.sdk` — and then runs the host build and its headless acceptance suite. Each half is named on its own line, and one never hides the other: a payload build that fails still leaves the suite to run, and the suite still reports beside a good build. A half that cannot run at all says `unavailable` and exits 3, because a check that measured nothing is not a pass ([ADR-0015](adr/0015-the-gate-is-one-command.md)). `--payload-only` and `--host-only` run one half.
+
+Nothing in the gate touches a console.
+
 ## 1. Install the PS5 payload SDK
 
 Download the prebuilt SDK and point `PS5_PAYLOAD_SDK` at it:
@@ -183,7 +197,7 @@ An addon is an ELF and a manifest in a directory of its own. Only the owner inst
 
 ## Troubleshooting
 
-- **`PS5_PAYLOAD_SDK is undefined`:** export the variable in the shell where you run `make` (step 1).
+- **`PS5_PAYLOAD_SDK is undefined`:** that is `make clean all` being run by hand. Run the gate instead, `sh tools/gate.sh`, which finds the SDK itself or builds in a container; to build by hand, export the variable in the shell where you run `make` (step 1).
 - **The build stops with "ARIEL_PUBKEY without ARIEL_RECOVERY_PUBKEY":** pass both keys (step 3).
 - **No answer on 2324:** Ariel is not running. Send the ELF again (step 4). A reboot of the console stops every payload.
 - **`exit 70` on every connection:** the token is wrong. Read it again on the console; the file is `/data/ariel/token`.
