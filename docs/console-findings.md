@@ -397,7 +397,7 @@ and for the removal, `command=rmdir` with `option.kind=dir`, `option.dev=6879311
 
 ## Network spike: the three probes on firmware 11.20
 
-The runbook is [network-spike.md](network-spike.md). `network-spike.elf` ran on 2026-10-25 on the CFI-2014 at 192.168.68.74, firmware 11.20, built from `32bc510` (sha256 `1efcca6af3e824c06be84be762b0c40fe646b68e3fa1e723347ca30fb2bb43f8`), with no selector file, so all three probes ran in order. The console stayed responsive and no probe froze it. The payload ran as euid 0 with uid 1, gid 1, egid 1.
+This is the Stage 6 entry of [#111](https://github.com/sbihaiko/ariel/issues/111): the probes that decided which of its three commands are built, and their transcripts. The runbook is [network-spike.md](network-spike.md). `network-spike.elf` ran on 2026-10-25 on the CFI-2014 at 192.168.68.74, firmware 11.20, built from `32bc510` (sha256 `1efcca6af3e824c06be84be762b0c40fe646b68e3fa1e723347ca30fb2bb43f8`), with no selector file, so all three probes ran in order. The console stayed responsive and no probe froze it. The payload ran as euid 0 with uid 1, gid 1, egid 1.
 
 Each outcome is one of: `read` (the call returned the fact), `refused` (the call returned an error, with the errno it set), or `froze` (the log's last line is an `intent` line with no `result` line after it, and the console stopped responding).
 
@@ -412,7 +412,7 @@ Each outcome is one of: `read` (the call returned the fact), `refused` (the call
 
 Each probe's transcript is the set of its lines from `/data/network-spike.log`, copied from the console, from the probe's `effective user` line to its `result` line or its last `intent` line.
 
-**Probe 1, interfaces:**
+#### Probe 1, interfaces
 
 ```text
 20:56:39 interfaces: effective user euid 0 (uid 1, gid 1, egid 1)
@@ -425,7 +425,7 @@ Each probe's transcript is the set of its lines from `/data/network-spike.log`, 
 20:56:39 interfaces: result read, 1408 bytes, 4 interfaces, 5 addresses
 ```
 
-**Probe 2, sockets:**
+#### Probe 2, sockets
 
 ```text
 20:56:39 sockets: effective user euid 0 (uid 1, gid 1, egid 1)
@@ -435,7 +435,7 @@ Each probe's transcript is the set of its lines from `/data/network-spike.log`, 
 20:56:39 sockets: result refused, net.inet.udp.pcblist errno 2 (No such file or directory)
 ```
 
-**Probe 3, echo:**
+#### Probe 3, echo
 
 ```text
 20:56:39 echo: effective user euid 0 (uid 1, gid 1, egid 1)
@@ -455,6 +455,6 @@ Each probe's transcript is the set of its lines from `/data/network-spike.log`, 
 
 ### What the probes answered
 
-- **The interface list can be read.** `ifconfig` has its fact on this firmware, through `PF_ROUTE` and `NET_RT_IFLIST`, and the payload needs no privilege beyond the one it already has.
-- **The ICMP echo works.** A raw ICMP socket opens and a loopback echo comes back, so `ping` has its fact too, and the console's network stack answered without the packet leaving the console.
-- **The socket tables are not exposed under the FreeBSD names.** Both `pcblist` names answer errno 2 before any read, which is the kernel saying the node does not exist rather than refusing the read. `netstat` therefore has no proven fact yet; what it answers, if it is built at all, follows the decision recorded on [#114](https://github.com/sbihaiko/ariel/issues/114).
+- **The interface list was read.** Probe 1 read `NET_RT_IFLIST` through `PF_ROUTE`: 1408 bytes, 4 interfaces, 5 addresses, with no privilege beyond the one the payload already has. `ifconfig` is built on this fact. [Transcript](#probe-1-interfaces)
+- **The ICMP echo was read.** Probe 3 opened a raw ICMP socket, and a loopback echo came back from `127.0.0.1` as an ICMP type 0 reply, so the console's network stack answered without the packet leaving the console. `ping` is built on this fact. [Transcript](#probe-3-echo)
+- **The socket tables were refused.** Probe 2 asked for `net.inet.tcp.pcblist` and `net.inet.udp.pcblist`, and both answered errno 2 (`No such file or directory`) on the size query, before any read: the kernel says the node does not exist. `netstat` has no fact on this firmware, so it is not built, and [#114](https://github.com/sbihaiko/ariel/issues/114) is closed as not planned. [Transcript](#probe-2-sockets)
