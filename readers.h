@@ -19,7 +19,7 @@ along with this program; see the file COPYING. If not, see
 
 /**
  * Run one platform reader of the agent port: ps, procstat, sysctl, authid,
- * dmesg, sysinfo and ifconfig. The arguments are as for runner_run, and json
+ * dmesg, sysinfo, ifconfig and ping. The arguments are as for runner_run, and json
  * is 1 for the --json form, which ps, sysinfo and ifconfig answer. Returns 0
  * and the reader's status when argv[0]
  * is a reader, or -1 when it is not one, or when the arguments ask for

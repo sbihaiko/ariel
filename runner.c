@@ -83,6 +83,7 @@ static const struct {
   {"id", "print the user and group ids"},
   {"ifconfig", "print the interfaces with their state, IPv4 address and mask"},
   {"ls", "list the entries of an absolute directory"},
+  {"ping", "say whether an IPv4 address answers, with its round trips"},
   {"procstat", "print one process by pid"},
   {"ps", "list the processes"},
   {"pwd", "print the working directory"},

@@ -3886,6 +3886,98 @@ def scenario_ifconfig_keys_are_documented(server):
             "the ifconfig section must document the %s key" % name)
 
 
+PING_SUMMARY = re.compile(r"^ping (\S+) (\d+) (\d+) (\d+) (\d+) (\d+)$")
+PING_REFUSAL = ["not available on this platform", "exit 1"]
+PING_NO_REPLY = ["no_reply", "exit 1"]
+# TEST-NET-1 is never routed, so nothing answers an echo sent to it.
+PING_SILENT = "192.0.2.1"
+
+
+def ping_summary(lines, address):
+    """The sent and received counts of a ping summary, or None where ICMP is refused."""
+    if lines == PING_REFUSAL:
+        return None
+    assert lines[-1] == "exit 0" and len(lines) == 2, (
+        "ping must answer one summary line and exit 0, got %r" % lines)
+    match = PING_SUMMARY.match(lines[0])
+    assert match and match.group(1) == address, (
+        "ping must answer ping <address> <sent> <received> <min> <avg> <max>, got %r"
+        % lines[0])
+    sent, received, low, avg, high = (int(n) for n in match.groups()[1:])
+    assert 1 <= received <= sent and low <= avg <= high, (
+        "ping's counts and times must agree, got %r" % lines[0])
+    return sent, received
+
+
+def scenario_ping_answers_the_loopback_summary(server):
+    """ping answers one summary line for the loopback address, or the refusal where the machine has no ICMP socket."""
+    summary = ping_summary(run_command(server, "ping 127.0.0.1"), "127.0.0.1")
+    if summary is None:
+        return
+    sent, received = summary
+    assert sent == 4 and received >= 1, (
+        "ping sends four probes by default and the loopback answers, got %r" % (summary,))
+
+
+def scenario_ping_caps_and_defaults(server):
+    """ping accepts counts of 1 to 10 and waits of 1 to 5000 ms, and sends the count it was given."""
+    if ping_summary(run_command(server, "ping 127.0.0.1"), "127.0.0.1") is None:
+        return
+    for command, sent in (("ping -c 1 127.0.0.1", 1), ("ping -c 10 127.0.0.1", 10),
+                          ("ping -W 5000 -c 1 127.0.0.1", 1)):
+        summary = ping_summary(run_command(server, command), "127.0.0.1")
+        assert summary and summary[0] == sent, (
+            "%r must send %d probes, got %r" % (command, sent, summary))
+    for command in ("ping -c 1 -W 1 %s" % PING_SILENT, "ping -c 10 -W 1 %s" % PING_SILENT):
+        lines = run_command(server, command)
+        assert lines in (PING_NO_REPLY, PING_REFUSAL), (
+            "%r is in range and must not be refused, got %r" % (command, lines))
+
+
+def scenario_ping_refuses_what_it_does_not_take(server):
+    """ping refuses a count or wait out of range, an unknown or repeated option, no operand, and a name or IPv6 address."""
+    for command in ("ping -c 0 127.0.0.1", "ping -c 11 127.0.0.1", "ping -c x 127.0.0.1",
+                    "ping -c 127.0.0.1", "ping -W 0 127.0.0.1", "ping -W 5001 127.0.0.1",
+                    "ping -W x 127.0.0.1", "ping localhost", "ping example.com",
+                    "ping ::1", "ping 1.2.3", "ping 127.0.0.1 127.0.0.2"):
+        assert run_command(server, command) == ["bad_argument", "exit 1"], (
+            "%r must answer bad_argument and nothing else" % command)
+    for command in ("ping -x 127.0.0.1", "ping --json 127.0.0.1", "ping -c 1 -c 2 127.0.0.1",
+                    "ping -W 1 -W 2 127.0.0.1"):
+        assert run_command(server, command) == ["bad_option", "exit 1"], (
+            "%r must answer bad_option and nothing else" % command)
+    for command in ("ping", "ping -c 4"):
+        assert run_command(server, command) == ["missing_operand", "exit 1"], (
+            "%r must answer missing_operand and nothing else" % command)
+
+
+def scenario_ping_answers_no_reply_for_a_silent_address(server):
+    """A silent address answers no_reply and exit 1, or the refusal where ICMP is refused."""
+    lines = run_command(server, "ping -c 1 -W 200 %s" % PING_SILENT)
+    assert lines in (PING_NO_REPLY, PING_REFUSAL), (
+        "a silent address must answer no_reply, got %r" % lines)
+
+
+def scenario_ping_worst_case_fits_the_deadline(server):
+    """Ten probes at five seconds each answer inside the connection's 60 second deadline."""
+    started = time.monotonic()
+    lines = run_command(server, "ping -c 10 -W 5000 %s" % PING_SILENT, timeout=65.0)
+    elapsed = time.monotonic() - started
+    assert lines in (PING_NO_REPLY, PING_REFUSAL), (
+        "a silent address must answer no_reply, got %r" % lines)
+    assert elapsed < 60, "the worst case must answer inside 60 seconds, took %.1f" % elapsed
+
+
+def scenario_ping_is_documented(server):
+    """docs/exit-codes.md names ping's options and no_reply, the word a silent address answers."""
+    del server
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    assert "`ping [-c N] [-W MS] ADDRESS`" in registry, (
+        "docs/exit-codes.md must name ping's options")
+    assert "`no_reply`" in registry, "docs/exit-codes.md must name no_reply"
+
+
 def scenario_wrong_token(server):
     wrong = "0" * 32 if server.token != "0" * 32 else "1" * 32
     sock = server.connect()
@@ -4291,7 +4383,7 @@ def scenario_no_system_change_on_agent_port(server):
 
 
 INSPECTION_COMMANDS = (
-    "authid", "echo", "help", "id", "ifconfig", "procstat", "ps", "sfoinfo",
+    "authid", "echo", "help", "id", "ifconfig", "ping", "procstat", "ps", "sfoinfo",
     "sleep", "sum", "sync", "sysctl",
 )
 
@@ -10395,6 +10487,18 @@ SCENARIOS = [
      scenario_ifconfig_shows_the_loopback, HOST_MACHINE_REASON),
     ("the ifconfig JSON keys are documented in json-output.md",
      scenario_ifconfig_keys_are_documented, None),
+    ("ping answers one summary line for the loopback address, or the refusal",
+     scenario_ping_answers_the_loopback_summary, None),
+    ("ping sends four probes by default and accepts the count and wait ranges",
+     scenario_ping_caps_and_defaults, None),
+    ("ping refuses an out-of-range value, an unknown option, no operand and a "
+     "name or IPv6 address", scenario_ping_refuses_what_it_does_not_take, None),
+    ("ping answers no_reply for a silent address",
+     scenario_ping_answers_no_reply_for_a_silent_address, None),
+    ("ping's worst case answers inside the 60 second deadline",
+     scenario_ping_worst_case_fits_the_deadline, None),
+    ("ping's options and no_reply are documented in exit-codes.md",
+     scenario_ping_is_documented, None),
     ("wrong token closes with exit 70", scenario_wrong_token, None),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, None),

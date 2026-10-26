@@ -551,6 +551,11 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
     return run_ifconfig(json, argc, argv, outfd, errfd, status);
   }
 
+  if(!strcmp(argv[0], "ping")) {
+    diagnostics_run_ping(argc, argv, outfd, errfd, status);
+    return 0;
+  }
+
   if(!strcmp(argv[0], "procstat")) {
     return run_procstat(argc, argv, outfd, errfd, status);
   }

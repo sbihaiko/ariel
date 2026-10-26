@@ -58,4 +58,13 @@ void diagnostics_say_sysinfo(int json, int fd, const char *sysname,
  **/
 void diagnostics_say_log(int fd, const char *data, size_t len);
 
+/**
+ * Run ping: probe one literal IPv4 address with ICMP echo requests and write
+ * the summary line, or `no_reply` on errfd when nothing came back. A host that
+ * cannot open an ICMP socket writes the platform refusal. The arguments are as
+ * for readers_run; the status is 0 when a reply came back and 1 otherwise.
+ **/
+void diagnostics_run_ping(int argc, char *const argv[], int outfd, int errfd,
+                          int *status);
+
 #endif /* ARIEL_DIAGNOSTICS_H */
