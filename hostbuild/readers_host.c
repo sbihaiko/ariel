@@ -24,6 +24,9 @@ along with this program; see the file COPYING. If not, see
 
 #include <ctype.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -428,6 +431,103 @@ run_sysinfo(int json, int argc, char *const argv[], int outfd, int errfd,
 }
 
 
+/* The host's interfaces and their IPv4 addresses. Each IPv4 address is a row;
+   an interface with no IPv4 address gets one row with no address. */
+static int
+host_interfaces(interface_row_t **rows, size_t *count) {
+  struct ifaddrs *list;
+  struct ifaddrs *ifa;
+  size_t entries = 0;
+  size_t n = 0;
+
+  if(getifaddrs(&list)) {
+    return -1;
+  }
+  for(ifa=list; ifa; ifa=ifa->ifa_next) {
+    entries++;
+  }
+  *rows = calloc(entries ? entries : 1, sizeof(**rows));
+  if(!*rows) {
+    freeifaddrs(list);
+    return -1;
+  }
+
+  for(ifa=list; ifa; ifa=ifa->ifa_next) {
+    interface_row_t *row = &(*rows)[n];
+    struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
+
+    if(!addr || addr->sin_family != AF_INET) {
+      continue;
+    }
+    snprintf(row->name, sizeof(row->name), "%s", ifa->ifa_name);
+    row->up = (ifa->ifa_flags & IFF_UP) != 0;
+    row->has_address = 1;
+    memcpy(row->address, &addr->sin_addr, sizeof(row->address));
+    if(ifa->ifa_netmask) {
+      struct sockaddr_in *mask = (struct sockaddr_in *)ifa->ifa_netmask;
+
+      memcpy(row->mask, &mask->sin_addr, sizeof(row->mask));
+    }
+    n++;
+  }
+
+  for(ifa=list; ifa; ifa=ifa->ifa_next) {
+    struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
+    interface_row_t *row;
+    int known = 0;
+    size_t i;
+
+    if(addr && addr->sin_family == AF_INET) {
+      continue;
+    }
+    for(i=0; i<n; i++) {
+      if(!strcmp((*rows)[i].name, ifa->ifa_name)) {
+        known = 1;
+        break;
+      }
+    }
+    if(known) {
+      continue;
+    }
+    row = &(*rows)[n++];
+    snprintf(row->name, sizeof(row->name), "%s", ifa->ifa_name);
+    row->up = (ifa->ifa_flags & IFF_UP) != 0;
+  }
+
+  freeifaddrs(list);
+  *count = n;
+  return 0;
+}
+
+
+static int
+run_ifconfig(int json, int argc, char *const argv[], int outfd, int errfd,
+             int *status) {
+  interface_row_t *rows;
+  size_t count;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+    } else {
+      say(errfd, "bad_argument\n");
+    }
+    *status = 1;
+    return 0;
+  }
+  if(host_interfaces(&rows, &count)) {
+    say(errfd, "not available on this platform\n");
+    *status = 1;
+    return 0;
+  }
+
+  diagnostics_say_interfaces(json, outfd, rows, count);
+  free(rows);
+  *status = 0;
+  return 0;
+}
+
+
 int
 readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
              int *status) {
@@ -445,6 +545,10 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
 
   if(!strcmp(argv[0], "sysinfo")) {
     return run_sysinfo(json, argc, argv, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "ifconfig")) {
+    return run_ifconfig(json, argc, argv, outfd, errfd, status);
   }
 
   if(!strcmp(argv[0], "procstat")) {

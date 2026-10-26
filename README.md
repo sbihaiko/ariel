@@ -62,7 +62,7 @@ The port offers one command per connection, and the set is chosen so that an age
 |---|---|---|
 | Looking around the file system | `ls`, `stat`, `file`, `df`, `du`, `find`, `cat`, `head`, `tail`, `wc`, `grep`, `cmp`, `hexdump` | no |
 | Pulling a binary back | `read`, which answers a byte range with the file's size and SHA-256, and `sha256sum` | no |
-| Reading the machine | `ps`, `procstat`, `dmesg`, `sysinfo`, `date`, `sysctl` for a parameter, `id`, `authid`, `sfoinfo`, `sum`, `sync` | no |
+| Reading the machine | `ps`, `procstat`, `dmesg`, `sysinfo`, `ifconfig`, `date`, `sysctl` for a parameter, `id`, `authid`, `sfoinfo`, `sum`, `sync` | no |
 | Changing files | `mkdir`, `rmdir`, `touch`, `ln`, `cp`, `mv`, `rm`, `chmod`, `chown`, `chgrp`, `write`, `unzip`, `tar` | yes |
 | Installing and running payloads | `payload push`, `payload commit`, `payload install`, `payload config`, `payload rollback`, `payload run`, `payload list`, `payload logs` | push, commit, install, config and rollback; `run`, `list` and `logs` ask nobody |
 | Keeping a place between connections | `session new`, `session close`, `session list`, the `@<sid>` prefix, `pwd`, `cd`, `export`, `env` | `export` and `env` |
@@ -74,7 +74,7 @@ The port offers one command per connection, and the set is chosen so that an age
 | Running an addon | `addon list`, `addon check`, `addon run` | `run` |
 | The console's own built-ins | `hbldr`, `hbdbg`, `launch`, `pkg_install`, `suspend`, `notify`, `reptyr`, `sfocreate` | yes |
 
-`authid` and `sfoinfo` are the two PS5 commands that read only, and `sfocreate` joined the gated set in Stage 3 ([#49](https://github.com/sbihaiko/ariel/issues/49)). `ifconfig` and `ping` are not on the port yet: their probes passed and their tickets are open ([Stage 6](#stage-6-optional-network-sight)). `netstat` is not built at all, because this firmware exposes no socket table. `diff` and `timeout` are deliberately absent: what covers each is in [What is missing](#commands-deliberately-not-built).
+`authid` and `sfoinfo` are the two PS5 commands that read only, and `sfocreate` joined the gated set in Stage 3 ([#49](https://github.com/sbihaiko/ariel/issues/49)). `ifconfig` is on the port: its probe passed on 11.20 and it reads the console's interface list. `ping` is not on the port yet: its probe passed and its ticket is open ([Stage 6](#stage-6-optional-network-sight)). `netstat` is not built at all, because this firmware exposes no socket table. `diff` and `timeout` are deliberately absent: what covers each is in [What is missing](#commands-deliberately-not-built).
 
 ### Safety model
 
@@ -90,7 +90,7 @@ The telnet shell is outside the gate. Approvals cover the agent port; the telnet
 
 ### Stage 6 (optional): network sight
 
-The spec is [#111](https://github.com/sbihaiko/ariel/issues/111), which replaces [#94](https://github.com/sbihaiko/ariel/issues/94), a spec for `netstat` alone under the number 7 the stage carried then, whose spike never ran. The spike ran on 2026-10-25 on the CFI-2014 at firmware 11.20 and answered two of its three questions: the interface list and the loopback echo read, so `ifconfig` and `ping` are being built; the socket tables do not exist under the FreeBSD names, so `netstat` closes unbuilt ([#117](https://github.com/sbihaiko/ariel/issues/117), [console findings](docs/console-findings.md#network-spike-the-three-probes-on-firmware-1120)).
+The spec is [#111](https://github.com/sbihaiko/ariel/issues/111), which replaces [#94](https://github.com/sbihaiko/ariel/issues/94), a spec for `netstat` alone under the number 7 the stage carried then, whose spike never ran. The spike ran on 2026-10-25 on the CFI-2014 at firmware 11.20 and answered two of its three questions: the interface list and the loopback echo read, so `ifconfig` is built and `ping` is being built; the socket tables do not exist under the FreeBSD names, so `netstat` closes unbuilt ([#117](https://github.com/sbihaiko/ariel/issues/117), [console findings](docs/console-findings.md#network-spike-the-three-probes-on-firmware-1120)).
 
 No current command says which ports the console listens on or which peers it is connected to: the only way to learn whether a payload is serving is to try to connect, where a refusal and a slow accept read the same. The address the agent connected to says nothing about a second interface or one that is down, and a failed download cannot separate an address that never answered from one that refused. The console answers ping while asleep and running no payload ([#71](https://github.com/sbihaiko/ariel/issues/71)), so a reply says the network stack is alive, never that a payload is.
 
@@ -106,7 +106,7 @@ Not started. The plan is to expose the same capabilities as an [MCP](https://mod
 
 ### Commands deliberately not built
 
-Two commands were planned and dropped because another mechanism already covers each: `diff`, which `cmp` (same-or-differ with the first differing offset) and `hexdump` cover, a finer comparison being the agent's own work on its own machine; and `timeout`, which the 60 s connection deadline covers with `timed_out`, and a health check with the bound `payload config` gives it. `netstat` is missing for a third reason: the console's kernel does not expose the socket tables under the names a payload can reach, so no command can list them ([Stage 6](#stage-6-optional-network-sight), [console findings](docs/console-findings.md#network-spike-the-three-probes-on-firmware-1120)). `ifconfig` and `ping` are not in this list because their probes passed and they are being built.
+Two commands were planned and dropped because another mechanism already covers each: `diff`, which `cmp` (same-or-differ with the first differing offset) and `hexdump` cover, a finer comparison being the agent's own work on its own machine; and `timeout`, which the 60 s connection deadline covers with `timed_out`, and a health check with the bound `payload config` gives it. `netstat` is missing for a third reason: the console's kernel does not expose the socket tables under the names a payload can reach, so no command can list them ([Stage 6](#stage-6-optional-network-sight), [console findings](docs/console-findings.md#network-spike-the-three-probes-on-firmware-1120)). `ifconfig` and `ping` are not in this list because their probes passed: `ifconfig` is built, and `ping` is being built.
 
 ### Standing limits
 

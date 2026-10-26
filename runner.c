@@ -81,6 +81,7 @@ static const struct {
   {"help", "list the commands"},
   {"hexdump", "print an absolute file in hex"},
   {"id", "print the user and group ids"},
+  {"ifconfig", "print the interfaces with their state, IPv4 address and mask"},
   {"ls", "list the entries of an absolute directory"},
   {"procstat", "print one process by pid"},
   {"ps", "list the processes"},
@@ -2398,7 +2399,8 @@ table_command(const char *name) {
 
 static int
 json_command(const char *name) {
-  return !strcmp(name, "ps") || !strcmp(name, "sysinfo") || table_command(name);
+  return !strcmp(name, "ps") || !strcmp(name, "sysinfo") ||
+         !strcmp(name, "ifconfig") || table_command(name);
 }
 
 
@@ -2496,7 +2498,8 @@ run_json(int argc, char *const argv[], int outfd, int errfd, int *status) {
     free(plain);
     return refuse_option(errfd, status);
   }
-  if(!strcmp(argv[0], "ps") || !strcmp(argv[0], "sysinfo")) {
+  if(!strcmp(argv[0], "ps") || !strcmp(argv[0], "sysinfo") ||
+     !strcmp(argv[0], "ifconfig")) {
     rc = readers_run(1, count, plain, outfd, errfd, status);
   } else {
     *status = run_table(1, count, plain, outfd, errfd);

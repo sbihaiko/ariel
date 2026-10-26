@@ -19,6 +19,27 @@ along with this program; see the file COPYING. If not, see
 
 #include <stddef.h>
 
+/* IFNAMSIZ, spelled out because the host build's POSIX level hides it. */
+#define INTERFACE_NAME_SIZE 16
+
+/** One interface address, or an interface with no IPv4 address. **/
+typedef struct {
+  char name[INTERFACE_NAME_SIZE];
+  int up;
+  int has_address;
+  unsigned char address[4];
+  unsigned char mask[4];
+} interface_row_t;
+
+/**
+ * Write the ifconfig answer: one line per row, or one JSON object per row,
+ * sorted by name and then by address, under the output cap. A row with no
+ * address writes `-` for the address and the mask. The rows are sorted in
+ * place.
+ **/
+void diagnostics_say_interfaces(int json, int fd, interface_row_t *rows,
+                                size_t count);
+
 /**
  * Write the sysinfo answer: three lines, or one JSON object with the same
  * facts. The platform reads its own uname, uptime and memory figures; the

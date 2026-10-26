@@ -3813,6 +3813,79 @@ def scenario_sysinfo_aggregates_the_machine(server):
         "sysinfo takes no option but --json")
 
 
+IFCONFIG_LINE = re.compile(
+    r"^(\S+) (up|down) "
+    r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|-) "
+    r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|-)$")
+IFCONFIG_KEYS = {"name", "state", "address", "mask"}
+
+
+def scenario_ifconfig_lists_each_address(server):
+    """ifconfig answers one line per interface address, sorted by name, with - for no IPv4."""
+    lines = run_command(server, "ifconfig")
+    assert lines[-1] == "exit 0", "ifconfig must exit 0, got %r" % lines
+    rows = lines[:-1]
+    assert rows, "ifconfig must list at least one interface"
+    names = []
+    for row in rows:
+        match = IFCONFIG_LINE.match(row)
+        assert match, "ifconfig must answer <name> <state> <address> <mask>, got %r" % row
+        name, _state, address, mask = match.groups()
+        assert (address == "-") == (mask == "-"), (
+            "an interface has an address and a mask, or neither, got %r" % row)
+        names.append(name)
+    assert names == sorted(names), (
+        "ifconfig must list interfaces in byte order by name, got %r" % names)
+
+
+def scenario_ifconfig_json_is_one_object_per_line(server):
+    """ifconfig --json answers one object per address with the four keys, saying what the lines say."""
+    plain = run_command(server, "ifconfig")[:-1]
+    raw = run_command_raw(server, "ifconfig --json")
+    assert raw.endswith("exit 0\n"), (
+        "a JSON answer ends with the exit line, got %r" % raw[-40:])
+    objects = [json.loads(line) for line in raw[:-len("exit 0\n")].splitlines()]
+    for info in objects:
+        assert set(info) == IFCONFIG_KEYS, (
+            "the ifconfig JSON keys are stable, got %r" % sorted(info))
+        assert info["state"] in ("up", "down"), (
+            "the JSON state is up or down, got %r" % info["state"])
+    assert [" ".join((o["name"], o["state"], o["address"], o["mask"]))
+            for o in objects] == plain, (
+        "ifconfig --json must answer the plain lines, object for line")
+    assert len(raw.encode("ascii")) <= CAP_BYTES, "an answer holds at most 64 KiB"
+
+
+def scenario_ifconfig_refuses_what_it_does_not_take(server):
+    """ifconfig takes no option but --json, and no operand."""
+    for command in ("ifconfig -a", "ifconfig --limit 2", "ifconfig -a --json",
+                    "ifconfig --json=yaml"):
+        assert run_command(server, command) == ["bad_option", "exit 1"], (
+            "%r must answer bad_option and nothing else" % command)
+    assert run_command(server, "ifconfig eth0") == ["bad_argument", "exit 1"], (
+        "ifconfig takes no operand")
+
+
+def scenario_ifconfig_shows_the_loopback(server):
+    """The host's loopback address is answered as an up interface on every host."""
+    lines = run_command(server, "ifconfig")
+    loopback = [line for line in lines[:-1] if line.split(" ")[2:3] == ["127.0.0.1"]]
+    assert loopback and loopback[0].split(" ")[1] == "up", (
+        "ifconfig must answer 127.0.0.1 on an up interface, got %r" % lines)
+
+
+def scenario_ifconfig_keys_are_documented(server):
+    """docs/json-output.md has an ifconfig section that names its four keys."""
+    del server
+    with open(os.path.join(repo_dir(), "docs", "json-output.md")) as handle:
+        doc = handle.read()
+    assert "## `ifconfig`" in doc, "docs/json-output.md must have an ifconfig section"
+    section = doc.split("## `ifconfig`", 1)[1].split("\n## ", 1)[0]
+    for name in sorted(IFCONFIG_KEYS):
+        assert "| `%s` |" % name in section, (
+            "the ifconfig section must document the %s key" % name)
+
+
 def scenario_wrong_token(server):
     wrong = "0" * 32 if server.token != "0" * 32 else "1" * 32
     sock = server.connect()
@@ -4218,8 +4291,8 @@ def scenario_no_system_change_on_agent_port(server):
 
 
 INSPECTION_COMMANDS = (
-    "authid", "echo", "help", "id", "procstat", "ps", "sfoinfo", "sleep",
-    "sum", "sync", "sysctl",
+    "authid", "echo", "help", "id", "ifconfig", "procstat", "ps", "sfoinfo",
+    "sleep", "sum", "sync", "sysctl",
 )
 
 # The kernel parameter each host reads for its operating system, and its value.
@@ -10312,6 +10385,16 @@ SCENARIOS = [
      "success", scenario_dmesg_names_the_platform_refusal, HOST_MACHINE_REASON),
     ("sysinfo aggregates uname, uptime and memory, plainly and as JSON",
      scenario_sysinfo_aggregates_the_machine, HOST_MACHINE_REASON),
+    ("ifconfig answers one line per interface address, sorted by name",
+     scenario_ifconfig_lists_each_address, None),
+    ("ifconfig --json answers one object per address with the four keys",
+     scenario_ifconfig_json_is_one_object_per_line, None),
+    ("ifconfig refuses an option other than --json and an operand",
+     scenario_ifconfig_refuses_what_it_does_not_take, None),
+    ("ifconfig answers the loopback address as an up interface",
+     scenario_ifconfig_shows_the_loopback, HOST_MACHINE_REASON),
+    ("the ifconfig JSON keys are documented in json-output.md",
+     scenario_ifconfig_keys_are_documented, None),
     ("wrong token closes with exit 70", scenario_wrong_token, None),
     ("right token and a Stage 1 command outside the set answers "
      "unknown_command", scenario_unknown_command, None),
@@ -10976,6 +11059,7 @@ HOST_MACHINE_SCENARIOS = {
     "the host build's dmesg names the platform refusal instead of an empty "
     "success",
     "sysinfo aggregates uname, uptime and memory, plainly and as JSON",
+    "ifconfig answers the loopback address as an up interface",
 }
 
 

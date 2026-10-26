@@ -16,9 +16,14 @@ along with this program; see the file COPYING. If not, see
 
 #include <ctype.h>
 #include <errno.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <net/route.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -337,6 +342,237 @@ ps5_memory(unsigned long long *total, unsigned long long *free_bytes) {
 }
 
 
+struct ps5_iface {
+  unsigned index;
+  int addressed;
+  interface_row_t row;
+};
+
+
+/* The sockaddrs that follow a routing header, one per RTAX bit, in bit order.
+   Returns -1 when they run past end. */
+static int
+iflist_addrs(unsigned char *at, unsigned char *end, int addrs,
+             struct sockaddr *out[RTAX_MAX]) {
+  int bit;
+
+  for(bit=0; bit<RTAX_MAX; bit++) {
+    out[bit] = NULL;
+    if(!(addrs & (1 << bit))) {
+      continue;
+    }
+    if(end - at < 2) {
+      return -1;
+    }
+    out[bit] = (struct sockaddr *)at;
+    if(SA_SIZE(at) > (size_t)(end - at)) {
+      return -1;
+    }
+    at += SA_SIZE(at);
+  }
+  return 0;
+}
+
+
+static int
+iflist_name(const struct sockaddr *sa, char *name) {
+  const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)sa;
+
+  if(!sdl->sdl_nlen || sdl->sdl_nlen >= INTERFACE_NAME_SIZE ||
+     offsetof(struct sockaddr_dl, sdl_data) + sdl->sdl_nlen >
+     (size_t)sdl->sdl_len) {
+    return -1;
+  }
+  memcpy(name, sdl->sdl_data, sdl->sdl_nlen);
+  name[sdl->sdl_nlen] = '\0';
+  return 0;
+}
+
+
+static int
+iflist_ipv4(const struct sockaddr *sa, unsigned char *out) {
+  if(sa->sa_family != AF_INET || sa->sa_len < 8) {
+    return -1;
+  }
+  memcpy(out, (const unsigned char *)sa + 4, 4);
+  return 0;
+}
+
+
+/* A mask is written with its trailing zero bytes left out, so the bytes the
+   sockaddr does not reach are zero. */
+static void
+iflist_mask(const struct sockaddr *sa, unsigned char *out) {
+  size_t i;
+
+  memset(out, 0, 4);
+  if(!sa) {
+    return;
+  }
+  for(i=0; i<4; i++) {
+    if(4 + i < (size_t)sa->sa_len) {
+      out[i] = ((const unsigned char *)sa)[4 + i];
+    }
+  }
+}
+
+
+static int
+iflist_next(unsigned char *at, unsigned char *end, size_t *len) {
+  const struct ifa_msghdr *hdr = (const struct ifa_msghdr *)at;
+
+  if((size_t)(end - at) < sizeof(*hdr)) {
+    return -1;
+  }
+  *len = hdr->ifam_msglen;
+  if(*len < sizeof(*hdr) || *len > (size_t)(end - at)) {
+    return -1;
+  }
+  return 0;
+}
+
+
+/* The interfaces and their IPv4 addresses, from the routing socket's interface
+   list: an interface message, then one message per address. An interface with
+   no IPv4 address gets one row with no address. */
+static int
+ps5_interfaces(interface_row_t **rows, size_t *count) {
+  int mib[6] = {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST, 0};
+  struct ps5_iface *slots = NULL;
+  unsigned char *buf = NULL;
+  unsigned char *end;
+  unsigned char *at;
+  size_t size = 0;
+  size_t cap;
+  size_t nslots = 0;
+  size_t n = 0;
+  size_t len = 0;
+  size_t i;
+  int rc = -1;
+
+  *rows = NULL;
+  if(sysctl(mib, 6, NULL, &size, NULL, 0)) {
+    return -1;
+  }
+  cap = size / sizeof(struct ifa_msghdr) + 1;
+  buf = malloc(size ? size : 1);
+  slots = calloc(cap, sizeof(*slots));
+  *rows = calloc(cap, sizeof(**rows));
+  if(!buf || !slots || !*rows || sysctl(mib, 6, buf, &size, NULL, 0)) {
+    goto out;
+  }
+
+  end = buf + size;
+  for(at=buf; at<end; at+=len) {
+    struct sockaddr *sa[RTAX_MAX];
+    const struct if_msghdr *ifm;
+    struct ps5_iface *slot;
+
+    if(iflist_next(at, end, &len)) {
+      goto out;
+    }
+    ifm = (const struct if_msghdr *)at;
+    if(ifm->ifm_type != RTM_IFINFO) {
+      continue;
+    }
+    if(len < sizeof(*ifm) || nslots == cap ||
+       iflist_addrs(at + sizeof(*ifm), at + len, ifm->ifm_addrs, sa) ||
+       !sa[RTAX_IFP]) {
+      goto out;
+    }
+    slot = &slots[nslots++];
+    slot->index = ifm->ifm_index;
+    slot->row.up = (ifm->ifm_flags & IFF_UP) != 0;
+    if(iflist_name(sa[RTAX_IFP], slot->row.name)) {
+      goto out;
+    }
+  }
+
+  for(at=buf; at<end; at+=len) {
+    struct sockaddr *sa[RTAX_MAX];
+    const struct ifa_msghdr *ifam;
+    unsigned char ip[4];
+    struct ps5_iface *slot = NULL;
+    size_t k;
+
+    if(iflist_next(at, end, &len)) {
+      goto out;
+    }
+    ifam = (const struct ifa_msghdr *)at;
+    if(ifam->ifam_type != RTM_NEWADDR) {
+      continue;
+    }
+    if(iflist_addrs(at + sizeof(*ifam), at + len, ifam->ifam_addrs, sa)) {
+      goto out;
+    }
+    if(!sa[RTAX_IFA] || iflist_ipv4(sa[RTAX_IFA], ip)) {
+      continue;
+    }
+    for(k=0; k<nslots; k++) {
+      if(slots[k].index == ifam->ifam_index) {
+        slot = &slots[k];
+        break;
+      }
+    }
+    if(!slot) {
+      continue;
+    }
+    (*rows)[n] = slot->row;
+    (*rows)[n].has_address = 1;
+    memcpy((*rows)[n].address, ip, sizeof(ip));
+    iflist_mask(sa[RTAX_NETMASK], (*rows)[n].mask);
+    slot->addressed = 1;
+    n++;
+  }
+
+  for(i=0; i<nslots; i++) {
+    if(!slots[i].addressed) {
+      (*rows)[n++] = slots[i].row;
+    }
+  }
+
+  *count = n;
+  rc = 0;
+
+out:
+  free(buf);
+  free(slots);
+  if(rc) {
+    free(*rows);
+    *rows = NULL;
+  }
+  return rc;
+}
+
+
+static int
+run_ifconfig(int json, int argc, char *const argv[], int outfd, int errfd,
+             int *status) {
+  interface_row_t *rows;
+  size_t count;
+
+  if(argc > 1) {
+    if(argv[1][0] == '-') {
+      say(errfd, "bad_option\n");
+    } else {
+      say(errfd, "bad_argument\n");
+    }
+    *status = 1;
+    return 0;
+  }
+  if(ps5_interfaces(&rows, &count)) {
+    say(errfd, "not available on this platform\n");
+    *status = 1;
+    return 0;
+  }
+
+  diagnostics_say_interfaces(json, outfd, rows, count);
+  free(rows);
+  *status = 0;
+  return 0;
+}
+
+
 /* The kernel log. The console keeps it in kern.msgbuf; when the kernel does
    not expose it, the refusal is named rather than answered as empty. */
 static int
@@ -455,6 +691,10 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
 
   if(!strcmp(argv[0], "sysinfo")) {
     return run_sysinfo(json, argc, argv, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "ifconfig")) {
+    return run_ifconfig(json, argc, argv, outfd, errfd, status);
   }
 
   if(!strcmp(argv[0], "procstat")) {

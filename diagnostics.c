@@ -17,6 +17,7 @@ along with this program; see the file COPYING. If not, see
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -83,6 +84,66 @@ diagnostics_say_sysinfo(int json, int fd, const char *sysname,
   say(fd, line);
   snprintf(line, sizeof(line), "memory %llu %llu\n", memory_total, memory_free);
   say(fd, line);
+}
+
+
+static int
+interface_order(const void *a, const void *b) {
+  const interface_row_t *x = a;
+  const interface_row_t *y = b;
+  int order = strcmp(x->name, y->name);
+
+  if(order) {
+    return order;
+  }
+  if(x->has_address != y->has_address) {
+    return x->has_address < y->has_address ? -1 : 1;
+  }
+  return memcmp(x->address, y->address, sizeof(x->address));
+}
+
+
+static void
+format_address(char *out, size_t cap, const unsigned char *bytes, int present) {
+  if(!present) {
+    snprintf(out, cap, "-");
+    return;
+  }
+  snprintf(out, cap, "%u.%u.%u.%u", bytes[0], bytes[1], bytes[2], bytes[3]);
+}
+
+
+void
+diagnostics_say_interfaces(int json, int fd, interface_row_t *rows,
+                           size_t count) {
+  answer_t answer;
+  char address[16];
+  char mask[16];
+  char quoted[128];
+  char line[256];
+  size_t i;
+
+  qsort(rows, count, sizeof(*rows), interface_order);
+  answer_init(&answer, fd, SIZE_MAX);
+  for(i=0; i<count; i++) {
+    const interface_row_t *row = &rows[i];
+    const char *state = row->up ? "up" : "down";
+
+    format_address(address, sizeof(address), row->address, row->has_address);
+    format_address(mask, sizeof(mask), row->mask, row->has_address);
+    if(json) {
+      size_t quoted_len = json_format_string(quoted, sizeof(quoted), row->name);
+
+      snprintf(line, sizeof(line),
+               "{\"name\":%.*s,\"state\":\"%s\",\"address\":\"%s\",\"mask\":\"%s\"}",
+               (int)quoted_len, quoted, state, address, mask);
+    } else {
+      snprintf(line, sizeof(line), "%s %s %s %s", row->name, state, address,
+               mask);
+    }
+    answer_line(&answer, line, strlen(line));
+  }
+  answer_done(&answer);
 }
 
 

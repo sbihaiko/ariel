@@ -1,6 +1,6 @@
 # JSON output of the table commands
 
-`ps`, `ls`, `stat`, `df`, `find` and `sysinfo` take `--json`, which answers one JSON object per line in place of the aligned text. The answer ends with the `exit <n>` line, as every answer does (ADR-0012, decision 8). `--json` may stand anywhere after the command name. `ls` and `find` also take `--limit N` before their operands, in either order with `--json`, and answer the same objects bounded by N. Any other option (a word that starts with `-`), an operand `ps` does not take, or `--json` with a command that has no JSON form answers `bad_option` (exit 1) and nothing else. A command without `--json` prints what it always printed.
+`ps`, `ls`, `stat`, `df`, `find`, `sysinfo` and `ifconfig` take `--json`, which answers one JSON object per line in place of the aligned text. The answer ends with the `exit <n>` line, as every answer does (ADR-0012, decision 8). `--json` may stand anywhere after the command name. `ls` and `find` also take `--limit N` before their operands, in either order with `--json`, and answer the same objects bounded by N. Any other option (a word that starts with `-`), an operand `ps` does not take, or `--json` with a command that has no JSON form answers `bad_option` (exit 1) and nothing else. A command without `--json` prints what it always printed.
 
 `sysinfo` answers exactly one object, not one per fact: its three plain lines are one machine, so they are one row. An operand it does not take answers `bad_argument` (exit 1), and an option other than `--json` answers `bad_option` (exit 1).
 
@@ -78,6 +78,17 @@ One object for the machine. The plain answer's three lines, `uname`, `uptime` an
 | `uptime_seconds` | number | Whole seconds since the machine booted. |
 | `memory_total_bytes` | number | The machine's total memory in bytes. |
 | `memory_free_bytes` | number | The memory free at the moment of the answer, in bytes. |
+
+## `ifconfig`
+
+One object per interface address, in the order of the plain lines: sorted by name in byte order. An interface with no IPv4 address has one object with `-` for the address and the mask.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | The interface name, as the system gives it. |
+| `state` | string | `up` or `down`: the administrative state of the interface. |
+| `address` | string | The IPv4 address in dotted form, or `-` when the interface has none. |
+| `mask` | string | The IPv4 netmask in dotted form, or `-` when the interface has none. |
 
 ## Host build
 
