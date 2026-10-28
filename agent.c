@@ -166,15 +166,6 @@ static const char shots_done[] =
 static const char shots_failed[] =
   "shots_failed\n"
   "exit 1\n";
-/** pkg_install's answer is the app directory the title's parameter file
-    names, not the install call's return. **/
-static const char installed[] =
-  "installed\n"
-  "exit 0\n";
-static const char install_incomplete[] =
-  "install_incomplete\n"
-  "exit 1\n";
-
 /** The answer to an approval that could not be requested: a frozen console says so. **/
 static const char *
 approval_refused(void) {
@@ -5253,30 +5244,75 @@ out:
 #define PKG_INSTALL_WAIT_MS 45000L
 
 
+/** An install that did not finish names the title and the part missing. **/
+static void
+pkg_install_incomplete(int fd, const char *title, const char *part) {
+  char answer[256];
+  int len = snprintf(answer, sizeof(answer),
+                     "install_incomplete %s %s\nexit 1\n", title, part);
+
+  if(len > 0) {
+    write_all(fd, answer, (size_t)len);
+  }
+}
+
+
 /**
- * pkg_install answered by the app directory the title's own parameter file
- * names. The install call returns once the request is accepted, not once
- * the app is there, so its return is a failure signal only. The owner signed
- * the operand as it was written; the payload is given the local path a
- * file URI names.
+ * pkg_install's ending, after the owner's grant. The install call returns once
+ * the request is accepted, not once the app is there, so the title's app
+ * directory is waited for, then its parts are checked. A finished install
+ * names the title, the bytes and the SHA-256 of the package it installed. The
+ * owner signed the operand as it was written; the payload is given the local
+ * path a file URI names.
  **/
 static void
 pkg_install_command(agent_t *agent, int fd, int argc, char *argv[],
                     approval_facts_t *facts, const char *path) {
   char title[FILEOPS_TITLE_MAX + 1];
-  int complete = 0;
+  char hex[SHA256_HEX_LEN + 1];
+  char answer[256];
+  const char *part = "package";
+  uint64_t bytes = 0;
   int status;
+  int len;
+  int named;
 
   argv[1] = (char *)path;
   if(!builtin_run_status(agent, fd, argc, argv, 2, facts, &status)) {
     return;
   }
 
-  if(status == 0 && !fileops_title_id(path, title, sizeof(title))) {
-    complete = agent->platform->install_result(agent->platform, title,
-                                               PKG_INSTALL_WAIT_MS) == 1;
+  named = !fileops_title_id(path, title, sizeof(title));
+  if(!named) {
+    snprintf(title, sizeof(title), "-");
   }
-  reply(fd, complete ? installed : install_incomplete);
+  if(status != 0 || !named ||
+     agent->platform->install_result(agent->platform, title,
+                                     PKG_INSTALL_WAIT_MS) != 1) {
+    pkg_install_incomplete(fd, title, "package");
+    return;
+  }
+  if(runner_title_missing(agent->platform->fs_root, title, &part)) {
+    pkg_install_incomplete(fd, title, part);
+    return;
+  }
+
+  switch(runner_package_fact(path, &bytes, hex)) {
+  case 0:
+    len = snprintf(answer, sizeof(answer), "installed %s %llu %s\nexit 0\n",
+                   title, (unsigned long long)bytes, hex);
+    break;
+  case 2:
+    len = snprintf(answer, sizeof(answer), "too_large_to_verify %s\nexit 1\n",
+                   title);
+    break;
+  default:
+    pkg_install_incomplete(fd, title, "package");
+    return;
+  }
+  if(len > 0) {
+    write_all(fd, answer, (size_t)len);
+  }
 }
 
 

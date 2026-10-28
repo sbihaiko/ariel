@@ -371,6 +371,32 @@ def check_file_command_runs_after_approval(session, context):
         "rmdir must remove the directory")
 
 
+PKG_PROBE = b"not a package\n"
+
+
+def check_pkg_install_names_the_missing_part(session, context):
+    """A signed pkg_install of a file that is not a package names its title and part."""
+    del context
+    title = "GATE" + os.urandom(4).hex().upper()
+    path = "/data/%s-probe.pkg" % title
+    command = "write %s %d %s" % (
+        path, len(PKG_PROBE), hashlib.sha256(PKG_PROBE).hexdigest())
+    try:
+        run_gated_file_command(session, command, body=PKG_PROBE)
+        assert session.link.exchange(command, body=PKG_PROBE) == ["exit 0"], (
+            "a signed write of the probe must run")
+        install = "pkg_install " + path
+        run_gated_file_command(session, install)
+        lines = session.link.exchange(install)
+        assert lines == ["install_incomplete %s package" % title, "exit 1"], (
+            "an install that did not complete must name its title and the "
+            "missing part and exit 1, got %r" % lines)
+        assert session.link.exchange("stat " + path)[-1:] == ["exit 0"], (
+            "a refused install must leave its source package in place")
+    finally:
+        remove_throwaway(session, path)
+
+
 def listing(session, path):
     lines = session.link.exchange("ls " + path)
     assert lines and lines[-1] == "exit 0", (
@@ -1077,6 +1103,9 @@ CHECKS = [
      "without asking", check_tar_refusals_without_asking),
     ("mkdir and rmdir run only after the owner signs, once each, on the console",
      check_file_command_runs_after_approval),
+    ("a signed pkg_install of a file that is not a package names its title and "
+     "the missing part, exit 1, and leaves the file in place",
+     check_pkg_install_names_the_missing_part),
     ("cp -r copies a throwaway tree after the owner signs, the copy lists the "
      "source's entries, rm -r removes the copy, and both paths are removed",
      check_recursive_copy_and_remove),

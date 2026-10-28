@@ -2596,10 +2596,11 @@ sfo_string(const char *path, const char *key, char *value, size_t cap) {
 
 
 static int
-verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1]) {
+verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1], uint64_t *bytes) {
   unsigned char digest[SHA256_DIGEST_LEN];
   char buf[IO_CHUNK];
   sha256_t hash;
+  uint64_t total = 0;
   ssize_t n;
   int err;
   int fd;
@@ -2619,11 +2620,13 @@ verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1]) {
       break;
     }
     sha256_update(&hash, buf, (size_t)n);
+    total += (uint64_t)n;
   }
   close(fd);
 
   sha256_final(&hash, digest);
   sha256_hex(digest, hex);
+  *bytes = total;
   return 0;
 }
 
@@ -2643,6 +2646,7 @@ verify_title_checks(const char *root, const char *app, const verify_args_t *args
   char path[PATH_MAX];
   char hex[SHA256_HEX_LEN + 1];
   struct stat st;
+  uint64_t hashed;
   size_t count = 0;
   size_t i;
   char *line;
@@ -2695,7 +2699,7 @@ verify_title_checks(const char *root, const char *app, const verify_args_t *args
         line = lines[count++];
         if((unsigned long long)st.st_size > VERIFY_CEILING) {
           snprintf(line, OUT_LINE_CAP, "too_large_to_verify app.pkg");
-        } else if((rc=verify_sha256(path, hex))) {
+        } else if((rc=verify_sha256(path, hex, &hashed))) {
           report("verify", path, errfd, rc);
           return 1;
         } else if(strcmp(hex, args->sha256)) {
@@ -2709,6 +2713,72 @@ verify_title_checks(const char *root, const char *app, const verify_args_t *args
 
   *total = count;
   return 0;
+}
+
+
+/** The part of a title that a finding of its checks names. **/
+static const char *
+title_part(const char *finding) {
+  static const struct {
+    const char *kind;
+    const char *part;
+  } parts[] = {
+    {"missing app.", "package"},
+    {"empty app.", "package"},
+    {"missing sce_sys/param.sfo", "sfo"},
+    {"empty sce_sys/param.sfo", "sfo"},
+    {"missing content_id", "sfo"},
+    {"missing appmeta", "appmeta"},
+    {"licence_missing", "licence"},
+    {"licence_mismatch", "licence"},
+  };
+  size_t i;
+
+  for(i=0; i<sizeof(parts)/sizeof(parts[0]); i++) {
+    if(!strncmp(finding, parts[i].kind, strlen(parts[i].kind))) {
+      return parts[i].part;
+    }
+  }
+  return "package";
+}
+
+
+int
+runner_title_missing(const char *root, const char *title, const char **part) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  char app[PATH_MAX];
+  verify_args_t args;
+  size_t count = 0;
+  size_t i;
+
+  memset(&args, 0, sizeof(args));
+  args.title = title;
+  if(snprintf(app, sizeof(app), "%s/user/app/%s", root, title) >= (int)sizeof(app) ||
+     verify_title_checks(root, app, &args, lines, &count, -1)) {
+    *part = "package";
+    return 1;
+  }
+  for(i=0; i<count; i++) {
+    if(!strncmp(lines[i], "finding ", sizeof("finding ") - 1)) {
+      *part = title_part(lines[i] + sizeof("finding ") - 1);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+int
+runner_package_fact(const char *path, uint64_t *bytes, char hex[SHA256_HEX_LEN + 1]) {
+  struct stat st;
+
+  if(lstat(path, &st) || !S_ISREG(st.st_mode)) {
+    return 1;
+  }
+  if((unsigned long long)st.st_size > VERIFY_CEILING) {
+    return 2;
+  }
+  return verify_sha256(path, hex, bytes) ? 1 : 0;
 }
 
 

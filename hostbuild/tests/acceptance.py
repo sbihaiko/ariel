@@ -1468,6 +1468,12 @@ HOST_ROOT_SCENARIOS = {
     "any alias, without asking",
     "pkg_install answers the app directory the title names, so an install "
     "that does not complete never answers exit 0",
+    "pkg_install names the missing part one at a time, and a finished install "
+    "names the title, bytes and SHA-256 of its source",
+    "pkg_install names no hash for a package over the ceiling, and leaves "
+    "the source alone",
+    "pkg_install with a name that carries no title ID answers '-' as the "
+    "title",
     "pkg_install takes a file URI, signs it as written, and does not run "
     "another target on that grant",
 }
@@ -8286,6 +8292,24 @@ def app_dir(server, title=APP_TITLE):
     return os.path.join(server.root, "user", "app", title)
 
 
+PKG_CONTENT_ID = "UP9000-CUSA04730_00-0000000000000001"
+PKG_CEILING = 256 * 1024 * 1024
+
+
+def granted_pkg_install(server, pkg):
+    """Grant one pkg_install of pkg and return its reply lines."""
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % pkg, "pkg_install", pkg)
+    sign_and_grant(server, approval, challenge)
+    return run_command(server, "pkg_install %s" % pkg)
+
+
+def lay_down(path, data=b"part\n"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
 @builtin_scenario
 def scenario_pkg_install_never_answers_zero_without_the_app(server):
     """A command whose install does not complete never answers exit 0.
@@ -8296,24 +8320,110 @@ def scenario_pkg_install_never_answers_zero_without_the_app(server):
     answer and the directory's appearance is the only exit 0.
     """
     pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"pkg\n")
-    approval, challenge = builtin_approval(
-        server, "pkg_install %s" % pkg, "pkg_install", pkg)
-    sign_and_grant(server, approval, challenge)
-    lines = run_command(server, "pkg_install %s" % pkg)
+    lines = granted_pkg_install(server, pkg)
     assert lines[-1] != "exit 0", (
         "an install with no app directory must never answer exit 0, got %r"
         % (lines,))
-    assert lines == ["install_incomplete", "exit 1"], (
-        "an install that did not complete must answer install_incomplete and "
-        "exit 1, got %r" % (lines,))
+    assert lines == ["install_incomplete %s package" % APP_TITLE, "exit 1"], (
+        "an install that did not complete must name the missing part and "
+        "answer exit 1, got %r" % (lines,))
 
-    os.makedirs(app_dir(server))
-    approval, challenge = builtin_approval(
-        server, "pkg_install %s" % pkg, "pkg_install", pkg)
-    sign_and_grant(server, approval, challenge)
-    assert run_command(server, "pkg_install %s" % pkg) == [
-        "installed", "exit 0"], (
-        "the app directory is the fact the install completed")
+
+@builtin_scenario
+def scenario_pkg_install_names_the_missing_part(server):
+    """An install that did not finish names the part missing, one part at a time.
+
+    The parts are the package, the parameter file, the metadata entry and the
+    licence, in the order a title's own checks find them. A finished install
+    ends with the title, the byte count and the SHA-256 of the package it
+    installed, and the source package is still there, unchanged.
+    """
+    data = b"package body\n" * 64
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", data)
+    app = app_dir(server)
+    os.makedirs(app)
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s package" % APP_TITLE, "exit 1"], (
+        "an empty app directory is a missing package")
+
+    for entry in ("app.pkg", "app.pbm", "app.json", "app.xml"):
+        lay_down(os.path.join(app, entry))
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s sfo" % APP_TITLE, "exit 1"], (
+        "a package without its parameter file is missing the parameter file")
+
+    lay_down(os.path.join(app, "sce_sys", "param.sfo"),
+             sfo_string_bytes("CONTENT_ID", PKG_CONTENT_ID))
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s appmeta" % APP_TITLE, "exit 1"], (
+        "a title without its metadata entry is missing the metadata entry")
+
+    lay_down(os.path.join(server.root, "user", "appmeta", APP_TITLE))
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s licence" % APP_TITLE, "exit 1"], (
+        "a title without its licence is missing the licence")
+
+    lay_down(os.path.join(server.root, "user", "license",
+                          "fake%s.rif" % PKG_CONTENT_ID))
+    digest = hashlib.sha256(data).hexdigest()
+    assert granted_pkg_install(server, pkg) == [
+        "installed %s %d %s" % (APP_TITLE, len(data), digest), "exit 0"], (
+        "a finished install must name the title, the bytes and the SHA-256 "
+        "of the package it installed")
+    with open(pkg, "rb") as handle:
+        assert handle.read() == data, (
+            "an install must never change or delete its source package")
+
+
+@builtin_scenario
+def scenario_pkg_install_too_large_to_verify(server):
+    """A package over the hash ceiling is not read, so its install is not named.
+
+    The install's own answer is a fact about the app directory; the hash is
+    the part that cannot be measured inside a connection, so the reply names
+    the ceiling instead of a hash, and the source is left alone.
+    """
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"pkg\n")
+    os.truncate(pkg, PKG_CEILING + 1)
+    app = app_dir(server)
+    for entry in ("app.pkg", "app.pbm", "app.json", "app.xml"):
+        lay_down(os.path.join(app, entry))
+    lay_down(os.path.join(app, "sce_sys", "param.sfo"),
+             sfo_string_bytes("CONTENT_ID", PKG_CONTENT_ID))
+    lay_down(os.path.join(server.root, "user", "appmeta", APP_TITLE))
+    lay_down(os.path.join(server.root, "user", "license",
+                          "fake%s.rif" % PKG_CONTENT_ID))
+    assert granted_pkg_install(server, pkg) == [
+        "too_large_to_verify %s" % APP_TITLE, "exit 1"], (
+        "a package over the hash ceiling must name the ceiling, not a hash")
+    assert os.path.getsize(pkg) == PKG_CEILING + 1, (
+        "an install must never change or delete its source package")
+
+
+@builtin_scenario
+def scenario_pkg_install_without_a_title_names_no_title(server):
+    """A package whose name carries no title ID answers its missing part with no title."""
+    pkg = write_scratch(server, "bad.iso", b"pkg\n")
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete - package", "exit 1"], (
+        "a name with no title ID must answer install_incomplete with '-' as "
+        "the title and the package as the part")
+
+
+def scenario_pkg_install_ending_is_documented(server):
+    """The exit-code registry names the ending's words and the parts it can name."""
+    del server  # the registry is read, not the port
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for text in ("`installed <TITLE> <bytes> <sha256>`",
+                 "`install_incomplete <TITLE> <part>`",
+                 "`too_large_to_verify`",
+                 "`package`", "`licence`", "`appmeta`", "`sfo`"):
+        assert text in registry, (
+            "docs/exit-codes.md must document %s before pkg_install answers it"
+            % text)
+    assert not re.search(r"^\| 94 \|.*install_incomplete", registry, re.M), (
+        "install_incomplete must have one number in the registry, not two")
 
 
 @builtin_scenario
@@ -8325,7 +8435,7 @@ def scenario_pkg_install_file_uri_is_gated_as_written(server):
         server, "pkg_install %s" % uri, "pkg_install", uri)
     sign_and_grant(server, approval, challenge)
     assert run_command(server, "pkg_install %s" % uri) == [
-        "install_incomplete", "exit 1"], (
+        "install_incomplete %s package" % APP_TITLE_URI, "exit 1"], (
         "the URI must reach the payload and answer its measured fact")
 
     # The grant named the URI, so the bare path it reduces to is another
@@ -11054,6 +11164,17 @@ SCENARIOS = [
     ("pkg_install answers the app directory the title names, so an install "
      "that does not complete never answers exit 0",
      scenario_pkg_install_never_answers_zero_without_the_app, HOST_ROOT_REASON),
+    ("pkg_install names the missing part one at a time, and a finished install "
+     "names the title, bytes and SHA-256 of its source",
+     scenario_pkg_install_names_the_missing_part, HOST_ROOT_REASON),
+    ("pkg_install names no hash for a package over the ceiling, and leaves "
+     "the source alone",
+     scenario_pkg_install_too_large_to_verify, HOST_ROOT_REASON),
+    ("pkg_install with a name that carries no title ID answers '-' as the "
+     "title", scenario_pkg_install_without_a_title_names_no_title,
+     HOST_ROOT_REASON),
+    ("pkg_install's ending and its parts are documented in exit-codes.md",
+     scenario_pkg_install_ending_is_documented, None),
     ("pkg_install takes a file URI, signs it as written, and does not run "
      "another target on that grant",
      scenario_pkg_install_file_uri_is_gated_as_written, HOST_ROOT_REASON),
