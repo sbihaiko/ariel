@@ -15338,8 +15338,12 @@ def scenario_trace_answers_the_fixed_field_set_in_order(server):
             "the licence must be answered, got %r" % lines)
         assert "running 0" in lines, "no payload runs, got %r" % lines
         mounts = [line for line in lines if line.startswith("mount ")]
-        assert "mounts %d" % len(mounts) in lines, (
-            "the mount count must match the mounts listed, got %r" % lines)
+        counts = [line for line in lines if line.startswith("mounts ")]
+        assert len(counts) == 1 and len(mounts) <= TRACE_LIST_MAX, (
+            "the mounts must be one count line with at most %d entries, got %r"
+            % (TRACE_LIST_MAX, lines))
+        assert int(counts[0].split(" ")[1]) >= len(mounts), (
+            "the count gives the total, so it cannot be under the list, got %r" % lines)
         free = [line for line in lines if line.startswith("free ")]
         assert len(free) == 1 and int(free[0].split(" ")[1]) > 0, (
             "free space must be a positive byte count, got %r" % free)
@@ -15561,12 +15565,18 @@ def scenario_trace_diff_answers_trace_unchanged_when_nothing_moved(server):
         make_verify_title(fresh, "CUSA91011")
         assert run_command(fresh, "trace basis")[-1] == "exit 0"
         before = trace_record_bytes(fresh, "basis")
+        lines = run_command(fresh, "trace --diff basis")
         # A busy Linux host can mount or unmount something between two
-        # snapshots; that is the host's change, not the one under test.
-        lines = [line for line in run_command(fresh, "trace --diff basis")
-                 if not line.startswith("mount ")]
-        assert lines == ["trace_unchanged", "exit 0"], (
-            "a delta with nothing changed must answer the single word, got %r" % lines)
+        # snapshots, and the spec has a delta name a changed mount. What
+        # this holds to, quiet host or not: nothing but the host's own
+        # mounts may move, and the count is the lines it answered.
+        moved = [line for line in lines if not line.startswith("mount ")]
+        if lines[0] == "trace_unchanged":
+            assert lines == ["trace_unchanged", "exit 0"], (
+                "a delta with nothing changed must answer the single word, got %r" % lines)
+        else:
+            assert moved == ["changed %d" % (len(lines) - 2), "exit 0"], (
+                "only the host's mounts may move on a quiet tree, got %r" % lines)
         assert trace_record_bytes(fresh, "basis") == before, (
             "trace --diff must not rewrite the record it compares")
     finally:

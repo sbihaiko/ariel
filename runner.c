@@ -3058,7 +3058,6 @@ run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd)
 #define TRACE_KEEP 8
 #define TRACE_LIST_MAX 16
 #define TRACE_NAME_MAX 32
-#define TRACE_MOUNTS_MAX 64
 #define TRACE_FIELD_RAW 256
 #define TRACE_FIELD_OUT 128
 #define TRACE_LINE_CAP 512
@@ -3080,9 +3079,10 @@ struct trace_names {
 };
 
 struct trace_mounts {
+  size_t total;
   size_t count;
-  char targets[TRACE_MOUNTS_MAX][TRACE_FIELD_RAW];
-  char sources[TRACE_MOUNTS_MAX][TRACE_FIELD_RAW];
+  char targets[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+  char sources[TRACE_LIST_MAX][TRACE_FIELD_RAW];
 };
 
 struct trace_scan {
@@ -3241,7 +3241,8 @@ static void
 trace_mount_add(void *ctx, const char *target, const char *source) {
   struct trace_mounts *mounts = ctx;
 
-  if(mounts->count < TRACE_MOUNTS_MAX) {
+  mounts->total++;
+  if(mounts->count < TRACE_LIST_MAX) {
     trace_copy(mounts->targets[mounts->count], TRACE_FIELD_RAW, target);
     trace_copy(mounts->sources[mounts->count], TRACE_FIELD_RAW, source);
     mounts->count++;
@@ -3323,7 +3324,7 @@ trace_build(const char *root, struct trace_scan *scan, struct trace_record *reco
            (unsigned long long)vfs.f_bavail * vfs.f_frsize);
   trace_put(record, line);
 
-  snprintf(line, sizeof(line), "mounts %zu\n", scan->mounts.count);
+  snprintf(line, sizeof(line), "mounts %zu\n", scan->mounts.total);
   trace_put(record, line);
   for(i=0; i<scan->mounts.count; i++) {
     trace_escape(first, scan->mounts.targets[i]);
