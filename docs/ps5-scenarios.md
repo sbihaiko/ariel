@@ -49,6 +49,7 @@ depend on the answer.
 ### S0 — stock, heavy writes
 
 **Changes:** none. No jailbreak, no payloads, network blocked from PSN.
+**DNS:** primary `62.210.39.117` (secondary `62.210.38.117`), set in the console's network settings before the boot.
 **Load:** copy 20 GB from the pendrive to the internal drive and back.
 **Duration:** 48 hours of normal use after the copy.
 **Pass:** no hang, no Safe Mode, no lost files.
