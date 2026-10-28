@@ -238,9 +238,21 @@ ShadowMountPlus in `autoload.txt`**, completed with no hang. ShadowMountPlus was
 then loaded by hand, on a running system, and started cleanly: it found nothing to
 mount, registered no title and stayed idle.
 
-That is one observation, not a proven cause. It does move the weight toward the
-plain sequence "payloads loaded during the entry chain, one of which mounts", and
-away from ShadowMountPlus being dangerous on its own.
+That was read as a suspect for half an hour, and it was wrong. A screenshot of the
+frozen screen shows the autoloader stopped at **stage 2 of 3** -- the Relapse kernel
+exploit itself, after it printed the kernel base -- before `/mnt/usb0` was read and
+before any payload in `autoload.txt` was started. ShadowMountPlus never ran in those
+boots.
+
+Three consecutive hangs at that stage with different kernel bases
+(`0xffffffe01f0000`, `0xffffffff87080000`) mean the exploit executes and fails inside
+itself, not that a payload is incompatible. The community documentation says the same:
+Relapse "may hang or panic the console, so reboot before trying again".
+
+Two of those hangs ended in a self-repair on the next boot, with `/data` and the
+account intact -- including one where the repair ran without any prompt. This is the
+first evidence that a hang is not itself what destroys the drive. The four earlier
+events may have shared a different, additional cause.
 
 ### What this rules out for the Overdrive conversion
 
