@@ -12141,6 +12141,12 @@ FREEZE_RECORD_CRASH_TITLE = ("a crash at each durable step of the freeze "
 FREEZE_UNFREEZE_CRASH_TITLE = ("a crash at each durable step of a key "
                                "unfreeze leaves the console frozen or "
                                "unfrozen, never between")
+FREEZE_UNFREEZE_NO_REPORT_TITLE = ("the fault injected into a key unfreeze "
+                                   "ends the host with an exit status, not a "
+                                   "signal macOS writes a crash report for")
+FREEZE_UNFREEZE_FAILED_TITLE = ("a key unfreeze whose keyring transaction "
+                                "cannot be written answers key_failed, and "
+                                "the host keeps serving")
 
 
 def freeze_file(server):
@@ -12443,6 +12449,65 @@ def scenario_freeze_unfreeze_crash(server):
             keys.stop()
 
 
+def scenario_freeze_unfreeze_no_report(server):
+    """The injected fault ends the host without a signal macOS records.
+
+    A crash-recovery test needs the process to stop after a step, with nothing
+    flushed after it. SIGABRT does that, but it also makes macOS write an
+    .ips report per run, which is the noise #129 filed.
+    """
+    del server
+    keys = Server(SERVER_BINARY, env={
+        "ARIEL_HOST_NONCE_SEED": "freeze-unfreeze-report"})
+    try:
+        install_payload(keys, "crashreport", healthy_build("crashreport"))
+        set_freeze(keys)
+        assert run_payload(keys, "crashreport") == FROZEN_REPLY
+        keys.env = {FAULT_ENV: "prepared"}
+        keys.restart()
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        command_until_crash(keys, "key unfreeze")
+        code = keys.proc.returncode
+        assert code > 0, (
+            "the injected fault must end the host with a plain exit status; "
+            "%d is signal %d, which macOS writes a crash report for"
+            % (code, -code))
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_unfreeze_failed_transaction(server):
+    """A keyring transaction that cannot be written is an error reply.
+
+    The keyring's temporary path is a directory, so the unfreeze cannot write
+    it. The failed transaction must answer key_failed and leave the host
+    serving, with the freeze still recorded in the keyring.
+    """
+    del server
+    keys = Server(SERVER_BINARY, env={
+        "ARIEL_HOST_NONCE_SEED": "freeze-unfreeze-failed"})
+    try:
+        install_payload(keys, "failunfreeze", healthy_build("failunfreeze"))
+        set_freeze(keys)
+        assert run_payload(keys, "failunfreeze") == FROZEN_REPLY
+        tmp = os.path.join(keys.root, "data", "ariel", "keyring.tmp")
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.mkdir(tmp)
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, "key unfreeze") == ["key_failed", "exit 1"], (
+            "a keyring transaction that cannot be written must answer "
+            "key_failed and exit 1")
+        assert keys.proc.poll() is None, (
+            "a failed transaction must not end the host")
+        assert run_command(keys, "env PATH") == FROZEN_REPLY, (
+            "a failed unfreeze must leave the keyring frozen")
+    finally:
+        keys.stop()
+
+
 FREEZE_SCENARIOS = [
     (FREEZE_NEW_TITLE, scenario_freeze_refuses_new_approvals, HOST_ROOT_REASON),
     (FREEZE_COMMIT_TITLE, scenario_freeze_refuses_commit_granted_before_it,
@@ -12461,18 +12526,27 @@ FREEZE_SCENARIOS = [
     (FREEZE_RACE_TITLE, scenario_freeze_racing_admissions, CLOCK_REASON),
     (FREEZE_RECORD_CRASH_TITLE, scenario_freeze_record_crash, FAULT_REASON),
     (FREEZE_UNFREEZE_CRASH_TITLE, scenario_freeze_unfreeze_crash, FAULT_REASON),
+    (FREEZE_UNFREEZE_NO_REPORT_TITLE, scenario_freeze_unfreeze_no_report,
+     FAULT_REASON),
+    (FREEZE_UNFREEZE_FAILED_TITLE, scenario_freeze_unfreeze_failed_transaction,
+     HOST_ROOT_REASON),
 ]
 
 CLOCK_SCENARIOS.update({FREEZE_COMMIT_TITLE, FREEZE_DELETE_TITLE,
                         FREEZE_SLOTS_TITLE, FREEZE_PRIMARY_TITLE,
-                        FREEZE_RACE_TITLE, FREEZE_UNFREEZE_CRASH_TITLE})
+                        FREEZE_RACE_TITLE, FREEZE_UNFREEZE_CRASH_TITLE,
+                        FREEZE_UNFREEZE_NO_REPORT_TITLE,
+                        FREEZE_UNFREEZE_FAILED_TITLE})
 HOST_ROOT_SCENARIOS.update({FREEZE_NEW_TITLE, FREEZE_COMMIT_TITLE,
                             FREEZE_RUN_TITLE, FREEZE_DELETE_TITLE,
                             FREEZE_RESTART_TITLE, FREEZE_SLOTS_TITLE,
                             FREEZE_ROTATE_TITLE, FREEZE_PRIMARY_TITLE,
                             FREEZE_RACE_TITLE, FREEZE_RECORD_CRASH_TITLE,
-                            FREEZE_UNFREEZE_CRASH_TITLE})
-FAULT_SCENARIOS.update({FREEZE_RECORD_CRASH_TITLE, FREEZE_UNFREEZE_CRASH_TITLE})
+                            FREEZE_UNFREEZE_CRASH_TITLE,
+                            FREEZE_UNFREEZE_NO_REPORT_TITLE,
+                            FREEZE_UNFREEZE_FAILED_TITLE})
+FAULT_SCENARIOS.update({FREEZE_RECORD_CRASH_TITLE, FREEZE_UNFREEZE_CRASH_TITLE,
+                        FREEZE_UNFREEZE_NO_REPORT_TITLE})
 HOST_RESTART_SCENARIOS.add(FREEZE_RESTART_TITLE)
 
 SCENARIOS.extend(FREEZE_SCENARIOS)
