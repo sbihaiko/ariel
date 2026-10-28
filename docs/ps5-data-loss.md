@@ -279,3 +279,28 @@ One trap, read in the binary and confirmed on the console: ShadowMountPlus watch
 `manual.lst` with `kqueue`. Writing the file over FTP replaces the inode, so the
 watcher keeps waiting on the old one and nothing mounts. A path added over FTP is
 only picked up when the payload starts, not while it runs.
+
+## First measurement after the change (2026-10-28)
+
+Overdrive's download root was moved from `/data` to `/mnt/usb0`, and one PKG was
+downloaded and installed end to end: Undertale (`CUSA09415`), 151.9 MB.
+
+| Check | Result |
+| --- | --- |
+| Where the file was written | `/mnt/usb0/downloads/packages/` |
+| `/data/ps5-react/PPSA99058` during the transfer | `app.log` grew 116 KB to 128 KB; cache and queue only |
+| Install | native, `/user/app/CUSA09415/app.pkg` plus `/user/appmeta/CUSA09415` |
+| Package after install | deleted by the app |
+
+Two things this establishes:
+
+1. A 150 MB download no longer touches `/data`. That was the exact shape of the
+   fourth loss -- the only one of the four whose scene was a download -- and the
+   write now lands on the pendrive, which is 13x faster than the network anyway.
+2. **A game fPKG installs natively and registers on this console.** So the failure
+   of the Overdrive package was not the install path being broken; it was that
+   Overdrive is shipped as an image, not as a package.
+
+Not established: whether the installed title launches. That is deliberately left
+for a session of its own -- it is scenario S5, and launching a PS4 title is the
+class of action that produced two of the four losses.
