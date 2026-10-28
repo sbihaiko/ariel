@@ -831,8 +831,10 @@ host_system_act(platform_t *self, const approval_facts_t *facts) {
 
 /**
  * ARIEL_HOST_FAULT names the step at which this build ends itself. The
- * process aborts there, with nothing flushed after the step, so a restart
- * meets the store as the crash left it.
+ * process exits there, with nothing flushed after the step, so a restart
+ * meets the store as the crash left it. It leaves by _exit rather than
+ * abort: SIGABRT makes macOS write a crash report for every injected step of
+ * every test run, and a recovery test only needs the store left mid-change.
  **/
 static void
 host_fault(platform_t *self, const char *step) {
@@ -841,7 +843,7 @@ host_fault(platform_t *self, const char *step) {
   (void)self;
 
   if(want && !strcmp(want, step)) {
-    abort();
+    _exit(EXIT_FAILURE);
   }
 }
 
