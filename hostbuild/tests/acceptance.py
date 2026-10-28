@@ -15392,6 +15392,87 @@ def scenario_trace_is_listed_and_documented(server):
         "docs/exit-codes.md must state how many records are kept")
     assert "at most %d entries" % TRACE_LIST_MAX in registry, (
         "docs/exit-codes.md must state the bound of each list")
+    for form in ("`trace --list`", "`trace --diff", "`trace_unchanged`", "`trace_missing`"):
+        assert form in registry, "docs/exit-codes.md must document %s" % form
+
+
+def scenario_trace_list_names_the_records_in_order(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        assert run_command(fresh, "trace --list") == ["exit 0"], (
+            "trace --list must answer nothing when no record is kept")
+        for name in ("beta", "alpha", "gamma"):
+            assert run_command(fresh, "trace " + name)[-1] == "exit 0"
+        assert run_command(fresh, "trace --list") == [
+            "record alpha", "record beta", "record gamma", "exit 0"], (
+            "trace --list must name the records kept, in name order")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_diff_answers_the_line_that_names_a_removed_licence(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        title = "CUSA91010"
+        make_verify_title(fresh, title)
+        assert run_command(fresh, "trace basis")[-1] == "exit 0"
+        licence = "fake%s.rif" % verify_content_id(title)
+        os.remove(os.path.join(fresh.root, "user", "license", licence))
+        lines = run_command(fresh, "trace --diff basis")
+        assert lines == ["licences 1 0", "licence %s present absent" % licence,
+                         "changed 2", "exit 0"], (
+            "the delta must answer exactly the changed fields, got %r" % lines)
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_diff_answers_trace_unchanged_when_nothing_moved(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91011")
+        assert run_command(fresh, "trace basis")[-1] == "exit 0"
+        before = trace_record_bytes(fresh, "basis")
+        assert run_command(fresh, "trace --diff basis") == ["trace_unchanged", "exit 0"], (
+            "a delta with nothing changed must answer the single word")
+        assert trace_record_bytes(fresh, "basis") == before, (
+            "trace --diff must not rewrite the record it compares")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_diff_answers_trace_missing_for_an_unknown_name(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        assert run_command(fresh, "trace --diff nope") == ["trace_missing nope", "exit 95"], (
+            "a name that is not kept must answer trace_missing")
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a missing name must write no record")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_list_and_diff_refuse_bad_options_and_arguments(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        for command, expected in (
+                ("trace --list x", ["bad_argument", "exit 1"]),
+                ("trace --list --replace", ["bad_option", "exit 1"]),
+                ("trace --diff", ["missing_operand", "exit 1"]),
+                ("trace --diff ../x", ["bad_path", "exit 1"]),
+                ("trace --diff x extra", ["bad_argument", "exit 1"]),
+                ("trace --diff x --replace", ["bad_option", "exit 1"]),
+                ("trace --diff --list", ["bad_option", "exit 1"])):
+            assert run_command(fresh, command) == expected, (
+                "%r must answer %r" % (command, expected))
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a refused --list or --diff must write no record")
+    finally:
+        fresh.stop()
 
 
 TRACE_SCENARIOS = [
@@ -15415,6 +15496,16 @@ TRACE_SCENARIOS = [
      scenario_trace_refuses_bad_options_and_arguments, HOST_ROOT_REASON),
     ("trace is listed by help, and its fields and bounds are documented",
      scenario_trace_is_listed_and_documented, HOST_ROOT_REASON),
+    ("trace --list names the records kept in name order, and nothing when there are none",
+     scenario_trace_list_names_the_records_in_order, HOST_ROOT_REASON),
+    ("trace --diff answers the one line that names a removed licence, and the count",
+     scenario_trace_diff_answers_the_line_that_names_a_removed_licence, HOST_ROOT_REASON),
+    ("trace --diff answers trace_unchanged when nothing changed, and rewrites nothing",
+     scenario_trace_diff_answers_trace_unchanged_when_nothing_moved, HOST_ROOT_REASON),
+    ("trace --diff answers trace_missing for a name that is not kept",
+     scenario_trace_diff_answers_trace_missing_for_an_unknown_name, HOST_ROOT_REASON),
+    ("trace --list and --diff refuse bad options and arguments before reading",
+     scenario_trace_list_and_diff_refuse_bad_options_and_arguments, HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in TRACE_SCENARIOS)
 SCENARIOS.extend(TRACE_SCENARIOS)

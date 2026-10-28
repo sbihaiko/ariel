@@ -103,7 +103,7 @@ static const struct {
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
   {"verify", "say whether one installed title is whole, with --size and --sha256 to compare; --all sweeps the console, with --floor N for free space"},
-  {"trace", "record the console's state under NAME, kept in the state directory; --replace overwrites a record of that name"},
+  {"trace", "record the console's state under NAME, kept in the state directory; --replace overwrites a record of that name; --list names the records kept; --diff NAME answers what changed since NAME"},
   {"wc","count the lines, words and bytes of an absolute file"},
 };
 
@@ -2991,6 +2991,11 @@ run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd)
 #define TRACE_FIELD_OUT 128
 #define TRACE_LINE_CAP 512
 #define TRACE_RECORD_CAP (32UL * 1024)
+#define TRACE_FIELDS_MAX 96
+#define TRACE_KEY_MAX (TRACE_FIELD_OUT + 16)
+#define TRACE_SECTIONS 5
+#define TRACE_FREE_SLACK (16ULL * 1024ULL * 1024ULL)
+#define TRACE_BOOT_SLACK 1ULL
 
 #define TRACE_ANY 0
 #define TRACE_DIRS 1
@@ -3021,6 +3026,23 @@ struct trace_record {
   char *text;
   size_t len;
   int failed;
+};
+
+struct trace_field {
+  char key[TRACE_KEY_MAX];
+  char value[TRACE_FIELD_OUT + 1];
+};
+
+struct trace_fields {
+  size_t count;
+  struct trace_field items[TRACE_FIELDS_MAX];
+};
+
+static const char *const trace_counts[TRACE_SECTIONS] = {
+  "mounts", "titles", "metadata", "licences", "running"
+};
+static const char *const trace_entries[TRACE_SECTIONS] = {
+  "mount", "title", "metadata", "licence", "running"
 };
 
 
@@ -3378,13 +3400,348 @@ trace_store(const char *root, const char *name, const char *text, size_t len, in
 
 
 static int
+trace_capture(const char *root, struct trace_record *record) {
+  struct trace_scan *scan;
+  int rc;
+
+  record->text = malloc(TRACE_RECORD_CAP + 1);
+  scan = calloc(1, sizeof(*scan));
+  if(!record->text || !scan) {
+    free(record->text);
+    free(scan);
+    record->text = NULL;
+    return -1;
+  }
+  record->len = 0;
+  record->failed = 0;
+  record->text[0] = '\0';
+  rc = trace_build(root, scan, record);
+  free(scan);
+  if(rc) {
+    free(record->text);
+    record->text = NULL;
+  }
+  return rc;
+}
+
+
+// Returns 0 and the text, 1 when no record is kept under the path, -1 on failure.
+static int
+trace_read_record(const char *path, char **text) {
+  struct stat st;
+  size_t done = 0;
+  ssize_t got;
+  int fd;
+
+  if((fd=open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    return errno == ENOENT ? 1 : -1;
+  }
+  if(fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > (off_t)TRACE_RECORD_CAP) {
+    close(fd);
+    return -1;
+  }
+  *text = malloc((size_t)st.st_size + 1);
+  if(!*text) {
+    close(fd);
+    return -1;
+  }
+  while(done < (size_t)st.st_size) {
+    got = read(fd, *text + done, (size_t)st.st_size - done);
+    if(got < 0 && errno == EINTR) {
+      continue;
+    }
+    if(got <= 0) {
+      break;
+    }
+    done += (size_t)got;
+  }
+  close(fd);
+  if(done < (size_t)st.st_size) {
+    free(*text);
+    *text = NULL;
+    return -1;
+  }
+  (*text)[done] = '\0';
+  return 0;
+}
+
+
+static int
+trace_section(const char *word, const char *const names[]) {
+  int i;
+
+  for(i=0; i<TRACE_SECTIONS; i++) {
+    if(!strcmp(word, names[i])) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+static int
+trace_fields_add(struct trace_fields *fields, const char *key, const char *value) {
+  struct trace_field *field;
+
+  if(fields->count == TRACE_FIELDS_MAX) {
+    return -1;
+  }
+  field = &fields->items[fields->count++];
+  snprintf(field->key, sizeof(field->key), "%s", key);
+  snprintf(field->value, sizeof(field->value), "%s", value);
+  return 0;
+}
+
+
+// Each list opens with its count; the lines after it are its entries. Clock and uptime are never compared.
+static int
+trace_fields_parse(const char *text, struct trace_fields *fields) {
+  char line[TRACE_LINE_CAP];
+  char key[TRACE_KEY_MAX];
+  int counted[TRACE_SECTIONS];
+  const char *cursor = text;
+  const char *end;
+  char *word;
+  char *rest;
+  char *value;
+  int section;
+  size_t len;
+
+  memset(counted, 0, sizeof(counted));
+  while(*cursor) {
+    end = strchr(cursor, '\n');
+    len = end ? (size_t)(end - cursor) : strlen(cursor);
+    if(len >= sizeof(line)) {
+      return -1;
+    }
+    memcpy(line, cursor, len);
+    line[len] = '\0';
+    cursor += end ? len + 1 : len;
+
+    word = line;
+    rest = strchr(line, ' ');
+    if(rest) {
+      *rest++ = '\0';
+    } else {
+      rest = line + len;
+    }
+    if(!strcmp(word, "clock") || !strcmp(word, "uptime")) {
+      continue;
+    }
+    if(!strcmp(word, "free") || !strcmp(word, "boot")) {
+      if(trace_fields_add(fields, word, rest)) {
+        return -1;
+      }
+      continue;
+    }
+    section = trace_section(word, trace_counts);
+    if(section >= 0 && !counted[section]) {
+      counted[section] = 1;
+      if(trace_fields_add(fields, word, rest)) {
+        return -1;
+      }
+      continue;
+    }
+    section = trace_section(word, trace_entries);
+    if(section < 0) {
+      continue;
+    }
+    if(section <= 1) {
+      value = strchr(rest, ' ');
+      if(!value) {
+        continue;
+      }
+      *value++ = '\0';
+    } else {
+      value = "present";
+    }
+    snprintf(key, sizeof(key), "%s %s", word, rest);
+    if(trace_fields_add(fields, key, value)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+
+static const struct trace_field *
+trace_field_find(const struct trace_fields *fields, const char *key) {
+  size_t i;
+
+  for(i=0; i<fields->count; i++) {
+    if(!strcmp(fields->items[i].key, key)) {
+      return &fields->items[i];
+    }
+  }
+  return NULL;
+}
+
+
+// Free space moves with the record's own writes, and boot is derived from two whole-second readings.
+static int
+trace_moved(const char *key, const char *before, const char *after) {
+  unsigned long long a = strtoull(before, NULL, 10);
+  unsigned long long b = strtoull(after, NULL, 10);
+  unsigned long long slack;
+
+  if(!strcmp(key, "free")) {
+    slack = TRACE_FREE_SLACK;
+  } else if(!strcmp(key, "boot")) {
+    slack = TRACE_BOOT_SLACK;
+  } else {
+    return strcmp(before, after) != 0;
+  }
+  return (a > b ? a - b : b - a) > slack;
+}
+
+
+static void
+trace_say_change(int outfd, const char *key, const char *before, const char *after) {
+  say(outfd, key);
+  say(outfd, " ");
+  say(outfd, before);
+  say(outfd, " ");
+  say(outfd, after);
+  say(outfd, "\n");
+}
+
+
+static size_t
+trace_fields_diff(const struct trace_fields *before, const struct trace_fields *after, int outfd) {
+  const struct trace_field *old;
+  const struct trace_field *now;
+  size_t changed = 0;
+  size_t i;
+
+  for(i=0; i<before->count; i++) {
+    old = &before->items[i];
+    now = trace_field_find(after, old->key);
+    if(!now) {
+      trace_say_change(outfd, old->key, old->value, "absent");
+      changed++;
+    } else if(trace_moved(old->key, old->value, now->value)) {
+      trace_say_change(outfd, old->key, old->value, now->value);
+      changed++;
+    }
+  }
+  for(i=0; i<after->count; i++) {
+    if(!trace_field_find(before, after->items[i].key)) {
+      trace_say_change(outfd, after->items[i].key, "absent", after->items[i].value);
+      changed++;
+    }
+  }
+  return changed;
+}
+
+
+static int
+run_trace_list(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char dir[PATH_MAX];
+  struct trace_names *names;
+  size_t i;
+
+  if(argc > 2) {
+    say(errfd, argv[2][0] == '-' ? "bad_option\n" : "bad_argument\n");
+    return 1;
+  }
+  names = calloc(1, sizeof(*names));
+  if(!names) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  snprintf(dir, sizeof(dir), "%s/data/ariel/traces/records", root);
+  trace_scan(names, dir, TRACE_FILES);
+  for(i=0; i<names->count; i++) {
+    say(outfd, "record ");
+    say(outfd, names->names[i]);
+    say(outfd, "\n");
+  }
+  free(names);
+  return 0;
+}
+
+
+static int
+run_trace_diff(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char path[PATH_MAX];
+  struct trace_record now;
+  struct trace_fields *before = NULL;
+  struct trace_fields *after = NULL;
+  char *kept = NULL;
+  size_t changed = 0;
+  char count[32];
+  int rc = 0;
+
+  if(argc < 3) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[2][0] == '-') {
+    say(errfd, "bad_option\n");
+    return 1;
+  }
+  if(!trace_name_ok(argv[2])) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  if(argc > 3) {
+    say(errfd, argv[3][0] == '-' ? "bad_option\n" : "bad_argument\n");
+    return 1;
+  }
+
+  snprintf(path, sizeof(path), "%s/data/ariel/traces/records/%s", root, argv[2]);
+  rc = trace_read_record(path, &kept);
+  if(rc == 1) {
+    say(errfd, "trace_missing ");
+    say(errfd, argv[2]);
+    say(errfd, "\n");
+    return 95;
+  }
+  if(rc || trace_capture(root, &now)) {
+    free(kept);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  before = calloc(1, sizeof(*before));
+  after = calloc(1, sizeof(*after));
+  if(!before || !after || trace_fields_parse(kept, before) ||
+     trace_fields_parse(now.text, after)) {
+    rc = 1;
+  } else {
+    changed = trace_fields_diff(before, after, outfd);
+    if(changed == 0) {
+      say(outfd, "trace_unchanged\n");
+    } else {
+      snprintf(count, sizeof(count), "changed %zu\n", changed);
+      say(outfd, count);
+    }
+  }
+  free(kept);
+  free(now.text);
+  free(before);
+  free(after);
+  if(rc) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  return 0;
+}
+
+
+static int
 run_trace(platform_t *platform, int argc, char *const argv[], int outfd, int errfd) {
   struct trace_record record;
-  struct trace_scan *scan;
   int replace = 0;
   int rc;
   int i;
 
+  if(argc >= 2 && !strcmp(argv[1], "--list")) {
+    return run_trace_list(platform->fs_root, argc, argv, outfd, errfd);
+  }
+  if(argc >= 2 && !strcmp(argv[1], "--diff")) {
+    return run_trace_diff(platform->fs_root, argc, argv, outfd, errfd);
+  }
   if(argc < 2) {
     say(errfd, "missing_operand\n");
     return 1;
@@ -3409,21 +3766,7 @@ run_trace(platform_t *platform, int argc, char *const argv[], int outfd, int err
     return 1;
   }
 
-  record.text = malloc(TRACE_RECORD_CAP + 1);
-  scan = calloc(1, sizeof(*scan));
-  if(!record.text || !scan) {
-    free(record.text);
-    free(scan);
-    say(errfd, "operation_failed\n");
-    return 1;
-  }
-  record.len = 0;
-  record.failed = 0;
-  record.text[0] = '\0';
-  rc = trace_build(platform->fs_root, scan, &record);
-  free(scan);
-  if(rc) {
-    free(record.text);
+  if(trace_capture(platform->fs_root, &record)) {
     say(errfd, "operation_failed\n");
     return 1;
   }
