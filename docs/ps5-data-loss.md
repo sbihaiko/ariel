@@ -328,3 +328,40 @@ with no game loaded through the mounter. It did not hang.
 What it does **not** prove: it is one title, one session, on a console that also had
 ShadowMountPlus loaded. It does not falsify H1 on its own -- that needs the same
 title run from an image (S4), which is the next comparison.
+
+## The reproduction (2026-10-28, 23:30)
+
+Child of Light was downloaded as a PKG to a second USB drive, installed natively by
+the console's installer (2.28 GB in `/user/app/CUSA00339`), and launched under
+conditions chosen to remove every other suspect:
+
+- the download finished before the launch; nothing was writing to `/data`;
+- `/data` had 931 GB free;
+- exactly one image was mounted (Overdrive itself), as it was at the time of the
+  original losses;
+- no other title was running.
+
+**The console hung on launch, again.**
+
+That settles what the four losses were not. It was not the mounter, not a download in
+flight, not free space, not the drive, and not the way the package was obtained. The
+same title, installed the way the console wants, with nothing else happening, still
+took the machine down.
+
+What remains is the title itself as it runs on this firmware -- a PS4 binary under
+kstuff on 11.20 -- or something both this title and the other two freezers share and
+Undertale does not.
+
+The immediate comparison already exists: Undertale, also PS4, also a PKG, also
+installed, played and saved without a problem an hour earlier on the same console.
+So "PS4 title" alone is not the answer either; something narrower separates them.
+
+Next experiment, in order of cost:
+
+1. Read the kernel log during the launch of a *working* PS4 title and of a hanging
+   one, with klog already running, and diff them. This is the only measurement that
+   has not been tried, and the only one that can name a mechanism.
+2. Run the same title with ShadowMountPlus stopped entirely, so the kstuff pause and
+   the fakelib overlay it manages are out of the picture.
+3. Run the same title with the console offline, so nothing from PSN or the store is
+   reachable at launch.
