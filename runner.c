@@ -3058,6 +3058,7 @@ run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd)
 #define TRACE_KEEP 8
 #define TRACE_LIST_MAX 16
 #define TRACE_NAME_MAX 32
+#define TRACE_MOUNTS_MAX 64
 #define TRACE_FIELD_RAW 256
 #define TRACE_FIELD_OUT 128
 #define TRACE_LINE_CAP 512
@@ -3079,10 +3080,9 @@ struct trace_names {
 };
 
 struct trace_mounts {
-  size_t total;
   size_t count;
-  char targets[TRACE_LIST_MAX][TRACE_FIELD_RAW];
-  char sources[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+  char targets[TRACE_MOUNTS_MAX][TRACE_FIELD_RAW];
+  char sources[TRACE_MOUNTS_MAX][TRACE_FIELD_RAW];
 };
 
 struct trace_scan {
@@ -3136,6 +3136,19 @@ trace_name_ok(const char *name) {
 }
 
 
+// A copy that cannot overflow its buffer, and never writes past the end.
+static void
+trace_copy(char *out, size_t cap, const char *in) {
+  size_t len = strlen(in);
+
+  if(len >= cap) {
+    len = cap - 1;
+  }
+  memcpy(out, in, len);
+  out[len] = '\0';
+}
+
+
 // Keeps the smallest TRACE_LIST_MAX names in order and counts every name.
 static void
 trace_names_add(struct trace_names *list, const char *name) {
@@ -3151,10 +3164,10 @@ trace_names_add(struct trace_names *list, const char *name) {
     list->count++;
   }
   while(at > 0 && strcmp(name, list->names[at - 1]) < 0) {
-    snprintf(list->names[at], TRACE_FIELD_RAW, "%s", list->names[at - 1]);
+    trace_copy(list->names[at], TRACE_FIELD_RAW, list->names[at - 1]);
     at--;
   }
-  snprintf(list->names[at], TRACE_FIELD_RAW, "%s", name);
+  trace_copy(list->names[at], TRACE_FIELD_RAW, name);
 }
 
 
@@ -3228,10 +3241,9 @@ static void
 trace_mount_add(void *ctx, const char *target, const char *source) {
   struct trace_mounts *mounts = ctx;
 
-  mounts->total++;
-  if(mounts->count < TRACE_LIST_MAX) {
-    snprintf(mounts->targets[mounts->count], TRACE_FIELD_RAW, "%s", target);
-    snprintf(mounts->sources[mounts->count], TRACE_FIELD_RAW, "%s", source);
+  if(mounts->count < TRACE_MOUNTS_MAX) {
+    trace_copy(mounts->targets[mounts->count], TRACE_FIELD_RAW, target);
+    trace_copy(mounts->sources[mounts->count], TRACE_FIELD_RAW, source);
     mounts->count++;
   }
 }
@@ -3311,7 +3323,7 @@ trace_build(const char *root, struct trace_scan *scan, struct trace_record *reco
            (unsigned long long)vfs.f_bavail * vfs.f_frsize);
   trace_put(record, line);
 
-  snprintf(line, sizeof(line), "mounts %zu\n", scan->mounts.total);
+  snprintf(line, sizeof(line), "mounts %zu\n", scan->mounts.count);
   trace_put(record, line);
   for(i=0; i<scan->mounts.count; i++) {
     trace_escape(first, scan->mounts.targets[i]);
