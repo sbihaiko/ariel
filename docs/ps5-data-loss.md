@@ -304,3 +304,27 @@ Two things this establishes:
 Not established: whether the installed title launches. That is deliberately left
 for a session of its own -- it is scenario S5, and launching a PS4 title is the
 class of action that produced two of the four losses.
+
+## S5, first run: a native package played and saved (2026-10-28)
+
+The one experiment the whole page was waiting for, run by accident of ordering and
+then deliberately finished.
+
+Undertale (`CUSA09415`, PS4 title, 151.9 MB) was downloaded by Overdrive to the
+pendrive, installed by the console's own installer, then launched:
+
+| Check | Result |
+| --- | --- |
+| Process | `eboot.bin` under `CUSA09415`, pid 762 |
+| Played | a few minutes, save written |
+| Save on disk | `/user/home/10993c58/savedata/CUSA09415/Undertale.bin` |
+| Exit | clean, no leftover process |
+| `/data` during play | unchanged |
+| ShadowMountPlus | loaded the whole time, holding the Overdrive image |
+
+This is the configuration the four losses never had: a title that writes during play,
+with no game loaded through the mounter. It did not hang.
+
+What it does **not** prove: it is one title, one session, on a console that also had
+ShadowMountPlus loaded. It does not falsify H1 on its own -- that needs the same
+title run from an image (S4), which is the next comparison.

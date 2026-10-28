@@ -131,7 +131,7 @@ One block per session. Copy it into the table below.
 
 | # | Date | Scenario | Versions changed | Free space before | Mounts at start | Load | Duration | Outcome | Error code | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | | | | | | | | | | |
+| 1 | 2026-10-28 | S5 (partial) | kstuff 1.09, SMP 1.6b16, no config override | 933.9 GB | `Overdrive_d68885f3` | download 151.9 MB + install + play | ~10 min | pass | nenhum | `CUSA09415`; save em `/user/home/10993c58/savedata/CUSA09415/` |
 
 ## Outcomes
 
