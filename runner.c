@@ -3317,6 +3317,19 @@ trace_write_file(const char *path, const char *data, size_t len) {
 }
 
 
+// A name copied whole or not at all: a truncated name is not that name.
+static int
+trace_name_set(char *out, const char *name) {
+  size_t len = strlen(name);
+
+  if(len > TRACE_NAME_MAX) {
+    return -1;
+  }
+  memcpy(out, name, len + 1);
+  return 0;
+}
+
+
 // The order file, not file times, says which record is oldest: times can tie.
 static int
 trace_remember(const char *base, const char *records, const char *name) {
@@ -3333,20 +3346,27 @@ trace_remember(const char *base, const char *records, const char *name) {
   size_t i;
 
   memset(&order, 0, sizeof(order));
-  snprintf(path, sizeof(path), "%s/order", base);
+  if(snprintf(path, sizeof(path), "%s/order", base) >= (int)sizeof(path)) {
+    return -1;
+  }
   if((file=fopen(path, "r"))) {
     while(order.count < TRACE_KEEP && fgets(line, sizeof(line), file)) {
       line[strcspn(line, "\n")] = '\0';
-      if(line[0] && strcmp(line, name)) {
-        snprintf(order.names[order.count++], TRACE_NAME_MAX + 1, "%s", line);
+      if(line[0] && strcmp(line, name) && !trace_name_set(order.names[order.count], line)) {
+        order.count++;
       }
     }
     fclose(file);
   }
-  snprintf(order.names[order.count++], TRACE_NAME_MAX + 1, "%s", name);
+  if(trace_name_set(order.names[order.count], name)) {
+    return -1;
+  }
+  order.count++;
 
   while(order.count > TRACE_KEEP) {
-    snprintf(path, sizeof(path), "%s/%s", records, order.names[0]);
+    if(snprintf(path, sizeof(path), "%s/%s", records, order.names[0]) >= (int)sizeof(path)) {
+      return -1;
+    }
     if(unlink(path) && errno != ENOENT) {
       return -1;
     }
@@ -3357,11 +3377,16 @@ trace_remember(const char *base, const char *records, const char *name) {
   for(i=0; i<order.count; i++) {
     used += (size_t)snprintf(text + used, sizeof(text) - used, "%s\n", order.names[i]);
   }
-  snprintf(tmp, sizeof(tmp), "%s/order.tmp", base);
+  if(snprintf(tmp, sizeof(tmp), "%s/order.tmp", base) >= (int)sizeof(tmp)) {
+    return -1;
+  }
   if(trace_write_file(tmp, text, used)) {
     return -1;
   }
-  snprintf(path, sizeof(path), "%s/order", base);
+  if(snprintf(path, sizeof(path), "%s/order", base) >= (int)sizeof(path)) {
+    unlink(tmp);
+    return -1;
+  }
   if(rename(tmp, path)) {
     unlink(tmp);
     return -1;
@@ -3555,7 +3580,9 @@ trace_fields_parse(const char *text, struct trace_fields *fields) {
     } else {
       value = "present";
     }
-    snprintf(key, sizeof(key), "%s %s", word, rest);
+    if(snprintf(key, sizeof(key), "%s %s", word, rest) >= (int)sizeof(key)) {
+      return -1;
+    }
     if(trace_fields_add(fields, key, value)) {
       return -1;
     }
