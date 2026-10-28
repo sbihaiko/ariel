@@ -552,3 +552,39 @@ guard: nothing in the shell knows how to refuse a kill on a listening port.
 **The next measurement this event asks for.** Two independent gaps, and this event adds
 a third that is ours to close: the swap-by-reboot above is the only one that needs no
 measurement, because it removes the load instead of explaining it.
+
+## Where the bytes live is not what protects them (2026-10-28)
+
+A claim that came up while deciding how to install two packages, and that reads as a
+conclusion if it is not written down: *a title under `/user/app` is safe from the losses
+the others took.* It is not, and the reason is worth stating before anyone builds on it.
+
+**The path changes nothing about the storage.** `/user/app`, `/data` and
+`/data/downloads` are all one filesystem, `ssd0.user`. Every one of the first six events
+happened on that filesystem. A title that moves from `/data` to `/user/app` moves no byte
+anywhere safer; it is the same device, the same ext4 journal, the same window for a panic
+to land inside.
+
+**What separates the events is the writer and the route, not the directory.** Two shapes
+recur: an image mounted for play (H1) and a process writing files one by one — the entry
+payloads being staged, a `cp` of a game archive, a download the app itself writes (H3).
+A native install is a third shape: the console's own `bgft` and `pkg-helper` write it,
+with a database of what landed and its own resumption, which is why an interrupted
+native install resumes instead of starting over. That is the change — the identity of
+the code doing the writing, not the name of the folder it writes into.
+
+**A native install is not a lighter write.** It still puts roughly ten gigabytes on the
+internal drive, which is the same heavy write every event shares. What it does not do is
+write with an app that has no record of its own progress, and it does not mount an image
+to run the result.
+
+**Two events never touched this question.** The sixth was a plain `cp` under `/data`;
+the seventh was a process killed while it held a listening socket. Neither involved
+`/user/app`, an image, or an install, which is why neither can be used either to support
+or to weaken the claim.
+
+**What would separate the claim from the mechanism.** An event with a native install in
+flight, no image mounted, and no app writing — a loss there would say the storage path
+carries risk nobody has named yet. Until one exists, the honest statement is the one the
+first section already makes: reducing risk means choosing the writer and refusing the
+mount, and the directory is where the result happens to land.
