@@ -1164,6 +1164,8 @@ ADOPT_AUDIT_TITLE = ("key adopt-anchor keeps the consumed nonces and the audit "
                      "log")
 ADOPT_MATCH_TITLE = ("key adopt-anchor is refused, without a challenge, while "
                      "the anchor matches")
+NO_ANCHOR_TITLE = ("a build that pins no anchor answers no_anchor, and key "
+                   "adopt-anchor cannot seed it")
 
 # The durable steps of a rotation, each with the generation that is active
 # once Ariel restarts: a prepared rotation rolls back, the rest roll forward.
@@ -7103,6 +7105,34 @@ def assert_refused_everything(server):
         assert_refused_without_asking(server, command)
 
 
+def scenario_no_anchor_refuses_approvals(server):
+    """A payload built without ARIEL_PUBKEY names the build, not the keyring.
+
+    key_refused covers an owner's problem: a keyring that is empty or under
+    another anchor, which key adopt-anchor exists to fix. A build with no
+    anchor is not that, and the adopt command cannot fix it either, so the
+    two states must answer different words.
+    """
+    del server  # the anchor is fixed at start, so this needs an Ariel of its own
+    bare = Server(SERVER_BINARY, env={"ARIEL_HOST_ANCHOR_NONE": "1",
+                                      "ARIEL_HOST_NONCE_SEED": "noanchor"})
+    try:
+        for command in ("env PATH", ADOPT_COMMAND, "reboot",
+                        "key rotate " + public_key(bare, SECOND_PRIMARY_KEY)):
+            lines = run_command(bare, command)
+            assert lines == ["no_anchor", "exit 1"], (
+                "%r on a build with no anchor must answer no_anchor and exit "
+                "1, got %r" % (command, lines))
+        assert run_command(bare, "pwd") == ["/", "exit 0"], (
+            "a build with no anchor must still answer the read-only commands")
+        assert ("key.adopt-anchor.refused", "keyring") in [
+            event[:2] for event in audit_events(bare)], (
+            "a refused adopt on a build with no anchor must reach the audit "
+            "log")
+    finally:
+        bare.stop()
+
+
 def scenario_keyring_missing_refuses_approvals(server):
     """A recorded generation 1 with the keyring gone refuses every approval,
     and the build's own keys do not come back in the keyring's place."""
@@ -7297,6 +7327,15 @@ def scenario_ps5_pubkey_needs_recovery(server):
     assert "ARIEL_RECOVERY_PUBKEY" not in paired.stderr, (
         "a build that pins both keys must not be refused for the pair, got %r"
         % paired.stderr)
+    # make test deploys, and a payload with no anchor refuses every gated
+    # command on the console it lands on, so the deploy is refused first.
+    deploy = subprocess.run(
+        ["make", "-n", "-f", os.path.join(repo_dir(), "Makefile"),
+         "PS5_PAYLOAD_SDK=/nonexistent", "ARIEL_DEPLOY=yes", "test"],
+        capture_output=True, text=True)
+    assert deploy.returncode != 0 and "unanchored" in deploy.stderr, (
+        "the PS5 makefile must refuse to deploy an unanchored payload, got %r"
+        % deploy.stderr)
 
 
 def scenario_recovery_pubkey_is_documented(server):
@@ -10899,6 +10938,7 @@ SCENARIOS = [
      CLOCK_REASON),
     (ADOPT_MATCH_TITLE, scenario_adopt_anchor_refused_when_anchor_matches,
      False),
+    (NO_ANCHOR_TITLE, scenario_no_anchor_refuses_approvals, False),
     ("the PS5 makefile refuses an owner key pinned without its recovery key",
      scenario_ps5_pubkey_needs_recovery, None),
     ("the README and the quick start document ARIEL_RECOVERY_PUBKEY",

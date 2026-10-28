@@ -288,6 +288,14 @@ int store_key_adopt(const approval_challenge_t *challenge,
                     uint32_t *generation);
 
 /**
+ * Whether the build carries no anchor. The keyring refuses everything in that
+ * state, and key adopt-anchor cannot seed it, because seeding needs the
+ * anchor it is missing. A caller uses this to answer a word that names the
+ * build rather than the keyring.
+ **/
+int store_anchor_missing(void);
+
+/**
  * Copy the autoload list into buf, NUL-terminated: one payload name per line,
  * Ariel first. Returns its length, or -1 when it cannot be read.
  **/

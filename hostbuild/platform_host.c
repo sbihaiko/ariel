@@ -316,6 +316,11 @@ host_anchor(platform_t *self, unsigned char primary[APPROVAL_PUBKEY_LEN],
             unsigned char recovery[APPROVAL_PUBKEY_LEN]) {
   (void)self;
 
+  // ARIEL_HOST_ANCHOR_NONE starts a build that pins nothing, as a payload
+  // built without ARIEL_PUBKEY does. The host build only.
+  if(getenv("ARIEL_HOST_ANCHOR_NONE")) {
+    return -1;
+  }
   memcpy(primary, host_anchor_primary, APPROVAL_PUBKEY_LEN);
   memcpy(recovery, host_anchor_recovery, APPROVAL_PUBKEY_LEN);
   return 0;

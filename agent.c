@@ -146,6 +146,9 @@ static const char approval_stale[] =
 static const char key_refused[] =
   "key_refused\n"
   "exit 1\n";
+static const char no_anchor[] =
+  "no_anchor\n"
+  "exit 1\n";
 static const char key_failed[] =
   "key_failed\n"
   "exit 1\n";
@@ -1022,7 +1025,8 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
     audit_reply(fd, facts->command, "refused", target, "-", unknown);
     return 0;
   case STORE_GATE_KEYRING:
-    audit_reply(fd, facts->command, "refused", target, "-", key_refused);
+    audit_reply(fd, facts->command, "refused", target, "-",
+                store_anchor_missing() ? no_anchor : key_refused);
     return 0;
   case STORE_GATE_FROZEN:
     audit_reply(fd, facts->command, "refused", target, "-", frozen_reply);
@@ -1789,6 +1793,13 @@ key_rotate_command(agent_t *agent, int fd, int role, const char *hex) {
 
   command = role == STORE_KEY_ROLE_RECOVERY ? "key.rotate-recovery"
                                             : "key.rotate";
+  // A build with no anchor refuses the key before the key's own merits are
+  // judged: there is no keyring to rotate, and key_refused would send the
+  // owner to look for a keyring problem that is not there.
+  if(store_anchor_missing()) {
+    audit_reply(fd, command, "refused", "keyring", "-", no_anchor);
+    return;
+  }
   if(store_key_check(hex)) {
     audit_reply(fd, command, "refused", "keyring", "-", key_refused);
     return;
@@ -1836,7 +1847,7 @@ key_adopt_command(agent_t *agent, int fd) {
   uint32_t generation = 0;
 
   if(agent->platform->anchor(agent->platform, primary, recovery)) {
-    audit_reply(fd, command, "refused", "keyring", "-", key_refused);
+    audit_reply(fd, command, "refused", "keyring", "-", no_anchor);
     return;
   }
 

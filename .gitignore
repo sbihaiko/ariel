@@ -14,3 +14,7 @@ hostbuild/canonical_test
 
 # Local tooling: agent worktrees and per-machine settings, never the repository's.
 .claude/
+runs/.hub/
+
+# The console hosts and the agent token, per machine; never committed.
+ariel.env
