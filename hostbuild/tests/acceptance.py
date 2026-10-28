@@ -1470,8 +1470,8 @@ HOST_ROOT_SCENARIOS = {
     "that does not complete never answers exit 0",
     "pkg_install names the missing part one at a time, and a finished install "
     "names the title, bytes and SHA-256 of its source",
-    "pkg_install names no hash for a package over the ceiling, and leaves "
-    "the source alone",
+    "pkg_install exits 0 with a dash for the hash of a finished install over "
+    "the ceiling, and leaves the source alone",
     "pkg_install with a name that carries no title ID answers '-' as the "
     "title",
     "pkg_install takes a file URI, signs it as written, and does not run "
@@ -8377,11 +8377,11 @@ def scenario_pkg_install_names_the_missing_part(server):
 
 @builtin_scenario
 def scenario_pkg_install_too_large_to_verify(server):
-    """A package over the hash ceiling is not read, so its install is not named.
+    """A finished install over the hash ceiling exits 0 and names no hash.
 
-    The install's own answer is a fact about the app directory; the hash is
-    the part that cannot be measured inside a connection, so the reply names
-    the ceiling instead of a hash, and the source is left alone.
+    The package is not read for its hash, so the hash field is a dash; the
+    title and the byte count are still named, and the install still exits 0.
+    The source is left alone.
     """
     pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"pkg\n")
     os.truncate(pkg, PKG_CEILING + 1)
@@ -8394,8 +8394,9 @@ def scenario_pkg_install_too_large_to_verify(server):
     lay_down(os.path.join(server.root, "user", "license",
                           "fake%s.rif" % PKG_CONTENT_ID))
     assert granted_pkg_install(server, pkg) == [
-        "too_large_to_verify %s" % APP_TITLE, "exit 1"], (
-        "a package over the hash ceiling must name the ceiling, not a hash")
+        "installed %s %d -" % (APP_TITLE, PKG_CEILING + 1), "exit 0"], (
+        "a finished install over the hash ceiling must name its bytes with "
+        "no hash and exit 0")
     assert os.path.getsize(pkg) == PKG_CEILING + 1, (
         "an install must never change or delete its source package")
 
@@ -8417,7 +8418,7 @@ def scenario_pkg_install_ending_is_documented(server):
         registry = handle.read()
     for text in ("`installed <TITLE> <bytes> <sha256>`",
                  "`install_incomplete <TITLE> <part>`",
-                 "`too_large_to_verify`",
+                 "`installed <TITLE> <bytes> -`",
                  "`package`", "`licence`", "`appmeta`", "`sfo`"):
         assert text in registry, (
             "docs/exit-codes.md must document %s before pkg_install answers it"
@@ -11167,8 +11168,8 @@ SCENARIOS = [
     ("pkg_install names the missing part one at a time, and a finished install "
      "names the title, bytes and SHA-256 of its source",
      scenario_pkg_install_names_the_missing_part, HOST_ROOT_REASON),
-    ("pkg_install names no hash for a package over the ceiling, and leaves "
-     "the source alone",
+    ("pkg_install exits 0 with a dash for the hash of a finished install over "
+     "the ceiling, and leaves the source alone",
      scenario_pkg_install_too_large_to_verify, HOST_ROOT_REASON),
     ("pkg_install with a name that carries no title ID answers '-' as the "
      "title", scenario_pkg_install_without_a_title_names_no_title,

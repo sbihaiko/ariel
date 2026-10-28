@@ -2775,6 +2775,7 @@ runner_package_fact(const char *path, uint64_t *bytes, char hex[SHA256_HEX_LEN +
   if(lstat(path, &st) || !S_ISREG(st.st_mode)) {
     return 1;
   }
+  *bytes = (uint64_t)st.st_size;
   if((unsigned long long)st.st_size > VERIFY_CEILING) {
     return 2;
   }

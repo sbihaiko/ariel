@@ -5299,17 +5299,16 @@ pkg_install_command(agent_t *agent, int fd, int argc, char *argv[],
 
   switch(runner_package_fact(path, &bytes, hex)) {
   case 0:
-    len = snprintf(answer, sizeof(answer), "installed %s %llu %s\nexit 0\n",
-                   title, (unsigned long long)bytes, hex);
     break;
   case 2:
-    len = snprintf(answer, sizeof(answer), "too_large_to_verify %s\nexit 1\n",
-                   title);
+    snprintf(hex, sizeof(hex), "-");
     break;
   default:
     pkg_install_incomplete(fd, title, "package");
     return;
   }
+  len = snprintf(answer, sizeof(answer), "installed %s %llu %s\nexit 0\n",
+                 title, (unsigned long long)bytes, hex);
   if(len > 0) {
     write_all(fd, answer, (size_t)len);
   }
