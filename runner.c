@@ -60,6 +60,8 @@ along with this program; see the file COPYING. If not, see
 #define SFO_TYPE_INT 4
 #define SFO_MAX_SIZE (1024 * 1024)
 #define SLEEP_MAX 60
+#define VERIFY_CEILING (256ULL * 1024 * 1024)
+#define VERIFY_LINES 10
 
 
 static const struct {
@@ -97,7 +99,8 @@ static const struct {
   {"sysctl", "print a kernel parameter"},
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
-  {"wc", "count the lines, words and bytes of an absolute file"},
+  {"verify", "say whether one installed title is whole, with --size and --sha256 to compare"},
+  {"wc","count the lines, words and bytes of an absolute file"},
 };
 
 
@@ -2368,6 +2371,357 @@ run_sfoinfo(int argc, char *const argv[], int outfd, int errfd) {
 }
 
 
+static const char *const verify_entries[] = {
+  "app.pkg", "app.pbm", "app.json", "app.xml", "sce_sys/param.sfo",
+};
+
+
+static int
+verify_title_ok(const char *title) {
+  return title[0] && strcmp(title, ".") && strcmp(title, "..") &&
+         !strchr(title, '/');
+}
+
+
+static int
+verify_hex_digest(const char *text) {
+  size_t i;
+
+  if(strlen(text) != SHA256_HEX_LEN) {
+    return 0;
+  }
+  for(i=0; i<SHA256_HEX_LEN; i++) {
+    if(!((text[i] >= '0' && text[i] <= '9') || (text[i] >= 'a' && text[i] <= 'f'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+typedef struct {
+  const char *title;
+  const char *sha256;
+  int has_size;
+  size_t size;
+} verify_args_t;
+
+
+static int
+verify_parse(int argc, char *const argv[], verify_args_t *args, int errfd) {
+  int i;
+
+  memset(args, 0, sizeof(*args));
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[1][0] == '-') {
+    say(errfd, "bad_option\n");
+    return 1;
+  }
+  args->title = argv[1];
+
+  for(i=2; i<argc; i++) {
+    if(!strcmp(argv[i], "--size") && !args->has_size && i+1 < argc &&
+       !parse_count(argv[i+1], &args->size)) {
+      args->has_size = 1;
+      i++;
+    } else if(!strcmp(argv[i], "--sha256") && !args->sha256 && i+1 < argc &&
+              verify_hex_digest(argv[i+1])) {
+      args->sha256 = argv[++i];
+    } else if(argv[i][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    } else {
+      say(errfd, "bad_argument\n");
+      return 1;
+    }
+  }
+
+  if(!verify_title_ok(args->title)) {
+    say(errfd, "bad_argument\n");
+    return 1;
+  }
+  return 0;
+}
+
+
+static void
+verify_entry(const char *app, const char *entry, char *line) {
+  char path[PATH_MAX];
+  struct stat st;
+
+  if(snprintf(path, sizeof(path), "%s/%s", app, entry) >= (int)sizeof(path) ||
+     lstat(path, &st) || !S_ISREG(st.st_mode)) {
+    snprintf(line, OUT_LINE_CAP, "finding missing %s", entry);
+  } else if(st.st_size == 0) {
+    snprintf(line, OUT_LINE_CAP, "finding empty %s", entry);
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok %s", entry);
+  }
+}
+
+
+// The smallest licence file name in user/license that names the title.
+static int
+verify_find_licence(const char *root, const char *title, char *name, size_t size) {
+  char dir[PATH_MAX];
+  char needle[PATH_MAX];
+  struct dirent *entry;
+  DIR *handle;
+  int found = 0;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/license", root) >= (int)sizeof(dir) ||
+     snprintf(needle, sizeof(needle), "-%s_", title) >= (int)sizeof(needle) ||
+     !(handle=opendir(dir))) {
+    return 0;
+  }
+  while((entry=readdir(handle))) {
+    size_t len = strlen(entry->d_name);
+
+    if(strncmp(entry->d_name, "fake", 4) ||
+       strcmp(entry->d_name + len - 4, ".rif") ||
+       !strstr(entry->d_name, needle)) {
+      continue;
+    }
+    if(!found || strcmp(entry->d_name, name) < 0) {
+      snprintf(name, size, "%s", entry->d_name);
+      found = 1;
+    }
+  }
+  closedir(handle);
+  return found;
+}
+
+
+static int
+verify_licence_is(const char *licence, const char *content) {
+  size_t len = strlen(licence);
+
+  return strlen(content) == len - 8 && !strncmp(content, licence + 4, len - 8);
+}
+
+
+static int
+sfo_find(const unsigned char *buf, uint64_t size, const char *key, char *value,
+         size_t cap) {
+  uint32_t keys = le32(buf + 8);
+  uint32_t data = le32(buf + 12);
+  uint32_t count = le32(buf + 16);
+  uint32_t i;
+
+  for(i=0; i<count; i++) {
+    uint64_t offset = SFO_HEADER + (uint64_t)i * SFO_ENTRY;
+    const unsigned char *entry;
+    const unsigned char *nul;
+    const unsigned char *text;
+    uint64_t key_start;
+    uint64_t val_start;
+    uint32_t val_len;
+    size_t len;
+
+    if(offset + SFO_ENTRY > size) {
+      return 1;
+    }
+    entry = buf + offset;
+    key_start = (uint64_t)keys + le16(entry);
+    val_len = le32(entry + 4);
+    val_start = (uint64_t)data + le32(entry + 12);
+    if(key_start >= size || val_start + val_len > size) {
+      return 1;
+    }
+    nul = memchr(buf + key_start, 0, (size_t)(size - key_start));
+    if(!nul) {
+      return 1;
+    }
+    if(strcmp((const char *)buf + key_start, key)) {
+      continue;
+    }
+    if(entry[3] != SFO_TYPE_STR) {
+      return 1;
+    }
+    text = buf + val_start;
+    nul = memchr(text, 0, val_len);
+    len = nul ? (size_t)(nul - text) : val_len;
+    if(len >= cap) {
+      return 1;
+    }
+    memcpy(value, text, len);
+    value[len] = '\0';
+    return 0;
+  }
+  return 1;
+}
+
+
+static int
+sfo_string(const char *path, const char *key, char *value, size_t cap) {
+  unsigned char *buf;
+  struct stat st;
+  ssize_t n;
+  int rc = 1;
+  int fd;
+
+  if((fd=open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    return 1;
+  }
+  if(fstat(fd, &st) || st.st_size < SFO_HEADER || st.st_size > SFO_MAX_SIZE ||
+     !(buf=malloc((size_t)st.st_size))) {
+    close(fd);
+    return 1;
+  }
+  n = fill(fd, (char *)buf, (size_t)st.st_size);
+  close(fd);
+  if(n == st.st_size && le32(buf) == SFO_MAGIC) {
+    rc = sfo_find(buf, (uint64_t)st.st_size, key, value, cap);
+  }
+  free(buf);
+  return rc;
+}
+
+
+static int
+verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char buf[IO_CHUNK];
+  sha256_t hash;
+  ssize_t n;
+  int err;
+  int fd;
+
+  if((fd=open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    return errno;
+  }
+  sha256_init(&hash);
+  for(;;) {
+    n = fill(fd, buf, sizeof(buf));
+    if(n < 0) {
+      err = errno;
+      close(fd);
+      return err;
+    }
+    if(n == 0) {
+      break;
+    }
+    sha256_update(&hash, buf, (size_t)n);
+  }
+  close(fd);
+
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+  return 0;
+}
+
+
+/**
+ * verify TITLE [--size N] [--sha256 HEX]: answer one line per check, then
+ * whole or not_whole. A size or hash is compared only when the caller names
+ * one, and a file over VERIFY_CEILING is never read for its hash.
+ **/
+static int
+run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  char licence[PATH_MAX];
+  char content[PATH_MAX];
+  char path[PATH_MAX];
+  char app[PATH_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  verify_args_t args;
+  struct stat st;
+  size_t count = 0;
+  size_t i;
+  char *line;
+  int whole = 1;
+  int rc;
+
+  if(verify_parse(argc, argv, &args, errfd)) {
+    return 1;
+  }
+  if(snprintf(app, sizeof(app), "%s/user/app/%s", root, args.title) >= (int)sizeof(app)) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  if(lstat(app, &st) || !S_ISDIR(st.st_mode)) {
+    say(outfd, "not_installed ");
+    say(outfd, args.title);
+    say(outfd, "\n");
+    return 1;
+  }
+  if(refuse_protected(app, errfd)) {
+    return STATUS_PROTECTED;
+  }
+
+  for(i=0; i<sizeof(verify_entries)/sizeof(verify_entries[0]); i++) {
+    verify_entry(app, verify_entries[i], lines[count++]);
+  }
+
+  line = lines[count++];
+  if(snprintf(path, sizeof(path), "%s/user/appmeta/%s", root, args.title) >= (int)sizeof(path) ||
+     lstat(path, &st)) {
+    snprintf(line, OUT_LINE_CAP, "finding missing appmeta");
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok appmeta");
+  }
+
+  line = lines[count++];
+  if(!verify_find_licence(root, args.title, licence, sizeof(licence))) {
+    snprintf(line, OUT_LINE_CAP, "finding licence_missing %s", args.title);
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok licence");
+    line = lines[count++];
+    if(snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app) >= (int)sizeof(path) ||
+       sfo_string(path, "CONTENT_ID", content, sizeof(content))) {
+      snprintf(line, OUT_LINE_CAP, "finding missing content_id");
+    } else if(!verify_licence_is(licence, content)) {
+      snprintf(line, OUT_LINE_CAP, "finding licence_mismatch %s", licence);
+    } else {
+      snprintf(line, OUT_LINE_CAP, "ok content_id");
+    }
+  }
+
+  if(args.has_size || args.sha256) {
+    snprintf(path, sizeof(path), "%s/app.pkg", app);
+    if(!lstat(path, &st) && S_ISREG(st.st_mode)) {
+      if(args.has_size) {
+        line = lines[count++];
+        if((unsigned long long)st.st_size == (unsigned long long)args.size) {
+          snprintf(line, OUT_LINE_CAP, "ok app.pkg size");
+        } else {
+          snprintf(line, OUT_LINE_CAP, "finding size_mismatch app.pkg %lld",
+                   (long long)st.st_size);
+        }
+      }
+      if(args.sha256) {
+        line = lines[count++];
+        if((unsigned long long)st.st_size > VERIFY_CEILING) {
+          snprintf(line, OUT_LINE_CAP, "too_large_to_verify app.pkg");
+        } else if((rc=verify_sha256(path, hex))) {
+          report("verify", path, errfd, rc);
+          return 1;
+        } else if(strcmp(hex, args.sha256)) {
+          snprintf(line, OUT_LINE_CAP, "finding hash_mismatch app.pkg");
+        } else {
+          snprintf(line, OUT_LINE_CAP, "ok app.pkg sha256");
+        }
+      }
+    }
+  }
+
+  for(i=0; i<count; i++) {
+    if(strncmp(lines[i], "ok ", 3)) {
+      whole = 0;
+    }
+    say(outfd, lines[i]);
+    say(outfd, "\n");
+  }
+  say(outfd, whole ? "whole " : "not_whole ");
+  say(outfd, args.title);
+  say(outfd, "\n");
+  return whole ? 0 : 1;
+}
+
+
 typedef int (*file_command_fn)(int argc, char *const argv[], int outfd,
                                int errfd);
 
@@ -2575,6 +2929,11 @@ runner_dispatch(platform_t *platform, int argc, char *const argv[], int outfd,
 
   if(!strcmp(argv[0], "sfoinfo")) {
     *status = run_sfoinfo(argc, argv, outfd, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "verify")) {
+    *status = run_verify(platform->fs_root, argc, argv, outfd, errfd);
     return 0;
   }
 

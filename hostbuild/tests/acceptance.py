@@ -4396,8 +4396,13 @@ OSTYPE = {"Darwin": ("kern.ostype", "Darwin"),
 
 def sfo_bytes(title):
     """A PARAM.SFO with one string entry, laid out as bundles/core/sfo.h says."""
-    key = b"TITLE\0"
-    value = title.encode("ascii") + b"\0"
+    return sfo_string_bytes("TITLE", title)
+
+
+def sfo_string_bytes(name, text):
+    """A PARAM.SFO with one string entry called name, laid out as bundles/core/sfo.h says."""
+    key = name.encode("ascii") + b"\0"
+    value = text.encode("ascii") + b"\0"
     keys_offset = 20 + 16
     data_offset = keys_offset + len(key)
     return (struct.pack("<IIIII", 0x46535000, 0x101, keys_offset, data_offset, 1)
@@ -14580,6 +14585,276 @@ FTP_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in FTP_SCENARIOS)
 SCENARIOS.extend(FTP_SCENARIOS)
+
+
+VERIFY_CEILING_BYTES = 256 * 1024 * 1024
+VERIFY_CHECKS = ("app.pkg", "app.pbm", "app.json", "app.xml", "sce_sys/param.sfo",
+                 "appmeta", "licence", "content_id")
+VERIFY_PACKAGE = b"verify package\n"
+VERIFY_WORDS = ("whole", "not_whole", "not_installed", "too_large_to_verify",
+                "bad_argument", "bad_option", "missing_operand")
+VERIFY_KINDS = ("missing", "empty", "licence_missing", "licence_mismatch",
+                "size_mismatch", "hash_mismatch")
+
+
+def verify_content_id(title):
+    return "UP2611-%s_00" % title
+
+
+def write_verify_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
+def make_verify_title(server, title, licences=None, content_key="CONTENT_ID"):
+    """A title laid out as verify reads it: its entries, its appmeta and its licences."""
+    if licences is None:
+        licences = (verify_content_id(title),)
+    app = os.path.join(server.root, "user", "app", title)
+    write_verify_file(os.path.join(app, "app.pkg"), VERIFY_PACKAGE)
+    for name in ("app.pbm", "app.json", "app.xml"):
+        write_verify_file(os.path.join(app, name), name.encode("ascii") + b"\n")
+    write_verify_file(os.path.join(app, "sce_sys", "param.sfo"),
+                      sfo_string_bytes(content_key, verify_content_id(title)))
+    os.makedirs(os.path.join(server.root, "user", "appmeta", title), exist_ok=True)
+    for content_id in licences:
+        write_verify_file(
+            os.path.join(server.root, "user", "license", "fake%s.rif" % content_id),
+            b"licence\n")
+    return app
+
+
+def verify_app_path(server, title, *parts):
+    return os.path.join(server.root, "user", "app", title, *parts)
+
+
+def verify_reply(title, findings=None, drop=(), extra=()):
+    """The reply verify owes: one line per check, then the status and the exit."""
+    findings = findings or {}
+    lines = [findings.get(check, "ok %s" % check)
+             for check in VERIFY_CHECKS if check not in drop]
+    lines.extend(extra)
+    whole = all(line.startswith("ok ") for line in lines)
+    lines.append(("whole %s" if whole else "not_whole %s") % title)
+    lines.append("exit 0" if whole else "exit 1")
+    return lines
+
+
+OTHER_SHA256 = hashlib.sha256(b"not the package\n").hexdigest()
+
+
+def zero_sha256(size):
+    digest = hashlib.sha256()
+    block = bytes(1024 * 1024)
+    remaining = size
+    while remaining:
+        step = min(len(block), remaining)
+        digest.update(block[:step])
+        remaining -= step
+    return digest.hexdigest()
+
+
+def scenario_verify_whole_title_answers_every_check(server):
+    title = "CUSA90101"
+    make_verify_title(server, title)
+    assert run_command(server, "verify %s" % title) == [
+        "ok app.pkg", "ok app.pbm", "ok app.json", "ok app.xml",
+        "ok sce_sys/param.sfo", "ok appmeta", "ok licence", "ok content_id",
+        "whole %s" % title, "exit 0"]
+
+
+def scenario_verify_missing_entry_is_a_finding(server):
+    title = "CUSA90102"
+    make_verify_title(server, title)
+    os.remove(verify_app_path(server, title, "app.xml"))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"app.xml": "finding missing app.xml"})
+
+
+def scenario_verify_empty_entry_is_a_finding(server):
+    title = "CUSA90103"
+    make_verify_title(server, title)
+    write_verify_file(verify_app_path(server, title, "app.json"), b"")
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"app.json": "finding empty app.json"})
+
+
+def scenario_verify_missing_metadata_is_a_finding(server):
+    title = "CUSA90104"
+    make_verify_title(server, title)
+    os.rmdir(os.path.join(server.root, "user", "appmeta", title))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"appmeta": "finding missing appmeta"})
+
+
+def scenario_verify_absent_licence_is_a_finding(server):
+    title = "CUSA90105"
+    make_verify_title(server, title, licences=("UP2611-CUSA90199_00",))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"licence": "finding licence_missing %s" % title},
+        drop=("content_id",)), (
+        "a licence for another title must not count as this title's licence")
+
+
+def scenario_verify_licence_mismatch_is_a_finding(server):
+    title = "CUSA90106"
+    make_verify_title(server, title, licences=("UP9999-%s_00" % title,))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"content_id": "finding licence_mismatch fakeUP9999-%s_00.rif" % title})
+
+
+def scenario_verify_compares_against_the_parameter_file(server):
+    title = "CUSA90107"
+    make_verify_title(server, title, licences=("UP2611-%s_00" % title,),
+                      content_key="TITLE")
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"content_id": "finding missing content_id"})
+
+
+def scenario_verify_size_named_by_the_caller(server):
+    title = "CUSA90108"
+    make_verify_title(server, title)
+    size = len(VERIFY_PACKAGE)
+    assert run_command(server, "verify %s --size %d" % (title, size)) == verify_reply(
+        title, extra=("ok app.pkg size",))
+    assert run_command(server, "verify %s --size %d" % (title, size + 1)) == verify_reply(
+        title, extra=("finding size_mismatch app.pkg %d" % size,))
+
+
+def scenario_verify_hash_computed_only_when_named(server):
+    title = "CUSA90109"
+    make_verify_title(server, title)
+    digest = hashlib.sha256(VERIFY_PACKAGE).hexdigest()
+    assert run_command(server, "verify %s --sha256 %s" % (title, digest)) == verify_reply(
+        title, extra=("ok app.pkg sha256",))
+    assert run_command(server, "verify %s --sha256 %s" % (title, OTHER_SHA256)) == (
+        verify_reply(title, extra=("finding hash_mismatch app.pkg",)))
+
+
+def scenario_verify_oversize_answers_the_ceiling_word(server):
+    title = "CUSA90110"
+    make_verify_title(server, title)
+    os.truncate(verify_app_path(server, title, "app.pkg"), VERIFY_CEILING_BYTES + 1)
+    assert run_command(server, "verify %s" % title) == verify_reply(title), (
+        "a file over the ceiling must not be hashed when no hash is named")
+    assert run_command(server, "verify %s --sha256 %s" % (
+        title, OTHER_SHA256)) == verify_reply(
+        title, extra=("too_large_to_verify app.pkg",))
+
+
+def scenario_verify_hashes_a_file_at_the_ceiling(server):
+    title = "CUSA90111"
+    make_verify_title(server, title)
+    app_pkg = verify_app_path(server, title, "app.pkg")
+    os.truncate(app_pkg, 0)
+    os.truncate(app_pkg, VERIFY_CEILING_BYTES)
+    assert run_command(server, "verify %s --sha256 %s" % (
+        title, zero_sha256(VERIFY_CEILING_BYTES))) == verify_reply(
+        title, extra=("ok app.pkg sha256",))
+
+
+def scenario_verify_not_installed_answers_its_word(server):
+    title = "CUSA90198"
+    assert run_command(server, "verify %s" % title) == [
+        "not_installed %s" % title, "exit 1"]
+
+
+def scenario_verify_bad_arguments_answer_without_checking(server):
+    title = "CUSA90112"
+    make_verify_title(server, title)
+    digest = hashlib.sha256(VERIFY_PACKAGE).hexdigest()
+    cases = (
+        ("verify", ["missing_operand", "exit 1"]),
+        ("verify --size 1", ["bad_option", "exit 1"]),
+        ("verify %s --bogus" % title, ["bad_option", "exit 1"]),
+        ("verify %s --size" % title, ["bad_option", "exit 1"]),
+        ("verify %s --size 12x" % title, ["bad_option", "exit 1"]),
+        ("verify %s --size 1 --size 2" % title, ["bad_option", "exit 1"]),
+        ("verify %s --sha256 ABC" % title, ["bad_option", "exit 1"]),
+        ("verify %s --sha256 %s" % (title, digest.upper()), ["bad_option", "exit 1"]),
+        ("verify %s extra" % title, ["bad_argument", "exit 1"]),
+        ("verify ../etc", ["bad_argument", "exit 1"]),
+    )
+    for command, expected in cases:
+        assert run_command(server, command) == expected, (
+            "%r must answer %r" % (command, expected))
+
+
+def tree_state(root):
+    state = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            info = os.lstat(path)
+            state[path] = (info.st_mode, info.st_size, info.st_mtime_ns)
+    return state
+
+
+def scenario_verify_needs_no_approval_and_changes_nothing(server):
+    title = "CUSA90113"
+    make_verify_title(server, title)
+    user_root = os.path.join(server.root, "user")
+    before = tree_state(user_root)
+    lines = run_command(server, "verify %s --size %d" % (title, len(VERIFY_PACKAGE)))
+    assert lines[-1] == "exit 0" and not any(
+        line.startswith("approval_required") for line in lines), (
+        "verify must answer at once, without a challenge, got %r" % lines)
+    assert tree_state(user_root) == before, "verify must change nothing on disk"
+
+
+def scenario_verify_words_are_documented(server):
+    lines = run_command(server, "help")
+    listed = {line.split(" ")[0] for line in lines[:-1]}
+    assert "verify" in listed, "help must list verify, got %r" % lines
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for word in VERIFY_WORDS:
+        assert "`%s`" % word in registry, (
+            "docs/exit-codes.md must name %s before verify answers it" % word)
+    for kind in VERIFY_KINDS:
+        assert "- `%s`:" % kind in registry, (
+            "docs/exit-codes.md must define the finding kind %s" % kind)
+    assert "256 MiB" in registry, (
+        "docs/exit-codes.md must record the hash ceiling of verify")
+
+
+VERIFY_SCENARIOS = [
+    ("verify answers ok for every check and whole, exit 0 on a whole title",
+     scenario_verify_whole_title_answers_every_check, HOST_ROOT_REASON),
+    ("verify answers missing for a required entry that is absent",
+     scenario_verify_missing_entry_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers empty for a required entry of zero bytes",
+     scenario_verify_empty_entry_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers missing for an absent appmeta entry",
+     scenario_verify_missing_metadata_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers licence_missing, and another title's licence does not count",
+     scenario_verify_absent_licence_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers licence_mismatch when the licence's content ID differs",
+     scenario_verify_licence_mismatch_is_a_finding, HOST_ROOT_REASON),
+    ("verify compares the licence with the title's PARAM.SFO, and answers missing "
+     "when that file has no CONTENT_ID", scenario_verify_compares_against_the_parameter_file,
+     HOST_ROOT_REASON),
+    ("verify compares a size the caller names, and answers size_mismatch for another",
+     scenario_verify_size_named_by_the_caller, HOST_ROOT_REASON),
+    ("verify computes a hash only when one is named, and answers hash_mismatch",
+     scenario_verify_hash_computed_only_when_named, HOST_ROOT_REASON),
+    ("verify answers too_large_to_verify above the hash ceiling, and hashes only "
+     "when a hash is named", scenario_verify_oversize_answers_the_ceiling_word,
+     HOST_ROOT_REASON),
+    ("verify hashes a file exactly at the hash ceiling",
+     scenario_verify_hashes_a_file_at_the_ceiling, HOST_ROOT_REASON),
+    ("verify answers not_installed for an absent title, exit 1",
+     scenario_verify_not_installed_answers_its_word, HOST_ROOT_REASON),
+    ("verify refuses bad options, arguments and titles before checking",
+     scenario_verify_bad_arguments_answer_without_checking, HOST_ROOT_REASON),
+    ("verify needs no approval and changes nothing on disk",
+     scenario_verify_needs_no_approval_and_changes_nothing, HOST_ROOT_REASON),
+    ("verify is listed by help, and its words and finding kinds are documented",
+     scenario_verify_words_are_documented, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in VERIFY_SCENARIOS)
+SCENARIOS.extend(VERIFY_SCENARIOS)
 
 
 def main():
