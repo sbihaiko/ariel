@@ -14582,6 +14582,197 @@ HOST_ROOT_SCENARIOS.update(title for title, _, _ in FTP_SCENARIOS)
 SCENARIOS.extend(FTP_SCENARIOS)
 
 
+TRACE_RECORDS = 8
+TRACE_NAME_MAX = 32
+TRACE_SHOW = {"mounts": 8, "titles": 32, "metadata": 32, "licences": 32,
+              "payloads": 8}
+TRACE_ORDER = ["clock", "uptime", "boot", "space", "mounts", "titles",
+               "metadata", "licences", "payloads"]
+TRACE_ENTRY = {"mounts": "mount", "titles": "title", "metadata": "meta",
+               "licences": "licence", "payloads": "payload"}
+TRACE_WORDS = TRACE_ORDER + list(TRACE_ENTRY.values()) + ["truncated"]
+
+
+def make_trace_title(server, title):
+    """A title with known sizes, its metadata entry and its licence: 1334 bytes."""
+    base = os.path.join(server.root, "user")
+    app = os.path.join(base, "app", title)
+    os.makedirs(os.path.join(app, "sce_sys"), exist_ok=True)
+    with open(os.path.join(app, "app.pkg"), "wb") as handle:
+        handle.write(b"A" * 1234)
+    with open(os.path.join(app, "sce_sys", "param.sfo"), "wb") as handle:
+        handle.write(b"S" * 100)
+    os.makedirs(os.path.join(base, "appmeta"), exist_ok=True)
+    with open(os.path.join(base, "appmeta", title), "wb") as handle:
+        handle.write(b"M")
+    os.makedirs(os.path.join(base, "license"), exist_ok=True)
+    with open(os.path.join(base, "license", "fake%s.rif" % title), "wb") as handle:
+        handle.write(b"L")
+
+
+def drop_trace_title(server, title):
+    base = os.path.join(server.root, "user")
+    shutil.rmtree(os.path.join(base, "app", title), ignore_errors=True)
+    for path in (os.path.join(base, "appmeta", title),
+                 os.path.join(base, "license", "fake%s.rif" % title)):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def trace_reply(server, name, extra=""):
+    return run_command(server, "trace %s%s" % (name, extra))
+
+
+def assert_trace_shape(record):
+    """The record holds only the fixed fields, in their order, each section bounded."""
+    words = [line.split(" ", 1)[0] for line in record]
+    unknown = [word for word in words if word not in TRACE_WORDS]
+    assert not unknown, "a record line outside the field set: %r" % unknown
+    heads = [word for word in words if word in TRACE_ORDER]
+    assert heads == TRACE_ORDER, (
+        "the fields must come once each, in their fixed order: %r" % heads)
+    section = None
+    shown = {}
+    totals = {}
+    for line in record:
+        word, _, rest = line.partition(" ")
+        if word in TRACE_ENTRY:
+            section = word
+            totals[word] = int(rest)
+        elif word == "truncated":
+            assert section in TRACE_ENTRY, "truncated must follow a section"
+            assert rest == "%d of %d" % (TRACE_SHOW[section], totals[section]), (
+                "a cut section names what it shows and what it left out: %r"
+                % line)
+        elif word in TRACE_ORDER:
+            section = word
+        else:
+            assert TRACE_ENTRY.get(section) == word, (
+                "%r is not an entry of %r" % (line, section))
+            shown[section] = shown.get(section, 0) + 1
+    for section, total in totals.items():
+        assert shown.get(section, 0) == min(total, TRACE_SHOW[section]), (
+            "%s shows %d of %d, past its bound" % (
+                section, shown.get(section, 0), total))
+
+
+def scenario_trace_answers_the_record_in_order(server):
+    """trace answers the whole record: the fixed fields in order, then exit 0."""
+    make_trace_title(server, "TRACEFULL1")
+    try:
+        lines = trace_reply(server, "TRACE-ORDER")
+        assert lines[-1] == "exit 0", (
+            "a record must answer exit 0, got %r" % lines[-2:])
+        record = lines[:-1]
+        assert_trace_shape(record)
+        assert "title TRACEFULL1 1334" in record, (
+            "a title's size is the sum of its files: %r" % record)
+        assert "meta TRACEFULL1" in record, "the metadata entry is named"
+        assert "licence fakeTRACEFULL1.rif" in record, "the licence is named"
+        assert not any(server.token in line for line in lines), (
+            "the token must never be answered")
+        assert not any("approv" in line or "nonce" in line for line in lines), (
+            "approval state must never be answered")
+        server.assert_no_line()
+    finally:
+        drop_trace_title(server, "TRACEFULL1")
+
+
+def scenario_trace_record_survives_restart(server):
+    """A record written before a restart is still kept after it."""
+    assert trace_reply(server, "TRACE-KEEP")[-1] == "exit 0", (
+        "the record must be written before the restart")
+    server.restart()
+    assert trace_reply(server, "TRACE-KEEP") == ["trace_exists", "exit 96"], (
+        "a record must survive a restart of Ariel")
+
+
+def scenario_trace_refuses_a_name_outside_the_shape(server):
+    """A missing, too long, separated or non-ASCII name answers bad_path."""
+    assert run_command(server, "trace") == ["missing_operand", "exit 1"], (
+        "trace with no name must answer missing_operand")
+    for name in ["a/b", "A" * (TRACE_NAME_MAX + 1)]:
+        assert trace_reply(server, name) == ["bad_path", "exit 1"], (
+            "%r must answer bad_path" % name)
+    assert run_command(server, 'trace "a b"') == ["bad_path", "exit 1"], (
+        "a name with a space must answer bad_path")
+    assert run_command_bytes(server, b"trace caf\xc3\xa9") == [
+        "bad_path", "exit 1"], "a non-ASCII name must answer bad_path"
+    assert trace_reply(server, "A" * TRACE_NAME_MAX)[-1] == "exit 0", (
+        "a name of %d bytes is the longest accepted" % TRACE_NAME_MAX)
+
+
+def scenario_trace_refuses_an_existing_name_unless_replaced(server):
+    """A name that exists is refused until replacement is asked for."""
+    assert trace_reply(server, "TRACE-DUP")[-1] == "exit 0"
+    assert trace_reply(server, "TRACE-DUP") == ["trace_exists", "exit 96"], (
+        "an existing name must be refused without --replace")
+    make_trace_title(server, "TRACEDUP1")
+    try:
+        lines = trace_reply(server, "TRACE-DUP", " --replace")
+        assert lines[-1] == "exit 0", "--replace must write the record"
+        assert "title TRACEDUP1 1334" in lines, (
+            "a replaced record holds the state at its replacement")
+    finally:
+        drop_trace_title(server, "TRACEDUP1")
+    assert trace_reply(server, "TRACE-DUP") == ["trace_exists", "exit 96"], (
+        "a replaced name is kept, and a second write is refused again")
+    assert trace_reply(server, "TRACE-DUP", " --force") == [
+        "bad_option", "exit 1"], "an unknown option must answer bad_option"
+
+
+def scenario_trace_keeps_only_the_newest_records(server):
+    """Past the fixed number of records, the oldest is dropped first."""
+    assert trace_reply(server, "TRACE-OLD")[-1] == "exit 0"
+    for index in range(TRACE_RECORDS):
+        assert trace_reply(server, "TRACE-NEW%d" % index)[-1] == "exit 0"
+    assert trace_reply(server, "TRACE-NEW%d" % (TRACE_RECORDS - 1)) == [
+        "trace_exists", "exit 96"], "the newest record must be kept"
+    assert trace_reply(server, "TRACE-OLD")[-1] == "exit 0", (
+        "the oldest record must be dropped once the cap is passed")
+
+
+def scenario_trace_answer_stays_bounded(server):
+    """A console with a thousand title directories still answers, within 64 KiB."""
+    base = os.path.join(server.root, "user", "app")
+    names = ["TRACEBULK%04d" % index for index in range(1000)]
+    for name in names:
+        os.makedirs(os.path.join(base, name), exist_ok=True)
+    try:
+        lines = trace_reply(server, "TRACE-BULK")
+        assert lines[-1] == "exit 0", "a large console must still answer"
+        size = sum(len(line) + 1 for line in lines)
+        assert size <= 64 * 1024, "the answer is %d bytes, over 64 KiB" % size
+        total = int(next(line for line in lines
+                         if line.startswith("titles ")).split()[1])
+        assert total >= len(names), "every title directory is counted"
+        shown = [line for line in lines if line.startswith("title ")]
+        assert len(shown) == TRACE_SHOW["titles"], (
+            "the title lines are bounded at %d" % TRACE_SHOW["titles"])
+        assert "truncated %d of %d" % (TRACE_SHOW["titles"], total) in lines, (
+            "a cut section says what it left out")
+    finally:
+        for name in names:
+            shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+
+
+TRACE_SCENARIOS = [
+    ("trace answers the whole record in its fixed order, then exit 0",
+     scenario_trace_answers_the_record_in_order, None),
+    ("a trace record survives a restart of Ariel",
+     scenario_trace_record_survives_restart, None),
+    ("trace refuses a name outside the shape with bad_path",
+     scenario_trace_refuses_a_name_outside_the_shape, None),
+    ("trace refuses an existing name unless --replace is given",
+     scenario_trace_refuses_an_existing_name_unless_replaced, None),
+    ("trace keeps only the newest records, dropping the oldest first",
+     scenario_trace_keeps_only_the_newest_records, None),
+    ("a trace answer stays bounded with a thousand title directories",
+     scenario_trace_answer_stays_bounded, None),
+]
+SCENARIOS.extend(TRACE_SCENARIOS)
+
+
 def main():
     argv = sys.argv[1:]
 

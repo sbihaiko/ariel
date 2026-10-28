@@ -272,3 +272,17 @@ runs_running(const char *name) {
 
   return running;
 }
+
+
+void
+runs_visit_going(runs_visit_t visit, void *ctx) {
+  size_t i;
+
+  pthread_mutex_lock(&lock);
+  for(i=0; i<RUNS_MAX; i++) {
+    if(runs[i].running) {
+      visit(ctx, runs[i].name);
+    }
+  }
+  pthread_mutex_unlock(&lock);
+}

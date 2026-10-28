@@ -64,4 +64,9 @@ int runs_health(platform_t *platform, const char *name, const char *sha256,
 /** Whether a background run of name is still going. Returns 1 or 0. **/
 int runs_running(const char *name);
 
+typedef void (*runs_visit_t)(void *ctx, const char *name);
+
+/** Call visit with the name of each background run still going. **/
+void runs_visit_going(runs_visit_t visit, void *ctx);
+
 #endif /* ARIEL_RUNS_H */

@@ -36,6 +36,7 @@ along with this program; see the file COPYING. If not, see
 #include "approval.h"
 #include "autoload.h"
 #include "protected.h"
+#include "trace.h"
 #include "sha256.h"
 #include "allowlist.h"
 #include "store.h"
@@ -422,6 +423,7 @@ store_init(const char *dir, platform_t *p) {
   snprintf(state_dir, sizeof(state_dir), "%s", dir);
   protected_init(dir);
   addon_init(dir);
+  trace_init(dir);
   platform = p;
   staging_bytes = 0;
   notified = 0;

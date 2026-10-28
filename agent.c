@@ -53,6 +53,7 @@ along with this program; see the file COPYING. If not, see
 #include "store.h"
 #include "tar.h"
 #include "token.h"
+#include "trace.h"
 
 /**
  * The agent port bounds: a command line is at most 4 KiB and 64 tokens,
@@ -5487,6 +5488,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 3 && !strcmp(argv[0], "payload") && !strcmp(argv[1], "logs")) {
     payload_logs(fd, argv[2]);
+    return;
+  }
+
+  if(argc >= 1 && !strcmp(argv[0], "trace")) {
+    trace_command(agent->platform, fd, argc, argv);
     return;
   }
 
