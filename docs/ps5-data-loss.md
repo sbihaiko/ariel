@@ -515,3 +515,40 @@ data survived.
 stopped and ProsperoMgr not loaded. If it survives, candidate 1 takes the weight. If
 it dies again, the copy alone is enough and the console cannot be used for bulk
 transfers without a defined procedure.
+
+## Seventh event (2026-10-28): a power-off while the agent's process was being swapped
+
+The first event whose load this repository wrote itself, and the first one with no
+download, no copy and no title in it.
+
+**What was running.** The ariel agent (pid 158) on 2324 with the build that pinned no
+anchor, `shsrv` on 2323, `ftpsrv` on 2121, kstuff-lite. The console was idle.
+
+**The load.** An anchored build of the same agent was being put in place. The old
+process was killed to free 2324, and the new ELF was sent to `hbldr`. The console
+powered off between the kill and the load.
+
+**What followed.** The console came back by the same path the earlier events took: the
+network up, `shsrv` and `ftpsrv` loaded from `autoload.txt`, and the agent absent,
+because `autoload.txt` still named the old `ariel.elf` and the new build had been sent
+under a different name. Nothing was lost.
+
+**What it adds.** A fourth candidate for the same symptom, and the one that proves the
+guardrail is behavioural rather than technical:
+
+1. **A process killed while it owns a listening socket.** 2324 was bound, the process
+   was signalled, and the console died. No earlier event had a process killed by us.
+2. **The gap between the kill and the replacement.** For some seconds the console had
+   no agent at all, which is the one state the payload stack had not been in.
+
+Neither is separated from the other by this measurement, and neither is separated from
+the three candidates the sixth event left open.
+
+**What changed because of it.** The swap is never done to a running process again. The
+new ELF takes the name `autoload.txt` already points at, and the replacement happens on
+the next boot, where the old process is not interrupted mid-life. That procedure is the
+guard: nothing in the shell knows how to refuse a kill on a listening port.
+
+**The next measurement this event asks for.** Two independent gaps, and this event adds
+a third that is ours to close: the swap-by-reboot above is the only one that needs no
+measurement, because it removes the load instead of explaining it.
