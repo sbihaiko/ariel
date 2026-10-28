@@ -14756,6 +14756,98 @@ def scenario_trace_answer_stays_bounded(server):
             shutil.rmtree(os.path.join(base, name), ignore_errors=True)
 
 
+def trace_dir(server):
+    return os.path.join(server.root, "data", "ariel", "trace")
+
+
+def record_files(server, name):
+    """The record files kept under name, found by their file names."""
+    found = []
+    for entry in os.listdir(trace_dir(server)):
+        seq, _, rest = entry.partition("_")
+        if seq.isdigit() and rest == name:
+            found.append(entry)
+    return sorted(found)
+
+
+def scenario_trace_marks_a_title_it_cannot_measure(server):
+    """A title deeper than the walk goes is marked '-', and the record is still written."""
+    deep = os.path.join(server.root, "user", "app", "TRACEDEEP1")
+    os.makedirs(os.path.join(deep, *["d%d" % depth for depth in range(10)]))
+    make_trace_title(server, "TRACEMEAS1")
+    try:
+        lines = trace_reply(server, "TRACE-DEEP")
+        assert lines[-1] == "exit 0", (
+            "a title that cannot be measured must not fail the record: %r"
+            % lines[-2:])
+        assert "title TRACEDEEP1 -" in lines, (
+            "a title that cannot be measured is marked '-'")
+        assert "title TRACEMEAS1 1334" in lines, (
+            "the other titles are still measured")
+    finally:
+        shutil.rmtree(os.path.join(server.root, "user", "app", "TRACEDEEP1"),
+                      ignore_errors=True)
+        drop_trace_title(server, "TRACEMEAS1")
+
+
+def long_trace_name(index):
+    """A 253-byte name whose escape is three times its length past the first three bytes."""
+    return "%03d%s" % (index, "+" * 250)
+
+
+def cut_trace_name(index):
+    """The shown form: 63 escaped bytes, then the '~' that marks the cut."""
+    return "%03d%s~" % (index, "%2B" * 20)
+
+
+def scenario_trace_bounds_names_of_any_length(server):
+    """Names of the longest length and worst escape still answer, each cut at 64 bytes."""
+    base = os.path.join(server.root, "user")
+    os.makedirs(os.path.join(base, "appmeta"), exist_ok=True)
+    os.makedirs(os.path.join(base, "license"), exist_ok=True)
+    names = [long_trace_name(index) for index in range(TRACE_SHOW["titles"])]
+    for name in names:
+        os.makedirs(os.path.join(base, "app", name), exist_ok=True)
+        open(os.path.join(base, "appmeta", name), "wb").close()
+        open(os.path.join(base, "license", name), "wb").close()
+    try:
+        lines = trace_reply(server, "TRACE-LONG")
+        assert lines[-1] == "exit 0", (
+            "long names must not fail the record: %r" % lines[-2:])
+        size = sum(len(line) + 1 for line in lines)
+        assert size <= 64 * 1024, "the answer is %d bytes, over 64 KiB" % size
+        expected = [cut_trace_name(index)
+                    for index in range(TRACE_SHOW["titles"])]
+        for word in ("title", "meta", "licence"):
+            fields = [line.split()[1] for line in lines
+                      if line.split()[0] == word]
+            assert fields == expected, (
+                "%s names are cut at 64 bytes and marked '~': %r" % (word, fields[:2]))
+    finally:
+        for name in names:
+            shutil.rmtree(os.path.join(base, "app", name), ignore_errors=True)
+            for path in (os.path.join(base, "appmeta", name),
+                         os.path.join(base, "license", name)):
+                if os.path.exists(path):
+                    os.remove(path)
+
+
+def scenario_trace_replace_removes_every_older_file(server):
+    """An interrupted replace leaves two files under one name; the next replace removes both."""
+    assert trace_reply(server, "TRACE-SPLIT")[-1] == "exit 0"
+    (kept,) = record_files(server, "TRACE-SPLIT")
+    seq = int(kept.split("_", 1)[0])
+    shutil.copyfile(os.path.join(trace_dir(server), kept),
+                    os.path.join(trace_dir(server), "%08d_TRACE-SPLIT" % (seq + 1)))
+    assert len(record_files(server, "TRACE-SPLIT")) == 2, (
+        "the fixture must hold two files under one name")
+    assert trace_reply(server, "TRACE-SPLIT", " --replace")[-1] == "exit 0"
+    assert len(record_files(server, "TRACE-SPLIT")) == 1, (
+        "a replace must remove every older file under the name: %r"
+        % record_files(server, "TRACE-SPLIT"))
+    assert trace_reply(server, "TRACE-SPLIT") == ["trace_exists", "exit 96"]
+
+
 TRACE_SCENARIOS = [
     ("trace answers the whole record in its fixed order, then exit 0",
      scenario_trace_answers_the_record_in_order, None),
@@ -14769,6 +14861,12 @@ TRACE_SCENARIOS = [
      scenario_trace_keeps_only_the_newest_records, None),
     ("a trace answer stays bounded with a thousand title directories",
      scenario_trace_answer_stays_bounded, None),
+    ("a trace marks a title it cannot measure with '-' and still answers",
+     scenario_trace_marks_a_title_it_cannot_measure, None),
+    ("a trace cuts names of any length at 64 bytes and still answers",
+     scenario_trace_bounds_names_of_any_length, None),
+    ("trace --replace removes every older file kept under the name",
+     scenario_trace_replace_removes_every_older_file, None),
 ]
 SCENARIOS.extend(TRACE_SCENARIOS)
 

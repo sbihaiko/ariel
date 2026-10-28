@@ -28,13 +28,18 @@ along with this program; see the file COPYING. If not, see
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <mntent.h>
+#else
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#endif
 
 #include "answer.h"
 #include "runs.h"
@@ -45,6 +50,9 @@ along with this program; see the file COPYING. If not, see
 
 /** The longest name a record takes. **/
 #define TRACE_NAME_MAX 32
+
+/** The most escaped bytes a name shows; a longer one is cut and ends in '~'. **/
+#define TRACE_TEXT_MAX 64
 
 /** The entries each section shows before it is cut. **/
 #define TRACE_SHOW_MOUNTS 8
@@ -85,8 +93,13 @@ struct record {
 
 struct going {
   size_t total;
-  size_t shown;
-  char names[TRACE_SHOW_PAYLOADS][PAYLOAD_NAME_MAX + 1];
+  char names[RUNS_MAX][PAYLOAD_NAME_MAX + 1];
+};
+
+struct mounts {
+  size_t total;
+  char target[TRACE_SHOW_MOUNTS][TRACE_TEXT_MAX + 1];
+  char source[TRACE_SHOW_MOUNTS][TRACE_TEXT_MAX + 1];
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -169,19 +182,37 @@ add_line(struct record *record, const char *format, ...) {
 }
 
 
-/* Each byte outside letters, digits, '.', '_' and '-' is written %XX, as the
-   canonical action does (docs/exit-codes.md). */
-static void
-escape(char *out, size_t size, const char *in) {
-  const unsigned char *p = (const unsigned char *)in;
-  size_t len = 0;
+/* Bytes outside letters, digits, '.', '_' and '-' are %XX; a cut name ends in '~'. */
+static size_t
+escaped_width(unsigned char c) {
+  return isalnum(c) || c == '.' || c == '_' || c == '-' ? 1 : 3;
+}
 
-  for(; *p && len + 4 <= size; p++) {
-    if(isalnum(*p) || *p == '.' || *p == '_' || *p == '-') {
-      out[len++] = (char)*p;
+
+static void
+escape(char *out, const char *in) {
+  const unsigned char *p = (const unsigned char *)in;
+  size_t total = 0;
+  size_t limit = TRACE_TEXT_MAX;
+  size_t len = 0;
+  size_t i;
+
+  for(i=0; p[i]; i++) {
+    total += escaped_width(p[i]);
+  }
+  if(total > TRACE_TEXT_MAX) {
+    limit = TRACE_TEXT_MAX - 1;
+  }
+  for(i=0; p[i] && len + escaped_width(p[i]) <= limit; i++) {
+    if(escaped_width(p[i]) == 1) {
+      out[len++] = (char)p[i];
     } else {
-      len += (size_t)snprintf(out + len, size - len, "%%%02X", *p);
+      snprintf(out + len, 4, "%%%02X", p[i]);
+      len += 3;
     }
+  }
+  if(p[i]) {
+    out[len++] = '~';
   }
   out[len] = '\0';
 }
@@ -326,6 +357,25 @@ tree_bytes(const char *path, int depth) {
 
 static int
 boot_time(time_t *boot) {
+#if defined(__linux__)
+  char line[256];
+  unsigned long long secs = 0;
+  FILE *file = fopen("/proc/stat", "r");
+  int found = 0;
+
+  if(!file) {
+    return -1;
+  }
+  while(!found && fgets(line, sizeof(line), file)) {
+    found = sscanf(line, "btime %llu", &secs) == 1;
+  }
+  fclose(file);
+  if(!found) {
+    return -1;
+  }
+  *boot = (time_t)secs;
+  return 0;
+#else
   struct timeval tv;
   size_t size = sizeof(tv);
 
@@ -334,6 +384,49 @@ boot_time(time_t *boot) {
   }
   *boot = tv.tv_sec;
   return 0;
+#endif
+}
+
+
+static void
+visit_mount(void *ctx, const char *target, const char *source) {
+  struct mounts *mounts = ctx;
+
+  if(mounts->total < TRACE_SHOW_MOUNTS) {
+    escape(mounts->target[mounts->total], target);
+    escape(mounts->source[mounts->total], source);
+  }
+  mounts->total++;
+}
+
+
+static int
+visit_mounts(void (*visit)(void *, const char *, const char *), void *ctx) {
+#if defined(__linux__)
+  struct mntent *ent;
+  FILE *file = setmntent("/proc/self/mounts", "r");
+
+  if(!file) {
+    return -1;
+  }
+  while((ent = getmntent(file))) {
+    visit(ctx, ent->mnt_dir, ent->mnt_fsname);
+  }
+  endmntent(file);
+  return 0;
+#else
+  struct statfs *mounts;
+  int count = getmntinfo(&mounts, MNT_NOWAIT);
+  int i;
+
+  if(count < 0) {
+    return -1;
+  }
+  for(i=0; i<count; i++) {
+    visit(ctx, mounts[i].f_mntonname, mounts[i].f_mntfromname);
+  }
+  return 0;
+#endif
 }
 
 
@@ -341,11 +434,10 @@ static void
 visit_going(void *ctx, const char *name) {
   struct going *going = ctx;
 
-  if(going->shown < TRACE_SHOW_PAYLOADS) {
-    snprintf(going->names[going->shown], sizeof(going->names[0]), "%s", name);
-    going->shown++;
+  if(going->total < RUNS_MAX) {
+    snprintf(going->names[going->total], sizeof(going->names[0]), "%s", name);
+    going->total++;
   }
-  going->total++;
 }
 
 
@@ -359,15 +451,13 @@ static int
 fill_record(platform_t *platform, struct record *record) {
   char apps[PATH_MAX];
   char path[PATH_MAX];
-  char esc[3 * PATH_MAX + 1];
-  char esc2[3 * PATH_MAX + 1];
+  char esc[TRACE_TEXT_MAX + 1];
   struct names list;
   struct statvfs vfs;
-  struct statfs *mounts;
+  struct mounts mounts;
   struct going going;
   time_t now = time(NULL);
   time_t boot;
-  int count;
   size_t i;
   size_t shown;
 
@@ -382,18 +472,16 @@ fill_record(platform_t *platform, struct record *record) {
            (unsigned long long)vfs.f_bavail * vfs.f_frsize,
            (unsigned long long)vfs.f_blocks * vfs.f_frsize);
 
-  count = getmntinfo(&mounts, MNT_NOWAIT);
-  if(count < 0) {
+  memset(&mounts, 0, sizeof(mounts));
+  if(visit_mounts(visit_mount, &mounts)) {
     return -1;
   }
-  add_line(record, "mounts %d", count);
-  shown = (size_t)count < TRACE_SHOW_MOUNTS ? (size_t)count : TRACE_SHOW_MOUNTS;
+  add_line(record, "mounts %zu", mounts.total);
+  shown = mounts.total < TRACE_SHOW_MOUNTS ? mounts.total : TRACE_SHOW_MOUNTS;
   for(i=0; i<shown; i++) {
-    escape(esc, sizeof(esc), mounts[i].f_mntonname);
-    escape(esc2, sizeof(esc2), mounts[i].f_mntfromname);
-    add_line(record, "mount %s %s", esc, esc2);
+    add_line(record, "mount %s %s", mounts.target[i], mounts.source[i]);
   }
-  cut(record, shown, (size_t)count);
+  cut(record, shown, mounts.total);
 
   if(join(apps, sizeof(apps), platform->fs_root, "user/app") ||
      list_names(apps, 1, &list)) {
@@ -402,19 +490,17 @@ fill_record(platform_t *platform, struct record *record) {
   add_line(record, "titles %zu", list.count);
   shown = list.count < TRACE_SHOW_TITLES ? list.count : TRACE_SHOW_TITLES;
   for(i=0; i<shown; i++) {
-    long long bytes;
+    long long bytes = -1;
 
-    if(join(path, sizeof(path), apps, list.item[i])) {
-      names_free(&list);
-      return -1;
+    if(!join(path, sizeof(path), apps, list.item[i])) {
+      bytes = tree_bytes(path, 0);
     }
-    bytes = tree_bytes(path, 0);
+    escape(esc, list.item[i]);
     if(bytes < 0) {
-      names_free(&list);
-      return -1;
+      add_line(record, "title %s -", esc);
+    } else {
+      add_line(record, "title %s %lld", esc, bytes);
     }
-    escape(esc, sizeof(esc), list.item[i]);
-    add_line(record, "title %s %lld", esc, bytes);
   }
   cut(record, shown, list.count);
   names_free(&list);
@@ -426,7 +512,7 @@ fill_record(platform_t *platform, struct record *record) {
   add_line(record, "metadata %zu", list.count);
   shown = list.count < TRACE_SHOW_METADATA ? list.count : TRACE_SHOW_METADATA;
   for(i=0; i<shown; i++) {
-    escape(esc, sizeof(esc), list.item[i]);
+    escape(esc, list.item[i]);
     add_line(record, "meta %s", esc);
   }
   cut(record, shown, list.count);
@@ -439,7 +525,7 @@ fill_record(platform_t *platform, struct record *record) {
   add_line(record, "licences %zu", list.count);
   shown = list.count < TRACE_SHOW_LICENCES ? list.count : TRACE_SHOW_LICENCES;
   for(i=0; i<shown; i++) {
-    escape(esc, sizeof(esc), list.item[i]);
+    escape(esc, list.item[i]);
     add_line(record, "licence %s", esc);
   }
   cut(record, shown, list.count);
@@ -447,13 +533,14 @@ fill_record(platform_t *platform, struct record *record) {
 
   memset(&going, 0, sizeof(going));
   runs_visit_going(visit_going, &going);
-  qsort(going.names, going.shown, sizeof(going.names[0]), going_cmp);
+  qsort(going.names, going.total, sizeof(going.names[0]), going_cmp);
+  shown = going.total < TRACE_SHOW_PAYLOADS ? going.total : TRACE_SHOW_PAYLOADS;
   add_line(record, "payloads %zu", going.total);
-  for(i=0; i<going.shown; i++) {
-    escape(esc, sizeof(esc), going.names[i]);
+  for(i=0; i<shown; i++) {
+    escape(esc, going.names[i]);
     add_line(record, "payload %s", esc);
   }
-  cut(record, going.shown, going.total);
+  cut(record, shown, going.total);
 
   return record->full ? -1 : 0;
 }
@@ -561,7 +648,6 @@ write_record(platform_t *platform, int fd, const char *name, int replace) {
   char existing[PATH_MAX];
   unsigned long long seq = 1;
   int found = 0;
-  char found_file[NAME_MAX + 1] = "";
   size_t i;
 
   memset(&list, 0, sizeof(list));
@@ -576,7 +662,6 @@ write_record(platform_t *platform, int fd, const char *name, int replace) {
   for(i=0; i<list.count; i++) {
     if(!strcmp(list.item[i].name, name)) {
       found = 1;
-      snprintf(found_file, sizeof(found_file), "%s", list.item[i].file);
     }
   }
   if(found && !replace) {
@@ -602,11 +687,14 @@ write_record(platform_t *platform, int fd, const char *name, int replace) {
   if(store_record(record.text, record.len, path)) {
     goto fail;
   }
-  if(found && join(existing, sizeof(existing), trace_dir, found_file)) {
-    goto fail;
-  }
-  if(found && unlink(existing)) {
-    goto fail;
+  for(i=0; i<list.count; i++) {
+    if(strcmp(list.item[i].name, name)) {
+      continue;
+    }
+    if(join(existing, sizeof(existing), trace_dir, list.item[i].file) ||
+       unlink(existing)) {
+      goto fail;
+    }
   }
 
   if(scan(&list)) {
