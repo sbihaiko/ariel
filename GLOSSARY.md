@@ -73,3 +73,11 @@ Domain terms of Ariel. Use these words, in this sense, in code, tests, issues an
 - **Test clock**: the host-only clock the suite moves instead of waiting.
 - **Simulated reboot**: on the host build, a granted `reboot` that restarts Ariel's process and runs the autoload entries, as a boot does.
 - **Crash restart**: a restart of Ariel that runs no autoload entry and restarts no payload.
+
+## Verification (specified, not built yet)
+
+- **Title**: an application installed on the console, identified by its title ID.
+- **License**: the file `/user/license/fake<CONTENTID>.rif` that lets a title run. Its content ID must equal the `CONTENT_ID` entry of the title's `PARAM.SFO` (ADR-0016).
+- **Verify**: the read-only check that one title, or with `--all` every title and the console, is structurally whole. It changes nothing and needs no approval.
+- **Finding**: one failed check, reported as `finding <kind> <detail>`. Its kind is one of the closed set in `docs/exit-codes.md`.
+- **Snapshot**: a bounded, named record of the console's state, kept by `trace`. Its fields are fixed and hold no file contents, token or approval state.

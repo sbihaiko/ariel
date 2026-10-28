@@ -67,7 +67,7 @@ The payload list line is `payload <name> source=... version=... release=... asse
 | Exit | Word | Meaning | What the agent does |
 |---|---|---|---|
 | 0 | | Success | |
-| 1 | `unknown_command`, `bad_option`, `bad_range`, `bad_name`, `unknown_payload`, `ariel_pinned`, `already_in_autoload`, `not_in_autoload`, `autoload_full`, `autoload_failed`, `grant_failed`, `not_executable`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `no_previous_version`, `rollback_failed`, `health_failed`, `health_unrecorded`, `health_not_run`, `health_partial`, `key_refused`, `key_failed`, `no_anchor`, `safe_boot_pending`, `unsupported_kind`, `config_failed`, `bad_argument`, `bad_quoting`, `too_many_arguments`, `timed_out`, `no_reply`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, `too_large`, `export_failed`, `value_too_long`, `unsafe_member`, `bad_archive`, `escaping_member`, `bad_member`, `not_a_tar`, `addon_refused`, others | Any other error | Read the word; do not retry as is |
+| 1 | `unknown_command`, `bad_option`, `bad_range`, `bad_name`, `unknown_payload`, `ariel_pinned`, `already_in_autoload`, `not_in_autoload`, `autoload_full`, `autoload_failed`, `grant_failed`, `not_executable`, `already_running`, `too_many_runs`, `no_log`, `log_failed`, `spawn_failed`, `no_previous_version`, `rollback_failed`, `health_failed`, `health_unrecorded`, `health_not_run`, `health_partial`, `key_refused`, `key_failed`, `no_anchor`, `safe_boot_pending`, `unsupported_kind`, `config_failed`, `bad_argument`, `bad_quoting`, `too_many_arguments`, `timed_out`, `no_reply`, `relative_path`, `bad_path`, `exists`, `no_such_file`, `not_a_directory`, `is_a_directory`, `not_a_file`, `symbolic_link`, `operation_failed`, `bad_mode`, `bad_owner`, `bad_group`, `missing_operand`, `too_large`, `export_failed`, `value_too_long`, `unsafe_member`, `bad_archive`, `escaping_member`, `bad_member`, `not_a_tar`, `addon_refused`, `not_installed`, `too_large_to_verify`, others | Any other error | Read the word; do not retry as is |
 | 70 | | Missing or wrong token; the connection is closed | Fix the token |
 | 75 | `approval_required` | The action waits for the owner's signature; the reply carries the challenge | Have the owner sign, send `approval grant`, then repeat the command |
 | 76 | `approval_busy` | Too many pending approvals, or a notification shown less than 10 s ago | Wait and push again |
@@ -88,6 +88,9 @@ The payload list line is `payload <name> source=... version=... release=... asse
 | 91 | `manifest_missing` | An addon's directory has no `manifest` file, or the entry is not a directory. The reply names the addon: `manifest_missing <name>` | Have the owner install the addon's manifest out of band; the agent cannot add one |
 | 92 | `manifest_malformed` | An addon's `manifest` is not a regular file of the form the addon paragraph below describes, is over 512 bytes, or cannot be opened. The reply names the addon: `manifest_malformed <name>` | Have the owner fix the manifest out of band |
 | 93 | `session_expired` | The session an ID names is unknown, expired or malformed. The ID is not live: nothing ran, and `session close` closed nothing | Mint a new session and repeat the command there |
+| 94 | `install_incomplete` | An install did not finish. The reply names the part that is missing: `install_incomplete <TITLE> <part>`, where part is one of `package`, `licence`, `appmeta`, `sfo` | Read the named part; do not treat the title as installed. Repair only through an explicit gated command |
+| 95 | `trace_missing` | No snapshot is kept under the name, so `trace --diff <NAME>` has nothing to compare against. Nothing is compared | Take a snapshot under that name first, or name one that exists |
+| 96 | `trace_exists` | A snapshot is kept under the name and `--replace` was not given. The kept snapshot is unchanged | Use another name. Repeat with `--replace` only when the owner asks for the replacement |
 
 A build that pins no anchor refuses every gated command, and `key adopt-anchor` cannot seed it because the anchor it would adopt is what the build lacks. That state answers `no_anchor` (exit 1) rather than `key_refused`, because it names the build and not the keyring: an empty or mismatched keyring is the owner's to fix from the port, and a missing anchor is not. The audit log records the refusal with the command that answered it, as it does for `key_refused`.
 
@@ -105,4 +108,19 @@ A command line whose first token begins with `@` carries a session prefix: the t
 
 A session carries an environment of its own. `@<sid> export NAME=VALUE` writes the session's map, and its challenge carries `option.scope=session` and never the session's ID, so a grant for one session's export does not run another's. `@<sid> env NAME` answers the session's value when the session holds the name, and the process's own value when it does not, so the answer is the session's layer over the process environment. The map belongs to the session and to nothing else: any connection that names the same session ID reaches it, no process variable changes, another session does not see it, and it leaves the table with the session, whose ID then answers `session_expired` (93). A payload run in the foreground, a payload run in the background and an `exec` started from a session all receive the session's layer over the process environment, copied at the moment of the spawn, so a later `export` in that session does not change a payload that is already running. An addon still runs in a process with an empty environment and never sees a session. A session holds at most 16 names, a name is at most 32 bytes and one assignment at most 1024 bytes: a seventeenth name answers `export_failed` (exit 1), a longer name answers `bad_name` (exit 1) before the owner is asked, and a longer assignment answers `value_too_long` (exit 1). Outside a session `export`, `env` and `exec` behave and sign exactly as they did: `export` sets the process variable, `env` reads it back from the process environment, and `exec` hands the program that same environment. A session layers its own names over that process environment, so a value exported outside one is visible inside it, and `@<sid> export` changes only the session's map.
 
-Free from 94. The `status <n>` line is outside this registry.
+The verify and trace verbs add these words, which have no row of their own. `not_installed` names a title that `verify TITLE` finds absent, and `too_large_to_verify` names the ceiling a content hash was asked above; both are exit 1, because `verify` exits 0 when every check holds and 1 when any does not. `trace_unchanged` is the one word a diff with no changed field answers, with exit 0: it is a successful answer, distinct from `trace_missing`, which says nothing was compared. `licence_mismatch` is a finding kind and has its place in the closed set below.
+
+Free from 97. The `status <n>` line is outside this registry.
+
+## Finding kinds
+
+A verification reports a problem as `finding <kind> <detail>`, and it reports only the kinds in this list. A kind outside it is not printed and is not a word a caller may branch on. The verbs are specified, not built yet: this list fixes the kinds before any code emits one.
+
+- `missing`: a required entry is absent.
+- `empty`: a required entry is present and zero bytes.
+- `licence_missing`: a title has no license under `/user/license`.
+- `licence_mismatch`: the content ID in the title's license file, `/user/license/fake<CONTENTID>.rif`, does not equal the `CONTENT_ID` entry of the title's `PARAM.SFO`.
+- `licence_orphan`: a license names no installed title.
+- `staging_orphan`: a staging directory has no application.
+- `space_below`: free space is below the floor the caller named.
+- `unsupported`: a fact this firmware does not expose.
