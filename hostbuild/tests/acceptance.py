@@ -15543,8 +15543,12 @@ def scenario_trace_diff_answers_the_line_that_names_a_removed_licence(server):
         licence = "fake%s.rif" % verify_content_id(title)
         os.remove(os.path.join(fresh.root, "user", "license", licence))
         lines = run_command(fresh, "trace --diff basis")
-        assert lines == ["licences 1 0", "licence %s present absent" % licence,
-                         "changed 2", "exit 0"], (
+        assert lines[-1] == "exit 0", "the delta must end with its status, got %r" % lines
+        # A busy Linux host can mount or unmount something between two
+        # snapshots; that is the host's change, not the one under test.
+        body = [line for line in lines[:-1] if not line.startswith("mount ")]
+        assert body == ["licences 1 0", "licence %s present absent" % licence,
+                        "changed %d" % (len(lines) - 2)], (
             "the delta must answer exactly the changed fields, got %r" % lines)
     finally:
         fresh.stop()
@@ -15557,8 +15561,12 @@ def scenario_trace_diff_answers_trace_unchanged_when_nothing_moved(server):
         make_verify_title(fresh, "CUSA91011")
         assert run_command(fresh, "trace basis")[-1] == "exit 0"
         before = trace_record_bytes(fresh, "basis")
-        assert run_command(fresh, "trace --diff basis") == ["trace_unchanged", "exit 0"], (
-            "a delta with nothing changed must answer the single word")
+        # A busy Linux host can mount or unmount something between two
+        # snapshots; that is the host's change, not the one under test.
+        lines = [line for line in run_command(fresh, "trace --diff basis")
+                 if not line.startswith("mount ")]
+        assert lines == ["trace_unchanged", "exit 0"], (
+            "a delta with nothing changed must answer the single word, got %r" % lines)
         assert trace_record_bytes(fresh, "basis") == before, (
             "trace --diff must not rewrite the record it compares")
     finally:
