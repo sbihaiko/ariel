@@ -365,3 +365,111 @@ Next experiment, in order of cost:
    the fakelib overlay it manages are out of the picture.
 3. Run the same title with the console offline, so nothing from PSN or the store is
    reachable at launch.
+
+## The controlled sequence (2026-10-28/29, 00:30 to 01:25)
+
+Four experiments in one night, each removing one suspect. Two titles, both known
+freezers, both installed from a complete package on a USB drive.
+
+### Catherine, complete package, nothing else running
+
+Downloaded to the second USB drive: 12,516.8 MiB (13,124,829,184 bytes), `.complete`
+marker written, 64/64 connections, `failed=0`, ~45 minutes. Installed natively into
+`/user/app/CUSA14836`, `app.pkg` 12,516.8 MiB, appmeta populated, fake licence
+`/user/license/fakeUP2611-CUSA14836_00.rif` present.
+
+First launch, disk idle, Overdrive open but not downloading: **hung**. The kernel log
+stops at
+
+```
+[AppDb][AppInfoClient] Initialize()[305]: Initialize() pid:0x15e
+```
+
+after `[PSM] PsmFramework::Initailize() 94 msec. elapsed`. No error, no panic, no
+watchdog line. The network dies with the console: 100% ping loss, every TCP port gone.
+
+### What the hang leaves behind
+
+Power cut, boot, "Reparando..." completes, system returns. The next launch is refused:
+
+```
+[ScePatchChecker] check (CUSA14836): return 0x8041013d
+[NPDRM] del UP2611-CUSA14836_00-CATHERINEFBUS009
+mountApp0Dir:        LNC_ISOK::0x80a4000c
+initializeApp0Dir:   LNC_ISOK::0x80a4000c
+launchApp:           LNC_ISOK::0x80a4000c
+LaunchFlowError.CUSA14836 -> "cannot start / delete the application"
+```
+
+This corrects the earlier reading of the same chain on Child of Light. `0x80a4000c`
+is **the aftermath of the hang**, not evidence of a truncated package: the hang
+damages the registration, NPDRM deletes the entitlement, and every later launch fails
+to mount app0. The package on the drive was complete and its size matched the
+installed copy byte for byte.
+
+`0x8041013d` is not a launch fault either. It appears all over this console --
+`PFAuthClient`, `ScePs4AppCategory`, `SceRnpsAppMgr`, `ScePatchChecker` -- whenever
+something asks the network. It is the offline error, noise in every log that follows a
+launch.
+
+### ShadowMountPlus stopped
+
+The mounter was shut down cleanly with `/data/shadowmount/STOP`: process gone,
+`/mnt/shadowmnt` empty, the Overdrive image unmounted, kstuff and ftpsrv untouched.
+Catherine was reinstalled from the same package (licence recreated), Overdrive closed,
+and the disk confirmed idle by two `/user` samples 45 seconds apart (17.8 G used,
+845.7 G free, identical).
+
+Launch: **hung again**, at the same `AppInfoClient Initialize()` line.
+
+The mounter is not the cause, and neither is an image being mounted at launch.
+
+### Heavy writes in flight
+
+Last night's hypothesis: the hang needs writes in flight. Overdrive was set to
+download to the internal drive (`/data/downloads/packages`), measured at `recv
+10,150 KB/s`, `disk 10,196 KB/s`, `conns=16/16`, `write_max 9 ms`. With that running,
+Catherine was launched.
+
+It was **refused, not hung**: first `checkExistingApp: 0x80940010`, then
+`mountApp0Dir: 0x80a4000c`, clean `LaunchFlowError`, console alive. Catherine cannot
+mount app0 even immediately after a fresh install with the licence in place.
+
+Child of Light was then launched under the same load, and it **ran**:
+
+```
+<111> EXEC /app0/childoflight.elf [user], vm#1, dmem#1 abi=ps4 category=ps4_game <717789 msec>
+[KERNEL] INFO: pid 111
+[KERNEL] INFO: SDK vesion: PS4:01600051
+[KERNEL] INFO: Total Memory Size: 0x1e0600000 / DMEM 0x120000000 / FMEM 0x1c000000
+### GFX(pipe0) Game. proc gen:0 gpu gen:0 ub:0 vmid:1 pid:111
+```
+
+The game process was created, given memory and a GPU pipe. Seconds later the console
+**powered itself off**. Booted back into "Reparando...", then normal, with the account
+and saves intact.
+
+### What this settles, and what it corrects
+
+- ShadowMountPlus is innocent. Two hangs, one of them with the payload not loaded.
+- A download in flight is not required for the hang, and does not produce one by
+  itself: the hang happens with the disk idle.
+- `0x80a4000c` and `0x8041013d` are aftermath and noise, not cause.
+- "Child of Light never opened" was wrong. It opens, executes as pid 111, and the
+  console dies afterwards.
+- Catherine and Child of Light are not the same failure. Child of Light mounts app0
+  and executes; Catherine never mounts app0 at all, and is refused even on a clean
+  install.
+- Undertale (152 MB) remains the only title that plays and saves.
+
+### The next three measurements
+
+1. Bracket the size. A PS4 PKG of 200 MB to 1 GB, installed and launched the same way,
+   between Undertale's 152 MB (works) and Child of Light's 2.28 GB (executes, then
+   kills the console). If the boundary is size, the rule becomes practical.
+2. Verify the Catherine package offline with the UltraPack tooling
+   (`ffpfsc-pkg-tool`, `cli.py --fpkg-inner`) against its declared PFS image size, so
+   "cannot mount app0" has a cause that is not guesswork.
+3. Diff the kernel log of a working launch (Undertale) against this hanging one
+   (`AppInfoClient Initialize()` last line). Still the only measurement that can name
+   a mechanism.
