@@ -99,7 +99,7 @@ static const struct {
   {"sysctl", "print a kernel parameter"},
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
-  {"verify", "say whether one installed title is whole, with --size and --sha256 to compare"},
+  {"verify", "say whether one installed title is whole, with --size and --sha256 to compare; --all sweeps the console, with --floor N for free space"},
   {"wc","count the lines, words and bytes of an absolute file"},
 };
 
@@ -2404,6 +2404,9 @@ typedef struct {
   const char *sha256;
   int has_size;
   size_t size;
+  int all;
+  int has_floor;
+  size_t floor;
 } verify_args_t;
 
 
@@ -2416,18 +2419,25 @@ verify_parse(int argc, char *const argv[], verify_args_t *args, int errfd) {
     say(errfd, "missing_operand\n");
     return 1;
   }
-  if(argv[1][0] == '-') {
+  if(!strcmp(argv[1], "--all")) {
+    args->all = 1;
+  } else if(argv[1][0] == '-') {
     say(errfd, "bad_option\n");
     return 1;
+  } else {
+    args->title = argv[1];
   }
-  args->title = argv[1];
 
   for(i=2; i<argc; i++) {
-    if(!strcmp(argv[i], "--size") && !args->has_size && i+1 < argc &&
-       !parse_count(argv[i+1], &args->size)) {
+    if(args->all && !strcmp(argv[i], "--floor") && !args->has_floor && i+1 < argc &&
+       !parse_count(argv[i+1], &args->floor)) {
+      args->has_floor = 1;
+      i++;
+    } else if(!args->all && !strcmp(argv[i], "--size") && !args->has_size && i+1 < argc &&
+              !parse_count(argv[i+1], &args->size)) {
       args->has_size = 1;
       i++;
-    } else if(!strcmp(argv[i], "--sha256") && !args->sha256 && i+1 < argc &&
+    } else if(!args->all && !strcmp(argv[i], "--sha256") && !args->sha256 && i+1 < argc &&
               verify_hex_digest(argv[i+1])) {
       args->sha256 = argv[++i];
     } else if(argv[i][0] == '-') {
@@ -2439,7 +2449,7 @@ verify_parse(int argc, char *const argv[], verify_args_t *args, int errfd) {
     }
   }
 
-  if(!verify_title_ok(args->title)) {
+  if(!args->all && !verify_title_ok(args->title)) {
     say(errfd, "bad_argument\n");
     return 1;
   }
@@ -2615,28 +2625,325 @@ verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1]) {
 
 
 /**
- * verify TITLE [--size N] [--sha256 HEX]: answer one line per check, then
- * whole or not_whole. A size or hash is compared only when the caller names
- * one, and a file over VERIFY_CEILING is never read for its hash.
+ * The checks of the title at app, one line each in lines, counted in total.
+ * A size or hash is compared only when the caller names one, and a file over
+ * VERIFY_CEILING is never read for its hash. A hash that cannot be read is
+ * reported and answers 1.
  **/
 static int
-run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd) {
-  char lines[VERIFY_LINES][OUT_LINE_CAP];
+verify_title_checks(const char *root, const char *app, const verify_args_t *args,
+                    char lines[VERIFY_LINES][OUT_LINE_CAP], size_t *total, int errfd) {
   char licence[PATH_MAX];
   char content[PATH_MAX];
   char path[PATH_MAX];
-  char app[PATH_MAX];
   char hex[SHA256_HEX_LEN + 1];
-  verify_args_t args;
   struct stat st;
   size_t count = 0;
   size_t i;
   char *line;
-  int whole = 1;
   int rc;
+
+  for(i=0; i<sizeof(verify_entries)/sizeof(verify_entries[0]); i++) {
+    verify_entry(app, verify_entries[i], lines[count++]);
+  }
+
+  line = lines[count++];
+  if(snprintf(path, sizeof(path), "%s/user/appmeta/%s", root, args->title) >= (int)sizeof(path) ||
+     lstat(path, &st)) {
+    snprintf(line, OUT_LINE_CAP, "finding missing appmeta");
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok appmeta");
+  }
+
+  line = lines[count++];
+  if(!verify_find_licence(root, args->title, licence, sizeof(licence))) {
+    snprintf(line, OUT_LINE_CAP, "finding licence_missing %s", args->title);
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok licence");
+    line = lines[count++];
+    if(snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app) >= (int)sizeof(path) ||
+       sfo_string(path, "CONTENT_ID", content, sizeof(content))) {
+      snprintf(line, OUT_LINE_CAP, "finding missing content_id");
+    } else if(!verify_licence_is(licence, content)) {
+      snprintf(line, OUT_LINE_CAP, "finding licence_mismatch %s", licence);
+    } else {
+      snprintf(line, OUT_LINE_CAP, "ok content_id");
+    }
+  }
+
+  if(args->has_size || args->sha256) {
+    snprintf(path, sizeof(path), "%s/app.pkg", app);
+    if(!lstat(path, &st) && S_ISREG(st.st_mode)) {
+      if(args->has_size) {
+        line = lines[count++];
+        if((unsigned long long)st.st_size == (unsigned long long)args->size) {
+          snprintf(line, OUT_LINE_CAP, "ok app.pkg size");
+        } else {
+          snprintf(line, OUT_LINE_CAP, "finding size_mismatch app.pkg %lld",
+                   (long long)st.st_size);
+        }
+      }
+      if(args->sha256) {
+        line = lines[count++];
+        if((unsigned long long)st.st_size > VERIFY_CEILING) {
+          snprintf(line, OUT_LINE_CAP, "too_large_to_verify app.pkg");
+        } else if((rc=verify_sha256(path, hex))) {
+          report("verify", path, errfd, rc);
+          return 1;
+        } else if(strcmp(hex, args->sha256)) {
+          snprintf(line, OUT_LINE_CAP, "finding hash_mismatch app.pkg");
+        } else {
+          snprintf(line, OUT_LINE_CAP, "ok app.pkg sha256");
+        }
+      }
+    }
+  }
+
+  *total = count;
+  return 0;
+}
+
+
+static void
+verify_finding(int outfd, const char *kind, const char *detail) {
+  say(outfd, "finding ");
+  say(outfd, kind);
+  say(outfd, " ");
+  say(outfd, detail);
+  say(outfd, "\n");
+}
+
+
+// A finding of one title names the title after its kind. licence_missing
+// already names its title as its detail, so it keeps that one name.
+static void
+verify_title_finding(int outfd, const char *title, const char *line) {
+  const char *kind = line + sizeof("finding ") - 1;
+  size_t kind_len = strcspn(kind, " ");
+
+  if(kind_len == sizeof("licence_missing") - 1 &&
+     !strncmp(kind, "licence_missing", kind_len)) {
+    say(outfd, line);
+    say(outfd, "\n");
+    return;
+  }
+  say(outfd, "finding ");
+  put(outfd, kind, kind_len);
+  say(outfd, " ");
+  say(outfd, title);
+  say(outfd, " ");
+  say(outfd, kind + kind_len + 1);
+  say(outfd, "\n");
+}
+
+
+// Whether an installed title, a directory under user/app, is named by licence.
+static int
+verify_licence_named(const char *root, const char *licence) {
+  char dir[PATH_MAX];
+  char app[PATH_MAX];
+  char needle[PATH_MAX];
+  struct dirent *entry;
+  struct stat st;
+  DIR *apps;
+  int found = 0;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/app", root) >= (int)sizeof(dir) ||
+     !(apps=opendir(dir))) {
+    return 0;
+  }
+  while(!found && (entry=readdir(apps))) {
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+       snprintf(needle, sizeof(needle), "-%s_", entry->d_name) >= (int)sizeof(needle) ||
+       !strstr(licence, needle)) {
+      continue;
+    }
+    found = snprintf(app, sizeof(app), "%s/%s", dir, entry->d_name) < (int)sizeof(app) &&
+            !lstat(app, &st) && S_ISDIR(st.st_mode);
+  }
+  closedir(apps);
+  return found;
+}
+
+
+static size_t
+verify_orphan_licences(const char *root, int titles_listed, int outfd) {
+  char dir[PATH_MAX];
+  struct dirent *entry;
+  DIR *licences;
+  size_t findings = 0;
+  size_t len;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/license", root) >= (int)sizeof(dir)) {
+    return 0;
+  }
+  if(!(licences=opendir(dir))) {
+    if(errno == ENOENT) {
+      return 0;
+    }
+    verify_finding(outfd, "unsupported", "licences");
+    return 1;
+  }
+  if(!titles_listed) {
+    closedir(licences);
+    return 0;
+  }
+  while((entry=readdir(licences))) {
+    len = strlen(entry->d_name);
+    if(strncmp(entry->d_name, "fake", 4) || strcmp(entry->d_name + len - 4, ".rif") ||
+       verify_licence_named(root, entry->d_name)) {
+      continue;
+    }
+    verify_finding(outfd, "licence_orphan", entry->d_name);
+    findings++;
+  }
+  closedir(licences);
+  return findings;
+}
+
+
+static size_t
+verify_orphan_staging(const char *root, int outfd) {
+  char dir[PATH_MAX];
+  char stage[PATH_MAX];
+  char app[PATH_MAX];
+  struct dirent *entry;
+  struct stat st;
+  DIR *staging;
+  size_t findings = 0;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/staging", root) >= (int)sizeof(dir)) {
+    return 0;
+  }
+  if(!(staging=opendir(dir))) {
+    if(errno == ENOENT) {
+      return 0;
+    }
+    verify_finding(outfd, "unsupported", "staging");
+    return 1;
+  }
+  while((entry=readdir(staging))) {
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+       snprintf(stage, sizeof(stage), "%s/%s", dir, entry->d_name) >= (int)sizeof(stage) ||
+       lstat(stage, &st) || !S_ISDIR(st.st_mode)) {
+      continue;
+    }
+    if(snprintf(app, sizeof(app), "%s/user/app/%s", root, entry->d_name) < (int)sizeof(app) &&
+       !lstat(app, &st) && S_ISDIR(st.st_mode)) {
+      continue;
+    }
+    verify_finding(outfd, "staging_orphan", entry->d_name);
+    findings++;
+  }
+  closedir(staging);
+  return findings;
+}
+
+
+static size_t
+verify_space(const char *root, size_t floor, int outfd) {
+  char path[PATH_MAX];
+  char bytes[32];
+  struct statvfs vfs;
+  unsigned long long available;
+
+  if(snprintf(path, sizeof(path), "%s/user", root) >= (int)sizeof(path) ||
+     statvfs(path, &vfs)) {
+    verify_finding(outfd, "unsupported", "space");
+    return 1;
+  }
+  available = (unsigned long long)vfs.f_bavail * vfs.f_frsize;
+  if(available >= (unsigned long long)floor) {
+    return 0;
+  }
+  snprintf(bytes, sizeof(bytes), "%llu", available);
+  verify_finding(outfd, "space_below", bytes);
+  return 1;
+}
+
+
+/**
+ * verify --all [--floor N]: the checks of every installed title, then the
+ * console-wide findings. A clean console answers one line. Findings are
+ * answered in the order the console lists its titles.
+ **/
+static int
+run_verify_all(const char *root, const verify_args_t *args, int outfd, int errfd) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  char dir[PATH_MAX];
+  char app[PATH_MAX];
+  verify_args_t title;
+  struct dirent *entry;
+  struct stat st;
+  size_t findings = 0;
+  size_t count;
+  size_t i;
+  int titles_listed = 1;
+  DIR *apps;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/app", root) >= (int)sizeof(dir)) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  if(!(apps=opendir(dir))) {
+    if(errno != ENOENT) {
+      titles_listed = 0;
+      verify_finding(outfd, "unsupported", "titles");
+      findings++;
+    }
+  } else {
+    while((entry=readdir(apps))) {
+      if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+         snprintf(app, sizeof(app), "%s/%s", dir, entry->d_name) >= (int)sizeof(app) ||
+         lstat(app, &st) || !S_ISDIR(st.st_mode)) {
+        continue;
+      }
+      memset(&title, 0, sizeof(title));
+      title.title = entry->d_name;
+      if(verify_title_checks(root, app, &title, lines, &count, errfd)) {
+        closedir(apps);
+        return 1;
+      }
+      for(i=0; i<count; i++) {
+        if(!strncmp(lines[i], "finding ", 8)) {
+          verify_title_finding(outfd, entry->d_name, lines[i]);
+          findings++;
+        }
+      }
+    }
+    closedir(apps);
+  }
+
+  findings += verify_orphan_licences(root, titles_listed, outfd);
+  findings += verify_orphan_staging(root, outfd);
+  if(args->has_floor) {
+    findings += verify_space(root, args->floor, outfd);
+  }
+
+  say(outfd, findings ? "not_whole console\n" : "whole console\n");
+  return findings ? 1 : 0;
+}
+
+
+/**
+ * verify TITLE [--size N] [--sha256 HEX] or verify --all [--floor N]: answer
+ * one line per check, then whole or not_whole.
+ **/
+static int
+run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  verify_args_t args;
+  char app[PATH_MAX];
+  struct stat st;
+  size_t count = 0;
+  size_t i;
+  int whole = 1;
 
   if(verify_parse(argc, argv, &args, errfd)) {
     return 1;
+  }
+  if(args.all) {
+    return run_verify_all(root, &args, outfd, errfd);
   }
   if(snprintf(app, sizeof(app), "%s/user/app/%s", root, args.title) >= (int)sizeof(app)) {
     say(errfd, "bad_path\n");
@@ -2651,61 +2958,8 @@ run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd)
   if(refuse_protected(app, errfd)) {
     return STATUS_PROTECTED;
   }
-
-  for(i=0; i<sizeof(verify_entries)/sizeof(verify_entries[0]); i++) {
-    verify_entry(app, verify_entries[i], lines[count++]);
-  }
-
-  line = lines[count++];
-  if(snprintf(path, sizeof(path), "%s/user/appmeta/%s", root, args.title) >= (int)sizeof(path) ||
-     lstat(path, &st)) {
-    snprintf(line, OUT_LINE_CAP, "finding missing appmeta");
-  } else {
-    snprintf(line, OUT_LINE_CAP, "ok appmeta");
-  }
-
-  line = lines[count++];
-  if(!verify_find_licence(root, args.title, licence, sizeof(licence))) {
-    snprintf(line, OUT_LINE_CAP, "finding licence_missing %s", args.title);
-  } else {
-    snprintf(line, OUT_LINE_CAP, "ok licence");
-    line = lines[count++];
-    if(snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app) >= (int)sizeof(path) ||
-       sfo_string(path, "CONTENT_ID", content, sizeof(content))) {
-      snprintf(line, OUT_LINE_CAP, "finding missing content_id");
-    } else if(!verify_licence_is(licence, content)) {
-      snprintf(line, OUT_LINE_CAP, "finding licence_mismatch %s", licence);
-    } else {
-      snprintf(line, OUT_LINE_CAP, "ok content_id");
-    }
-  }
-
-  if(args.has_size || args.sha256) {
-    snprintf(path, sizeof(path), "%s/app.pkg", app);
-    if(!lstat(path, &st) && S_ISREG(st.st_mode)) {
-      if(args.has_size) {
-        line = lines[count++];
-        if((unsigned long long)st.st_size == (unsigned long long)args.size) {
-          snprintf(line, OUT_LINE_CAP, "ok app.pkg size");
-        } else {
-          snprintf(line, OUT_LINE_CAP, "finding size_mismatch app.pkg %lld",
-                   (long long)st.st_size);
-        }
-      }
-      if(args.sha256) {
-        line = lines[count++];
-        if((unsigned long long)st.st_size > VERIFY_CEILING) {
-          snprintf(line, OUT_LINE_CAP, "too_large_to_verify app.pkg");
-        } else if((rc=verify_sha256(path, hex))) {
-          report("verify", path, errfd, rc);
-          return 1;
-        } else if(strcmp(hex, args.sha256)) {
-          snprintf(line, OUT_LINE_CAP, "finding hash_mismatch app.pkg");
-        } else {
-          snprintf(line, OUT_LINE_CAP, "ok app.pkg sha256");
-        }
-      }
-    }
+  if(verify_title_checks(root, app, &args, lines, &count, errfd)) {
+    return 1;
   }
 
   for(i=0; i<count; i++) {

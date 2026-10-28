@@ -14741,7 +14741,8 @@ VERIFY_PACKAGE = b"verify package\n"
 VERIFY_WORDS = ("whole", "not_whole", "not_installed", "too_large_to_verify",
                 "bad_argument", "bad_option", "missing_operand")
 VERIFY_KINDS = ("missing", "empty", "licence_missing", "licence_mismatch",
-                "size_mismatch", "hash_mismatch")
+                "size_mismatch", "hash_mismatch", "licence_orphan",
+                "staging_orphan", "space_below", "unsupported")
 
 
 def verify_content_id(title):
@@ -14964,6 +14965,149 @@ def scenario_verify_words_are_documented(server):
             "docs/exit-codes.md must define the finding kind %s" % kind)
     assert "256 MiB" in registry, (
         "docs/exit-codes.md must record the hash ceiling of verify")
+    assert "verify --all" in registry, "docs/exit-codes.md must describe verify --all"
+    assert "`--floor`" in registry, "docs/exit-codes.md must name the free-space floor"
+
+
+def verify_all_findings_reply(lines, findings):
+    """The reply verify --all owes: the findings in any order, then the status and the exit."""
+    if not findings:
+        assert lines == ["whole console", "exit 0"], (
+            "a clean console answers one line and exit 0, got %r" % lines)
+        return
+    assert lines[-2:] == ["not_whole console", "exit 1"], (
+        "a console with findings answers not_whole and exit 1, got %r" % lines)
+    assert sorted(lines[:-2]) == sorted(findings), (
+        "verify --all must answer %r, got %r" % (findings, lines[:-2]))
+
+
+def scenario_verify_all_clean_console_answers_one_line(server):
+    del server  # each console is a root of its own, so no other scenario's title is swept
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90301")
+        make_verify_title(fresh, "CUSA90302")
+        write_verify_file(os.path.join(fresh.root, "user", "license", "notes.txt"),
+                          b"not a licence\n")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [])
+        assert run_command(fresh, "verify --all --floor 0") == ["whole console", "exit 0"], (
+            "a floor of zero bytes cannot be below, so it must add no finding")
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_checks_every_title_and_names_each_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90311")
+        make_verify_title(fresh, "CUSA90312")
+        make_verify_title(fresh, "CUSA90313", licences=("UP9999-CUSA90313_00",))
+        make_verify_title(fresh, "CUSA90314")
+        os.remove(verify_app_path(fresh, "CUSA90312", "app.xml"))
+        write_verify_file(verify_app_path(fresh, "CUSA90314", "app.json"), b"")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding missing CUSA90312 app.xml",
+            "finding licence_mismatch CUSA90313 fakeUP9999-CUSA90313_00.rif",
+            "finding empty CUSA90314 app.json",
+        ])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_orphan_licence_is_a_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90321")
+        write_verify_file(os.path.join(fresh.root, "user", "license",
+                                       "fakeUP2611-CUSA90399_00.rif"), b"licence\n")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding licence_orphan fakeUP2611-CUSA90399_00.rif"])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_orphan_staging_is_a_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90331")
+        os.makedirs(os.path.join(fresh.root, "user", "staging", "CUSA90332"))
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding staging_orphan CUSA90332"])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_space_below_floor_is_a_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90341")
+        lines = run_command(fresh, "verify --all --floor %d" % (1 << 62))
+        assert len(lines) == 3 and re.fullmatch(r"finding space_below \d+", lines[0]), (
+            "a floor above the free space must answer space_below, got %r" % lines)
+        assert lines[1:] == ["not_whole console", "exit 1"], (
+            "a console below its floor answers not_whole, got %r" % lines)
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_unsupported_fact_is_not_a_pass(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90351")
+        license_dir = os.path.join(fresh.root, "user", "license")
+        shutil.rmtree(license_dir)
+        write_verify_file(license_dir, b"the licence store is not a directory here\n")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding licence_missing CUSA90351",
+            "finding unsupported licences"])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_refuses_bad_options_before_checking(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        title = "CUSA90361"
+        make_verify_title(fresh, title)
+        digest = hashlib.sha256(VERIFY_PACKAGE).hexdigest()
+        cases = (
+            ("verify --all extra", ["bad_argument", "exit 1"]),
+            ("verify --all --all", ["bad_option", "exit 1"]),
+            ("verify --all --size 1", ["bad_option", "exit 1"]),
+            ("verify --all --sha256 %s" % digest, ["bad_option", "exit 1"]),
+            ("verify --all --floor", ["bad_option", "exit 1"]),
+            ("verify --all --floor 12x", ["bad_option", "exit 1"]),
+            ("verify --all --floor 1 --floor 2", ["bad_option", "exit 1"]),
+            ("verify %s --floor 1" % title, ["bad_option", "exit 1"]),
+        )
+        for command, expected in cases:
+            assert run_command(fresh, command) == expected, (
+                "%r must answer %r" % (command, expected))
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_needs_no_approval_and_changes_nothing(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90371")
+        os.makedirs(os.path.join(fresh.root, "user", "staging", "CUSA90372"))
+        user_root = os.path.join(fresh.root, "user")
+        before = tree_state(user_root)
+        lines = run_command(fresh, "verify --all --floor 1")
+        assert lines[-2] in ("whole console", "not_whole console") and not any(
+            line.startswith("approval_required") for line in lines), (
+            "verify --all must answer at once, without a challenge, got %r" % lines)
+        assert tree_state(user_root) == before, "verify --all must change nothing on disk"
+    finally:
+        fresh.stop()
 
 
 VERIFY_SCENARIOS = [
@@ -14999,6 +15143,22 @@ VERIFY_SCENARIOS = [
      scenario_verify_needs_no_approval_and_changes_nothing, HOST_ROOT_REASON),
     ("verify is listed by help, and its words and finding kinds are documented",
      scenario_verify_words_are_documented, HOST_ROOT_REASON),
+    ("verify --all answers whole console and exit 0 for a clean console",
+     scenario_verify_all_clean_console_answers_one_line, HOST_ROOT_REASON),
+    ("verify --all checks every title and names each finding by its title and kind",
+     scenario_verify_all_checks_every_title_and_names_each_finding, HOST_ROOT_REASON),
+    ("verify --all answers licence_orphan for a licence that names no installed title",
+     scenario_verify_all_orphan_licence_is_a_finding, HOST_ROOT_REASON),
+    ("verify --all answers staging_orphan for a staging directory with no app",
+     scenario_verify_all_orphan_staging_is_a_finding, HOST_ROOT_REASON),
+    ("verify --all answers space_below when free space is under the named floor",
+     scenario_verify_all_space_below_floor_is_a_finding, HOST_ROOT_REASON),
+    ("verify --all answers unsupported for a fact the console does not expose, not a pass",
+     scenario_verify_all_unsupported_fact_is_not_a_pass, HOST_ROOT_REASON),
+    ("verify --all refuses bad options and arguments before checking",
+     scenario_verify_all_refuses_bad_options_before_checking, HOST_ROOT_REASON),
+    ("verify --all needs no approval and changes nothing on disk",
+     scenario_verify_all_needs_no_approval_and_changes_nothing, HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in VERIFY_SCENARIOS)
 SCENARIOS.extend(VERIFY_SCENARIOS)
