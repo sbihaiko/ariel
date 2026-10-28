@@ -62,6 +62,8 @@ along with this program; see the file COPYING. If not, see
 #define SLEEP_MAX 60
 #define VERIFY_CEILING (256ULL * 1024 * 1024)
 #define VERIFY_LINES 10
+/* One file name from a directory entry: 255 bytes plus the terminator. */
+#define VERIFY_NAME_CAP 256
 
 
 static const struct {
@@ -2633,7 +2635,8 @@ verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1]) {
 static int
 verify_title_checks(const char *root, const char *app, const verify_args_t *args,
                     char lines[VERIFY_LINES][OUT_LINE_CAP], size_t *total, int errfd) {
-  char licence[PATH_MAX];
+  /* A licence is one directory entry, so its name and not a path bounds it. */
+  char licence[VERIFY_NAME_CAP];
   char content[PATH_MAX];
   char path[PATH_MAX];
   char hex[SHA256_HEX_LEN + 1];
@@ -2672,7 +2675,10 @@ verify_title_checks(const char *root, const char *app, const verify_args_t *args
   }
 
   if(args->has_size || args->sha256) {
-    snprintf(path, sizeof(path), "%s/app.pkg", app);
+    if(snprintf(path, sizeof(path), "%s/app.pkg", app) >= (int)sizeof(path)) {
+      say(errfd, "bad_path\n");
+      return 1;
+    }
     if(!lstat(path, &st) && S_ISREG(st.st_mode)) {
       if(args->has_size) {
         line = lines[count++];
