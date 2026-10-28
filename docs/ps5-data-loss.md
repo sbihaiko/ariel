@@ -20,6 +20,21 @@ A "loss" means the console fell to Safe Mode with only *Reset PS5 (reinstall sys
 software)* selectable. Reinstalling is what erases the internal drive; the console
 did not necessarily erase it by itself.
 
+## The four losses, re-read against verify, trace and pkg_install
+
+The first four entries are identified only by their scene here: the autoloader, two
+game launches, and an Overdrive download. This table applies the verbs in #119 to
+those four scenes; it does not add facts the record lacks. The `trace` record is bounded (32 KiB and 96 fields); it records names, counts and sizes, not file contents. A record identical before
+and after a hang is evidence that those fields did not change, not a verdict on what
+happened.
+
+| Loss | What `verify TITLE` would have said | What the pre-loss `trace NAME` and later `trace --diff NAME` would have shown | What `pkg_install`'s ending would have said |
+| --- | --- | --- | --- |
+| Autoloader (event 1) | No title is identified as part of this event, so no title verification result can be inferred. If run for an identified installed title, it checks structure and licence-to-`PARAM.SFO` content ID; `exit 0` means all checks held, `exit 1` means a finding. Neither status diagnoses the autoloader. | `trace NAME` would have preserved the documented fields (clock/uptime, volume free space, mounts, app directories and sizes, appmeta, licences, payload processes, kernel-log boot marker). The later diff would list changed fields or answer `trace_unchanged`; it would not identify why the autoloader failed. | No `pkg_install` event is identified, so no install ending can be inferred. If a title install had completed, it would say `installed <TITLE> <bytes> <sha256-or->` (`exit 0`); an incomplete one would name `package`, `licence`, `appmeta`, or `sfo` (`exit 1`). |
+| Game launch (event 2) | For the launched title, checks would identify required missing/empty entries, appmeta, and licence/content-ID mismatch; a clean structural result exits 0 and a finding exits 1. A clean result would not prove the title launches or explain a hang. | The record/diff would show only changes among its fixed fields, including app size, metadata/licence names, mounts and process/boot marker; it cannot record file contents or the cause of a hang. | If installed through `pkg_install`, its ending would report the installed package title, byte count and SHA-256, or the missing part and `exit 1`. It would not establish that the title was structurally valid or would launch. |
+| Game launch (event 3) | Same limits as event 2: `verify TITLE` could report structural findings and status, not launchability or hang cause. The findings document does not identify this event's title or its on-disk checks, so the actual result is unknown. | A pre-launch record and diff would expose changes only in the documented fields; an unchanged diff would establish only that those fields did not change, not whether the launch caused damage outside them. | The document does not establish that `pkg_install` performed this install or preserve its ending. Its contract would report `installed <TITLE> <bytes> <sha256-or->` (`exit 0`) or `install_incomplete <TITLE> <part>` (`exit 1`), not launch outcome. |
+| Overdrive download (event 4) | No title is identified as the subject of this download, so no actual verification answer follows. `verify --all` could check installed-title structure and report console-wide `licence_orphan`, `staging_orphan`, or `space_below` findings (with `--floor`); those checks would not establish the download's cause or completion. | The snapshot could record free space, app directories/sizes, metadata, licences, mounts and processes; the diff would name changed fields or return `trace_unchanged`. It would not record package contents or determine why the loss occurred. | The findings identify an Overdrive download, not an Ariel `pkg_install` run; its ending is therefore unknown. If `pkg_install` had run, success would name the package's title, bytes and SHA-256; failure would name `package`, `licence`, `appmeta`, or `sfo`, with `exit 1`. |
+
 Configuration at the time: tethered exploit (Relapse reached through the WebKit
 autoloader), kstuff-lite, ShadowMountPlus, no etaHEN. Games were images (`.exfat`,
 `.ffpfsc`, `.ffpkg`) under `/data/homebrew`, mounted by ShadowMountPlus. Overdrive
