@@ -473,3 +473,45 @@ and saves intact.
 3. Diff the kernel log of a working launch (Undertale) against this hanging one
    (`AppInfoClient Initialize()` last line). Still the only measurement that can name
    a mechanism.
+
+## Sixth event (2026-10-28): a power-off during a bulk local copy
+
+The first event with a plain file copy as the load, and the first one whose cause is
+not a title launch.
+
+**What was running.** A local copy inside the console, `cp` of one Switch `.nsp` at a
+time from the pendrive (`/mnt/usb1`) to the internal drive (`/data/prosperoeden/roms`),
+started from the telnet shell. In parallel, an Overdrive download of `CUSA04730` that
+had already stopped on its own (`attempt 6 failed: Could not connect to server; HTTP 0`,
+`retries=6`, 0 KB/s) with an 8.46 GiB `.part` on disk. Earlier in the same session,
+`ProsperoMgr.elf` had been loaded through `hbldr` and was running (TitleId
+`FAKE00000`, listening on 7070).
+
+**The load.** One 2.87 GiB `.nsp` had copied and verified byte for byte; the next
+(2.90 GiB) was at 0.54 GiB when the console powered off. Throughput was about 7.5 MB/s,
+so the copy was a long, steady stream of writes — not a burst.
+
+**What followed.** The console came back with the network up and the payloads loaded,
+and the screen showed a black frame naming `FAKE00000`. Closing that window returned
+the interface. Nothing was lost: `/data` intact, the pendrive intact, the one finished
+`.nsp` complete, the partial one incomplete, and no Safe Mode and no "Reparando".
+
+**What it adds.** Three candidates, and the measurement does not separate them:
+
+1. **The bulk copy.** Fifth appearance of writes in flight with a loss, and the first
+   one where no title was launching. It strengthens hypothesis A (a crash landing in a
+   metadata-write window) without proving it.
+2. **ProsperoMgr.** It was the only new process, it holds a fake title id, and it was
+   the only thing on the screen when the console died. A homebrew that takes the
+   display is now a candidate no earlier event covered.
+3. **The stalled download.** Its HTTP layer had been retrying against an unreachable
+   server for minutes, which is the one state no earlier loss had either.
+
+**What was not lost.** No wipe, no Safe Mode, no reinstall. The difference from the
+first four events is worth stating: the load was heavy, the console died, and the
+data survived.
+
+**The next measurement this event asks for.** Repeat the copy with the download
+stopped and ProsperoMgr not loaded. If it survives, candidate 1 takes the weight. If
+it dies again, the copy alone is enough and the console cannot be used for bulk
+transfers without a defined procedure.
