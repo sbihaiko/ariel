@@ -217,3 +217,53 @@ installed FPKGs and save data.
 - What error code, if any, did Safe Mode display at each event?
 - Does the console's own downloader resume an interrupted package, or does it start
   over?
+
+## Fifth event (2026-10-28): the one the system survived
+
+Written after the fact, from the console's own state.
+
+A freeze during the WebKit autoloader sequence, at boot, with four payloads in
+`autoload.txt`: kstuff-lite 1.09, ShadowMountPlus 1.6beta16 configured for manual
+mounts only, ftpsrv and the agent. No image had been mounted and nothing was
+running in the background; the boot had not finished. Power was cut.
+
+**This one did not cost the internal drive.** On the next boot the console
+reported a damaged system, repaired itself, kept `/data` (agent state, ShadowMount
+config) and the account, and removed the broken package install that had been left
+in `/user/app`. It reached the home screen. Previous events offered Safe Mode with
+option 8 only; this one did not.
+
+The same boot sequence with the same pendrive and the same kstuff, **without
+ShadowMountPlus in `autoload.txt`**, completed with no hang. ShadowMountPlus was
+then loaded by hand, on a running system, and started cleanly: it found nothing to
+mount, registered no title and stayed idle.
+
+That is one observation, not a proven cause. It does move the weight toward the
+plain sequence "payloads loaded during the entry chain, one of which mounts", and
+away from ShadowMountPlus being dangerous on its own.
+
+### What this rules out for the Overdrive conversion
+
+Converting the app to a native package does not work here, and the reason is not
+in our build:
+
+- the package installs and appears on the home screen, but the launcher refuses to
+  start it (`getAppStatus` 0x80940004, `launchApp` 0x80020060). Two builds were
+  tried, one with `sdkVersion` 0.00 and one with 2.00, with identical results;
+- upstream ships Overdrive only as `.exfat`, and Orbit Store as `.elf` plus
+  `.ffpkg`. Neither has ever been distributed as a `.pkg`. Big homebrew apps on
+  this platform run from a mounted image; the package installer is the games path.
+
+So the mounter is not a detail of one app. It is how homebrew is delivered, and
+removing it means giving up the apps.
+
+### Manual mounting, as built
+
+`config.ini` gets `scanpath=/data/shadowmount/noauto` (an empty directory) and the
+`manual.lst` watcher is used instead. Mounts then happen only for the paths
+written in the list.
+
+One trap, read in the binary and confirmed on the console: ShadowMountPlus watches
+`manual.lst` with `kqueue`. Writing the file over FTP replaces the inode, so the
+watcher keeps waiting on the old one and nothing mounts. A path added over FTP is
+only picked up when the payload starts, not while it runs.
