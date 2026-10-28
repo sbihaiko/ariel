@@ -23,6 +23,7 @@ along with this program; see the file COPYING. If not, see
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -314,6 +315,54 @@ ps5_uptime_seconds(unsigned long long *uptime) {
     return -1;
   }
   *uptime = (unsigned long long)(now - boot.tv_sec);
+  return 0;
+}
+
+
+int
+readers_boot_time(time_t *boot) {
+  struct timeval tv;
+  size_t size = sizeof(tv);
+
+  if(sysctlbyname("kern.boottime", &tv, &size, NULL, 0)) {
+    return -1;
+  }
+  *boot = tv.tv_sec;
+  return 0;
+}
+
+
+int
+readers_mounts(const char *root, reader_mount_t *out, size_t max, size_t *total) {
+  struct statfs *mounts;
+  char rooted[READER_TEXT];
+  int count;
+  size_t i;
+
+  *total = 0;
+  if((count = getfsstat(NULL, 0, MNT_NOWAIT)) < 0) {
+    return -1;
+  }
+  if(!(mounts = calloc((size_t)count + 1, sizeof(*mounts)))) {
+    return -1;
+  }
+  if((count = getfsstat(mounts, (int)((size_t)count + 1) * (int)sizeof(*mounts),
+                        MNT_NOWAIT)) < 0) {
+    free(mounts);
+    return -1;
+  }
+  for(i=0; i<(size_t)count; i++) {
+    if(!readers_mount_rooted(root, mounts[i].f_mntonname, rooted, sizeof(rooted))) {
+      continue;
+    }
+    if(*total < max) {
+      snprintf(out[*total].target, sizeof(out[*total].target), "%s", rooted);
+      snprintf(out[*total].source, sizeof(out[*total].source), "%s",
+               mounts[i].f_mntfromname);
+    }
+    (*total)++;
+  }
+  free(mounts);
   return 0;
 }
 

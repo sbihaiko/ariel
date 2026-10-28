@@ -14857,6 +14857,211 @@ HOST_ROOT_SCENARIOS.update(title for title, _, _ in VERIFY_SCENARIOS)
 SCENARIOS.extend(VERIFY_SCENARIOS)
 
 
+TRACE_KEEP = 16
+TRACE_NAME_MAX = 32
+TRACE_HEADERS = ("trace", "seq", "clock", "uptime", "boot", "free", "mounts",
+                 "titles", "metadata", "licences", "payloads")
+TRACE_ITEMS = {"mounts": "mount", "titles": "title", "metadata": "entry",
+               "licences": "licence", "payloads": "payload"}
+TRACE_BOUNDS = {"mounts": 16, "titles": 32, "metadata": 32, "licences": 32,
+                "payloads": 8}
+
+
+def trace_dir(server):
+    return os.path.join(server.root, "data", "ariel", "traces")
+
+
+def trace_file(server, name):
+    return os.path.join(trace_dir(server), name)
+
+
+def trace_names(server):
+    try:
+        return sorted(os.listdir(trace_dir(server)))
+    except FileNotFoundError:
+        return []
+
+
+def trace_record(lines):
+    assert lines and lines[-1] == "exit 0", (
+        "trace must answer exit 0, got %r" % lines)
+    return lines[:-1]
+
+
+def trace_body(lines):
+    return "".join(line + "\n" for line in trace_record(lines))
+
+
+def assert_trace_record(lines, name):
+    """The fields in their documented order, each list within its bound."""
+    record = trace_record(lines)
+    assert record[0] == "trace %s" % name, (
+        "the record must open with its name, got %r" % record[0])
+    headers = iter(TRACE_HEADERS)
+    open_list = None
+    total = shown = 0
+    for line in record:
+        key = line.split(" ")[0]
+        if open_list and key == TRACE_ITEMS[open_list]:
+            shown += 1
+            continue
+        if open_list:
+            assert shown == min(total, TRACE_BOUNDS[open_list]), (
+                "%s lists %d of %d, expected %d" % (
+                    open_list, shown, total, min(total, TRACE_BOUNDS[open_list])))
+        expected = next(headers, None)
+        assert key == expected, (
+            "field %r out of order: expected %r at %r" % (key, expected, line))
+        open_list = key if key in TRACE_ITEMS else None
+        if open_list:
+            total = int(line.split(" ")[1])
+            shown = 0
+    if open_list:
+        assert shown == min(total, TRACE_BOUNDS[open_list]), (
+            "%s lists %d of %d" % (open_list, shown, total))
+    assert next(headers, None) is None, "a field of the record is missing"
+
+
+def scenario_trace_writes_and_answers_the_record(server):
+    name = "before-hang"
+    lines = run_command(server, "trace %s" % name)
+    assert_trace_record(lines, name)
+    assert not any("approval" in line for line in lines), (
+        "trace must need no approval, got %r" % lines)
+    with open(trace_file(server, name), "rb") as handle:
+        assert handle.read().decode("ascii") == trace_body(lines), (
+            "the stored record must be the record that was answered")
+
+
+def scenario_trace_record_survives_a_restart(server):
+    name = "survives"
+    lines = run_command(server, "trace %s" % name)
+    server.restart()
+    with open(trace_file(server, name), "rb") as handle:
+        assert handle.read().decode("ascii") == trace_body(lines), (
+            "a restart must leave the stored record as it was written")
+    assert run_command(server, "cat %s" % trace_file(server, name))[-1] == "exit 87", (
+        "the record is Ariel's own state and stays protected")
+
+
+def scenario_trace_refuses_a_bad_name_without_writing(server):
+    before = trace_names(server)
+    cases = ("../x", "a/b", ".", "..", "-x", "--replace", "n" * (TRACE_NAME_MAX + 1),
+             "a\x7fb")
+    for name in cases:
+        assert run_command(server, "trace %s" % name) == ["bad_path", "exit 1"], (
+            "trace %r must answer bad_path" % name)
+    assert trace_names(server) == before, "a refused name must write nothing"
+
+
+def scenario_trace_bad_operands_answer_their_words(server):
+    before = trace_names(server)
+    assert run_command(server, "trace") == ["missing_operand", "exit 1"]
+    assert run_command(server, "trace a b") == ["bad_argument", "exit 1"]
+    assert run_command(server, "trace a --bogus") == ["bad_option", "exit 1"]
+    assert trace_names(server) == before
+
+
+def scenario_trace_accepts_the_longest_name(server):
+    name = "n" * TRACE_NAME_MAX
+    assert_trace_record(run_command(server, "trace %s" % name), name)
+    assert os.path.exists(trace_file(server, name))
+
+
+def scenario_trace_refuses_an_existing_name_unless_replaced(server):
+    name = "compare-me"
+    first = run_command(server, "trace %s" % name)
+    assert_trace_record(first, name)
+    with open(trace_file(server, name), "rb") as handle:
+        kept = handle.read()
+    assert run_command(server, "trace %s" % name) == ["trace_exists", "exit 96"]
+    with open(trace_file(server, name), "rb") as handle:
+        assert handle.read() == kept, "a refused name must keep its record"
+    replaced = run_command(server, "trace %s --replace" % name)
+    assert_trace_record(replaced, name)
+    seq_before = int(trace_record(first)[1].split(" ")[1])
+    seq_after = int(trace_record(replaced)[1].split(" ")[1])
+    assert seq_after > seq_before, "a replacement is the newest record"
+
+
+def scenario_trace_keeps_a_fixed_number_and_drops_the_oldest(server):
+    names = ["keep-%02d" % i for i in range(TRACE_KEEP + 1)]
+    for name in names:
+        assert_trace_record(run_command(server, "trace %s" % name), name)
+    assert trace_names(server) == sorted(names[1:]), (
+        "%d records must be kept and the first one dropped, got %r" % (
+            TRACE_KEEP, trace_names(server)))
+
+
+def scenario_trace_answers_no_contents_token_or_approval_state(server):
+    secret = "SECRET-LICENCE-BODY-7731"
+    write_verify_file(
+        os.path.join(server.root, "user", "license", "fakeUP0000-CUSA90300_00.rif"),
+        secret.encode("ascii"))
+    text = "\n".join(run_command(server, "trace no-secrets"))
+    assert secret not in text, "a record must carry names, never file contents"
+    assert server.token not in text, "a record must never carry the token"
+    assert "approval" not in text and "signature" not in text, (
+        "a record must never carry approval state")
+
+
+def scenario_trace_answer_is_bounded(server):
+    for i in range(40):
+        write_verify_file(os.path.join(server.root, "user", "app", "BOUND%04d" % i,
+                                       "app.pkg"), b"x" * 10)
+    lines = run_command(server, "trace bounded")
+    assert_trace_record(lines, "bounded")
+    assert len(trace_body(lines)) < 64 * 1024, "the record must fit one frame"
+
+
+def scenario_trace_needs_no_approval_and_changes_nothing_else(server):
+    user_root = os.path.join(server.root, "user")
+    before = tree_state(user_root)
+    lines = run_command(server, "trace unchanged-tree")
+    assert_trace_record(lines, "unchanged-tree")
+    assert tree_state(user_root) == before, "trace must change nothing under user"
+
+
+def scenario_trace_words_and_fields_are_documented(server):
+    assert "trace" in {line.split(" ")[0] for line in run_command(server, "help")[:-1]}
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for word in ("trace_exists", "bad_path"):
+        assert "`%s`" % word in registry, (
+            "docs/exit-codes.md must name %s before trace answers it" % word)
+    for field in TRACE_HEADERS:
+        assert "`%s`" % field in registry, (
+            "docs/exit-codes.md must document the trace field %s" % field)
+
+
+TRACE_SCENARIOS = [
+    ("trace writes the record under its name and answers it in full, with no approval",
+     scenario_trace_writes_and_answers_the_record, HOST_ROOT_REASON),
+    ("trace's record survives a restart of the payload and stays protected",
+     scenario_trace_record_survives_a_restart, HOST_ROOT_REASON),
+    ("trace refuses a name outside the shape with bad_path and writes nothing",
+     scenario_trace_refuses_a_bad_name_without_writing, HOST_ROOT_REASON),
+    ("trace answers missing_operand, bad_argument and bad_option before writing",
+     scenario_trace_bad_operands_answer_their_words, HOST_ROOT_REASON),
+    ("trace accepts a name of the longest allowed length",
+     scenario_trace_accepts_the_longest_name, HOST_ROOT_REASON),
+    ("trace refuses an existing name with trace_exists unless --replace is given",
+     scenario_trace_refuses_an_existing_name_unless_replaced, HOST_ROOT_REASON),
+    ("trace keeps a fixed number of records and drops the oldest first",
+     scenario_trace_keeps_a_fixed_number_and_drops_the_oldest, HOST_ROOT_REASON),
+    ("trace answers names and sizes only, never contents, the token or approval state",
+     scenario_trace_answers_no_contents_token_or_approval_state, HOST_ROOT_REASON),
+    ("trace bounds each list, so a console with many titles still answers in one frame",
+     scenario_trace_answer_is_bounded, HOST_ROOT_REASON),
+    ("trace needs no approval and changes nothing under the owner's tree",
+     scenario_trace_needs_no_approval_and_changes_nothing_else, HOST_ROOT_REASON),
+    ("trace is listed by help, and its words and fields are documented",
+     scenario_trace_words_and_fields_are_documented, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in TRACE_SCENARIOS)
+SCENARIOS.extend(TRACE_SCENARIOS)
+
+
 def main():
     argv = sys.argv[1:]
 

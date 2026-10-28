@@ -29,6 +29,7 @@ along with this program; see the file COPYING. If not, see
 #include <limits.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <pthread.h>
 #include <regex.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #include "protected.h"
 #include "readers.h"
 #include "runner.h"
+#include "runs.h"
 #include "sha256.h"
 
 #define IO_CHUNK     1024
@@ -62,6 +64,14 @@ along with this program; see the file COPYING. If not, see
 #define SLEEP_MAX 60
 #define VERIFY_CEILING (256ULL * 1024 * 1024)
 #define VERIFY_LINES 10
+#define TRACE_KEEP 16
+#define TRACE_NAME_MAX 32
+#define TRACE_MOUNTS 16
+#define TRACE_TITLES 32
+#define TRACE_ENTRIES 32
+#define TRACE_LINE 1024
+#define TRACE_DEPTH 64
+#define STATUS_TRACE_EXISTS 96
 
 
 static const struct {
@@ -99,6 +109,7 @@ static const struct {
   {"sysctl", "print a kernel parameter"},
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
+  {"trace", "record the console's state under a name, with --replace to overwrite it"},
   {"verify", "say whether one installed title is whole, with --size and --sha256 to compare"},
   {"wc","count the lines, words and bytes of an absolute file"},
 };
@@ -2722,6 +2733,563 @@ run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd)
 }
 
 
+typedef struct {
+  char *data;
+  size_t len;
+  size_t cap;
+} trace_buf_t;
+
+typedef struct {
+  char name[TRACE_NAME_MAX + 1];
+  unsigned long long seq;
+} trace_rec_t;
+
+static pthread_mutex_t trace_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
+static int
+trace_name_ok(const char *name) {
+  size_t len = strlen(name);
+  size_t i;
+
+  if(!len || len > TRACE_NAME_MAX || name[0] == '-' || !strcmp(name, ".") ||
+     !strcmp(name, "..")) {
+    return 0;
+  }
+  for(i=0; i<len; i++) {
+    unsigned char c = (unsigned char)name[i];
+
+    if(c < 0x20 || c > 0x7e || c == '/') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+static int
+trace_parse(int argc, char *const argv[], int *replace, int errfd) {
+  int i;
+
+  *replace = 0;
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(!trace_name_ok(argv[1])) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  for(i=2; i<argc; i++) {
+    if(!strcmp(argv[i], "--replace") && !*replace) {
+      *replace = 1;
+    } else if(argv[i][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    } else {
+      say(errfd, "bad_argument\n");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+static int
+trace_put(trace_buf_t *buf, const char *line, int errfd) {
+  size_t len = strlen(line);
+
+  if(len + 1 > buf->cap - buf->len) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  memcpy(buf->data + buf->len, line, len);
+  buf->len += len;
+  buf->data[buf->len++] = '\n';
+  return 0;
+}
+
+
+static int
+trace_mkdir(const char *path) {
+  if(mkdir(path, 0700) && errno != EEXIST) {
+    return errno;
+  }
+  return 0;
+}
+
+
+static unsigned long long
+trace_seq_of(const char *path) {
+  char text[256];
+  char *at;
+  size_t n;
+  FILE *file;
+
+  if(!(file = fopen(path, "rb"))) {
+    return 0;
+  }
+  n = fread(text, 1, sizeof(text) - 1, file);
+  fclose(file);
+  text[n] = '\0';
+  if(!(at = strstr(text, "\nseq "))) {
+    return 0;
+  }
+  return strtoull(at + 5, NULL, 10);
+}
+
+
+static int
+trace_scan(const char *dir, trace_rec_t **recs, size_t *count) {
+  struct dirent *ent;
+  trace_rec_t *list = NULL;
+  size_t n = 0;
+  size_t cap = 0;
+  char path[PATH_MAX];
+  struct stat st;
+  int err = 0;
+  DIR *d;
+
+  *recs = NULL;
+  *count = 0;
+  if(!(d = opendir(dir))) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  while((ent = readdir(d))) {
+    trace_rec_t *grown;
+
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..") ||
+       strlen(ent->d_name) > TRACE_NAME_MAX) {
+      continue;
+    }
+    if(snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >= (int)sizeof(path) ||
+       lstat(path, &st) || !S_ISREG(st.st_mode)) {
+      continue;
+    }
+    if(n == cap) {
+      if(!(grown = realloc(list, (cap ? cap * 2 : 16) * sizeof(*list)))) {
+        err = ENOMEM;
+        break;
+      }
+      list = grown;
+      cap = cap ? cap * 2 : 16;
+    }
+    snprintf(list[n].name, sizeof(list[n].name), "%s", ent->d_name);
+    list[n].seq = trace_seq_of(path);
+    n++;
+  }
+  closedir(d);
+  if(err) {
+    free(list);
+    errno = err;
+    return -1;
+  }
+  *recs = list;
+  *count = n;
+  return 0;
+}
+
+
+static int
+trace_seq_cmp(const void *a, const void *b) {
+  const trace_rec_t *x = a;
+  const trace_rec_t *y = b;
+
+  return (x->seq > y->seq) - (x->seq < y->seq);
+}
+
+
+static void
+trace_prune(const char *dir, trace_rec_t *recs, size_t count) {
+  char path[PATH_MAX];
+  size_t i;
+
+  if(count <= TRACE_KEEP) {
+    return;
+  }
+  qsort(recs, count, sizeof(*recs), trace_seq_cmp);
+  for(i=0; i<count-TRACE_KEEP; i++) {
+    if(snprintf(path, sizeof(path), "%s/%s", dir, recs[i].name) < (int)sizeof(path)) {
+      unlink(path);
+    }
+  }
+}
+
+
+static int
+trace_write_file(const char *path, const char *data, size_t len) {
+  ssize_t n;
+  int err;
+  int fd;
+
+  if((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600)) < 0) {
+    return errno;
+  }
+  while(len > 0) {
+    if((n = write(fd, data, len)) < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
+      err = errno;
+      close(fd);
+      return err;
+    }
+    data += n;
+    len -= (size_t)n;
+  }
+  if(fsync(fd)) {
+    err = errno;
+    close(fd);
+    return err;
+  }
+  return close(fd) ? errno : 0;
+}
+
+
+static void
+trace_free_list(char **list, size_t count) {
+  size_t i;
+
+  for(i=0; i<count; i++) {
+    free(list[i]);
+  }
+  free(list);
+}
+
+
+/** Sorted names in dir, only its directories when dirs_only; a missing dir has none. **/
+static int
+trace_list(const char *dir, int dirs_only, char ***names, size_t *count) {
+  struct dirent *ent;
+  char **list = NULL;
+  size_t n = 0;
+  size_t cap = 0;
+  char path[PATH_MAX];
+  struct stat st;
+  int err = 0;
+  DIR *d;
+
+  *names = NULL;
+  *count = 0;
+  if(!(d = opendir(dir))) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  while((ent = readdir(d))) {
+    char **grown;
+
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >= (int)sizeof(path)) {
+      continue;
+    }
+    if(dirs_only && (lstat(path, &st) || !S_ISDIR(st.st_mode))) {
+      continue;
+    }
+    if(n == cap) {
+      if(!(grown = realloc(list, (cap ? cap * 2 : 16) * sizeof(*list)))) {
+        err = ENOMEM;
+        break;
+      }
+      list = grown;
+      cap = cap ? cap * 2 : 16;
+    }
+    if(!(list[n] = strdup(ent->d_name))) {
+      err = ENOMEM;
+      break;
+    }
+    n++;
+  }
+  closedir(d);
+  if(err) {
+    trace_free_list(list, n);
+    errno = err;
+    return -1;
+  }
+  qsort(list, n, sizeof(*list), name_cmp);
+  *names = list;
+  *count = n;
+  return 0;
+}
+
+
+/** The bytes of the regular files under path; links are not followed. **/
+static uint64_t
+trace_bytes(const char *path, int depth) {
+  struct dirent *ent;
+  uint64_t total = 0;
+  char *child;
+  struct stat st;
+  DIR *dir;
+
+  if(lstat(path, &st)) {
+    return 0;
+  }
+  if(S_ISREG(st.st_mode)) {
+    return (uint64_t)st.st_size;
+  }
+  if(!S_ISDIR(st.st_mode) || depth >= TRACE_DEPTH || !(dir = opendir(path))) {
+    return 0;
+  }
+  if(!(child = malloc(PATH_MAX))) {
+    closedir(dir);
+    return 0;
+  }
+  while((ent = readdir(dir))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(snprintf(child, PATH_MAX, "%s/%s", path, ent->d_name) < PATH_MAX) {
+      total += trace_bytes(child, depth + 1);
+    }
+  }
+  free(child);
+  closedir(dir);
+  return total;
+}
+
+
+static int
+trace_entries(const char *dir, const char *header, const char *item, size_t bound,
+              trace_buf_t *buf, int errfd) {
+  char line[TRACE_LINE];
+  char **names;
+  size_t count;
+  size_t i;
+
+  if(trace_list(dir, 0, &names, &count)) {
+    report("trace", dir, errfd, errno);
+    return 1;
+  }
+  snprintf(line, sizeof(line), "%s %zu", header, count);
+  if(trace_put(buf, line, errfd)) {
+    trace_free_list(names, count);
+    return 1;
+  }
+  for(i=0; i<count && i<bound; i++) {
+    snprintf(line, sizeof(line), "%s %s", item, names[i]);
+    if(trace_put(buf, line, errfd)) {
+      trace_free_list(names, count);
+      return 1;
+    }
+  }
+  trace_free_list(names, count);
+  return 0;
+}
+
+
+static int
+trace_record(const char *root, const char *name, unsigned long long seq,
+             trace_buf_t *buf, int errfd) {
+  char running[RUNS_MAX][PAYLOAD_NAME_MAX + 1];
+  reader_mount_t mounts[TRACE_MOUNTS];
+  char line[TRACE_LINE];
+  char dir[PATH_MAX];
+  char path[PATH_MAX];
+  struct statvfs vfs;
+  char **names;
+  size_t count;
+  size_t total;
+  size_t i;
+  time_t boot;
+  time_t now;
+
+  snprintf(line, sizeof(line), "trace %s", name);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+  snprintf(line, sizeof(line), "seq %llu", seq);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+
+  now = time(NULL);
+  if(now == (time_t)-1 || readers_boot_time(&boot) || now < boot) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  snprintf(line, sizeof(line), "clock %lld", (long long)now);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+  snprintf(line, sizeof(line), "uptime %lld", (long long)(now - boot));
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+  snprintf(line, sizeof(line), "boot %lld", (long long)boot);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+
+  if(statvfs(root[0] ? root : "/", &vfs)) {
+    report("trace", root, errfd, errno);
+    return 1;
+  }
+  snprintf(line, sizeof(line), "free %llu",
+           (unsigned long long)vfs.f_bavail * vfs.f_frsize);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+
+  if(readers_mounts(root, mounts, TRACE_MOUNTS, &total)) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  snprintf(line, sizeof(line), "mounts %zu", total);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+  for(i=0; i<total && i<TRACE_MOUNTS; i++) {
+    snprintf(line, sizeof(line), "mount %s %s", mounts[i].target, mounts[i].source);
+    if(trace_put(buf, line, errfd)) {
+      return 1;
+    }
+  }
+
+  snprintf(dir, sizeof(dir), "%s/user/app", root);
+  if(trace_list(dir, 1, &names, &count)) {
+    report("trace", dir, errfd, errno);
+    return 1;
+  }
+  snprintf(line, sizeof(line), "titles %zu", count);
+  if(trace_put(buf, line, errfd)) {
+    trace_free_list(names, count);
+    return 1;
+  }
+  for(i=0; i<count && i<TRACE_TITLES; i++) {
+    snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+    snprintf(line, sizeof(line), "title %s %llu", names[i],
+             (unsigned long long)trace_bytes(path, 0));
+    if(trace_put(buf, line, errfd)) {
+      trace_free_list(names, count);
+      return 1;
+    }
+  }
+  trace_free_list(names, count);
+
+  snprintf(dir, sizeof(dir), "%s/user/appmeta", root);
+  if(trace_entries(dir, "metadata", "entry", TRACE_ENTRIES, buf, errfd)) {
+    return 1;
+  }
+  snprintf(dir, sizeof(dir), "%s/user/license", root);
+  if(trace_entries(dir, "licences", "licence", TRACE_ENTRIES, buf, errfd)) {
+    return 1;
+  }
+
+  count = runs_active(running);
+  snprintf(line, sizeof(line), "payloads %zu", count);
+  if(trace_put(buf, line, errfd)) {
+    return 1;
+  }
+  for(i=0; i<count; i++) {
+    snprintf(line, sizeof(line), "payload %s", running[i]);
+    if(trace_put(buf, line, errfd)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+static int
+trace_store(const char *root, const char *name, int replace, trace_buf_t *buf,
+            int errfd) {
+  char data[PATH_MAX];
+  char state[PATH_MAX];
+  char traces[PATH_MAX];
+  char part[PATH_MAX];
+  char target[PATH_MAX];
+  trace_rec_t *recs;
+  unsigned long long max = 0;
+  struct stat st;
+  size_t count;
+  size_t i;
+  int err;
+
+  if(snprintf(data, sizeof(data), "%s/data", root) >= (int)sizeof(data) ||
+     snprintf(state, sizeof(state), "%s/ariel", data) >= (int)sizeof(state) ||
+     snprintf(traces, sizeof(traces), "%s/traces", state) >= (int)sizeof(traces) ||
+     snprintf(part, sizeof(part), "%s/trace.part", state) >= (int)sizeof(part) ||
+     snprintf(target, sizeof(target), "%s/%s", traces, name) >= (int)sizeof(target)) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+
+  pthread_mutex_lock(&trace_lock);
+  if((err = trace_mkdir(data)) || (err = trace_mkdir(state)) ||
+     (err = trace_mkdir(traces))) {
+    pthread_mutex_unlock(&trace_lock);
+    report("trace", traces, errfd, err);
+    return 1;
+  }
+  if(trace_scan(traces, &recs, &count)) {
+    pthread_mutex_unlock(&trace_lock);
+    report("trace", traces, errfd, errno);
+    return 1;
+  }
+  for(i=0; i<count; i++) {
+    if(recs[i].seq > max) {
+      max = recs[i].seq;
+    }
+  }
+  if(!lstat(target, &st) && !replace) {
+    free(recs);
+    pthread_mutex_unlock(&trace_lock);
+    say(errfd, "trace_exists\n");
+    return STATUS_TRACE_EXISTS;
+  }
+
+  if(trace_record(root, name, max + 1, buf, errfd)) {
+    free(recs);
+    pthread_mutex_unlock(&trace_lock);
+    return 1;
+  }
+  if((err = trace_write_file(part, buf->data, buf->len)) ||
+     (rename(part, target) && (err = errno))) {
+    free(recs);
+    pthread_mutex_unlock(&trace_lock);
+    report("trace", target, errfd, err);
+    return 1;
+  }
+
+  free(recs);
+  if(!trace_scan(traces, &recs, &count)) {
+    trace_prune(traces, recs, count);
+    free(recs);
+  }
+  pthread_mutex_unlock(&trace_lock);
+  return 0;
+}
+
+
+/**
+ * trace NAME [--replace]: record the console's state under NAME in Ariel's
+ * own state directory, and answer the same record. The record is bounded, so
+ * one answer carries it whole.
+ **/
+static int
+run_trace(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  trace_buf_t buf;
+  int replace;
+  int rc;
+
+  if(trace_parse(argc, argv, &replace, errfd)) {
+    return 1;
+  }
+  buf.cap = CONTENT_CAP;
+  buf.len = 0;
+  if(!(buf.data = malloc(buf.cap))) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  if((rc = trace_store(root, argv[1], replace, &buf, errfd)) == 0) {
+    say_bytes(outfd, buf.data, buf.len);
+  }
+  free(buf.data);
+  return rc;
+}
+
+
 typedef int (*file_command_fn)(int argc, char *const argv[], int outfd,
                                int errfd);
 
@@ -2934,6 +3502,11 @@ runner_dispatch(platform_t *platform, int argc, char *const argv[], int outfd,
 
   if(!strcmp(argv[0], "verify")) {
     *status = run_verify(platform->fs_root, argc, argv, outfd, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "trace")) {
+    *status = run_trace(platform->fs_root, argc, argv, outfd, errfd);
     return 0;
   }
 

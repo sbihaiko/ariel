@@ -64,4 +64,7 @@ int runs_health(platform_t *platform, const char *name, const char *sha256,
 /** Whether a background run of name is still going. Returns 1 or 0. **/
 int runs_running(const char *name);
 
+/** The names of the background runs still going, into names. Returns their count. **/
+size_t runs_active(char names[RUNS_MAX][PAYLOAD_NAME_MAX + 1]);
+
 #endif /* ARIEL_RUNS_H */

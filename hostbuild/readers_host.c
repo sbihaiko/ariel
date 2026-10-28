@@ -40,6 +40,7 @@ along with this program; see the file COPYING. If not, see
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/mount.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #endif
@@ -353,6 +354,99 @@ host_uptime_seconds(unsigned long long *uptime) {
   }
   fclose(file);
   *uptime = (unsigned long long)seconds;
+  return 0;
+#endif
+}
+
+
+int
+readers_boot_time(time_t *boot) {
+#if defined(__APPLE__)
+  struct timeval tv;
+  size_t size = sizeof(tv);
+
+  if(sysctlbyname("kern.boottime", &tv, &size, NULL, 0)) {
+    return -1;
+  }
+  *boot = tv.tv_sec;
+  return 0;
+#else
+  char line[256];
+  long long btime;
+  FILE *file;
+
+  if(!(file = fopen("/proc/stat", "r"))) {
+    return -1;
+  }
+  while(fgets(line, sizeof(line), file)) {
+    if(sscanf(line, "btime %lld", &btime) == 1) {
+      fclose(file);
+      *boot = (time_t)btime;
+      return 0;
+    }
+  }
+  fclose(file);
+  return -1;
+#endif
+}
+
+
+static void
+host_store_mount(const char *root, const char *target, const char *source,
+                 reader_mount_t *out, size_t max, size_t *total) {
+  char rooted[READER_TEXT];
+
+  if(!readers_mount_rooted(root, target, rooted, sizeof(rooted))) {
+    return;
+  }
+  if(*total < max) {
+    snprintf(out[*total].target, sizeof(out[*total].target), "%s", rooted);
+    snprintf(out[*total].source, sizeof(out[*total].source), "%s", source);
+  }
+  (*total)++;
+}
+
+
+int
+readers_mounts(const char *root, reader_mount_t *out, size_t max, size_t *total) {
+  *total = 0;
+#if defined(__APPLE__)
+  struct statfs *mounts;
+  int count;
+  size_t i;
+
+  if((count = getfsstat(NULL, 0, MNT_NOWAIT)) < 0) {
+    return -1;
+  }
+  if(!(mounts = calloc((size_t)count + 1, sizeof(*mounts)))) {
+    return -1;
+  }
+  if((count = getfsstat(mounts, (int)((size_t)count + 1) * (int)sizeof(*mounts),
+                        MNT_NOWAIT)) < 0) {
+    free(mounts);
+    return -1;
+  }
+  for(i=0; i<(size_t)count; i++) {
+    host_store_mount(root, mounts[i].f_mntonname, mounts[i].f_mntfromname,
+                     out, max, total);
+  }
+  free(mounts);
+  return 0;
+#else
+  char source[READER_TEXT];
+  char target[READER_TEXT];
+  char line[1024];
+  FILE *file;
+
+  if(!(file = fopen("/proc/self/mounts", "r"))) {
+    return -1;
+  }
+  while(fgets(line, sizeof(line), file)) {
+    if(sscanf(line, "%255s %255s", source, target) == 2) {
+      host_store_mount(root, target, source, out, max, total);
+    }
+  }
+  fclose(file);
   return 0;
 #endif
 }

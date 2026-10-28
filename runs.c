@@ -272,3 +272,21 @@ runs_running(const char *name) {
 
   return running;
 }
+
+
+size_t
+runs_active(char names[RUNS_MAX][PAYLOAD_NAME_MAX + 1]) {
+  size_t i;
+  size_t count = 0;
+
+  pthread_mutex_lock(&lock);
+  for(i=0; i<RUNS_MAX; i++) {
+    if(runs[i].running) {
+      snprintf(names[count], PAYLOAD_NAME_MAX + 1, "%s", runs[i].name);
+      count++;
+    }
+  }
+  pthread_mutex_unlock(&lock);
+
+  return count;
+}
