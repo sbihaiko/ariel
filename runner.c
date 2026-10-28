@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 #include "protected.h"
 #include "readers.h"
 #include "runner.h"
+#include "runs.h"
 #include "sha256.h"
 
 #define IO_CHUNK     1024
@@ -102,6 +103,7 @@ static const struct {
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
   {"verify", "say whether one installed title is whole, with --size and --sha256 to compare; --all sweeps the console, with --floor N for free space"},
+  {"trace", "record the console's state under NAME, kept in the state directory; --replace overwrites a record of that name"},
   {"wc","count the lines, words and bytes of an absolute file"},
 };
 
@@ -2982,6 +2984,473 @@ run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd)
 }
 
 
+#define TRACE_KEEP 8
+#define TRACE_LIST_MAX 16
+#define TRACE_NAME_MAX 32
+#define TRACE_FIELD_RAW 256
+#define TRACE_FIELD_OUT 128
+#define TRACE_LINE_CAP 512
+#define TRACE_RECORD_CAP (32UL * 1024)
+
+#define TRACE_ANY 0
+#define TRACE_DIRS 1
+#define TRACE_FILES 2
+
+struct trace_names {
+  size_t total;
+  size_t count;
+  char names[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+};
+
+struct trace_mounts {
+  size_t total;
+  size_t count;
+  char targets[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+  char sources[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+};
+
+struct trace_scan {
+  struct trace_mounts mounts;
+  struct trace_names titles;
+  struct trace_names metadata;
+  struct trace_names licences;
+  char running[TRACE_LIST_MAX][PAYLOAD_NAME_MAX + 1];
+};
+
+struct trace_record {
+  char *text;
+  size_t len;
+  int failed;
+};
+
+
+static int
+trace_name_ok(const char *name) {
+  size_t i;
+  size_t len = strlen(name);
+
+  if(len == 0 || len > TRACE_NAME_MAX || !strcmp(name, ".") || !strcmp(name, "..")) {
+    return 0;
+  }
+  for(i=0; i<len; i++) {
+    unsigned char c = (unsigned char)name[i];
+
+    if(c < 0x21 || c > 0x7e || c == '/' || c == '\\') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+// Keeps the smallest TRACE_LIST_MAX names in order and counts every name.
+static void
+trace_names_add(struct trace_names *list, const char *name) {
+  size_t at = list->count;
+
+  list->total++;
+  if(list->count == TRACE_LIST_MAX) {
+    if(strcmp(name, list->names[TRACE_LIST_MAX - 1]) >= 0) {
+      return;
+    }
+    at = TRACE_LIST_MAX - 1;
+  } else {
+    list->count++;
+  }
+  while(at > 0 && strcmp(name, list->names[at - 1]) < 0) {
+    snprintf(list->names[at], TRACE_FIELD_RAW, "%s", list->names[at - 1]);
+    at--;
+  }
+  snprintf(list->names[at], TRACE_FIELD_RAW, "%s", name);
+}
+
+
+static void
+trace_scan(struct trace_names *list, const char *dir, int want) {
+  char path[PATH_MAX];
+  struct dirent *ent;
+  struct stat st;
+  DIR *handle;
+
+  if(!(handle=opendir(dir))) {
+    return;
+  }
+  while((ent = readdir(handle))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >= (int)sizeof(path)) {
+      continue;
+    }
+    if(want != TRACE_ANY) {
+      if(lstat(path, &st)) {
+        continue;
+      }
+      if(want == TRACE_DIRS && !S_ISDIR(st.st_mode)) {
+        continue;
+      }
+      if(want == TRACE_FILES && !S_ISREG(st.st_mode)) {
+        continue;
+      }
+    }
+    trace_names_add(list, ent->d_name);
+  }
+  closedir(handle);
+}
+
+
+// Sums the regular files under path; a link is never followed.
+static unsigned long long
+trace_tree_bytes(const char *path) {
+  char child[PATH_MAX];
+  unsigned long long total = 0;
+  struct dirent *ent;
+  struct stat st;
+  DIR *handle;
+
+  if(lstat(path, &st)) {
+    return 0;
+  }
+  if(S_ISREG(st.st_mode)) {
+    return (unsigned long long)st.st_size;
+  }
+  if(!S_ISDIR(st.st_mode) || !(handle=opendir(path))) {
+    return 0;
+  }
+  while((ent = readdir(handle))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(snprintf(child, sizeof(child), "%s/%s", path, ent->d_name) >= (int)sizeof(child)) {
+      continue;
+    }
+    total += trace_tree_bytes(child);
+  }
+  closedir(handle);
+  return total;
+}
+
+
+static void
+trace_mount_add(void *ctx, const char *target, const char *source) {
+  struct trace_mounts *mounts = ctx;
+
+  mounts->total++;
+  if(mounts->count < TRACE_LIST_MAX) {
+    snprintf(mounts->targets[mounts->count], TRACE_FIELD_RAW, "%s", target);
+    snprintf(mounts->sources[mounts->count], TRACE_FIELD_RAW, "%s", source);
+    mounts->count++;
+  }
+}
+
+
+// Escapes what a record line cannot carry raw: spaces, controls, non-ASCII and %.
+static void
+trace_escape(char out[TRACE_FIELD_OUT + 1], const char *src) {
+  size_t used = 0;
+  size_t i;
+
+  for(i=0; src[i]; i++) {
+    unsigned char c = (unsigned char)src[i];
+    char piece[4];
+    size_t n = 1;
+
+    if(c > 0x20 && c < 0x7f && c != '%') {
+      piece[0] = (char)c;
+    } else {
+      snprintf(piece, sizeof(piece), "%%%02X", (unsigned)c);
+      n = 3;
+    }
+    if(used + n >= TRACE_FIELD_OUT) {
+      break;
+    }
+    memcpy(out + used, piece, n);
+    used += n;
+  }
+  out[used] = '\0';
+}
+
+
+static void
+trace_put(struct trace_record *record, const char *text) {
+  size_t len = strlen(text);
+
+  if(record->failed || len > TRACE_RECORD_CAP - record->len) {
+    record->failed = 1;
+    return;
+  }
+  memcpy(record->text + record->len, text, len);
+  record->len += len;
+  record->text[record->len] = '\0';
+}
+
+
+static int
+trace_build(const char *root, struct trace_scan *scan, struct trace_record *record) {
+  char line[TRACE_LINE_CAP];
+  char path[PATH_MAX];
+  char first[TRACE_FIELD_OUT + 1];
+  char second[TRACE_FIELD_OUT + 1];
+  unsigned long long uptime;
+  unsigned long long bytes;
+  struct statvfs vfs;
+  size_t running;
+  size_t i;
+  time_t now;
+
+  if((now=time(NULL)) == (time_t)-1 || readers_uptime(&uptime) ||
+     statvfs(root, &vfs) || readers_mounts(trace_mount_add, &scan->mounts)) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "%s/user/app", root);
+  trace_scan(&scan->titles, path, TRACE_DIRS);
+  snprintf(path, sizeof(path), "%s/user/appmeta", root);
+  trace_scan(&scan->metadata, path, TRACE_ANY);
+  snprintf(path, sizeof(path), "%s/user/license", root);
+  trace_scan(&scan->licences, path, TRACE_FILES);
+  running = runs_names(scan->running, TRACE_LIST_MAX);
+
+  snprintf(line, sizeof(line), "clock %lld\n", (long long)now);
+  trace_put(record, line);
+  snprintf(line, sizeof(line), "uptime %llu\n", uptime);
+  trace_put(record, line);
+  snprintf(line, sizeof(line), "free %llu\n",
+           (unsigned long long)vfs.f_bavail * vfs.f_frsize);
+  trace_put(record, line);
+
+  snprintf(line, sizeof(line), "mounts %zu\n", scan->mounts.total);
+  trace_put(record, line);
+  for(i=0; i<scan->mounts.count; i++) {
+    trace_escape(first, scan->mounts.targets[i]);
+    trace_escape(second, scan->mounts.sources[i]);
+    snprintf(line, sizeof(line), "mount %s %s\n", first, second);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "titles %zu\n", scan->titles.total);
+  trace_put(record, line);
+  for(i=0; i<scan->titles.count; i++) {
+    snprintf(path, sizeof(path), "%s/user/app/%s", root, scan->titles.names[i]);
+    bytes = trace_tree_bytes(path);
+    trace_escape(first, scan->titles.names[i]);
+    snprintf(line, sizeof(line), "title %s %llu\n", first, bytes);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "metadata %zu\n", scan->metadata.total);
+  trace_put(record, line);
+  for(i=0; i<scan->metadata.count; i++) {
+    trace_escape(first, scan->metadata.names[i]);
+    snprintf(line, sizeof(line), "metadata %s\n", first);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "licences %zu\n", scan->licences.total);
+  trace_put(record, line);
+  for(i=0; i<scan->licences.count; i++) {
+    trace_escape(first, scan->licences.names[i]);
+    snprintf(line, sizeof(line), "licence %s\n", first);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "running %zu\n", running);
+  trace_put(record, line);
+  for(i=0; i<running && i<TRACE_LIST_MAX; i++) {
+    snprintf(line, sizeof(line), "running %s\n", scan->running[i]);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "boot %lld\n", (long long)now - (long long)uptime);
+  trace_put(record, line);
+  return record->failed ? -1 : 0;
+}
+
+
+static int
+trace_write_file(const char *path, const char *data, size_t len) {
+  size_t done = 0;
+  int fd;
+
+  if((fd=open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644)) < 0) {
+    return -1;
+  }
+  while(done < len) {
+    ssize_t put = write(fd, data + done, len - done);
+
+    if(put < 0 && errno == EINTR) {
+      continue;
+    }
+    if(put <= 0) {
+      close(fd);
+      unlink(path);
+      return -1;
+    }
+    done += (size_t)put;
+  }
+  if(fsync(fd) || close(fd)) {
+    unlink(path);
+    return -1;
+  }
+  return 0;
+}
+
+
+// The order file, not file times, says which record is oldest: times can tie.
+static int
+trace_remember(const char *base, const char *records, const char *name) {
+  char text[(TRACE_KEEP + 1) * (TRACE_NAME_MAX + 2)];
+  char path[PATH_MAX];
+  char tmp[PATH_MAX];
+  char line[TRACE_NAME_MAX + 2];
+  struct {
+    size_t count;
+    char names[TRACE_KEEP + 1][TRACE_NAME_MAX + 1];
+  } order;
+  size_t used = 0;
+  FILE *file;
+  size_t i;
+
+  memset(&order, 0, sizeof(order));
+  snprintf(path, sizeof(path), "%s/order", base);
+  if((file=fopen(path, "r"))) {
+    while(order.count < TRACE_KEEP && fgets(line, sizeof(line), file)) {
+      line[strcspn(line, "\n")] = '\0';
+      if(line[0] && strcmp(line, name)) {
+        snprintf(order.names[order.count++], TRACE_NAME_MAX + 1, "%s", line);
+      }
+    }
+    fclose(file);
+  }
+  snprintf(order.names[order.count++], TRACE_NAME_MAX + 1, "%s", name);
+
+  while(order.count > TRACE_KEEP) {
+    snprintf(path, sizeof(path), "%s/%s", records, order.names[0]);
+    if(unlink(path) && errno != ENOENT) {
+      return -1;
+    }
+    memmove(order.names[0], order.names[1], (order.count - 1) * sizeof(order.names[0]));
+    order.count--;
+  }
+
+  for(i=0; i<order.count; i++) {
+    used += (size_t)snprintf(text + used, sizeof(text) - used, "%s\n", order.names[i]);
+  }
+  snprintf(tmp, sizeof(tmp), "%s/order.tmp", base);
+  if(trace_write_file(tmp, text, used)) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "%s/order", base);
+  if(rename(tmp, path)) {
+    unlink(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+
+// Returns 0 when stored, 1 when the name is kept and replace is not set, -1 on failure.
+static int
+trace_store(const char *root, const char *name, const char *text, size_t len, int replace) {
+  char base[PATH_MAX];
+  char records[PATH_MAX];
+  char tmp[PATH_MAX];
+  char final[PATH_MAX];
+  struct stat st;
+
+  if(snprintf(base, sizeof(base), "%s/data/ariel/traces", root) >= (int)sizeof(base) ||
+     snprintf(records, sizeof(records), "%s/records", base) >= (int)sizeof(records) ||
+     snprintf(tmp, sizeof(tmp), "%s/.%s.tmp", base, name) >= (int)sizeof(tmp) ||
+     snprintf(final, sizeof(final), "%s/%s", records, name) >= (int)sizeof(final)) {
+    return -1;
+  }
+  if((mkdir(base, 0755) && errno != EEXIST) || (mkdir(records, 0755) && errno != EEXIST)) {
+    return -1;
+  }
+  if(!lstat(final, &st) && !replace) {
+    return 1;
+  }
+  if(trace_write_file(tmp, text, len) || rename(tmp, final)) {
+    unlink(tmp);
+    return -1;
+  }
+  return trace_remember(base, records, name);
+}
+
+
+static int
+run_trace(platform_t *platform, int argc, char *const argv[], int outfd, int errfd) {
+  struct trace_record record;
+  struct trace_scan *scan;
+  int replace = 0;
+  int rc;
+  int i;
+
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[1][0] == '-') {
+    say(errfd, "bad_option\n");
+    return 1;
+  }
+  for(i=2; i<argc; i++) {
+    if(!strcmp(argv[i], "--replace") && !replace) {
+      replace = 1;
+    } else if(argv[i][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    } else {
+      say(errfd, "bad_argument\n");
+      return 1;
+    }
+  }
+  if(!trace_name_ok(argv[1])) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+
+  record.text = malloc(TRACE_RECORD_CAP + 1);
+  scan = calloc(1, sizeof(*scan));
+  if(!record.text || !scan) {
+    free(record.text);
+    free(scan);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  record.len = 0;
+  record.failed = 0;
+  record.text[0] = '\0';
+  rc = trace_build(platform->fs_root, scan, &record);
+  free(scan);
+  if(rc) {
+    free(record.text);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  rc = trace_store(platform->fs_root, argv[1], record.text, record.len, replace);
+  if(rc == 1) {
+    free(record.text);
+    say(errfd, "trace_exists ");
+    say(errfd, argv[1]);
+    say(errfd, "\n");
+    return 96;
+  }
+  if(rc) {
+    free(record.text);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  say_bytes(outfd, record.text, record.len);
+  free(record.text);
+  say(outfd, "recorded ");
+  say(outfd, argv[1]);
+  say(outfd, "\n");
+  return 0;
+}
+
+
 typedef int (*file_command_fn)(int argc, char *const argv[], int outfd,
                                int errfd);
 
@@ -3194,6 +3663,11 @@ runner_dispatch(platform_t *platform, int argc, char *const argv[], int outfd,
 
   if(!strcmp(argv[0], "verify")) {
     *status = run_verify(platform->fs_root, argc, argv, outfd, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "trace")) {
+    *status = run_trace(platform, argc, argv, outfd, errfd);
     return 0;
   }
 

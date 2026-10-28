@@ -23,6 +23,7 @@ along with this program; see the file COPYING. If not, see
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -301,8 +302,8 @@ run_authid(int outfd, int *status) {
 
 
 /* The console's uptime, in whole seconds. */
-static int
-ps5_uptime_seconds(unsigned long long *uptime) {
+int
+readers_uptime(unsigned long long *uptime) {
   struct timeval boot;
   size_t size = sizeof(boot);
   time_t now;
@@ -314,6 +315,24 @@ ps5_uptime_seconds(unsigned long long *uptime) {
     return -1;
   }
   *uptime = (unsigned long long)(now - boot.tv_sec);
+  return 0;
+}
+
+
+/* Each mounted filesystem's target and source, in the order the kernel lists them. */
+int
+readers_mounts(void (*emit)(void *ctx, const char *target, const char *source),
+               void *ctx) {
+  struct statfs *mounts;
+  int count;
+  int i;
+
+  if((count = getmntinfo(&mounts, MNT_NOWAIT)) <= 0) {
+    return -1;
+  }
+  for(i=0; i<count; i++) {
+    emit(ctx, mounts[i].f_mntonname, mounts[i].f_mntfromname);
+  }
   return 0;
 }
 
@@ -632,7 +651,7 @@ run_sysinfo(int json, int argc, char *const argv[], int outfd, int errfd,
     *status = 1;
     return 0;
   }
-  if(ps5_uptime_seconds(&uptime) || ps5_memory(&total, &free_bytes)) {
+  if(readers_uptime(&uptime) || ps5_memory(&total, &free_bytes)) {
     say(errfd, "not available on this platform\n");
     *status = 1;
     return 0;

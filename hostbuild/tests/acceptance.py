@@ -15164,6 +15164,262 @@ HOST_ROOT_SCENARIOS.update(title for title, _, _ in VERIFY_SCENARIOS)
 SCENARIOS.extend(VERIFY_SCENARIOS)
 
 
+TRACE_FIELDS = ("clock", "uptime", "free", "mounts", "titles", "metadata",
+                "licences", "running", "boot")
+TRACE_FIELD_OF = {"mount": "mounts", "title": "titles", "licence": "licences"}
+TRACE_KEEP = 8
+TRACE_LIST_MAX = 16
+TRACE_REPLY_CAP = 64 * 1024
+
+
+def trace_records_dir(server):
+    return os.path.join(server.root, "data", "ariel", "traces", "records")
+
+
+def trace_record_bytes(server, name):
+    with open(os.path.join(trace_records_dir(server), name), "rb") as handle:
+        return handle.read()
+
+
+def trace_fields_seen(lines):
+    """The field of each run of lines, in order, up to the status lines."""
+    fields = []
+    for line in lines:
+        head = line.split(" ", 1)[0]
+        if head in ("recorded", "exit", "trace_exists", "bad_path"):
+            break
+        field = TRACE_FIELD_OF.get(head, head)
+        if not fields or fields[-1] != field:
+            fields.append(field)
+    return fields
+
+
+def scenario_trace_answers_the_fixed_field_set_in_order(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        title = "CUSA91001"
+        app = make_verify_title(fresh, title)
+        lines = run_command(fresh, "trace baseline")
+        assert lines[-2:] == ["recorded baseline", "exit 0"], (
+            "trace must record its name and answer exit 0, got %r" % lines[-3:])
+        assert trace_fields_seen(lines) == list(TRACE_FIELDS), (
+            "the fields must come in the fixed order, got %r" % trace_fields_seen(lines))
+        size = sum(os.path.getsize(os.path.join(folder, name))
+                   for folder, _, names in os.walk(app) for name in names)
+        assert "titles 1" in lines and "title %s %d" % (title, size) in lines, (
+            "the title and its size must be answered, got %r" % lines)
+        assert "metadata 1" in lines and "metadata %s" % title in lines, (
+            "the metadata entry must be answered, got %r" % lines)
+        licence = "fake%s.rif" % verify_content_id(title)
+        assert "licences 1" in lines and "licence %s" % licence in lines, (
+            "the licence must be answered, got %r" % lines)
+        assert "running 0" in lines, "no payload runs, got %r" % lines
+        mounts = [line for line in lines if line.startswith("mount ")]
+        assert "mounts %d" % len(mounts) in lines, (
+            "the mount count must match the mounts listed, got %r" % lines)
+        free = [line for line in lines if line.startswith("free ")]
+        assert len(free) == 1 and int(free[0].split(" ")[1]) > 0, (
+            "free space must be a positive byte count, got %r" % free)
+        clock = int(next(line for line in lines if line.startswith("clock ")).split(" ")[1])
+        uptime = int(next(line for line in lines if line.startswith("uptime ")).split(" ")[1])
+        boot = int(next(line for line in lines if line.startswith("boot ")).split(" ")[1])
+        assert abs((clock - uptime) - boot) <= 2, (
+            "the boot marker must be the time the uptime began, got %r" % lines)
+        assert server_token_absent(fresh, lines), "the record must not carry the token"
+    finally:
+        fresh.stop()
+
+
+def server_token_absent(server, lines):
+    return server.token not in "\n".join(lines)
+
+
+def scenario_trace_stores_the_record_and_answers_it_in_full(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91002")
+        lines = run_command(fresh, "trace copy")
+        assert lines[-1] == "exit 0", "trace must answer exit 0, got %r" % lines
+        assert trace_record_bytes(fresh, "copy") == ("\n".join(lines[:-2]) + "\n").encode("ascii"), (
+            "the record kept in the state directory must be the record answered on the wire")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_record_survives_a_restart(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        assert run_command(fresh, "trace keep")[-1] == "exit 0"
+        before = trace_record_bytes(fresh, "keep")
+        fresh.restart()
+        assert trace_record_bytes(fresh, "keep") == before, (
+            "a restart must leave the record as it was written")
+        assert run_command(fresh, "trace keep") == ["trace_exists keep", "exit 96"], (
+            "a record kept across a restart must still be there")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_refuses_a_bad_name_with_bad_path(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        bad = ("trace ../x", "trace a/b", "trace .", "trace ..", 'trace ""',
+               'trace "a b"', 'trace "a\tb"', "trace " + "a" * 33,
+               "trace a\\b", "trace a\x7fb")
+        for command in bad:
+            assert run_command(fresh, command) == ["bad_path", "exit 1"], (
+                "%r must be refused with bad_path" % command)
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a refused name must write no record")
+        assert run_command(fresh, "trace " + "a" * 32)[-1] == "exit 0", (
+            "a name of 32 bytes is the longest accepted")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_refuses_an_existing_name_unless_replaced(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91005")
+        assert run_command(fresh, "trace basis")[-2:] == ["recorded basis", "exit 0"]
+        first = trace_record_bytes(fresh, "basis")
+        write_verify_file(os.path.join(fresh.root, "user", "license", "fakeEXTRA.rif"),
+                          b"licence\n")
+        assert run_command(fresh, "trace basis") == ["trace_exists basis", "exit 96"], (
+            "an existing name must be refused without --replace")
+        assert trace_record_bytes(fresh, "basis") == first, (
+            "a refused name must keep its record unchanged")
+        lines = run_command(fresh, "trace basis --replace")
+        assert lines[-1] == "exit 0" and "licences 2" in lines, (
+            "--replace must write the new record, got %r" % lines[-2:])
+        assert trace_record_bytes(fresh, "basis") != first, (
+            "--replace must change the kept record")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_keeps_a_fixed_number_and_drops_the_oldest(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        for index in range(TRACE_KEEP + 1):
+            assert run_command(fresh, "trace n%d" % index)[-1] == "exit 0"
+        assert len(os.listdir(trace_records_dir(fresh))) == TRACE_KEEP, (
+            "exactly %d records must be kept" % TRACE_KEEP)
+        assert run_command(fresh, "trace n1") == ["trace_exists n1", "exit 96"], (
+            "the second record is kept: only the oldest is dropped")
+        assert run_command(fresh, "trace n0")[-1] == "exit 0", (
+            "the oldest record must have been dropped, so its name is free")
+        assert run_command(fresh, "trace n8") == ["trace_exists n8", "exit 96"], (
+            "the newest record must be kept")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_bounds_the_answer_for_many_directories(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        apps = os.path.join(fresh.root, "user", "app")
+        for index in range(1000):
+            write_verify_file(os.path.join(apps, "CUSA%05d" % (92000 + index), "app.pkg"),
+                              b"x\n")
+        lines = run_command(fresh, "trace many", timeout=30.0)
+        assert lines[-1] == "exit 0" and "titles 1000" in lines, (
+            "a console with a thousand titles must still answer, got %r" % lines[-3:])
+        shown = [line for line in lines if line.startswith("title ")]
+        assert len(shown) == TRACE_LIST_MAX, (
+            "at most %d titles are listed, got %d" % (TRACE_LIST_MAX, len(shown)))
+        assert shown[0].startswith("title CUSA92000 "), (
+            "the listed titles are the first in name order, got %r" % shown[0])
+        reply = sum(len(line) + 1 for line in lines)
+        assert reply < TRACE_REPLY_CAP, "the answer must stay under the output cap"
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_holds_no_secret_and_needs_no_approval(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91008")
+        user_root = os.path.join(fresh.root, "user")
+        before = tree_state(user_root)
+        lines = run_command(fresh, "trace clean")
+        assert lines[-1] == "exit 0", "trace must answer exit 0, got %r" % lines
+        assert not any("approval" in line or line.startswith("challenge") for line in lines), (
+            "trace must need no approval and carry no approval state, got %r" % lines)
+        assert fresh.token.encode("ascii") not in trace_record_bytes(fresh, "clean"), (
+            "the record must not carry the access token")
+        assert tree_state(user_root) == before, "trace must change nothing the owner owns"
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_refuses_bad_options_and_arguments(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        for command, expected in (
+                ("trace", ["missing_operand", "exit 1"]),
+                ("trace x extra", ["bad_argument", "exit 1"]),
+                ("trace x --bogus", ["bad_option", "exit 1"]),
+                ("trace x --replace --replace", ["bad_option", "exit 1"])):
+            assert run_command(fresh, command) == expected, (
+                "%r must answer %r" % (command, expected))
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a refused trace must write no record")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_is_listed_and_documented(server):
+    lines = run_command(server, "help")
+    listed = {line.split(" ")[0] for line in lines[:-1]}
+    assert "trace" in listed, "help must list trace, got %r" % lines
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for field in TRACE_FIELDS:
+        assert "`%s`" % field in registry, (
+            "docs/exit-codes.md must document the trace field %s" % field)
+    assert "`--replace`" in registry, "docs/exit-codes.md must name --replace"
+    assert "keeps the %d newest" % TRACE_KEEP in registry, (
+        "docs/exit-codes.md must state how many records are kept")
+    assert "at most %d entries" % TRACE_LIST_MAX in registry, (
+        "docs/exit-codes.md must state the bound of each list")
+
+
+TRACE_SCENARIOS = [
+    ("trace answers the fixed field set in order, with its values",
+     scenario_trace_answers_the_fixed_field_set_in_order, HOST_ROOT_REASON),
+    ("trace keeps the record in the state directory and answers it in full",
+     scenario_trace_stores_the_record_and_answers_it_in_full, HOST_ROOT_REASON),
+    ("trace's record survives a restart of the payload",
+     scenario_trace_record_survives_a_restart, HOST_ROOT_REASON),
+    ("trace refuses a bad name with bad_path and writes nothing",
+     scenario_trace_refuses_a_bad_name_with_bad_path, HOST_ROOT_REASON),
+    ("trace refuses an existing name unless --replace is given",
+     scenario_trace_refuses_an_existing_name_unless_replaced, HOST_ROOT_REASON),
+    ("trace keeps a fixed number of records and drops the oldest",
+     scenario_trace_keeps_a_fixed_number_and_drops_the_oldest, HOST_ROOT_REASON),
+    ("trace bounds its answer for a console with many titles",
+     scenario_trace_bounds_the_answer_for_many_directories, HOST_ROOT_REASON),
+    ("trace holds no secret and needs no approval",
+     scenario_trace_holds_no_secret_and_needs_no_approval, HOST_ROOT_REASON),
+    ("trace refuses bad options and arguments before writing",
+     scenario_trace_refuses_bad_options_and_arguments, HOST_ROOT_REASON),
+    ("trace is listed by help, and its fields and bounds are documented",
+     scenario_trace_is_listed_and_documented, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in TRACE_SCENARIOS)
+SCENARIOS.extend(TRACE_SCENARIOS)
+
+
 def main():
     argv = sys.argv[1:]
 
