@@ -564,6 +564,15 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
     return run_sysctl(argc, argv, outfd, errfd, status);
   }
 
+  if(!strcmp(argv[0], "pkg_install")) {
+    // The host has no installer. The console's call returns once the
+    // install is accepted, so the virtual platform does the same and
+    // installs nothing: whether the app directory appeared is what the
+    // test root holds, and the agent reads that itself.
+    *status = 0;
+    return 0;
+  }
+
   if((argc == 1 && !strcmp(argv[0], "authid")) || builtin_gated(argv[0])) {
     say(errfd, "not available on this platform\n");
     *status = 1;

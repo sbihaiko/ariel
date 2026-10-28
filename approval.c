@@ -116,9 +116,11 @@ printable(const char *text) {
 /** A segment is the bytes between two slashes. A leading slash is one
     spelling of an absolute path, not a segment, so it is not empty. A
     segment of '.', '..' or no bytes at all is refused: escaping makes a
-    byte expressible, never traversal. **/
+    byte expressible, never traversal. A file URI is a local path with its
+    scheme in front, and its path part is held to the same rules. **/
 static int
 target_ok(const char *target) {
+  static const char scheme[] = "file://";
   size_t len;
   size_t i;
   size_t start;
@@ -127,6 +129,13 @@ target_ok(const char *target) {
   if(!target || !(len=strlen(target)) || len > TARGET_MAX ||
      !printable(target)) {
     return 0;
+  }
+
+  if(!strncmp(target, scheme, sizeof(scheme) - 1)) {
+    // The empty authority is the only one a package operand takes, so the
+    // path part begins right after the scheme and must be absolute.
+    return target[sizeof(scheme) - 1] == '/' &&
+           target_ok(target + sizeof(scheme) - 1);
   }
 
   start = target[0] == '/' ? 1 : 0;

@@ -1466,6 +1466,10 @@ HOST_ROOT_SCENARIOS = {
     "nothing is written",
     "tar refuses Ariel's own objects, and a member that names one, through "
     "any alias, without asking",
+    "pkg_install answers the app directory the title names, so an install "
+    "that does not complete never answers exit 0",
+    "pkg_install takes a file URI, signs it as written, and does not run "
+    "another target on that grant",
 }
 
 
@@ -8273,6 +8277,69 @@ def scenario_builtin_grant_runs_once_on_host(server):
         "the audit log must show the request, the grant and the run: %r" % ours)
 
 
+APP_TITLE = "CUSA04730"
+APP_TITLE_URI = "CUSA27976"
+
+
+def app_dir(server, title=APP_TITLE):
+    """The app directory the title's own parameter file names, under the root."""
+    return os.path.join(server.root, "user", "app", title)
+
+
+@builtin_scenario
+def scenario_pkg_install_never_answers_zero_without_the_app(server):
+    """A command whose install does not complete never answers exit 0.
+
+    The host's virtual platform accepts the install and installs nothing, as
+    the console's asynchronous call does. The command answers the app
+    directory the title's parameter file names, so a no-op is a non-zero
+    answer and the directory's appearance is the only exit 0.
+    """
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"pkg\n")
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % pkg, "pkg_install", pkg)
+    sign_and_grant(server, approval, challenge)
+    lines = run_command(server, "pkg_install %s" % pkg)
+    assert lines[-1] != "exit 0", (
+        "an install with no app directory must never answer exit 0, got %r"
+        % (lines,))
+    assert lines == ["install_incomplete", "exit 1"], (
+        "an install that did not complete must answer install_incomplete and "
+        "exit 1, got %r" % (lines,))
+
+    os.makedirs(app_dir(server))
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % pkg, "pkg_install", pkg)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "pkg_install %s" % pkg) == [
+        "installed", "exit 0"], (
+        "the app directory is the fact the install completed")
+
+
+@builtin_scenario
+def scenario_pkg_install_file_uri_is_gated_as_written(server):
+    """A file URI is accepted at the gate, signed as written, and not another target."""
+    pkg = write_scratch(server, APP_TITLE_URI + "-game.pkg", b"pkg\n")
+    uri = "file://" + pkg
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % uri, "pkg_install", uri)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "pkg_install %s" % uri) == [
+        "install_incomplete", "exit 1"], (
+        "the URI must reach the payload and answer its measured fact")
+
+    # The grant named the URI, so the bare path it reduces to is another
+    # target: it asks again rather than running on that grant.
+    builtin_approval(server, "pkg_install %s" % pkg, "pkg_install", pkg)
+
+    assert run_command(server, "pkg_install file://relative.pkg") == [
+        "bad_path", "exit 1"], (
+        "a file URI whose path is not absolute must answer bad_path at once")
+    assert run_command(server, "pkg_install relative.pkg") == [
+        "relative_path", "exit 1"], (
+        "a bare relative path must still answer relative_path")
+
+
 @builtin_scenario
 def scenario_builtin_arguments_are_bound(server):
     """A grant for one argument does not run a built-in with another."""
@@ -10984,6 +11051,12 @@ SCENARIOS = [
      scenario_builtins_ask_before_they_run, HOST_ROOT_REASON),
     ("a granted built-in on the host answers not available once and audits "
      "the grant and the run", scenario_builtin_grant_runs_once_on_host, True),
+    ("pkg_install answers the app directory the title names, so an install "
+     "that does not complete never answers exit 0",
+     scenario_pkg_install_never_answers_zero_without_the_app, HOST_ROOT_REASON),
+    ("pkg_install takes a file URI, signs it as written, and does not run "
+     "another target on that grant",
+     scenario_pkg_install_file_uri_is_gated_as_written, HOST_ROOT_REASON),
     ("a built-in run with another argument answers approval_stale and exit 78",
      scenario_builtin_arguments_are_bound, True),
     ("a built-in with a missing operand, a relative path or a bad value "

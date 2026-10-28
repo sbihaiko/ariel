@@ -166,6 +166,14 @@ static const char shots_done[] =
 static const char shots_failed[] =
   "shots_failed\n"
   "exit 1\n";
+/** pkg_install's answer is the app directory the title's parameter file
+    names, not the install call's return. **/
+static const char installed[] =
+  "installed\n"
+  "exit 0\n";
+static const char install_incomplete[] =
+  "install_incomplete\n"
+  "exit 1\n";
 
 /** The answer to an approval that could not be requested: a frozen console says so. **/
 static const char *
@@ -3776,23 +3784,39 @@ payload_logs(int fd, const char *name) {
 }
 
 
+/** One command on the platform, with its status but no exit line yet. **/
+static int
+run_command_status(agent_t *agent, int fd, int argc, char *argv[],
+                   runner_session_t *session, int *status) {
+  argv[argc] = NULL;
+
+  return !agent->platform->run(agent->platform, argc, argv, fd, fd, session,
+                               status);
+}
+
+
+/** The exit line of one command's status. **/
+static void
+exit_answer(int fd, int status) {
+  char answer[32];
+  int len = snprintf(answer, sizeof(answer), "exit %d\n", status);
+
+  if(len > 0) {
+    write_all(fd, answer, (size_t)len);
+  }
+}
+
+
 /** One command, one connection: output and diagnostics both go to fd. **/
 static int
 run_command(agent_t *agent, int fd, int argc, char *argv[],
             runner_session_t *session) {
-  char answer[32];
   int status = 0;
-  int len;
 
-  argv[argc] = NULL;
-
-  if(agent->platform->run(agent->platform, argc, argv, fd, fd, session,
-                          &status)) {
+  if(!run_command_status(agent, fd, argc, argv, session, &status)) {
     return 0;
   }
-
-  len = snprintf(answer, sizeof(answer), "exit %d\n", status);
-  write_all(fd, answer, (size_t)len);
+  exit_answer(fd, status);
 
   return 1;
 }
@@ -4696,34 +4720,47 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
 
 /**
  * One built-in, asked of the owner before it runs. Its arguments after the
- * target are bound as text, so a grant for one set does not run another. Once signed,
- * the built-in runs with its arguments and its done record comes first.
+ * target are bound as text, so a grant for one set does not run another. Once
+ * signed, the built-in runs with its arguments and its done record comes
+ * first. Returns 1 when it ran, with its exit status in status, and 0 when the
+ * answer was written here.
  **/
-static void
-builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
-            approval_facts_t *facts) {
+static int
+builtin_run_status(agent_t *agent, int fd, int argc, char *argv[], int first,
+                   approval_facts_t *facts, int *status) {
   approval_challenge_t challenge;
+  int arg_error = builtin_args(argc, argv, first, facts);
 
-  {
-    int arg_error = builtin_args(argc, argv, first, facts);
-
-    if(arg_error) {
-      audit_reply(fd, argv[0], "refused", "-", "-",
-                  arg_error == -2 ? bad_path : bad_argument);
-      return;
-    }
+  if(arg_error) {
+    audit_reply(fd, argv[0], "refused", "-", "-",
+                arg_error == -2 ? bad_path : bad_argument);
+    return 0;
   }
   facts->argc = (uint64_t)argc;
   if(!gate_pass(agent, fd, facts, &challenge)) {
-    return;
+    return 0;
   }
 
   if(audit_line(argv[0], "done", facts->target, challenge.id)) {
     reply(fd, audit_failed);
-    return;
+    return 0;
   }
-  if(!run_command(agent, fd, argc, argv, NULL)) {
+  if(!run_command_status(agent, fd, argc, argv, NULL, status)) {
     reply(fd, spawn_failed);
+    return 0;
+  }
+  return 1;
+}
+
+
+/** One built-in whose own exit status is its answer. **/
+static void
+builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
+            approval_facts_t *facts) {
+  int status;
+
+  if(builtin_run_status(agent, fd, argc, argv, first, facts, &status)) {
+    exit_answer(fd, status);
   }
 }
 
@@ -5209,18 +5246,70 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
 out:
   free(shots);
 }
+
+
+/** An install is asynchronous and a connection ends at 60 s: wait below
+    that deadline for the app directory rather than trust the call's return. **/
+#define PKG_INSTALL_WAIT_MS 45000L
+
+
+/**
+ * pkg_install answered by the app directory the title's own parameter file
+ * names. The install call returns once the request is accepted, not once
+ * the app is there, so its return is a failure signal only. The owner signed
+ * the operand as it was written; the payload is given the local path a
+ * file URI names.
+ **/
+static void
+pkg_install_command(agent_t *agent, int fd, int argc, char *argv[],
+                    approval_facts_t *facts, const char *path) {
+  char title[FILEOPS_TITLE_MAX + 1];
+  int complete = 0;
+  int status;
+
+  argv[1] = (char *)path;
+  if(!builtin_run_status(agent, fd, argc, argv, 2, facts, &status)) {
+    return;
+  }
+
+  if(status == 0 && !fileops_title_id(path, title, sizeof(title))) {
+    complete = agent->platform->install_result(agent->platform, title,
+                                               PKG_INSTALL_WAIT_MS) == 1;
+  }
+  reply(fd, complete ? installed : install_incomplete);
+}
+
+
 static void
 builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  char local[PATH_MAX];
   approval_facts_t facts;
+  const char *path;
   int rc;
 
   if(argc < 2) {
     audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
     return;
   }
+  path = argv[1];
+
+  // pkg_install takes a package as a path or as the file URI its usage
+  // documents. The check and the payload see the local path; the owner sees
+  // the operand as written, so a grant covers that URI and no other.
+  if(!strcmp(argv[0], "pkg_install")) {
+    // The operand as written is the target the owner signs, so it is the
+    // operand that must fit the target the encoder can carry, not only the
+    // path a URI reduces to.
+    if(fileops_local_path(argv[1], local, sizeof(local)) ||
+       strlen(argv[1]) > APPROVAL_TARGET_MAX) {
+      audit_reply(fd, argv[0], "refused", argv[1], "-", bad_path);
+      return;
+    }
+    path = local;
+  }
 
   memset(&facts, 0, sizeof(facts));
-  rc = fileops_builtin_check(agent->platform->fs_root, argv[1], &facts);
+  rc = fileops_builtin_check(agent->platform->fs_root, path, &facts);
   if(rc != FILEOPS_OK) {
     file_outcome(fd, argv[0], argv[1], "-", rc);
     return;
@@ -5228,6 +5317,10 @@ builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
   snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
   snprintf(facts.target, sizeof(facts.target), "%s", argv[1]);
+  if(!strcmp(argv[0], "pkg_install")) {
+    pkg_install_command(agent, fd, argc, argv, &facts, path);
+    return;
+  }
   builtin_run(agent, fd, argc, argv, 2, &facts);
 }
 

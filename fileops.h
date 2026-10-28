@@ -47,6 +47,9 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_BAD_MEMBER 23
 #define FILEOPS_BAD_OPTION 24
 
+/** The longest title ID a package's own name carries. **/
+#define FILEOPS_TITLE_MAX 15
+
 /** The largest executable a run reads into memory. **/
 #define FILEOPS_RUN_MAX (64UL * 1024 * 1024)
 
@@ -80,6 +83,22 @@ int fileops_act(const char *root, const char *command, const char *path,
  **/
 int fileops_builtin_check(const char *root, const char *path,
                           approval_facts_t *facts);
+
+/**
+ * The local path a package operand names: a file URI, "file://" followed by
+ * an absolute path with no authority, reduced to that path, or the operand
+ * itself when it is not a file URI. Returns 0 with the path in out, or -1
+ * when text is a file URI with anything else in it.
+ **/
+int fileops_local_path(const char *text, char *out, size_t size);
+
+/**
+ * The title ID a package's own name carries: the name below its last '/',
+ * up to its first '-', or below a trailing ".pkg". That is the name of the
+ * app directory the title's own parameter file gives. Returns 0 with the ID
+ * in out, or -1 when the name carries none.
+ **/
+int fileops_title_id(const char *path, char *out, size_t size);
 
 /**
  * Check one transfer, cp, mv or ln, from source to destination without acting.
