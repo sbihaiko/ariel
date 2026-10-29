@@ -19,13 +19,16 @@ along with this program; see the file COPYING. If not, see
 
 #include <stdio.h>
 
+#include "mcp_link.h"
+
 #define MCP_PROTOCOL_REVISION "2026-07-28"
 
 /**
  * Answer each request line read from in with one line on out, until in ends.
- * A notification is read and answers nothing.
+ * A notification is read and answers nothing. A tools/call runs its command on
+ * the console described by console.
  **/
-int mcp_serve(FILE *in, FILE *out);
+int mcp_serve(FILE *in, FILE *out, const struct mcp_console *console);
 
 /**
  * Write the tools/list result: the tool table, and nothing else.

@@ -12,6 +12,7 @@ Usage: mcp_acceptance.py [./ariel-mcp [./ariel-host]]
 import json
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -203,12 +204,6 @@ def scenario_notification_is_silent_and_ping_answers(binary, console):
     assert replies[1] == {"jsonrpc": "2.0", "id": 3, "result": {}}, replies[1]
 
 
-def scenario_tools_list_is_a_valid_empty_list(binary, console):
-    replies, _ = session(binary, console, [INITIALIZE, request(4, "tools/list")])
-    assert replies[1]["id"] == 4, replies[1]
-    assert replies[1]["result"] == {"tools": []}, replies[1]
-
-
 def scenario_unknown_method_answers_32601(binary, console):
     replies, _ = session(binary, console, [INITIALIZE, request(5, "resources/list")])
     error = replies[1]["error"]
@@ -222,6 +217,171 @@ def scenario_malformed_arguments_answer_32602(binary, console):
     error = replies[1]["error"]
     assert error["code"] == -32602, replies[1]
     assert replies[1]["id"] == 6, replies[1]
+
+
+# Issue #143: one table defines the surface. The read rows are named here from
+# the SPEC, not read back from the server, with the argument keys each takes.
+READ_ROWS = [
+    ("ariel_ls", ["path"]),
+    ("ariel_cat", ["path"]),
+    ("ariel_stat", ["path"]),
+    ("ariel_df", ["path"]),
+    ("ariel_find", ["path"]),
+    ("ariel_file", ["path"]),
+    ("ariel_head", ["path"]),
+    ("ariel_tail", ["path"]),
+    ("ariel_wc", ["path"]),
+    ("ariel_du", ["path"]),
+    ("ariel_pwd", []),
+    ("ariel_sysinfo", []),
+    ("ariel_sysctl", ["name"]),
+    ("ariel_ps", []),
+    ("ariel_procstat", ["pid"]),
+    ("ariel_dmesg", []),
+    ("ariel_ifconfig", []),
+    ("ariel_ping", ["address"]),
+]
+# Paths are absolute on the host, so fixtures live under the harness's root and
+# the arguments name them by "{root}".
+READ_CALLS = {
+    "ariel_ls": {"path": "{root}/mcp-read"},
+    "ariel_cat": {"path": "{root}/mcp-read/hello.txt"},
+    "ariel_stat": {"path": "{root}/mcp-read/hello.txt"},
+    "ariel_df": {"path": "{root}/mcp-read"},
+    "ariel_find": {"path": "{root}/mcp-read"},
+    "ariel_file": {"path": "{root}/mcp-read/hello.txt"},
+    "ariel_head": {"path": "{root}/mcp-read/hello.txt"},
+    "ariel_tail": {"path": "{root}/mcp-read/hello.txt"},
+    "ariel_wc": {"path": "{root}/mcp-read/hello.txt"},
+    "ariel_du": {"path": "{root}/mcp-read"},
+    "ariel_pwd": {},
+    "ariel_sysinfo": {},
+    "ariel_sysctl": {"name": "kern.ostype"},
+    "ariel_ps": {},
+    "ariel_procstat": {"pid": 1},
+    "ariel_dmesg": {},
+    "ariel_ifconfig": {},
+    "ariel_ping": {"address": "127.0.0.1", "count": 1, "wait": 200},
+}
+
+
+def listed_tools(binary, console):
+    replies, _ = session(binary, console, [INITIALIZE, request(4, "tools/list")])
+    assert replies[1]["id"] == 4, replies[1]
+    return replies[1]["result"]["tools"]
+
+
+def call_read(binary, console, name, arguments=None):
+    params = {"name": name, "arguments": arguments or {}}
+    replies, _ = session(binary, console, [INITIALIZE, request(2, "tools/call", params)])
+    assert len(replies) == 2, replies
+    assert replies[1]["id"] == 2, replies[1]
+    assert "error" not in replies[1], replies[1]
+    return replies[1]["result"]
+
+
+def write_fixture(console, relative, data):
+    path = os.path.join(console.root, relative)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
+def arguments_under(console, arguments):
+    return {key: value.replace("{root}", console.root) if isinstance(value, str) else value
+            for key, value in arguments.items()}
+
+
+def agent_answer(console, line):
+    """One command on the agent port, as an agent sends it: the whole reply."""
+    sock = console.connect()
+    try:
+        sock.sendall(("auth %s\n%s\n" % (console.token, line)).encode())
+        chunks = []
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        sock.close()
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def scenario_tools_list_names_every_read_row(binary, console):
+    tools = listed_tools(binary, console)
+    by_name = {tool["name"]: tool for tool in tools}
+    read_names = [tool["name"] for tool in tools
+                  if tool["annotations"]["readOnlyHint"] is True]
+    assert read_names == [name for name, _ in READ_ROWS], read_names
+    for name, keys in READ_ROWS:
+        tool = by_name[name]
+        assert tool["description"].strip(), tool
+        schema = tool["inputSchema"]
+        assert schema["type"] == "object", tool
+        for key in keys + ["session"]:
+            assert key in schema["properties"], (name, key, schema)
+        assert tool["annotations"]["destructiveHint"] is False, tool
+
+
+def scenario_read_tool_answers_without_approval(binary, console, name):
+    write_fixture(console, "mcp-read/hello.txt", b"hello from the console\n")
+    result = call_read(binary, console, name, arguments_under(console, READ_CALLS[name]))
+    text = result["content"][0]["text"]
+    assert "approval_required" not in text, result
+    assert result["structuredContent"]["exit"] != 75, result
+    assert result["structuredContent"].get("word") != "approval_required", result
+
+
+def scenario_read_answers_text_and_exit_status(binary, console):
+    write_fixture(console, "mcp-read/hello.txt", b"hello from the console\n")
+    path = os.path.join(console.root, "mcp-read/hello.txt")
+    result = call_read(binary, console, "ariel_cat", {"path": path})
+    assert result["isError"] is False, result
+    assert result["content"][0]["text"] == "hello from the console\n", result
+    assert result["structuredContent"] == {"exit": 0, "truncated": False}, result
+
+
+def scenario_read_over_64_kib_reports_truncated(binary, console):
+    write_fixture(console, "mcp-read/big.txt", b"a line of the console's text\n" * 2400)
+    path = os.path.join(console.root, "mcp-read/big.txt")
+    result = call_read(binary, console, "ariel_cat", {"path": path})
+    assert result["isError"] is False, result
+    assert result["structuredContent"]["exit"] == 0, result
+    assert result["structuredContent"]["truncated"] is True, result
+
+
+def scenario_session_argument_reaches_the_console_as_the_prefix(binary, console):
+    write_fixture(console, "mcp-read/work/.keep", b"")
+    reply = agent_answer(console, "session new")
+    match = re.match(r"session ([0-9a-f]{32}) ", reply)
+    assert match, reply
+    sid = match.group(1)
+    work = os.path.join(console.root, "mcp-read/work")
+    moved = agent_answer(console, "@%s cd %s" % (sid, work))
+    assert moved.endswith("exit 0\n"), moved
+    inside = call_read(binary, console, "ariel_pwd", {"session": sid})
+    assert inside["content"][0]["text"] == work + "\n", inside
+    assert inside["structuredContent"]["exit"] == 0, inside
+    outside = call_read(binary, console, "ariel_pwd")
+    assert outside["content"][0]["text"] == "/\n", outside
+    stale = call_read(binary, console, "ariel_pwd", {"session": "0" * 32})
+    assert stale["isError"] is True, stale
+    assert stale["structuredContent"]["word"] == "session_expired", stale
+
+
+def scenario_suspend_is_not_advertised_as_a_read_tool(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    suspend = by_name.get("ariel_suspend")
+    assert suspend is None or suspend["annotations"]["readOnlyHint"] is False, suspend
+
+
+def scenario_refused_read_answers_the_console_word(binary, console):
+    write_fixture(console, "mcp-read/hello.txt", b"hello from the console\n")
+    result = call_read(binary, console, "ariel_cat", {"path": "mcp-read/hello.txt"})
+    assert result["isError"] is True, result
+    assert result["structuredContent"]["exit"] == 1, result
+    assert result["structuredContent"]["word"] == "relative_path", result
 
 
 def scenario_list_tools_matches_tools_list(binary, console):
@@ -491,8 +651,6 @@ SCENARIOS = [
      scenario_second_initialize_is_refused),
     ("notifications/initialized is silent and ping answers",
      scenario_notification_is_silent_and_ping_answers),
-    ("tools/list answers a valid empty list",
-     scenario_tools_list_is_a_valid_empty_list),
     ("an unknown method answers -32601",
      scenario_unknown_method_answers_32601),
     ("malformed arguments answer -32602",
@@ -545,7 +703,24 @@ SCENARIOS = [
      scenario_silent_console_is_cut_by_the_timeout),
     ("--port and --timeout refuse values that are not numbers in range",
      scenario_numeric_flags_refuse_bad_values),
+    ("tools/list names every read row with a description, a schema and a class",
+     scenario_tools_list_names_every_read_row),
+    ("a read answers its text and exit status with isError false",
+     scenario_read_answers_text_and_exit_status),
+    ("an answer over 64 KiB reports truncated true",
+     scenario_read_over_64_kib_reports_truncated),
+    ("a session argument reaches the console as @<sid>, and pwd answers its directory",
+     scenario_session_argument_reaches_the_console_as_the_prefix),
+    ("ariel_suspend is not advertised as a read tool",
+     scenario_suspend_is_not_advertised_as_a_read_tool),
+    ("a refused read answers isError true with the console's word",
+     scenario_refused_read_answers_the_console_word),
 ]
+for _name, _keys in READ_ROWS:
+    SCENARIOS.append((
+        "%s answers without approval_required" % _name,
+        lambda binary, console, name=_name: scenario_read_tool_answers_without_approval(
+            binary, console, name)))
 
 
 def main():

@@ -14,14 +14,21 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 
 #include "mcp.h"
+#include "mcp_link.h"
 
 #define MCP_LINE_MAX 65536
 #define MCP_DEPTH_MAX 32
+#define CONSOLE_LINE_MAX 4096
+#define SESSION_HEX_LEN 32
+#define INTEGER_DIGITS_MAX 18
+#define WORD_MAX 32
 
 enum mcp_class {
   MCP_READ,
@@ -29,16 +36,81 @@ enum mcp_class {
   MCP_EXEC
 };
 
+enum mcp_kind {
+  ARG_STRING,
+  ARG_INTEGER
+};
+
+typedef struct {
+  const char *key;
+  enum mcp_kind kind;
+  int required;
+  const char *flag;
+} mcp_arg_t;
+
 typedef struct {
   const char *name;
   const char *description;
   enum mcp_class cls;
+  const char *word;
+  const mcp_arg_t *args;
 } mcp_tool_t;
 
-// The tool table is the whole surface. A NULL name ends it; it holds no rows
-// yet, so tools/list answers an empty list.
+static const mcp_arg_t no_args[] = {
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t path_args[] = {
+  { "path", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t name_args[] = {
+  { "name", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t pid_args[] = {
+  { "pid", ARG_INTEGER, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t ping_args[] = {
+  { "address", ARG_STRING, 1, NULL },
+  { "count", ARG_INTEGER, 0, "-c" },
+  { "wait", ARG_INTEGER, 0, "-W" },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+// The tool table is the whole surface: tools/list and tools/call both read it.
+// A NULL name ends it. A row's word is the console command it runs.
 static const mcp_tool_t mcp_tools[] = {
-  { NULL, NULL, MCP_READ }
+  { "ariel_ls", "List a directory on the console.", MCP_READ, "ls", path_args },
+  { "ariel_cat", "Read a file on the console.", MCP_READ, "cat", path_args },
+  { "ariel_stat", "Show a file's status on the console.", MCP_READ, "stat", path_args },
+  { "ariel_df", "Show free space for a path on the console.", MCP_READ, "df", path_args },
+  { "ariel_find", "Find files under a path on the console.", MCP_READ, "find", path_args },
+  { "ariel_file", "Name a file's type on the console.", MCP_READ, "file", path_args },
+  { "ariel_head", "Read the first lines of a file on the console.", MCP_READ, "head", path_args },
+  { "ariel_tail", "Read the last lines of a file on the console.", MCP_READ, "tail", path_args },
+  { "ariel_wc", "Count lines, words and bytes in a file on the console.", MCP_READ, "wc", path_args },
+  { "ariel_du", "Show disk use under a path on the console.", MCP_READ, "du", path_args },
+  { "ariel_pwd", "Show the working directory, or the session's inside a session.", MCP_READ, "pwd", no_args },
+  { "ariel_sysinfo", "Show system information from the console.", MCP_READ, "sysinfo", no_args },
+  { "ariel_sysctl", "Read one sysctl value from the console.", MCP_READ, "sysctl", name_args },
+  { "ariel_ps", "List processes on the console.", MCP_READ, "ps", no_args },
+  { "ariel_procstat", "Show one process's status on the console.", MCP_READ, "procstat", pid_args },
+  { "ariel_dmesg", "Read the console's kernel log.", MCP_READ, "dmesg", no_args },
+  { "ariel_ifconfig", "Show the console's network interfaces.", MCP_READ, "ifconfig", no_args },
+  { "ariel_ping", "Ping an address from the console.", MCP_READ, "ping", ping_args },
+  { NULL, NULL, MCP_READ, NULL, NULL }
+};
+
+static const char empty_object[] = "{}";
+
+struct command {
+  char text[CONSOLE_LINE_MAX + 1];
+  size_t len;
 };
 
 static const char null_id[] = "null";
@@ -303,17 +375,324 @@ valid_id(const char *p) {
 }
 
 
-static int
-tool_is_known(const char *name, size_t len) {
+static const mcp_tool_t *
+find_tool(const char *name, size_t len) {
   size_t i;
 
   for(i = 0; mcp_tools[i].name; i++) {
     if(strlen(mcp_tools[i].name) == len && !memcmp(mcp_tools[i].name, name, len)) {
-      return 1;
+      return &mcp_tools[i];
+    }
+  }
+  return NULL;
+}
+
+
+static int
+append(struct command *cmd, const char *text, size_t len) {
+  if(len > CONSOLE_LINE_MAX - cmd->len) {
+    return -1;
+  }
+  memcpy(cmd->text + cmd->len, text, len);
+  cmd->len += len;
+  cmd->text[cmd->len] = '\0';
+  return 0;
+}
+
+
+static int
+append_quoted(struct command *cmd, const char *text, size_t len) {
+  size_t i;
+
+  if(append(cmd, " \"", 2)) {
+    return -1;
+  }
+  for(i = 0; i < len; i++) {
+    if((text[i] == '"' || text[i] == '\\') && append(cmd, "\\", 1)) {
+      return -1;
+    }
+    if(append(cmd, text + i, 1)) {
+      return -1;
+    }
+  }
+  return append(cmd, "\"", 1);
+}
+
+
+static int
+hex_value(char c) {
+  if(c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if(c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if(c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+
+static int
+put_utf8(char *out, size_t *n, size_t cap, unsigned long cp) {
+  size_t need = cp < 0x80 ? 1 : cp < 0x800 ? 2 : 3;
+
+  if(*n + need > cap) {
+    return -1;
+  }
+  if(need == 1) {
+    out[(*n)++] = (char)cp;
+  } else if(need == 2) {
+    out[(*n)++] = (char)(0xC0 | (cp >> 6));
+    out[(*n)++] = (char)(0x80 | (cp & 0x3F));
+  } else {
+    out[(*n)++] = (char)(0xE0 | (cp >> 12));
+    out[(*n)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[(*n)++] = (char)(0x80 | (cp & 0x3F));
+  }
+  return 0;
+}
+
+
+/* The JSON text between the quotes at p..end, as the bytes it stands for. */
+static int
+decode_string(const char *p, const char *end, char *out, size_t cap, size_t *len) {
+  size_t n = 0;
+
+  while(p < end) {
+    unsigned long cp;
+
+    if(*p != '\\') {
+      if((unsigned char)*p < 0x20 || n + 1 > cap) {
+        return -1;
+      }
+      out[n++] = *p++;
+      continue;
+    }
+    if(end - p < 2) {
+      return -1;
+    }
+    if(p[1] == 'u') {
+      int i;
+
+      if(end - p < 6) {
+        return -1;
+      }
+      cp = 0;
+      for(i = 2; i < 6; i++) {
+        int h = hex_value(p[i]);
+
+        if(h < 0) {
+          return -1;
+        }
+        cp = cp * 16 + (unsigned long)h;
+      }
+      p += 6;
+    } else if(p[1] == '"' || p[1] == '\\' || p[1] == '/') {
+      cp = (unsigned char)p[1];
+      p += 2;
+    } else {
+      return -1;
+    }
+    if(cp < 0x20 || (cp >= 0xD800 && cp <= 0xDFFF) ||
+       put_utf8(out, &n, cap, cp)) {
+      return -1;
+    }
+  }
+  *len = n;
+  return 0;
+}
+
+
+static int
+session_id(const char *text, size_t len) {
+  size_t i;
+
+  if(len != SESSION_HEX_LEN) {
+    return 0;
+  }
+  for(i = 0; i < len; i++) {
+    char c = text[i];
+
+    if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+static int
+whole_integer(const char *p, const char *end) {
+  size_t digits;
+
+  if(p < end && *p == '-') {
+    p++;
+  }
+  digits = (size_t)(end - p);
+  if(digits == 0 || digits > INTEGER_DIGITS_MAX) {
+    return 0;
+  }
+  for(; p < end; p++) {
+    if(!isdigit((unsigned char)*p)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+static int
+build_command(const mcp_tool_t *row, const char *as, const char *ae,
+              struct command *cmd, char *why, size_t why_len) {
+  char value[CONSOLE_LINE_MAX + 1];
+  const mcp_arg_t *arg;
+  const char *vs;
+  const char *ve;
+  size_t vlen = 0;
+  int found;
+
+  cmd->len = 0;
+  cmd->text[0] = '\0';
+
+  found = object_member(as, ae, "session", &vs, &ve, NULL);
+  if(found < 0 || (found == 1 && (*vs != '"' ||
+                   decode_string(vs + 1, ve - 1, value, sizeof(value), &vlen) ||
+                   !session_id(value, vlen)))) {
+    snprintf(why, why_len, "invalid params: session is not a session id");
+    return -1;
+  }
+  if(found == 1 && (append(cmd, "@", 1) || append(cmd, value, vlen) ||
+                    append(cmd, " ", 1))) {
+    snprintf(why, why_len, "invalid params: the command is too long");
+    return -1;
+  }
+  if(append(cmd, row->word, strlen(row->word))) {
+    snprintf(why, why_len, "invalid params: the command is too long");
+    return -1;
+  }
+
+  for(arg = row->args; arg->key; arg++) {
+    found = object_member(as, ae, arg->key, &vs, &ve, NULL);
+    if(found < 0) {
+      snprintf(why, why_len, "invalid params: arguments must be an object");
+      return -1;
+    }
+    if(found == 0) {
+      if(arg->required) {
+        snprintf(why, why_len, "invalid params: %s is required", arg->key);
+        return -1;
+      }
+      continue;
+    }
+
+    if(arg->flag && (append(cmd, " ", 1) || append(cmd, arg->flag, strlen(arg->flag)))) {
+      snprintf(why, why_len, "invalid params: the command is too long");
+      return -1;
+    }
+    if(arg->kind == ARG_STRING) {
+      if(*vs != '"' || decode_string(vs + 1, ve - 1, value, sizeof(value), &vlen)) {
+        snprintf(why, why_len, "invalid params: %s must be text", arg->key);
+        return -1;
+      }
+      if(append_quoted(cmd, value, vlen)) {
+        snprintf(why, why_len, "invalid params: the command is too long");
+        return -1;
+      }
+    } else {
+      if(!whole_integer(vs, ve)) {
+        snprintf(why, why_len, "invalid params: %s must be a whole number", arg->key);
+        return -1;
+      }
+      if(append(cmd, " ", 1) || append(cmd, vs, (size_t)(ve - vs))) {
+        snprintf(why, why_len, "invalid params: the command is too long");
+        return -1;
+      }
     }
   }
   return 0;
 }
+
+
+static int
+console_word(const char *text, size_t len, char *word) {
+  size_t n = 0;
+
+  while(n < len && (islower((unsigned char)text[n]) || text[n] == '_')) {
+    n++;
+  }
+  if(n == 0 || n >= WORD_MAX) {
+    return 0;
+  }
+  if(n < len && text[n] != ' ' && text[n] != '\t' && text[n] != '\n') {
+    return 0;
+  }
+  memcpy(word, text, n);
+  word[n] = '\0';
+  return 1;
+}
+
+
+static int
+cut_marker(const char *text, size_t len) {
+  const char *line;
+  unsigned long shown;
+  unsigned long total;
+  int used = 0;
+  size_t i;
+
+  if(len == 0 || text[len - 1] != '\n') {
+    return 0;
+  }
+  i = len - 1;
+  while(i > 0 && text[i - 1] != '\n') {
+    i--;
+  }
+  line = text + i;
+  if(sscanf(line, "truncated %lu of %lu%n", &shown, &total, &used) != 2) {
+    return 0;
+  }
+  return line + used == text + len - 1;
+}
+
+
+static void
+json_text(FILE *out, const char *text, size_t len) {
+  size_t i;
+
+  fputc('"', out);
+  for(i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)text[i];
+
+    switch(c) {
+    case '"':
+      fputs("\\\"", out);
+      break;
+    case '\\':
+      fputs("\\\\", out);
+      break;
+    case '\n':
+      fputs("\\n", out);
+      break;
+    case '\r':
+      fputs("\\r", out);
+      break;
+    case '\t':
+      fputs("\\t", out);
+      break;
+    default:
+      if(c < 0x20) {
+        fprintf(out, "\\u%04x", c);
+      } else {
+        fputc(c, out);
+      }
+    }
+  }
+  fputc('"', out);
+}
+
+
 
 
 static void
@@ -356,15 +735,86 @@ write_error(FILE *out, const char *id, const char *idend, int code,
 
 
 static void
-handle(const char *text, const char *end, FILE *out, int *initialized) {
+write_failure(FILE *out, const char *id, const char *idend, const char *why) {
+  begin_result(out, id, idend);
+  fputs("{\"content\":[{\"type\":\"text\",\"text\":", out);
+  json_text(out, why, strlen(why));
+  fputs("}],\"isError\":true}", out);
+  end_reply(out);
+}
+
+
+static void
+write_answer(FILE *out, const char *id, const char *idend,
+             const struct mcp_answer *answer) {
+  char word[WORD_MAX];
+  int refused = answer->status != 0;
+
+  begin_result(out, id, idend);
+  fputs("{\"content\":[{\"type\":\"text\",\"text\":", out);
+  json_text(out, answer->text, answer->len);
+  fprintf(out, "}],\"structuredContent\":{\"exit\":%d,\"truncated\":%s",
+          answer->status, cut_marker(answer->text, answer->len) ? "true" : "false");
+  if(refused && console_word(answer->text, answer->len, word)) {
+    fprintf(out, ",\"word\":\"%s\"", word);
+  }
+  fprintf(out, "},\"isError\":%s}", refused ? "true" : "false");
+  end_reply(out);
+}
+
+
+static void
+call_tool(FILE *out, const char *ids, const char *ide, const char *ps,
+          const char *pe, int has_params, const struct mcp_console *console) {
+  const char *ns = NULL;
+  const char *ne = NULL;
+  const char *as = NULL;
+  const char *ae = NULL;
+  const mcp_tool_t *row;
+  struct command cmd;
+  struct mcp_answer answer;
+  char why[MCP_LINK_WHY_MAX];
+
+  if(has_params != 1 ||
+     object_member(ps, pe, "name", &ns, &ne, NULL) != 1 || !is_string(ns)) {
+    write_error(out, ids, ide, -32602, "invalid params: name is required");
+    return;
+  }
+  row = find_tool(ns + 1, (size_t)(ne - ns - 2));
+  if(!row) {
+    write_error(out, ids, ide, -32602, "invalid params: unknown tool");
+    return;
+  }
+  if(object_member(ps, pe, "arguments", &as, &ae, NULL) != 1) {
+    as = empty_object;
+    ae = empty_object + sizeof(empty_object) - 1;
+  }
+  if(*as != '{') {
+    write_error(out, ids, ide, -32602, "invalid params: arguments must be an object");
+    return;
+  }
+  if(build_command(row, as, ae, &cmd, why, sizeof(why))) {
+    write_error(out, ids, ide, -32602, why);
+    return;
+  }
+  if(mcp_exchange(console, cmd.text, &answer, why, sizeof(why))) {
+    write_failure(out, ids, ide, why);
+    return;
+  }
+  write_answer(out, ids, ide, &answer);
+  free(answer.text);
+}
+
+
+static void
+handle(const char *text, const char *end, FILE *out, int *initialized,
+       const struct mcp_console *console) {
   const char *ids = NULL;
   const char *ide = NULL;
   const char *ms = NULL;
   const char *me = NULL;
   const char *ps = NULL;
   const char *pe = NULL;
-  const char *ns = NULL;
-  const char *ne = NULL;
   const char *stop = NULL;
   int has_id;
   int has_method;
@@ -419,16 +869,7 @@ handle(const char *text, const char *end, FILE *out, int *initialized) {
     mcp_write_tools(out);
     end_reply(out);
   } else if(is_method(ms, me, "tools/call")) {
-    if(has_params != 1 ||
-       object_member(ps, pe, "name", &ns, &ne, NULL) != 1 || !is_string(ns)) {
-      write_error(out, ids, ide, -32602, "invalid params: name is required");
-      return;
-    }
-    if(!tool_is_known(ns + 1, (size_t)(ne - ns - 2))) {
-      write_error(out, ids, ide, -32602, "invalid params: unknown tool");
-      return;
-    }
-    write_error(out, ids, ide, -32603, "internal error: no tool is implemented");
+    call_tool(out, ids, ide, ps, pe, has_params, console);
   } else {
     write_error(out, ids, ide, -32601, "method not found");
   }
@@ -436,7 +877,7 @@ handle(const char *text, const char *end, FILE *out, int *initialized) {
 
 
 int
-mcp_serve(FILE *in, FILE *out) {
+mcp_serve(FILE *in, FILE *out, const struct mcp_console *console) {
   char *line = NULL;
   size_t cap = 0;
   int initialized = 0;
@@ -455,11 +896,36 @@ mcp_serve(FILE *in, FILE *out) {
       write_error(out, NULL, NULL, -32600, "request too large");
       continue;
     }
-    handle(line, line + len, out, &initialized);
+    handle(line, line + len, out, &initialized, console);
   }
 
   free(line);
   return 0;
+}
+
+
+static void
+write_schema(FILE *out, const mcp_arg_t *args) {
+  const char *sep = "";
+  const mcp_arg_t *arg;
+
+  fputs("{\"type\":\"object\",\"properties\":{", out);
+  for(arg = args; arg->key; arg++) {
+    fprintf(out, "%s\"%s\":{\"type\":\"%s\"}", sep, arg->key,
+            arg->kind == ARG_INTEGER ? "integer" : "string");
+    sep = ",";
+  }
+  fprintf(out, "%s\"session\":{\"type\":\"string\"}}", sep);
+
+  fputs(",\"required\":[", out);
+  sep = "";
+  for(arg = args; arg->key; arg++) {
+    if(arg->required) {
+      fprintf(out, "%s\"%s\"", sep, arg->key);
+      sep = ",";
+    }
+  }
+  fputs("]}", out);
 }
 
 
@@ -472,10 +938,10 @@ mcp_write_tools(FILE *out) {
   for(i = 0; mcp_tools[i].name; i++) {
     int read_only = mcp_tools[i].cls == MCP_READ;
 
-    fprintf(out, "%s{\"name\":\"%s\",\"description\":\"%s\","
-            "\"inputSchema\":{\"type\":\"object\"},"
-            "\"annotations\":{\"readOnlyHint\":%s,\"destructiveHint\":%s}}",
-            sep, mcp_tools[i].name, mcp_tools[i].description,
+    fprintf(out, "%s{\"name\":\"%s\",\"description\":\"%s\",\"inputSchema\":",
+            sep, mcp_tools[i].name, mcp_tools[i].description);
+    write_schema(out, mcp_tools[i].args);
+    fprintf(out, ",\"annotations\":{\"readOnlyHint\":%s,\"destructiveHint\":%s}}",
             read_only ? "true" : "false", read_only ? "false" : "true");
     sep = ",";
   }

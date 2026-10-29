@@ -21,12 +21,35 @@ along with this program; see the file COPYING. If not, see
 
 #define MCP_LINK_WHY_MAX 256
 
+struct mcp_console {
+  const char *host;
+  int port;
+  const char *token;
+  int timeout_s;
+};
+
 /**
- * Connect to the agent at host:port, send the token and pwd, and read the
- * reply. It returns 0 when the console accepted the token. Otherwise it returns
- * -1 and writes one line to why that names the failure and never the token.
+ * The console's answer to one command: the text before the exit line, owned by
+ * the caller and freed with free, and the exit status that ended it.
  **/
-int mcp_probe(const char *host, int port, const char *token, int timeout_s,
-              char *why, size_t why_len);
+struct mcp_answer {
+  char *text;
+  size_t len;
+  int status;
+};
+
+/**
+ * Send the token and one command to the agent and read its whole answer. It
+ * returns 0 with the answer, whatever the exit status. Otherwise it returns -1
+ * and writes one line to why that names the failure and never the token.
+ **/
+int mcp_exchange(const struct mcp_console *console, const char *command,
+                 struct mcp_answer *answer, char *why, size_t why_len);
+
+/**
+ * Prove the console accepts the token with pwd. It returns 0 when the console
+ * answers exit 0, and otherwise -1 with one line in why.
+ **/
+int mcp_probe(const struct mcp_console *console, char *why, size_t why_len);
 
 #endif /* ARIEL_MCP_LINK_H */

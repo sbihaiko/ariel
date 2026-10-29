@@ -371,6 +371,7 @@ int
 main(int argc, char **argv) {
   struct settings s;
   struct config c;
+  struct mcp_console console;
   char why[MCP_LINK_WHY_MAX];
 
   memset(&s, 0, sizeof(s));
@@ -393,8 +394,13 @@ main(int argc, char **argv) {
     return 2;
   }
 
+  console.host = c.host;
+  console.port = (int)c.port;
+  console.token = c.token;
+  console.timeout_s = (int)c.timeout;
+
   signal(SIGPIPE, SIG_IGN);
-  if(mcp_probe(c.host, (int)c.port, c.token, (int)c.timeout, why, sizeof(why))) {
+  if(mcp_probe(&console, why, sizeof(why))) {
     fprintf(stderr, "ariel-mcp: %s\n", why);
     return 1;
   }
@@ -403,5 +409,5 @@ main(int argc, char **argv) {
     return 0;
   }
 
-  return mcp_serve(stdin, stdout);
+  return mcp_serve(stdin, stdout, &console);
 }
