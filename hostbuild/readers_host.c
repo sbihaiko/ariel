@@ -32,6 +32,7 @@ along with this program; see the file COPYING. If not, see
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -603,8 +604,11 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
     // The host has no installer. The console's call returns once the
     // install is accepted, so the virtual platform does the same and
     // installs nothing: whether the app directory appeared is what the
-    // test root holds, and the agent reads that itself.
-    *status = 0;
+    // test root holds, and the agent reads that itself. An empty package is
+    // the one request it refuses, so a refused call can be reached here.
+    struct stat st;
+
+    *status = argc > 1 && !stat(argv[1], &st) && st.st_size == 0 ? 1 : 0;
     return 0;
   }
 

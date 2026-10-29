@@ -5286,10 +5286,17 @@ pkg_install_command(agent_t *agent, int fd, int argc, char *argv[],
   if(!named) {
     snprintf(title, sizeof(title), "-");
   }
-  if(status != 0 || !named ||
-     agent->platform->install_result(agent->platform, title,
+  if(status != 0) {
+    pkg_install_incomplete(fd, title, "call");
+    return;
+  }
+  if(!named) {
+    pkg_install_incomplete(fd, title, "title");
+    return;
+  }
+  if(agent->platform->install_result(agent->platform, title,
                                      PKG_INSTALL_WAIT_MS) != 1) {
-    pkg_install_incomplete(fd, title, "package");
+    pkg_install_incomplete(fd, title, "timeout");
     return;
   }
   if(runner_title_missing(agent->platform->fs_root, title, &part)) {
@@ -5304,7 +5311,7 @@ pkg_install_command(agent_t *agent, int fd, int argc, char *argv[],
     snprintf(hex, sizeof(hex), "-");
     break;
   default:
-    pkg_install_incomplete(fd, title, "package");
+    pkg_install_incomplete(fd, title, "source");
     return;
   }
   len = snprintf(answer, sizeof(answer), "installed %s %llu %s\nexit 0\n",

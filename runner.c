@@ -2717,14 +2717,22 @@ verify_title_checks(const char *root, const char *app, const verify_args_t *args
 
 
 /** The part of a title that a finding of its checks names. **/
-static const char *
-title_part(const char *finding) {
+const char *
+runner_title_part(const char *finding) {
   static const struct {
     const char *kind;
     const char *part;
   } parts[] = {
-    {"missing app.", "package"},
-    {"empty app.", "package"},
+    {"missing app.pkg", "package"},
+    {"empty app.pkg", "package"},
+    {"missing app.pbm", "package"},
+    {"empty app.pbm", "package"},
+    {"missing app.json", "package"},
+    {"empty app.json", "package"},
+    {"missing app.xml", "package"},
+    {"empty app.xml", "package"},
+    {"size_mismatch app.pkg", "package"},
+    {"hash_mismatch app.pkg", "package"},
     {"missing sce_sys/param.sfo", "sfo"},
     {"empty sce_sys/param.sfo", "sfo"},
     {"missing content_id", "sfo"},
@@ -2739,7 +2747,8 @@ title_part(const char *finding) {
       return parts[i].part;
     }
   }
-  return "package";
+  /* A finding added later is its own part, never mistaken for a missing package. */
+  return "unknown";
 }
 
 
@@ -2760,7 +2769,7 @@ runner_title_missing(const char *root, const char *title, const char **part) {
   }
   for(i=0; i<count; i++) {
     if(!strncmp(lines[i], "finding ", sizeof("finding ") - 1)) {
-      *part = title_part(lines[i] + sizeof("finding ") - 1);
+      *part = runner_title_part(lines[i] + sizeof("finding ") - 1);
       return 1;
     }
   }

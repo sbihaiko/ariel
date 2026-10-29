@@ -56,6 +56,11 @@ int runner_resolve(const runner_session_t *session, const char *path,
 int runner_title_missing(const char *root, const char *title, const char **part);
 
 /**
+ * The install part a verify finding names, given the text after "finding ".
+ **/
+const char *runner_title_part(const char *finding);
+
+/**
  * The byte count of the regular file at path, and its SHA-256 read once. Returns
  * 0 with both set, 1 when path is not a regular file or cannot be read, and 2
  * with only the byte count set when it is over the verify ceiling, which is not
