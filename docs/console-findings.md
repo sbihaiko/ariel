@@ -458,3 +458,11 @@ Each probe's transcript is the set of its lines from `/data/network-spike.log`, 
 - **The interface list was read.** Probe 1 read `NET_RT_IFLIST` through `PF_ROUTE`: 1408 bytes, 4 interfaces, 5 addresses, with no privilege beyond the one the payload already has. `ifconfig` is built on this fact. [Transcript](#probe-1-interfaces)
 - **The ICMP echo was read.** Probe 3 opened a raw ICMP socket, and a loopback echo came back from `127.0.0.1` as an ICMP type 0 reply, so the console's network stack answered without the packet leaving the console. `ping` is built on this fact. [Transcript](#probe-3-echo)
 - **The socket tables were refused.** Probe 2 asked for `net.inet.tcp.pcblist` and `net.inet.udp.pcblist`, and both answered errno 2 (`No such file or directory`) on the size query, before any read: the kernel says the node does not exist. `netstat` has no fact on this firmware, so it is not built, and [#114](https://github.com/sbihaiko/ariel/issues/114) is closed as not planned. [Transcript](#probe-2-sockets)
+
+## 2026-10-28: a day of play with no freeze
+
+The owner played Journey (CUSA00694) through 2026-10-28 on the CFI-2014 at 11.20 with the usual payloads, and the console did not freeze once. The same console had taken freezes on earlier days, which is why it is written down: a day without one is the first evidence that the current payload set is not by itself enough to freeze the console.
+
+What is not claimed. One day is not a run record: the game, the payloads loaded at each moment and the background traffic were not held constant, so this says the day happened, not why it went well. It is a note for the next run to compare against, and it is the owner's report, not a measurement taken by a payload.
+
+What the console was running when the day was checked, at its end: kstuff-lite, ftpsrv 0.21.1 answering on 2121, ShadowMount+ with Overdrive mounted under `/mnt/shadowmnt`, and the Ariel agent on 2324 — all of them unloaded at one point during the day and loaded again, since the ports were shut and answering at different times. The console also answered ping while running no payload, the same behaviour [Stage 6](#network-spike-the-three-probes-on-firmware-1120) records.
