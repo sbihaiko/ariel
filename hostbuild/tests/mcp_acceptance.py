@@ -649,6 +649,8 @@ def scenario_numeric_flags_refuse_bad_values(binary, console):
 
 WRITE_TOOL = "ariel_mkdir"
 APPROVAL_ID = re.compile(r"a-[0-9a-f]+")
+APPROVAL_EXPIRY_MS = 120_000
+UNKNOWN_APPROVAL_ID = "a-0123456789abcdef"
 
 
 def call_tool(binary, console, name, arguments):
@@ -713,6 +715,50 @@ def scenario_tampered_signature_answers_the_refusal_word(binary, console):
     assert refused["isError"] is True, refused
     assert refused["structuredContent"] == {
         "exit": 79, "truncated": False, "word": "signature_invalid"}, refused
+
+
+def agent_outcome(console, line):
+    """The word and exit status the agent answers to one line, sent as an agent sends it."""
+    lines = agent_answer(console, line).splitlines()
+    assert lines and lines[-1].startswith("exit "), lines
+    status = int(lines[-1].split()[1])
+    return (lines[0] if status else None), status
+
+
+def assert_grant_matches_agent(binary, console, approval_id, signature, why):
+    word, status = agent_outcome(console, "approval grant %s %s" % (approval_id, signature))
+    result = call_tool(binary, console, WRITE_TOOL,
+                       {"approval_id": approval_id, "signature": signature})
+    shown = result["structuredContent"]
+    assert shown["exit"] == status and shown.get("word") == word, (
+        why, shown, "the agent answered", word, status)
+
+
+def scenario_grant_refusals_match_the_agents_word(binary, console):
+    assert_grant_matches_agent(binary, console, "a/b", "0" * 128, "an id the agent never issued")
+    assert_grant_matches_agent(binary, console, UNKNOWN_APPROVAL_ID, "zz",
+                               "a signature that is not hex")
+    assert_grant_matches_agent(binary, console, UNKNOWN_APPROVAL_ID, "0" * 300,
+                               "a signature over the agent's length")
+
+
+def scenario_grant_at_the_full_envelope_length_reaches_the_agent(binary, console):
+    envelope = " ".join(["0" * 128, "c" * 64, "0" * 64])
+    assert_grant_matches_agent(binary, console, UNKNOWN_APPROVAL_ID, envelope,
+                               "a signed envelope with a 64-byte console name")
+
+
+def scenario_repeat_after_expiry_opens_a_new_approval(binary, console):
+    first = open_approval(binary, console, "expiry")["structuredContent"]
+    console.advance(APPROVAL_EXPIRY_MS + 1000)
+    again = call_tool(binary, console, WRITE_TOOL, {
+        "path": os.path.join(console.root, "data", "mcp-expiry")})
+    shown = again["structuredContent"]
+    assert again["isError"] is True and shown["exit"] == 75, again
+    assert shown["approval_id"] != first["approval_id"], (first, shown)
+    assert shown["challenge"].startswith("challenge %s " % shown["approval_id"]), shown
+    prompt = console.next_line(timeout=5.0)
+    assert prompt and prompt.startswith("prompt "), prompt
 
 
 def scenario_write_tool_is_listed_as_a_change(binary, console):
@@ -802,6 +848,12 @@ SCENARIOS = [
      scenario_second_call_while_pending_answers_no_challenge),
     ("a tampered signature answers the agent's refusal word, not a server error",
      scenario_tampered_signature_answers_the_refusal_word),
+    ("a grant refused locally answers the agent's own word and exit",
+     scenario_grant_refusals_match_the_agents_word),
+    ("a signed envelope with a 64-byte console name reaches the agent",
+     scenario_grant_at_the_full_envelope_length_reaches_the_agent),
+    ("a repeat after the approval expires opens a new approval with its challenge",
+     scenario_repeat_after_expiry_opens_a_new_approval),
     ("the write tool is listed as a change with approval_id and signature arguments",
      scenario_write_tool_is_listed_as_a_change),
 ]

@@ -20,6 +20,8 @@ along with this program; see the file COPYING. If not, see
 #include <string.h>
 #include <sys/types.h>
 
+#include "../approval.h"
+#include "../sha256.h"
 #include "mcp.h"
 #include "mcp_link.h"
 
@@ -30,7 +32,7 @@ along with this program; see the file COPYING. If not, see
 #define INTEGER_DIGITS_MAX 18
 #define WORD_MAX 32
 #define APPROVAL_ID_MAX 40
-#define SIGNATURE_MAX 256
+#define SIGNATURE_MAX (2 * APPROVAL_SIG_LEN + 1 + APPROVAL_CONSOLE_MAX + 1 + 2 * SHA256_DIGEST_LEN)
 
 enum mcp_class {
   MCP_READ,
@@ -772,6 +774,24 @@ safe_text(const char *text, size_t len, size_t max, int spaces) {
 }
 
 
+static int
+one_token(const char *text, size_t len, size_t max) {
+  size_t i;
+
+  if(len == 0 || len > max) {
+    return 0;
+  }
+  for(i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)text[i];
+
+    if(c <= ' ' || c >= 0x7F || c == '"' || c == '\'' || c == '\\') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
 /* The space-separated field n of text, when it is not empty. */
 static int
 nth_field(const char *text, size_t len, int n, const char **field, size_t *flen) {
@@ -900,7 +920,7 @@ refuse(FILE *out, const char *id, const char *idend, const char *word, int statu
 /*
  * The owner's grant, relayed: the server holds no key and checks nothing the
  * agent does not. It refuses only text that could not be one line of the
- * agent's grammar, with the agent's own word for it.
+ * agent's grammar; an id that is not one token could never have been issued.
  */
 static void
 grant_call(FILE *out, const char *ids, const char *ide, const char *as,
@@ -925,7 +945,7 @@ grant_call(FILE *out, const char *ids, const char *ide, const char *as,
     return;
   }
   if(decode_string(is + 1, ie - 1, id, APPROVAL_ID_MAX, &idlen) ||
-     !safe_text(id, idlen, APPROVAL_ID_MAX, 0)) {
+     !one_token(id, idlen, APPROVAL_ID_MAX)) {
     refuse(out, ids, ide, "unknown_approval", 1);
     return;
   }
