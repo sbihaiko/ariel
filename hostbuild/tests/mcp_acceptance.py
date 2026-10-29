@@ -9,6 +9,8 @@ or for the console.
 Usage: mcp_acceptance.py [./ariel-mcp [./ariel-host]]
 """
 
+import base64
+import hashlib
 import json
 import os
 import queue
@@ -240,6 +242,7 @@ READ_ROWS = [
     ("ariel_dmesg", []),
     ("ariel_ifconfig", []),
     ("ariel_ping", ["address"]),
+    ("ariel_read", ["path", "offset", "limit", "local_path"]),
 ]
 # Paths are absolute on the host, so fixtures live under the harness's root and
 # the arguments name them by "{root}".
@@ -262,6 +265,8 @@ READ_CALLS = {
     "ariel_dmesg": {},
     "ariel_ifconfig": {},
     "ariel_ping": {"address": "127.0.0.1", "count": 1, "wait": 200},
+    "ariel_read": {"path": "{root}/mcp-read/hello.txt",
+                   "local_path": "{root}/mcp-read/hello.copy"},
 }
 
 
@@ -769,6 +774,121 @@ def scenario_write_tool_is_listed_as_a_change(binary, console):
         assert key in tool["inputSchema"]["properties"], tool
 
 
+# Issue #145: bytes move by local path in both directions, never through the context.
+BLOB = bytes(range(256)) * 4
+
+
+def local_path(console, relative):
+    path = os.path.join(console.root, "local", relative)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def local_file(console, relative, data):
+    path = local_path(console, relative)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def scenario_push_from_a_local_file_moves_the_bytes(binary, console):
+    console.fresh()
+    local = local_file(console, "firmware.bin", BLOB)
+    result = call_tool(binary, console, "ariel_payload_push",
+                       {"name": "mcppush", "local_path": local})
+    shown = result["structuredContent"]
+    assert result["isError"] is True and shown["exit"] == 75, result
+    assert APPROVAL_ID.fullmatch(shown["approval_id"]) and shown["challenge"], shown
+    prompt = console.next_line(timeout=5.0)
+    match = acceptance.PROMPT_LINE.match(prompt or "")
+    assert match, "expected the owner's prompt, got %r" % prompt
+    assert match.group(1) == shown["approval_id"], (match.group(1), shown)
+    assert match.group(2) == "mcppush", prompt
+    assert int(match.group(3)) == len(BLOB), prompt
+    assert match.group(4) == hashlib.sha256(BLOB).hexdigest(), (
+        "the console stored a different hash from the local file's")
+
+
+def scenario_push_cut_by_the_console_returns_its_word(binary, console):
+    console.fresh()
+    path = local_path(console, "too-big.bin")
+    with open(path, "wb") as handle:
+        handle.truncate(64 * 1024 * 1024 + 1)
+    result = call_tool(binary, console, "ariel_payload_push",
+                       {"name": "toobig", "local_path": path})
+    assert result["isError"] is True, result
+    assert result["content"][0]["text"] == "staging_full\n", result
+    assert result["structuredContent"] == {
+        "exit": 80, "truncated": False, "word": "staging_full"}, result
+
+
+def scenario_binary_range_is_written_to_the_local_path(binary, console):
+    write_fixture(console, "mcp-read/blob.bin", BLOB)
+    destination = local_path(console, "range.bin")
+    result = call_tool(binary, console, "ariel_read", {
+        "path": os.path.join(console.root, "mcp-read", "blob.bin"),
+        "offset": 16, "limit": 64, "local_path": destination})
+    assert result["isError"] is False, result
+    expected = BLOB[16:80]
+    with open(destination, "rb") as handle:
+        assert handle.read() == expected, "the local file must hold the range"
+    shown = result["structuredContent"]
+    assert shown["exit"] == 0 and shown["truncated"] is False, shown
+    assert shown["path"] == destination and shown["size"] == 64, shown
+    assert shown["sha256"] == hashlib.sha256(expected).hexdigest(), shown
+    assert shown["file_sha256"] == hashlib.sha256(BLOB).hexdigest(), shown
+    text = result["content"][0]["text"]
+    assert destination in text, text
+    assert base64.b64encode(expected).decode() not in text, text
+
+
+def scenario_write_from_a_local_file_answers_the_challenge(binary, console):
+    console.fresh()
+    data = b"hello written from a local file\n"
+    local = local_file(console, "note.txt", data)
+    destination = os.path.join(console.root, "data", "mcp-written.txt")
+    result = call_tool(binary, console, "ariel_write",
+                       {"path": destination, "local_path": local})
+    shown = result["structuredContent"]
+    assert result["isError"] is True and shown["exit"] == 75, result
+    assert APPROVAL_ID.fullmatch(shown["approval_id"]), shown
+    assert shown["challenge"].startswith("challenge %s " % shown["approval_id"]), shown
+    prompt = console.next_line(timeout=5.0)
+    assert prompt and prompt.startswith("prompt "), prompt
+    assert hashlib.sha256(data).hexdigest() in prompt, prompt
+
+
+def scenario_byte_tools_say_what_the_server_touches(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    push = by_name["ariel_payload_push"]
+    assert "local_path" in push["description"] and "reads" in push["description"], push
+    assert "59 seconds" in push["description"], push
+    assert "stops moving" in push["description"], push
+    assert "upload_mismatch" in push["description"], push
+    assert push["annotations"] == {"readOnlyHint": False, "destructiveHint": True}, push
+    write = by_name["ariel_write"]["description"]
+    assert "local_path" in write and "reads" in write, write
+    read = by_name["ariel_read"]["description"]
+    assert "local_path" in read and "writes" in read, read
+
+
+def scenario_relative_local_path_is_refused_before_the_console(binary, console):
+    replies, _ = session(binary, console, [INITIALIZE, request(2, "tools/call", {
+        "name": "ariel_payload_push",
+        "arguments": {"name": "relative", "local_path": "firmware.bin"}})])
+    error = replies[1]["error"]
+    assert replies[1]["id"] == 2 and error["code"] == -32602, replies[1]
+    assert "absolute" in error["message"], replies[1]
+
+
+def scenario_missing_local_file_is_a_tool_failure(binary, console):
+    missing = local_path(console, "absent.bin")
+    result = call_tool(binary, console, "ariel_payload_push",
+                       {"name": "absent", "local_path": missing})
+    assert result["isError"] is True, result
+    assert missing in result["content"][0]["text"], result
+
+
 SCENARIOS = [
     ("initialize answers the ADR-0017 revision and serverInfo ariel",
      scenario_initialize_names_the_revision_and_server),
@@ -856,6 +976,20 @@ SCENARIOS = [
      scenario_repeat_after_expiry_opens_a_new_approval),
     ("the write tool is listed as a change with approval_id and signature arguments",
      scenario_write_tool_is_listed_as_a_change),
+    ("a push from a local file moves the bytes and the console stores the file's hash",
+     scenario_push_from_a_local_file_moves_the_bytes),
+    ("a push the console cuts answers the console's word, not a server wording",
+     scenario_push_cut_by_the_console_returns_its_word),
+    ("a binary range is written to the named local path with no base64 in the answer",
+     scenario_binary_range_is_written_to_the_local_path),
+    ("a write from a local file answers the challenge for the file's hash",
+     scenario_write_from_a_local_file_answers_the_challenge),
+    ("the byte tools' descriptions say the server reads and writes local_path, and the push names the stall",
+     scenario_byte_tools_say_what_the_server_touches),
+    ("a relative local_path is refused as invalid params before the console",
+     scenario_relative_local_path_is_refused_before_the_console),
+    ("a missing local file is a tool failure that names the file",
+     scenario_missing_local_file_is_a_tool_failure),
 ]
 for _name, _keys in READ_ROWS:
     SCENARIOS.append((

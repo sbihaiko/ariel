@@ -17,7 +17,8 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_MCP_LINK_H
 #define ARIEL_MCP_LINK_H
 
-#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 
 #define MCP_LINK_WHY_MAX 256
 
@@ -45,6 +46,22 @@ struct mcp_answer {
  **/
 int mcp_exchange(const struct mcp_console *console, const char *command,
                  struct mcp_answer *answer, char *why, size_t why_len);
+
+/**
+ * As mcp_exchange, for a command whose answer may be a bytes frame: the frame's
+ * body is taken by its length, so binary bytes may hold no newline before exit.
+ **/
+int mcp_exchange_frame(const struct mcp_console *console, const char *command,
+                       struct mcp_answer *answer, char *why, size_t why_len);
+
+/**
+ * Send the token, one command and then exactly size bytes read from body, and
+ * read the console's answer. The console's cut or refusal is its answer, so a
+ * body that stops sending early still returns the answer. Otherwise it returns
+ * -1 with one line in why, as mcp_exchange does.
+ **/
+int mcp_upload(const struct mcp_console *console, const char *command, FILE *body,
+               uint64_t size, struct mcp_answer *answer, char *why, size_t why_len);
 
 /**
  * Prove the console accepts the token with pwd. It returns 0 when the console

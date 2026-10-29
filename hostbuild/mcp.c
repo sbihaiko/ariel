@@ -15,6 +15,8 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <ctype.h>
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +34,7 @@ along with this program; see the file COPYING. If not, see
 #define INTEGER_DIGITS_MAX 18
 #define WORD_MAX 32
 #define APPROVAL_ID_MAX 40
+#define FILE_CHUNK 8192
 #define SIGNATURE_MAX (2 * APPROVAL_SIG_LEN + 1 + APPROVAL_CONSOLE_MAX + 1 + 2 * SHA256_DIGEST_LEN)
 
 enum mcp_class {
@@ -42,7 +45,8 @@ enum mcp_class {
 
 enum mcp_kind {
   ARG_STRING,
-  ARG_INTEGER
+  ARG_INTEGER,
+  ARG_LOCAL
 };
 
 typedef struct {
@@ -86,6 +90,26 @@ static const mcp_arg_t ping_args[] = {
   { NULL, ARG_STRING, 0, NULL }
 };
 
+static const mcp_arg_t read_args[] = {
+  { "path", ARG_STRING, 1, NULL },
+  { "offset", ARG_INTEGER, 0, "--offset" },
+  { "limit", ARG_INTEGER, 0, "--limit" },
+  { "local_path", ARG_LOCAL, 0, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t push_args[] = {
+  { "name", ARG_STRING, 1, NULL },
+  { "local_path", ARG_LOCAL, 0, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t write_args[] = {
+  { "path", ARG_STRING, 1, NULL },
+  { "local_path", ARG_LOCAL, 0, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
 // The tool table is the whole surface: tools/list and tools/call both read it.
 // A NULL name ends it. A row's word is the console command it runs.
 static const mcp_tool_t mcp_tools[] = {
@@ -108,6 +132,9 @@ static const mcp_tool_t mcp_tools[] = {
   { "ariel_ifconfig", "Show the console's network interfaces.", MCP_READ, "ifconfig", no_args },
   { "ariel_ping", "Ping an address from the console.", MCP_READ, "ping", ping_args },
   { "ariel_mkdir", "Create a directory on the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "mkdir", path_args },
+  { "ariel_read", "Read a byte range of a file on the console. With local_path, an absolute path on this host, the server writes the range to that file and answers its path, size and hash, never the bytes.", MCP_READ, "read", read_args },
+  { "ariel_payload_push", "Push a payload to the console. The server reads the bytes of local_path, an absolute path on this host, and streams them to the console. An upload that stops moving for 59 seconds is cut by the console, not by this server, and the console's word answers, such as upload_mismatch or staging_full. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "payload push", push_args },
+  { "ariel_write", "Write a file on the console from local_path, an absolute path on this host that the server reads and streams to the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "write", write_args },
   { NULL, NULL, MCP_READ, NULL, NULL }
 };
 
@@ -579,6 +606,9 @@ build_command(const mcp_tool_t *row, const char *as, const char *ae,
   }
 
   for(arg = row->args; arg->key; arg++) {
+    if(arg->kind == ARG_LOCAL) {
+      continue;
+    }
     found = object_member(as, ae, arg->key, &vs, &ve, NULL);
     if(found < 0) {
       snprintf(why, why_len, "invalid params: arguments must be an object");
@@ -817,6 +847,25 @@ nth_field(const char *text, size_t len, int n, const char **field, size_t *flen)
 }
 
 
+static const char *
+approval_line(const char *text, const char *end) {
+  const char *p = text;
+
+  while(p < end) {
+    if((size_t)(end - p) >= sizeof(approval_prefix) - 1 &&
+       !memcmp(p, approval_prefix, sizeof(approval_prefix) - 1)) {
+      return p;
+    }
+    p = memchr(p, '\n', (size_t)(end - p));
+    if(!p) {
+      return NULL;
+    }
+    p++;
+  }
+  return NULL;
+}
+
+
 /*
  * The owner's question in either shape of approval_required: the approval ID,
  * then the challenge line when the request opened the approval. A pending
@@ -824,8 +873,8 @@ nth_field(const char *text, size_t len, int n, const char **field, size_t *flen)
  */
 static void
 write_approval(FILE *out, const struct mcp_answer *answer) {
-  const char *text = answer->text;
   const char *end = answer->text + answer->len;
+  const char *text;
   const char *line_end;
   const char *challenge = NULL;
   const char *field;
@@ -833,8 +882,11 @@ write_approval(FILE *out, const struct mcp_answer *answer) {
   size_t field_len;
   size_t id_len;
 
-  if(answer->status != 75 || (size_t)(end - text) < sizeof(approval_prefix) - 1 ||
-     memcmp(text, approval_prefix, sizeof(approval_prefix) - 1)) {
+  if(answer->status != 75) {
+    return;
+  }
+  text = approval_line(answer->text, end);
+  if(!text) {
     return;
   }
   text += sizeof(approval_prefix) - 1;
@@ -971,6 +1023,233 @@ grant_call(FILE *out, const char *ids, const char *ide, const char *as,
 }
 
 
+static int
+row_has_local(const mcp_tool_t *row) {
+  const mcp_arg_t *arg;
+
+  for(arg = row->args; arg->key; arg++) {
+    if(arg->kind == ARG_LOCAL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+/* The local_path argument: 1 when given, 0 when absent, -1 when not text. */
+static int
+local_member(const char *as, const char *ae, char *path, size_t cap, size_t *len) {
+  const char *vs = NULL;
+  const char *ve = NULL;
+  int found;
+
+  found = object_member(as, ae, "local_path", &vs, &ve, NULL);
+  if(found != 1) {
+    return found < 0 ? -1 : 0;
+  }
+  if(*vs != '"' || decode_string(vs + 1, ve - 1, path, cap, len)) {
+    return -1;
+  }
+  path[*len] = '\0';
+  return 1;
+}
+
+
+static void
+local_failure(char *message, size_t cap, const char *verb, const char *local, int err) {
+  snprintf(message, cap, "cannot %s local_path %s: %s", verb, local, strerror(err));
+}
+
+
+static int
+hash_local(FILE *file, uint64_t *size, char hex[SHA256_HEX_LEN + 1]) {
+  unsigned char chunk[FILE_CHUNK];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  sha256_t hash;
+  size_t n;
+
+  sha256_init(&hash);
+  *size = 0;
+  while((n = fread(chunk, 1, sizeof(chunk), file)) > 0) {
+    sha256_update(&hash, chunk, n);
+    *size += n;
+  }
+  if(ferror(file)) {
+    return -1;
+  }
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+  return 0;
+}
+
+
+static void
+upload_call(FILE *out, const char *ids, const char *ide, const mcp_tool_t *row,
+            const char *as, const char *ae, const char *local,
+            const struct mcp_console *console) {
+  char message[CONSOLE_LINE_MAX + 128];
+  char hex[SHA256_HEX_LEN + 1];
+  char tail[SHA256_HEX_LEN + 32];
+  struct command cmd;
+  struct mcp_answer answer;
+  char why[MCP_LINK_WHY_MAX];
+  uint64_t size;
+  FILE *file;
+  int err;
+
+  if(build_command(row, as, ae, &cmd, why, sizeof(why))) {
+    write_error(out, ids, ide, -32602, why);
+    return;
+  }
+  file = fopen(local, "rb");
+  if(!file) {
+    local_failure(message, sizeof(message), "read", local, errno);
+    write_failure(out, ids, ide, message);
+    return;
+  }
+  if(hash_local(file, &size, hex)) {
+    err = errno;
+    fclose(file);
+    local_failure(message, sizeof(message), "read", local, err);
+    write_failure(out, ids, ide, message);
+    return;
+  }
+  rewind(file);
+
+  snprintf(tail, sizeof(tail), " %llu %s", (unsigned long long)size, hex);
+  if(append(&cmd, tail, strlen(tail))) {
+    fclose(file);
+    write_error(out, ids, ide, -32602, "invalid params: the command is too long");
+    return;
+  }
+  if(mcp_upload(console, cmd.text, file, size, &answer, why, sizeof(why))) {
+    fclose(file);
+    write_failure(out, ids, ide, why);
+    return;
+  }
+  fclose(file);
+  write_answer(out, ids, ide, &answer);
+  free(answer.text);
+}
+
+
+static int
+bytes_frame(const struct mcp_answer *answer, unsigned long long *size,
+            char hex[SHA256_HEX_LEN + 1], size_t *head) {
+  char line[128];
+  const char *nl = memchr(answer->text, '\n', answer->len);
+  size_t n;
+
+  if(!nl || (size_t)(nl - answer->text) >= sizeof(line)) {
+    return -1;
+  }
+  n = (size_t)(nl - answer->text);
+  memcpy(line, answer->text, n);
+  line[n] = '\0';
+  if(sscanf(line, "bytes %llu %64s", size, hex) != 2 || strlen(hex) != SHA256_HEX_LEN) {
+    return -1;
+  }
+  *head = n + 1;
+  return *size > answer->len - *head ? -1 : 0;
+}
+
+
+static void
+write_local_read(FILE *out, const char *ids, const char *ide, const char *local,
+                 unsigned long long size, const char *range, const char *whole,
+                 const char *tail, size_t tail_len) {
+  char summary[CONSOLE_LINE_MAX + 128];
+  size_t n;
+  char *text;
+
+  n = (size_t)snprintf(summary, sizeof(summary), "wrote %llu bytes to %s, sha256 %s\n",
+                       size, local, range);
+  text = malloc(n + tail_len + 1);
+  if(!text) {
+    write_failure(out, ids, ide, "out of memory for the console's answer");
+    return;
+  }
+  memcpy(text, summary, n);
+  memcpy(text + n, tail, tail_len);
+
+  begin_result(out, ids, ide);
+  fputs("{\"content\":[{\"type\":\"text\",\"text\":", out);
+  json_text(out, text, n + tail_len);
+  fprintf(out, "}],\"structuredContent\":{\"exit\":0,\"truncated\":%s,\"path\":",
+          cut_marker(tail, tail_len) ? "true" : "false");
+  json_text(out, local, strlen(local));
+  fprintf(out, ",\"size\":%llu,\"sha256\":\"%s\",\"file_sha256\":\"%s\"},\"isError\":false}",
+          size, range, whole);
+  end_reply(out);
+  free(text);
+}
+
+
+static void
+download_call(FILE *out, const char *ids, const char *ide, const mcp_tool_t *row,
+              const char *as, const char *ae, const char *local,
+              const struct mcp_console *console) {
+  char message[CONSOLE_LINE_MAX + 128];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char whole[SHA256_HEX_LEN + 1];
+  char range[SHA256_HEX_LEN + 1];
+  struct command cmd;
+  struct mcp_answer answer;
+  char why[MCP_LINK_WHY_MAX];
+  unsigned long long size;
+  sha256_t hash;
+  size_t head;
+  FILE *file;
+  int err;
+
+  if(build_command(row, as, ae, &cmd, why, sizeof(why))) {
+    write_error(out, ids, ide, -32602, why);
+    return;
+  }
+  if(mcp_exchange_frame(console, cmd.text, &answer, why, sizeof(why))) {
+    write_failure(out, ids, ide, why);
+    return;
+  }
+  if(answer.status != 0) {
+    write_answer(out, ids, ide, &answer);
+    free(answer.text);
+    return;
+  }
+  if(bytes_frame(&answer, &size, whole, &head)) {
+    free(answer.text);
+    write_failure(out, ids, ide, "the console answered without a bytes frame");
+    return;
+  }
+
+  err = 0;
+  file = fopen(local, "wb");
+  if(!file) {
+    err = errno;
+  } else {
+    if(fwrite(answer.text + head, 1, (size_t)size, file) != size) {
+      err = errno ? errno : EIO;
+    }
+    if(fclose(file) && !err) {
+      err = errno;
+    }
+  }
+  if(err) {
+    free(answer.text);
+    local_failure(message, sizeof(message), "write", local, err);
+    write_failure(out, ids, ide, message);
+    return;
+  }
+
+  sha256_init(&hash);
+  sha256_update(&hash, answer.text + head, (size_t)size);
+  sha256_final(&hash, digest);
+  sha256_hex(digest, range);
+  write_local_read(out, ids, ide, local, size, range, whole,
+                   answer.text + head + size, answer.len - head - (size_t)size);
+  free(answer.text);
+}
+
+
 static void
 call_tool(FILE *out, const char *ids, const char *ide, const char *ps,
           const char *pe, int has_params, const struct mcp_console *console) {
@@ -981,7 +1260,10 @@ call_tool(FILE *out, const char *ids, const char *ide, const char *ps,
   const mcp_tool_t *row;
   struct command cmd;
   struct mcp_answer answer;
+  char local[CONSOLE_LINE_MAX + 2];
+  size_t local_len = 0;
   char why[MCP_LINK_WHY_MAX];
+  int found;
 
   if(has_params != 1 ||
      object_member(ps, pe, "name", &ns, &ne, NULL) != 1 || !is_string(ns)) {
@@ -1004,6 +1286,30 @@ call_tool(FILE *out, const char *ids, const char *ide, const char *ps,
   if(row->cls != MCP_READ && grant_requested(as, ae)) {
     grant_call(out, ids, ide, as, ae, console);
     return;
+  }
+  if(row_has_local(row)) {
+    found = local_member(as, ae, local, sizeof(local) - 1, &local_len);
+    if(found < 0) {
+      write_error(out, ids, ide, -32602, "invalid params: local_path must be text");
+      return;
+    }
+    if(found == 0 && row->cls != MCP_READ) {
+      write_error(out, ids, ide, -32602, "invalid params: local_path is required");
+      return;
+    }
+    if(found == 1) {
+      if(local_len == 0 || local[0] != '/') {
+        write_error(out, ids, ide, -32602,
+                    "invalid params: local_path must be an absolute path");
+        return;
+      }
+      if(row->cls == MCP_READ) {
+        download_call(out, ids, ide, row, as, ae, local, console);
+      } else {
+        upload_call(out, ids, ide, row, as, ae, local, console);
+      }
+      return;
+    }
   }
   if(build_command(row, as, ae, &cmd, why, sizeof(why))) {
     write_error(out, ids, ide, -32602, why);

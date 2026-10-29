@@ -29,6 +29,7 @@ along with this program; see the file COPYING. If not, see
 #define REPLY_STEP 8192
 #define REPLY_LIMIT (256UL * 1024)
 #define REFUSED_STATUS 70
+#define FILE_CHUNK 8192
 
 static int
 connect_to(const struct mcp_console *console, char *why, size_t why_len) {
@@ -87,17 +88,38 @@ connect_to(const struct mcp_console *console, char *why, size_t why_len) {
 
 
 static int
-send_text(int fd, const char *text) {
-  size_t len = strlen(text);
-
+send_all(int fd, const char *data, size_t len) {
   while(len) {
-    ssize_t n = send(fd, text, len, 0);
+    ssize_t n = send(fd, data, len, 0);
 
     if(n <= 0) {
       return -1;
     }
-    text += n;
+    data += n;
     len -= (size_t)n;
+  }
+  return 0;
+}
+
+
+static int
+send_text(int fd, const char *text) {
+  return send_all(fd, text, strlen(text));
+}
+
+
+static int
+send_body(int fd, FILE *body, uint64_t size) {
+  char chunk[FILE_CHUNK];
+
+  while(size) {
+    size_t want = size < sizeof(chunk) ? (size_t)size : sizeof(chunk);
+    size_t got = fread(chunk, 1, want, body);
+
+    if(got == 0 || send_all(fd, chunk, got)) {
+      return -1;
+    }
+    size -= got;
   }
   return 0;
 }
@@ -115,13 +137,36 @@ first_word(const char *text, size_t len, char *word, size_t cap) {
 }
 
 
-int
-mcp_exchange(const struct mcp_console *console, const char *command,
-             struct mcp_answer *answer, char *why, size_t why_len) {
+/* The end of a bytes frame's body, which may hold no newline before exit. */
+static size_t
+frame_end(const char *reply, size_t used) {
+  char line[128];
+  const char *nl = memchr(reply, '\n', used);
+  unsigned long long size;
+  size_t head;
+
+  if(!nl || (size_t)(nl - reply) >= sizeof(line)) {
+    return 0;
+  }
+  head = (size_t)(nl - reply) + 1;
+  memcpy(line, reply, head - 1);
+  line[head - 1] = '\0';
+  if(sscanf(line, "bytes %llu %*s", &size) != 1 || size > used - head) {
+    return 0;
+  }
+  return head + (size_t)size;
+}
+
+
+static int
+exchange(const struct mcp_console *console, const char *command, FILE *body,
+         uint64_t size, int framed, struct mcp_answer *answer, char *why,
+         size_t why_len) {
   char *reply;
   size_t cap = REPLY_STEP;
   size_t used = 0;
   size_t start;
+  size_t floor = 0;
   int fd;
 
   fd = connect_to(console, why, why_len);
@@ -140,6 +185,10 @@ mcp_exchange(const struct mcp_console *console, const char *command,
     snprintf(why, why_len, "console %s:%d closed the connection",
              console->host, console->port);
     goto failed;
+  }
+  if(body) {
+    send_body(fd, body, size);
+    shutdown(fd, SHUT_WR);
   }
 
   for(;;) {
@@ -191,7 +240,10 @@ mcp_exchange(const struct mcp_console *console, const char *command,
     free(reply);
     return -1;
   }
-  while(start > 0 && reply[start - 1] != '\n') {
+  if(framed) {
+    floor = frame_end(reply, used);
+  }
+  while(start > floor && reply[start - 1] != '\n') {
     start--;
   }
   if(strncmp(reply + start, "exit ", 5)) {
@@ -211,6 +263,27 @@ failed:
   close(fd);
   free(reply);
   return -1;
+}
+
+
+int
+mcp_exchange(const struct mcp_console *console, const char *command,
+             struct mcp_answer *answer, char *why, size_t why_len) {
+  return exchange(console, command, NULL, 0, 0, answer, why, why_len);
+}
+
+
+int
+mcp_exchange_frame(const struct mcp_console *console, const char *command,
+                   struct mcp_answer *answer, char *why, size_t why_len) {
+  return exchange(console, command, NULL, 0, 1, answer, why, why_len);
+}
+
+
+int
+mcp_upload(const struct mcp_console *console, const char *command, FILE *body,
+           uint64_t size, struct mcp_answer *answer, char *why, size_t why_len) {
+  return exchange(console, command, body, size, 0, answer, why, why_len);
 }
 
 
