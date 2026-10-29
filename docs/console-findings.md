@@ -466,3 +466,104 @@ The owner played Journey (CUSA00694) through 2026-10-28 on the CFI-2014 at 11.20
 What is not claimed. One day is not a run record: the game, the payloads loaded at each moment and the background traffic were not held constant, so this says the day happened, not why it went well. It is a note for the next run to compare against, and it is the owner's report, not a measurement taken by a payload.
 
 What the console was running when the day was checked, at its end: kstuff-lite, ftpsrv 0.21.1 answering on 2121, ShadowMount+ with Overdrive mounted under `/mnt/shadowmnt`, and the Ariel agent on 2324 — all of them unloaded at one point during the day and loaded again, since the ports were shut and answering at different times. The console also answered ping while running no payload, the same behaviour [Stage 6](#network-spike-the-three-probes-on-firmware-1120) records.
+
+## Issue #135: what the system shutdown path does on firmware 11.200.005
+
+The spike behind [#133](https://github.com/sbihaiko/ariel/issues/133). `system-spike.elf` ran on 2026-10-29 on the CFI-2014 at 192.168.68.61, firmware 11.200.005, from `system_spike.c` (sha256 `c5235f1e9350cb91c0d0d8719bbf9cca3424d7cde988dea68eb8dfe62e40f600`), sent to the console over ftpsrv and started with the agent's `exec`, one candidate per run. The kernel log on 3232 was captured for the whole window.
+
+The candidates are exported by `libSceSystemService.so`; the SDK ships no header for them, so the spike declares each with a single pointer argument and passes a zeroed 64-byte buffer.
+
+| candidate | call | outcome |
+| --- | --- | --- |
+| read | `sceSystemStateMgrIsStandbyModeEnabled` | **read**: `1` |
+| read | `sceSystemStateMgrGetCurrentState` | **read**: `1000`, the running state |
+| read | `sceSystemStateMgrIsShellUIShutdownInProgress` | **refused**: `0x80940020`, errno 16 |
+| reboot | `sceSystemServiceRequestReboot(void *)` | **accepted and ignored**: `rc=0 errno=0`, and nothing happened — every port stayed open, the agent kept its pid, and the kernel log recorded no event |
+| shutdown | `sceShellCoreUtilRequestShutdown(void *)` | **worked**: the console ran its own shutdown and went off |
+| poweroff | `sceSystemServiceRequestPowerOff(void *)` | **accepted and ignored**: `rc=0 errno=0` on two runs, every port stayed open, no kernel event |
+| syscall | `reboot(RB_AUTOBOOT)` | **standby, not a reboot**: the kernel log shows `onMainOnStandby` and the console logged the user out, while the payloads kept their ports open |
+| reboot, state manager | `sceSystemStateMgrReboot(void *)` | **accepted and ignored**: `rc=0 errno=0`, every port stayed open |
+| reboot, the shell's own call | `sceApplicationSystemReboot(void *)` (`libSceSysCore`) | **refused**: `rc=0x80B60004`, the shell's own restart call, refused to a payload |
+
+### What the shutdown candidate did
+
+The call's own return was never printed: it ends the console and the connection with it, which is the outcome the spike exists to find. What the kernel log shows is the path the console took on its own, and it is the sequence this project's manual procedure asks an operator to wait for:
+
+```text
+[SceShellCore] RIF Manager OK, 0 sec
+[SceShellCore] System Logger OK, 0 sec
+AutoMounter onShutdown(): [Shutdown]
+AutoMounter requestUnmountUsbAll: start
+AutoMounter: m2Unmount started / m2Unmount ends(0ms)
+AutoMounter: device(/dev/da1s1) is unmounted from /mnt/usb0.
+AutoMounter: Notify PsmEvent OnUsbStorageUnmounted
+AutoMounter: device(/dev/da2s1) is unmounted from /mnt/usb1.
+AutoMounter: Notify PsmEvent OnUsbStorageUnmounted
+AutoMounter handleUsbUnmountAll: end of usb suspend handler.
+[SceShellCore] AutoMounter OK, 0 sec
+[SceShellCore] /user Cleaner OK, 0 sec
+[SceShellCore] Pre-shutdown tasks completed
+[SceLncService] ::ShellCoreMain::OnShutdown(true) took 1 seconds
+[SceLncService] CALL sceApplicationSystemReboot();
+[Syscore App] Start SystemReboot
+[Syscore Umd] Event id=SCE_UMD_SYSTEM_EVENT_REBOOT(0x6), phase=0 start
+[DTL] Closed.
+[Syscore App] sceUmdReboot(0) => 0
+```
+
+Mounted at the moment of the call: `/dev/da1s1` on `/mnt/usb0` and `/dev/da2s1` on `/mnt/usb1`, the two drives `console-setup.md` describes. Both were unmounted by the system, not by the spike, and the `/user` cleaner ran before the shutdown completed.
+
+### The spike's own transcript
+
+```text
+spike135 start pid=98 mode=reboot
+spike135 sceSystemStateMgrIsStandbyModeEnabled rc=1 errno=0
+spike135 sceSystemStateMgrGetCurrentState rc=1000 errno=0
+spike135 sceSystemStateMgrIsShellUIShutdownInProgress rc=-2147352576 errno=16
+spike135 calling sceSystemServiceRequestReboot
+spike135 sync done
+spike135 sceSystemServiceRequestReboot rc=0 errno=0
+spike135 sceSystemServiceRequestReboot returned and the console is still up
+spike135 end
+```
+
+### What this does and does not claim
+
+- A payload reaches `sceShellCoreUtilRequestShutdown`, and the console performs its full orderly shutdown — including the unmount of both removable volumes — without an operator pressing the button.
+- `sceSystemServiceRequestReboot` returning 0 is not evidence of a reboot: it returned 0 and the console stayed up. A command built on it would answer success and do nothing, which is the failure shape [#128](https://github.com/sbihaiko/ariel/issues/128) already cost this project once.
+- `sceSystemServiceRequestPowerOff` was not run, so nothing here says whether poweroff differs from shutdown from a payload.
+- The console was off after the shutdown; whether it was fully powered down or in a network-answering low-power state was not measured — ping answered for a minute after every port closed. Reaching the console again needed the physical button and the autoloader, which is the tethered behaviour `console-setup.md` records.
+
+### Three routes that answer and do nothing, and one that suspends
+
+`sceSystemServiceRequestReboot` and `sceSystemServiceRequestPowerOff` both returned `rc=0 errno=0` and changed nothing: every port stayed open across both calls, the agent kept its pid, and the kernel log recorded no shutdown, no unmount and no standby between them.
+
+`reboot(RB_AUTOBOOT)` — the route the agent's `reboot` command uses today — did **not** restart the console. The kernel log shows the system going to standby after it:
+
+```text
+AutoMounter handleUsbUnmountAll: end of usb suspend handler.
+AutoMounter: Notify PsmEvent OnUsbStorageUnmounted
+AutoMounter onMainOnStandby():
+AutoMounter: _m2Exists started / _m2Exists ends(0ms)
+[SceShellCore] AutoMounter OK, 0 sec
+```
+
+Every payload kept its port: ftpsrv, klogsrv, shsrv and the agent answered after the call. The screen showed the login, which is what raised the question — the console was suspended, not restarted. So `reboot` on this build suspends the console and leaves the jailbreak running, and the README's claim that it restarts the machine is wrong for this firmware.
+
+Two candidates remain, both listed but not yet run: `sceSystemStateMgrReboot`, and `sceApplicationSystemReboot` from `libSceSysCore` — the last one because it is the call the console's own shutdown flow makes on its way down (`[SceLncService] CALL sceApplicationSystemReboot();`), so it is the one most likely to be the real restart.
+
+### What the two windows leave
+
+Every restart route reachable from a payload answers with success or an error and never restarts:
+
+- `sceSystemServiceRequestReboot`, `sceSystemStateMgrReboot`: `rc=0`, no kernel event, every port open.
+- `sceSystemServiceRequestPowerOff`: `rc=0`, same.
+- `sceApplicationSystemReboot`: `0x80B60004`, refused — the call the console's own shutdown flow makes, refused when a payload makes it.
+- `reboot(RB_AUTOBOOT)`: standby. The kernel log shows `onMainOnStandby`, the screen returns to the login, and the payloads keep their ports, so the jailbreak survives. On a tethered console that is not obviously wrong behaviour — it is what keeps the chain loaded — but it is not a restart, and the command list says it is.
+
+Only `sceShellCoreUtilRequestShutdown` does what its name says, and it does the whole thing: `/mnt/usb0` and `/mnt/usb1` unmounted by AutoMounter, the `/user` cleaner run, `Pre-shutdown tasks completed`, then `sceUmdReboot(0) => 0`.
+
+### What this means for the commands
+
+- `shutdown` has a proven implementation. Nothing else needs to be designed for it.
+- `reboot` has none. Either it answers a word that says so, or it goes away and the README stops promising a restart. What it must not do is keep answering `rebooting` while suspending the console.
