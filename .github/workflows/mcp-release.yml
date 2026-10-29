@@ -1,0 +1,143 @@
+name: MCP release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Build ariel-mcp for macOS arm64
+      run: |
+        [ "$(uname -m)" = arm64 ] || { echo "this runner is not arm64" >&2; exit 1; }
+        make -C hostbuild clean ariel-mcp
+        [ "$(lipo -archs hostbuild/ariel-mcp)" = arm64 ] || exit 1
+        mkdir -p dist
+        cp hostbuild/ariel-mcp dist/ariel-mcp-macos-arm64
+
+    - name: Cross-build ariel-mcp for macOS x86_64
+      run: |
+        make -C hostbuild clean ariel-mcp CC="cc -arch x86_64"
+        [ "$(lipo -archs hostbuild/ariel-mcp)" = x86_64 ] || exit 1
+        cp hostbuild/ariel-mcp dist/ariel-mcp-macos-x86_64
+
+    - name: Upload ariel-mcp-macos-arm64
+      uses: actions/upload-artifact@v4
+      with:
+        name: ariel-mcp-macos-arm64
+        path: dist/ariel-mcp-macos-arm64
+        if-no-files-found: error
+
+    - name: Upload ariel-mcp-macos-x86_64
+      uses: actions/upload-artifact@v4
+      with:
+        name: ariel-mcp-macos-x86_64
+        path: dist/ariel-mcp-macos-x86_64
+        if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Build ariel-mcp for Linux x86_64
+      run: |
+        [ "$(uname -m)" = x86_64 ] || { echo "this runner is not x86_64" >&2; exit 1; }
+        make -C hostbuild clean ariel-mcp
+        mkdir -p dist
+        cp hostbuild/ariel-mcp dist/ariel-mcp-linux-x86_64
+
+    - name: Upload ariel-mcp-linux-x86_64
+      uses: actions/upload-artifact@v4
+      with:
+        name: ariel-mcp-linux-x86_64
+        path: dist/ariel-mcp-linux-x86_64
+        if-no-files-found: error
+
+  release:
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+
+    - name: Download the binaries
+      uses: actions/download-artifact@v4
+      with:
+        pattern: ariel-mcp-*
+        path: dist
+        merge-multiple: true
+
+    - name: Fail the release if a binary is missing
+      run: |
+        missing=0
+        for asset in ariel-mcp-macos-arm64 ariel-mcp-macos-x86_64 ariel-mcp-linux-x86_64; do
+          [ -s "dist/$asset" ] || { echo "missing binary: $asset" >&2; missing=1; }
+        done
+        [ "$missing" = 0 ] || exit 1
+
+    - name: Check that no binary carries a key or an anchor
+      run: |
+        status=0
+        for file in dist/ariel-mcp-*; do
+          for marker in ARIEL_PUBKEY ARIEL_RECOVERY_PUBKEY ARIEL_TEST_PUBKEY ps5_anchor; do
+            if grep -a -q -- "$marker" "$file"; then
+              echo "$file carries $marker" >&2
+              status=1
+            fi
+          done
+        done
+        [ "$status" = 0 ] || exit 1
+
+    - name: Attach the binaries to the release
+      run: |
+        gh release upload "$TAG" \
+          dist/ariel-mcp-macos-arm64 \
+          dist/ariel-mcp-macos-x86_64 \
+          dist/ariel-mcp-linux-x86_64 \
+          --clobber
+
+    - name: Write which binary fits which machine into the release notes
+      run: |
+        gh release view "$TAG" --json body --jq .body > existing.md
+        if grep -q "^## ariel-mcp binaries" existing.md; then
+          exit 0
+        fi
+        cat > notes.md <<'EOF'
+
+        ## ariel-mcp binaries
+
+        ariel-mcp is the host-side MCP server. Download the file for your machine:
+
+        | Machine | File |
+        |---|---|
+        | Mac with Apple silicon (M1 or later) | `ariel-mcp-macos-arm64` |
+        | Intel Mac | `ariel-mcp-macos-x86_64` |
+        | Linux on an x86_64 PC | `ariel-mcp-linux-x86_64` |
+
+        Each file has a stable address, for example
+        `https://github.com/sbihaiko/ariel/releases/latest/download/ariel-mcp-linux-x86_64`.
+
+        This is the first artifact of the project built without the SDK and without an anchor.
+        The binary pins no key and is built on a runner, not on the owner's machine.
+        The payload is not in this release.
+        EOF
+        { cat existing.md; cat notes.md; } > combined.md
+        gh release edit "$TAG" --notes-file combined.md

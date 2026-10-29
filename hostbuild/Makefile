@@ -85,5 +85,6 @@ test: $(BIN) $(MCP) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 	sh ../tools/install/test-install.sh
 	python3 tests/acceptance.py ./$(BIN)
 	python3 tests/mcp_acceptance.py ./$(MCP)
+	python3 tests/release_workflow_acceptance.py ./$(MCP)
 
 .PHONY: all clean test
