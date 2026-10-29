@@ -147,13 +147,42 @@ skip_word(cursor_t *c, const char *word) {
 
 
 static int
-skip_number(cursor_t *c) {
+skip_digits(cursor_t *c) {
   const char *start = c->p;
 
-  while(c->p < c->end && *c->p && strchr("+-.0123456789eE", *c->p)) {
+  while(c->p < c->end && *c->p >= '0' && *c->p <= '9') {
     c->p++;
   }
   return c->p == start ? -1 : 0;
+}
+
+
+static int
+skip_number(cursor_t *c) {
+  if(c->p < c->end && *c->p == '-') {
+    c->p++;
+  }
+  if(c->p < c->end && *c->p == '0') {
+    c->p++;
+  } else if(skip_digits(c)) {
+    return -1;
+  }
+  if(c->p < c->end && *c->p == '.') {
+    c->p++;
+    if(skip_digits(c)) {
+      return -1;
+    }
+  }
+  if(c->p < c->end && (*c->p == 'e' || *c->p == 'E')) {
+    c->p++;
+    if(c->p < c->end && (*c->p == '+' || *c->p == '-')) {
+      c->p++;
+    }
+    if(skip_digits(c)) {
+      return -1;
+    }
+  }
+  return 0;
 }
 
 

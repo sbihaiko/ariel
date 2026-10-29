@@ -20,7 +20,6 @@ along with this program; see the file COPYING. If not, see
 #include <stdio.h>
 
 #define MCP_PROTOCOL_REVISION "2026-07-28"
-#define MCP_SERVER_VERSION "0.20"
 
 /**
  * Answer each request line read from in with one line on out, until in ends.

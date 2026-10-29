@@ -27,8 +27,13 @@ def check(name, fn):
 
 
 def session(binary, lines):
-    """Run the server with lines on stdin and return its parsed replies."""
-    payload = "".join(json.dumps(line) + "\n" for line in lines)
+    """Run the server with lines on stdin and return its parsed replies.
+
+    A str item is sent verbatim, so a test can send text that is not JSON.
+    """
+    payload = "".join(
+        (line if isinstance(line, str) else json.dumps(line)) + "\n"
+        for line in lines)
     proc = subprocess.run(
         [binary], input=payload.encode(), stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, timeout=30)
@@ -107,6 +112,45 @@ def scenario_list_tools_matches_tools_list(binary):
                           stderr=subprocess.PIPE, timeout=30)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout.decode()) == replies[1]["result"], proc.stdout
+    assert PROTOCOL_REVISION.encode() in proc.stderr, proc.stderr
+
+
+def scenario_malformed_ids_answer_parse_error(binary):
+    for bad in ['--', '01', '1.', '+1', '1e']:
+        text = '{"jsonrpc":"2.0","id":%s,"method":"ping"}' % bad
+        replies, _ = session(binary, [INITIALIZE, text])
+        error = replies[1]["error"]
+        assert error["code"] == -32700, (bad, replies[1])
+        assert replies[1]["id"] is None, (bad, replies[1])
+
+
+def scenario_numeric_ids_are_echoed(binary):
+    replies, _ = session(binary, [
+        INITIALIZE,
+        '{"jsonrpc":"2.0","id":-1.5e+2,"method":"ping"}',
+        '{"jsonrpc":"2.0","id":0,"method":"ping"}',
+    ])
+    assert replies[1]["id"] == -150, replies[1]
+    assert replies[2]["id"] == 0, replies[2]
+
+
+def repository_version():
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    tags = subprocess.run(
+        ["git", "tag", "--list", "v[0-9]*", "--sort=-v:refname"], cwd=root,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    names = tags.stdout.decode().split()
+    return names[0][1:] if names else None
+
+
+def scenario_server_version_is_the_repository_version(binary):
+    replies, _ = session(binary, [INITIALIZE])
+    version = replies[0]["result"]["serverInfo"]["version"]
+    expected = repository_version()
+    if expected is None:
+        assert version, replies[0]
+    else:
+        assert version == expected, (version, expected)
 
 
 def scenario_key_path_refuses_to_start(binary):
@@ -130,8 +174,14 @@ SCENARIOS = [
      scenario_unknown_method_answers_32601),
     ("malformed arguments answer -32602",
      scenario_malformed_arguments_answer_32602),
-    ("--list-tools prints what tools/list answers",
+    ("--list-tools prints what tools/list answers and names the revision",
      scenario_list_tools_matches_tools_list),
+    ("a malformed id answers -32700 with a null id",
+     scenario_malformed_ids_answer_parse_error),
+    ("numeric ids are echoed as numbers",
+     scenario_numeric_ids_are_echoed),
+    ("serverInfo.version is the repository's newest v tag",
+     scenario_server_version_is_the_repository_version),
     ("a key path refuses to start and prints nothing",
      scenario_key_path_refuses_to_start),
 ]

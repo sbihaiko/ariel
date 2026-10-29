@@ -28,10 +28,15 @@ all: $(BIN) $(MCP) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 $(BIN): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-# The MCP server holds no key and carries no ARIEL_PUBKEY (ADR-0017).
+# The MCP server holds no key and carries no ARIEL_PUBKEY (ADR-0017). Its
+# serverInfo.version is the newest release tag, read the same way the tests read it.
 MCP_OBJS := mcp_main.o mcp.o
+MCP_VERSION := $(or $(patsubst v%,%,$(shell git tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -n 1)),0.0.0-unversioned)
 $(MCP): $(MCP_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(MCP_OBJS) $(LDLIBS)
+
+mcp.o: mcp.c mcp.h
+	$(CC) $(CFLAGS) -DMCP_SERVER_VERSION=\"$(MCP_VERSION)\" -c -o $@ $<
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

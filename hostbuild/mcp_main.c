@@ -35,6 +35,7 @@ main(int argc, char **argv) {
   }
 
   if(list) {
+    fprintf(stderr, "protocol %s\n", MCP_PROTOCOL_REVISION);
     mcp_write_tools(stdout);
     putchar('\n');
     return 0;
