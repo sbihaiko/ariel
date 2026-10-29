@@ -133,7 +133,7 @@ def scenario_x86_64_cross_build_carries_no_key_or_anchor():
         out = os.path.join(scratch, "ariel-mcp")
         subprocess.run(
             [os.environ.get("CC", "cc"), "-arch", "x86_64", *CFLAGS, "-o", out,
-             "mcp_main.c", "mcp.c"],
+             "mcp_main.c", "mcp.c", "mcp_link.c"],
             cwd=HOSTBUILD, check=True)
         scan_binary(out)
 
