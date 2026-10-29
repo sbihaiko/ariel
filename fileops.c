@@ -977,15 +977,17 @@ copy_entry(int sdir, const char *sleaf, const expected_object_t *expected,
 
 /**
  * Rename the name sleaf in sdir to dleaf in ddir. Returns 0, or the errno of
- * a refused rename. This console supports a rename where it refuses a hard
- * link, so a move inside one file system is this call and nothing else.
+ * a refused rename. A rename replaces an existing destination name, so the
+ * caller reserves that name first and this call can only replace its own
+ * reservation. This console supports a rename where it refuses a hard link,
+ * so a move inside one file system is this call and nothing else.
  **/
 static int
 rename_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
 #ifdef ARIEL_HOST_BUILD
   // The host suite has no second file system to try a move across, so a
-  // build told to answer EXDEV here takes the fallback below as a console
-  // with two file systems does.
+  // build told to answer EXDEV here takes the copy fallback below as a
+  // console with two file systems does.
   if(getenv("ARIEL_HOST_MOVE_EXDEV")) {
     return EXDEV;
   }
@@ -994,34 +996,22 @@ rename_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
 }
 
 
-/** Give sleaf in sdir the second name dleaf in ddir. Returns 0, or the errno. **/
-static int
-link_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
-#ifdef ARIEL_HOST_BUILD
-  // The same injected console has no hard link to offer across file systems:
-  // that is the refusal this console answers, and why a move across falls
-  // back to a copy.
-  if(getenv("ARIEL_HOST_MOVE_EXDEV")) {
-    return EPERM;
-  }
-#endif
-  return linkat(sdir, sleaf, ddir, dleaf, 0) ? errno : 0;
-}
-
-
 /**
- * Move the name sleaf in sdir to dleaf in ddir. A rename does it when both
- * names are on one file system. Only a rename refused with EXDEV falls back to
- * two steps: the source is given the second name, by a hard link where the
- * file system holds one and by a copy where it does not, and then the first
- * name goes. Neither step replaces an existing name, so an existing
- * destination is kept. The source is checked again before its name goes; a
- * different object there is taken back out of the destination.
+ * Move the name sleaf in sdir to dleaf in ddir. The destination name is
+ * reserved exclusively first, so a name that appeared after the check that
+ * found it absent is kept and answers exists; a rename then replaces only
+ * that reservation. This libc offers no renameat2 to ask for the same in one
+ * call, so the reservation stands in for RENAME_NOREPLACE. Only a rename
+ * refused with EXDEV falls back to a copy and then a removal of the first
+ * name: the reservation goes first, and the copy creates the destination
+ * exclusively as every copy does. The source is checked again before its name
+ * goes; a different object there is taken back out of the destination.
  **/
 static int
 move_entry(int sdir, const char *sleaf, const expected_object_t *expected,
            int ddir, const char *dleaf) {
   struct stat st;
+  int placeholder;
   int err;
   int rc;
 
@@ -1033,23 +1023,45 @@ move_entry(int sdir, const char *sleaf, const expected_object_t *expected,
     return FILEOPS_CHANGED;
   }
 
+#ifdef ARIEL_HOST_BUILD
+  // The host's file system loses no race between the check and the rename,
+  // so a build told to lose one leaves a destination name here first, as
+  // another process creating the destination would.
+  if(getenv("ARIEL_HOST_MOVE_RACE")) {
+    int racer = openat(ddir, dleaf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                       0644);
+    if(racer >= 0) {
+      write_full(racer, "raced in\n", sizeof("raced in\n") - 1);
+      close(racer);
+    }
+  }
+#endif
+
+  // Reserve the destination name exclusively, so a name that appears there
+  // before the rename is never replaced by it.
+  placeholder = openat(ddir, dleaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                     O_CLOEXEC, 0644);
+  if(placeholder < 0) {
+    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+  if(close(placeholder)) {
+    unlinkat(ddir, dleaf, 0);
+    return FILEOPS_FAILED;
+  }
+
   err = rename_entry(sdir, sleaf, ddir, dleaf);
   if(!err) {
     return FILEOPS_OK;
   }
+
+  // The rename did not happen, so the name is still the empty reservation:
+  // drop it before the copy fallback creates the name exclusively again.
+  unlinkat(ddir, dleaf, 0);
   if(err != EXDEV) {
     return err == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
   }
 
-  err = link_entry(sdir, sleaf, ddir, dleaf);
-  if(!err) {
-    rc = FILEOPS_OK;
-  } else if(err == EEXIST) {
-    return FILEOPS_EXISTS;
-  } else {
-    rc = copy_entry(sdir, sleaf, expected, ddir, dleaf);
-  }
-
+  rc = copy_entry(sdir, sleaf, expected, ddir, dleaf);
   if(rc == FILEOPS_OK) {
     if(fstatat(sdir, sleaf, &st, AT_SYMLINK_NOFOLLOW) ||
        (uint64_t)st.st_dev != expected->dev ||
@@ -1216,12 +1228,33 @@ fileops_symlink_check(const char *root, const char *target, const char *path,
 }
 
 
+/**
+ * Whether a symlinkat refusal means the destination cannot hold a symbolic
+ * link rather than that something went wrong. The exFAT stick answers
+ * EOPNOTSUPP; a file system that does not carry links may answer ENOTSUP or
+ * EPERM, so those are named too and kept apart from a real failure.
+ **/
+static int
+link_unsupported(int err) {
+  if(err == EOPNOTSUPP || err == EPERM) {
+    return 1;
+  }
+#if defined(ENOTSUP) && ENOTSUP != EOPNOTSUPP
+  if(err == ENOTSUP) {
+    return 1;
+  }
+#endif
+  return 0;
+}
+
+
 int
 fileops_symlink_act(const char *root, const char *target, const char *path,
                     const approval_facts_t *expected) {
   approval_facts_t now;
   char dleaf[PATH_MAX];
   int ddir;
+  int err;
   int rc;
 
   // The signed action names the target text as its target and the link's own
@@ -1245,8 +1278,22 @@ fileops_symlink_act(const char *root, const char *target, const char *path,
     return FILEOPS_CHANGED;
   }
 
-  rc = symlinkat(target, ddir, dleaf) ?
-       (errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED) : FILEOPS_OK;
+#ifdef ARIEL_HOST_BUILD
+  // Every host file system holds a symbolic link, so a build told to answer
+  // as the exFAT stick does refuses here, before anything is written.
+  if(getenv("ARIEL_HOST_SYMLINK_UNSUPPORTED")) {
+    close(ddir);
+    return FILEOPS_LINK_UNSUPPORTED;
+  }
+#endif
+
+  if(symlinkat(target, ddir, dleaf)) {
+    err = errno;
+    rc = err == EEXIST ? FILEOPS_EXISTS :
+         link_unsupported(err) ? FILEOPS_LINK_UNSUPPORTED : FILEOPS_FAILED;
+  } else {
+    rc = FILEOPS_OK;
+  }
   close(ddir);
   return rc;
 }
@@ -2350,6 +2397,8 @@ fileops_word(int rc) {
     return "bad_member";
   case FILEOPS_BAD_OPTION:
     return "bad_option";
+  case FILEOPS_LINK_UNSUPPORTED:
+    return "link_unsupported";
   default:
     return "ok";
   }

@@ -1219,6 +1219,10 @@ FAULT_SCENARIOS = {
     # The host has no second file system to try a move across, so the build
     # answers EXDEV for the rename when ARIEL_HOST_MOVE_EXDEV is set.
     "mv across file systems copies and then removes the source",
+    # The host's file systems all hold a link and lose no race on a move, so
+    # two builds are told to refuse a link and to create the destination.
+    "ln -s where the file system cannot hold a link answers link_unsupported",
+    "mv never replaces a destination that appeared after its check",
 }
 
 # The scenarios that rewrite or remove the state file on the host's disk,
@@ -5579,6 +5583,22 @@ def scenario_a_symbolic_link_is_not_followed(server):
     make_link(alias, secret_path(server, "token"), hard=False)
     assert_protected(server, "cat " + alias)
 
+    # A link ln -s made to an ordinary path is refused once that path becomes
+    # an alias of the state directory: the target is judged where cat resolves
+    # it, not when the link was made.
+    plain = os.path.join(server.root, "data", "xsym-plain-target")
+    with open(plain, "wb") as handle:
+        handle.write(b"plain\n")
+    indirect = os.path.join(server.root, "data", "xsym-indirect")
+    line = symlink_line(plain, indirect)
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], (
+        "a signed ln -s onto an ordinary path must run")
+    os.unlink(plain)
+    os.symlink(secret_path(server, "token"), plain)
+    assert_protected(server, "cat " + indirect)
+
 
 def scenario_mv_renames_within_one_file_system(server):
     """mv inside one file system renames: the source is gone and the object kept."""
@@ -5621,6 +5641,50 @@ def scenario_mv_across_filesystems_copies_then_removes(server):
             "a copy-move must leave the other name of the source alone")
     finally:
         crossed.stop()
+
+
+# The bytes a build told to lose the move's race leaves at the destination
+# before the reservation is made, in ARIEL_HOST_MOVE_RACE.
+MOVE_RACE_BYTES = b"raced in\n"
+
+
+def scenario_mv_never_replaces_a_name_that_appeared(server):
+    """A destination created between the check and the rename answers exists."""
+    del server  # this scenario needs a build told to lose that race
+    raced = Server(SERVER_BINARY, env={"ARIEL_HOST_MOVE_RACE": "1"})
+    try:
+        source = make_transfer_file(raced, "xmv-race-src", b"source bytes\n")
+        destination = os.path.join(raced.root, "data", "xmv-race-dst")
+        line = transfer_line("mv", source, destination)
+
+        approval, challenge = transfer_request(raced, line)
+        sign_and_grant(raced, approval, challenge)
+        assert run_command(raced, line) == ["exists", "exit 1"], (
+            "a destination that appeared after the check must answer exists")
+        assert read_bytes(destination) == MOVE_RACE_BYTES, (
+            "a move must never replace the name that appeared")
+        assert read_bytes(source) == b"source bytes\n", (
+            "a refused move must leave the source")
+    finally:
+        raced.stop()
+
+
+def scenario_ln_s_on_a_file_system_without_links(server):
+    """ln -s where the file system cannot hold a link answers link_unsupported."""
+    del server  # this scenario needs a build told to refuse a symbolic link
+    stick = Server(SERVER_BINARY, env={"ARIEL_HOST_SYMLINK_UNSUPPORTED": "1"})
+    try:
+        target = make_transfer_file(stick, "xnosym-target")
+        path = os.path.join(stick.root, "data", "xnosym-link")
+        line = symlink_line(target, path)
+
+        approval, challenge = transfer_request(stick, line)
+        sign_and_grant(stick, approval, challenge)
+        assert run_command(stick, line) == ["link_unsupported", "exit 1"], (
+            "a file system that cannot hold a link must answer link_unsupported")
+        assert not os.path.lexists(path), "a refused ln -s must create nothing"
+    finally:
+        stick.stop()
 
 
 WRITE_BYTES = b"written through the shell\n"
@@ -11188,6 +11252,10 @@ SCENARIOS = [
      "kept", scenario_mv_renames_within_one_file_system, HOST_ROOT_REASON),
     ("mv across file systems copies and then removes the source",
      scenario_mv_across_filesystems_copies_then_removes, FAULT_REASON),
+    ("mv never replaces a destination that appeared after its check",
+     scenario_mv_never_replaces_a_name_that_appeared, FAULT_REASON),
+    ("ln -s where the file system cannot hold a link answers link_unsupported",
+     scenario_ln_s_on_a_file_system_without_links, FAULT_REASON),
     ("ls -l shows detail, ls -a adds the hidden entries, and ls -x is bad_option",
      scenario_ls_long_and_all, HOST_ROOT_REASON),
     ("grep -r searches a tree; -l names files, -c counts, -l wins over -c",

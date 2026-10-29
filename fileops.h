@@ -46,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_ESCAPE    22
 #define FILEOPS_BAD_MEMBER 23
 #define FILEOPS_BAD_OPTION 24
+#define FILEOPS_LINK_UNSUPPORTED 25
 
 /** The longest title ID a package's own name carries. **/
 #define FILEOPS_TITLE_MAX 15
