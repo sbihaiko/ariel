@@ -97,6 +97,53 @@ enough to be written down, because a client that assumes normal FTP gets a
 - Names on this console start with a dash (`-JOURNEY-.bin`), so a client that
   hands paths to a shell breaks on them.
 
+## Shutting down a frozen console without losing the storage
+
+Measured on 2026-10-29, on the same CFI-2014 at 11.20, after the screen froze
+with a game in the foreground. The console was **not** dead: the shell on 2323
+still answered and `ps` showed every payload alive. The freeze was the picture,
+not the system. Pulling the power there is the same shape as the four losses in
+[ps5-data-loss.md](ps5-data-loss.md) — writes in flight, power gone.
+
+The procedure, in this order:
+
+1. **Ask Ariel to restart the console**, on 2324: `reboot`. It is gated, so the
+   owner signs the boot list the restart will run, and the kernel restarts the
+   machine instead of the power being cut. This is the clean route, and it is
+   only unavailable when the agent itself is dead — the case where the shell
+   answering is no longer evidence of anything.
+2. **With no agent but a live shell, `sync`** through `shsrv` on 2323. It
+   answers with nothing, which is success; a failure would print an error. This
+   is the step that costs nothing and is skipped by reflex, and it is the one
+   that actually makes a power cut safe: it flushes every mounted filesystem,
+   the internal volume included.
+3. **Read the kernel log on 3232 before touching the power button** — but read
+   it for what it says. A clean shutdown prints, in order, `AutoMounter ...
+   fakeEjection`, `unmountExFat` naming each device and its mount point
+   (`/dev/da1s1` from `/mnt/usb0`, `/dev/da2s1` from `/mnt/usb1`),
+   `Notify PsmEvent OnUsbStorageUnmounted` for each, and `end of usb suspend
+   handler`. Those lines cover the removable exFAT volumes, and only them: they
+   say nothing about the internal volume the titles live on, which step 2 is
+   what protects. They are confirmation, not the guarantee.
+4. **Hold the power button for about 10 seconds**, until it beeps twice, then
+   wait and power it on from the button.
+5. **Redo the entry chain**: the exploit is tethered, so nothing above survives.
+   Open `PINK00001` (WebKit Autoloader), which loads `autoload.txt` from
+   `/mnt/usb0/ps5_autoloader/` — `kstuff`, `shadowmountplus`, `ftpsrv`,
+   `ariel`.
+
+There is no `reboot` in the shell. `help` on 2323 lists `suspend` and `kill`
+and nothing that restarts the machine, and `kill` on init is a panic reboot on
+a console with four recorded losses — not a recovery. The shell's `sync` is
+still worth having when the agent is gone, because it is the only step of this
+list that a dead agent cannot do for us.
+
+What this does and does not claim: after the restart every port was closed
+until the autoloader ran again, which is the expected tethered behaviour. The
+procedure was not falsified against a console that would have lost data without
+it; it is written down because the alternative is a power cut with the cache
+dirty, and this console has four losses of that shape already.
+
 ## What the day showed
 
 No freeze, with the payloads loaded and unloaded between sessions — recorded in
