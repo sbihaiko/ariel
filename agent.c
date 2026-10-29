@@ -884,6 +884,18 @@ challenge_reply(int fd, const approval_challenge_t *challenge) {
 }
 
 
+/** The approval is already asked: its id alone, without a second challenge. **/
+static void
+pending_reply(int fd, const approval_challenge_t *challenge) {
+  char answer[APPROVAL_ID_MAX + 64];
+  int len;
+
+  len = snprintf(answer, sizeof(answer), "approval_required %s\nexit 75\n",
+                 challenge->id);
+  write_all(fd, answer, (size_t)len);
+}
+
+
 /** The answer for one file command's outcome: its word and exit, or ok. **/
 static void
 outcome_text(int rc, char *out, size_t size) {
@@ -1018,7 +1030,7 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
   case STORE_GATE_GO:
     return 1;
   case STORE_GATE_PENDING:
-    challenge_reply(fd, challenge);
+    pending_reply(fd, challenge);
     return 0;
   case STORE_GATE_STALE:
     audit_reply(fd, facts->command, "stale", target, challenge->id,

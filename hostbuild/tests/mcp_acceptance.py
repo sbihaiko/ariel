@@ -644,6 +644,85 @@ def scenario_numeric_flags_refuse_bad_values(binary, console):
         assert flag in one_line(proc.stderr.decode()), (flag, bad, proc.stderr)
 
 
+# Issue #144: a change tool returns the challenge, and the same call with the
+# signature returns the console's answer.
+
+WRITE_TOOL = "ariel_mkdir"
+APPROVAL_ID = re.compile(r"a-[0-9a-f]+")
+
+
+def call_tool(binary, console, name, arguments):
+    params = {"name": name, "arguments": arguments}
+    replies, _ = session(binary, console, [INITIALIZE, request(2, "tools/call", params)])
+    assert len(replies) == 2, replies
+    assert replies[1]["id"] == 2, replies[1]
+    assert "error" not in replies[1], replies[1]
+    return replies[1]["result"]
+
+
+def open_approval(binary, console, leaf):
+    """Ask for the gated write on a fresh table and drain the owner's prompt."""
+    console.fresh()
+    path = os.path.join(console.root, "data", "mcp-" + leaf)
+    result = call_tool(binary, console, WRITE_TOOL, {"path": path})
+    prompt = console.next_line(timeout=5.0)
+    assert prompt and prompt.startswith("prompt "), prompt
+    return result
+
+
+def scenario_write_tool_answers_the_challenge(binary, console):
+    result = open_approval(binary, console, "challenge")
+    assert result["isError"] is True, result
+    shown = result["structuredContent"]
+    assert shown["exit"] == 75 and shown["word"] == "approval_required", shown
+    assert APPROVAL_ID.fullmatch(shown["approval_id"]), shown
+    challenge = shown["challenge"].split(" ")
+    assert shown["challenge"].startswith("challenge %s " % shown["approval_id"]), shown
+    assert shown["console"] == challenge[2], shown
+    assert shown["action"] == challenge[6], shown
+    assert "ariel-sign sign <owner.key>" in shown["next"], shown
+
+
+def scenario_signed_grant_returns_the_granted_answer(binary, console):
+    shown = open_approval(binary, console, "grant")["structuredContent"]
+    envelope = acceptance.sign_challenge(console, shown["challenge"])
+    granted = call_tool(binary, console, WRITE_TOOL, {
+        "approval_id": shown["approval_id"], "signature": envelope})
+    assert granted["isError"] is False, granted
+    assert granted["content"][0]["text"] == "approval_granted %s\n" % shown["approval_id"], granted
+    assert granted["structuredContent"] == {"exit": 0, "truncated": False}, granted
+
+
+def scenario_second_call_while_pending_answers_no_challenge(binary, console):
+    first = open_approval(binary, console, "pending")["structuredContent"]
+    again = call_tool(binary, console, WRITE_TOOL,
+                      {"path": os.path.join(console.root, "data", "mcp-pending")})
+    assert again["isError"] is True, again
+    assert again["structuredContent"]["approval_id"] == first["approval_id"], again
+    assert "challenge" not in again["structuredContent"], again
+    assert again["content"][0]["text"] == "approval_required %s\n" % first["approval_id"], again
+    assert again["structuredContent"]["exit"] == 75, again
+
+
+def scenario_tampered_signature_answers_the_refusal_word(binary, console):
+    shown = open_approval(binary, console, "tampered")["structuredContent"]
+    envelope = acceptance.sign_challenge(console, shown["challenge"]).split(" ")
+    envelope[0] = wrong_token(envelope[0])
+    refused = call_tool(binary, console, WRITE_TOOL, {
+        "approval_id": shown["approval_id"], "signature": " ".join(envelope)})
+    assert refused["isError"] is True, refused
+    assert refused["structuredContent"] == {
+        "exit": 79, "truncated": False, "word": "signature_invalid"}, refused
+
+
+def scenario_write_tool_is_listed_as_a_change(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    tool = by_name[WRITE_TOOL]
+    assert tool["annotations"] == {"readOnlyHint": False, "destructiveHint": True}, tool
+    for key in ("path", "approval_id", "signature", "session"):
+        assert key in tool["inputSchema"]["properties"], tool
+
+
 SCENARIOS = [
     ("initialize answers the ADR-0017 revision and serverInfo ariel",
      scenario_initialize_names_the_revision_and_server),
@@ -715,6 +794,16 @@ SCENARIOS = [
      scenario_suspend_is_not_advertised_as_a_read_tool),
     ("a refused read answers isError true with the console's word",
      scenario_refused_read_answers_the_console_word),
+    ("a write tool on a fresh agent answers isError true with approval_id, the challenge and the action",
+     scenario_write_tool_answers_the_challenge),
+    ("the suite signs with the test key, passes approval_id and signature back, and gets the granted answer",
+     scenario_signed_grant_returns_the_granted_answer),
+    ("a second call while the approval is pending answers approval_id and no challenge line",
+     scenario_second_call_while_pending_answers_no_challenge),
+    ("a tampered signature answers the agent's refusal word, not a server error",
+     scenario_tampered_signature_answers_the_refusal_word),
+    ("the write tool is listed as a change with approval_id and signature arguments",
+     scenario_write_tool_is_listed_as_a_change),
 ]
 for _name, _keys in READ_ROWS:
     SCENARIOS.append((

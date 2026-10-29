@@ -29,6 +29,8 @@ along with this program; see the file COPYING. If not, see
 #define SESSION_HEX_LEN 32
 #define INTEGER_DIGITS_MAX 18
 #define WORD_MAX 32
+#define APPROVAL_ID_MAX 40
+#define SIGNATURE_MAX 256
 
 enum mcp_class {
   MCP_READ,
@@ -103,6 +105,7 @@ static const mcp_tool_t mcp_tools[] = {
   { "ariel_dmesg", "Read the console's kernel log.", MCP_READ, "dmesg", no_args },
   { "ariel_ifconfig", "Show the console's network interfaces.", MCP_READ, "ifconfig", no_args },
   { "ariel_ping", "Ping an address from the console.", MCP_READ, "ping", ping_args },
+  { "ariel_mkdir", "Create a directory on the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "mkdir", path_args },
   { NULL, NULL, MCP_READ, NULL, NULL }
 };
 
@@ -744,6 +747,114 @@ write_failure(FILE *out, const char *id, const char *idend, const char *why) {
 }
 
 
+static const char approval_prefix[] = "approval_required ";
+static const char challenge_prefix[] = "challenge ";
+static const char approval_next[] =
+  "Sign the challenge with ariel-sign sign <owner.key>, then call this tool "
+  "again with approval_id and signature.";
+
+static int
+safe_text(const char *text, size_t len, size_t max, int spaces) {
+  size_t i;
+
+  if(len == 0 || len > max) {
+    return 0;
+  }
+  for(i = 0; i < len; i++) {
+    char c = text[i];
+
+    if(!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.' &&
+       !(spaces && c == ' ')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+/* The space-separated field n of text, when it is not empty. */
+static int
+nth_field(const char *text, size_t len, int n, const char **field, size_t *flen) {
+  const char *p = text;
+  const char *end = text + len;
+  int i;
+
+  for(i = 0; i < n; i++) {
+    while(p < end && *p != ' ') {
+      p++;
+    }
+    if(p >= end) {
+      return 0;
+    }
+    p++;
+  }
+  *field = p;
+  while(p < end && *p != ' ') {
+    p++;
+  }
+  *flen = (size_t)(p - *field);
+  return *flen > 0;
+}
+
+
+/*
+ * The owner's question in either shape of approval_required: the approval ID,
+ * then the challenge line when the request opened the approval. A pending
+ * approval answers the ID alone, and the structured body says so by lacking it.
+ */
+static void
+write_approval(FILE *out, const struct mcp_answer *answer) {
+  const char *text = answer->text;
+  const char *end = answer->text + answer->len;
+  const char *line_end;
+  const char *challenge = NULL;
+  const char *field;
+  size_t challenge_len = 0;
+  size_t field_len;
+  size_t id_len;
+
+  if(answer->status != 75 || (size_t)(end - text) < sizeof(approval_prefix) - 1 ||
+     memcmp(text, approval_prefix, sizeof(approval_prefix) - 1)) {
+    return;
+  }
+  text += sizeof(approval_prefix) - 1;
+  line_end = memchr(text, '\n', (size_t)(end - text));
+  if(!line_end) {
+    return;
+  }
+  id_len = (size_t)(line_end - text);
+  if(!safe_text(text, id_len, APPROVAL_ID_MAX, 0)) {
+    return;
+  }
+  fputs(",\"approval_id\":", out);
+  json_text(out, text, id_len);
+
+  text = line_end + 1;
+  if((size_t)(end - text) >= sizeof(challenge_prefix) - 1 &&
+     !memcmp(text, challenge_prefix, sizeof(challenge_prefix) - 1)) {
+    const char *challenge_end = memchr(text, '\n', (size_t)(end - text));
+
+    challenge = text;
+    challenge_len = challenge_end ? (size_t)(challenge_end - text)
+                                  : (size_t)(end - text);
+  }
+  if(challenge) {
+    fputs(",\"challenge\":", out);
+    json_text(out, challenge, challenge_len);
+    if(nth_field(challenge, challenge_len, 2, &field, &field_len)) {
+      fputs(",\"console\":", out);
+      json_text(out, field, field_len);
+    }
+    if(nth_field(challenge, challenge_len, 6, &field, &field_len)) {
+      fputs(",\"action\":", out);
+      json_text(out, field, field_len);
+    }
+  }
+  fputs(",\"next\":", out);
+  json_text(out, approval_next, sizeof(approval_next) - 1);
+}
+
+
 static void
 write_answer(FILE *out, const char *id, const char *idend,
              const struct mcp_answer *answer) {
@@ -758,8 +869,85 @@ write_answer(FILE *out, const char *id, const char *idend,
   if(refused && console_word(answer->text, answer->len, word)) {
     fprintf(out, ",\"word\":\"%s\"", word);
   }
+  write_approval(out, answer);
   fprintf(out, "},\"isError\":%s}", refused ? "true" : "false");
   end_reply(out);
+}
+
+
+static int
+grant_requested(const char *as, const char *ae) {
+  const char *vs = NULL;
+  const char *ve = NULL;
+
+  return object_member(as, ae, "approval_id", &vs, &ve, NULL) == 1 ||
+         object_member(as, ae, "signature", &vs, &ve, NULL) == 1;
+}
+
+
+static void
+refuse(FILE *out, const char *id, const char *idend, const char *word, int status) {
+  struct mcp_answer answer;
+  char text[WORD_MAX + 16];
+
+  answer.len = (size_t)snprintf(text, sizeof(text), "%s\nexit %d\n", word, status);
+  answer.text = text;
+  answer.status = status;
+  write_answer(out, id, idend, &answer);
+}
+
+
+/*
+ * The owner's grant, relayed: the server holds no key and checks nothing the
+ * agent does not. It refuses only text that could not be one line of the
+ * agent's grammar, with the agent's own word for it.
+ */
+static void
+grant_call(FILE *out, const char *ids, const char *ide, const char *as,
+           const char *ae, const struct mcp_console *console) {
+  const char *is = NULL;
+  const char *ie = NULL;
+  const char *ss = NULL;
+  const char *se = NULL;
+  char id[APPROVAL_ID_MAX + 1];
+  char signature[SIGNATURE_MAX + 1];
+  size_t idlen = 0;
+  size_t siglen = 0;
+  struct command cmd;
+  struct mcp_answer answer;
+  char why[MCP_LINK_WHY_MAX];
+
+  if(object_member(as, ae, "approval_id", &is, &ie, NULL) != 1 ||
+     object_member(as, ae, "signature", &ss, &se, NULL) != 1 ||
+     !is_string(is) || !is_string(ss)) {
+    write_error(out, ids, ide, -32602,
+                "invalid params: approval_id and signature are both required");
+    return;
+  }
+  if(decode_string(is + 1, ie - 1, id, APPROVAL_ID_MAX, &idlen) ||
+     !safe_text(id, idlen, APPROVAL_ID_MAX, 0)) {
+    refuse(out, ids, ide, "unknown_approval", 1);
+    return;
+  }
+  if(decode_string(ss + 1, se - 1, signature, SIGNATURE_MAX, &siglen) ||
+     !safe_text(signature, siglen, SIGNATURE_MAX, 1)) {
+    refuse(out, ids, ide, "signature_malformed", 83);
+    return;
+  }
+
+  cmd.len = 0;
+  cmd.text[0] = '\0';
+  if(append(&cmd, "approval grant ", 15) || append(&cmd, id, idlen) ||
+     append(&cmd, " ", 1) || append(&cmd, signature, siglen)) {
+    write_error(out, ids, ide, -32602, "invalid params: the command is too long");
+    return;
+  }
+  if(mcp_exchange(console, cmd.text, &answer, why, sizeof(why))) {
+    write_failure(out, ids, ide, why);
+    return;
+  }
+  write_answer(out, ids, ide, &answer);
+  free(answer.text);
 }
 
 
@@ -791,6 +979,10 @@ call_tool(FILE *out, const char *ids, const char *ide, const char *ps,
   }
   if(*as != '{') {
     write_error(out, ids, ide, -32602, "invalid params: arguments must be an object");
+    return;
+  }
+  if(row->cls != MCP_READ && grant_requested(as, ae)) {
+    grant_call(out, ids, ide, as, ae, console);
     return;
   }
   if(build_command(row, as, ae, &cmd, why, sizeof(why))) {
@@ -905,21 +1097,26 @@ mcp_serve(FILE *in, FILE *out, const struct mcp_console *console) {
 
 
 static void
-write_schema(FILE *out, const mcp_arg_t *args) {
+write_schema(FILE *out, const mcp_tool_t *row) {
   const char *sep = "";
   const mcp_arg_t *arg;
 
   fputs("{\"type\":\"object\",\"properties\":{", out);
-  for(arg = args; arg->key; arg++) {
+  for(arg = row->args; arg->key; arg++) {
     fprintf(out, "%s\"%s\":{\"type\":\"%s\"}", sep, arg->key,
             arg->kind == ARG_INTEGER ? "integer" : "string");
     sep = ",";
   }
-  fprintf(out, "%s\"session\":{\"type\":\"string\"}}", sep);
+  fprintf(out, "%s\"session\":{\"type\":\"string\"}", sep);
+  if(row->cls != MCP_READ) {
+    fputs(",\"approval_id\":{\"type\":\"string\"},"
+          "\"signature\":{\"type\":\"string\"}", out);
+  }
+  fputs("}", out);
 
   fputs(",\"required\":[", out);
   sep = "";
-  for(arg = args; arg->key; arg++) {
+  for(arg = row->args; arg->key; arg++) {
     if(arg->required) {
       fprintf(out, "%s\"%s\"", sep, arg->key);
       sep = ",";
@@ -940,7 +1137,7 @@ mcp_write_tools(FILE *out) {
 
     fprintf(out, "%s{\"name\":\"%s\",\"description\":\"%s\",\"inputSchema\":",
             sep, mcp_tools[i].name, mcp_tools[i].description);
-    write_schema(out, mcp_tools[i].args);
+    write_schema(out, &mcp_tools[i]);
     fprintf(out, ",\"annotations\":{\"readOnlyHint\":%s,\"destructiveHint\":%s}}",
             read_only ? "true" : "false", read_only ? "false" : "true");
     sep = ",";
