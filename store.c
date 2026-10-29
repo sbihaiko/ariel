@@ -103,6 +103,13 @@ struct staged {
 #define KEYRING_READY    1
 #define KEYRING_MISMATCH 2
 
+/**
+ * Whether the build carries no anchor at all. A keyring that refuses because
+ * it is empty or mismatched can be seeded by the owner; a build with no
+ * anchor cannot, so the two states answer different words.
+ **/
+static int keyring_anchor_missing;
+
 /** The keyring generation a new approval is bound to, its active keys, and the keys it retired. **/
 static uint32_t keyring_generation;
 static unsigned char keyring_primary[APPROVAL_PUBKEY_LEN];
@@ -2269,9 +2276,11 @@ keyring_open(int state_fd) {
   struct stat st;
 
   keyring_state = KEYRING_REFUSED;
+  keyring_anchor_missing = 0;
   keyring_generation = 0;
   keyring_revoked_count = 0;
   if(platform->anchor(platform, anchor_primary, anchor_recovery)) {
+    keyring_anchor_missing = 1;
     return 0;
   }
   keyring_anchor_hash(anchor_primary, anchor_recovery, anchor_hash);
@@ -3923,6 +3932,12 @@ store_key_rotate(const approval_challenge_t *challenge, const char *hex,
 
   pthread_mutex_unlock(&lock);
   return outcome;
+}
+
+
+int
+store_anchor_missing(void) {
+  return keyring_anchor_missing;
 }
 
 

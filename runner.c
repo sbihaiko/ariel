@@ -45,6 +45,7 @@ along with this program; see the file COPYING. If not, see
 #include "protected.h"
 #include "readers.h"
 #include "runner.h"
+#include "runs.h"
 #include "sha256.h"
 
 #define IO_CHUNK     1024
@@ -60,6 +61,10 @@ along with this program; see the file COPYING. If not, see
 #define SFO_TYPE_INT 4
 #define SFO_MAX_SIZE (1024 * 1024)
 #define SLEEP_MAX 60
+#define VERIFY_CEILING (256ULL * 1024 * 1024)
+#define VERIFY_LINES 10
+/* One file name from a directory entry: 255 bytes plus the terminator. */
+#define VERIFY_NAME_CAP 256
 
 
 static const struct {
@@ -97,7 +102,9 @@ static const struct {
   {"sysctl", "print a kernel parameter"},
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
   {"tail", "print the last lines of an absolute file"},
-  {"wc", "count the lines, words and bytes of an absolute file"},
+  {"verify", "say whether one installed title is whole, with --size and --sha256 to compare; --all sweeps the console, with --floor N for free space"},
+  {"trace", "record the console's state under NAME, kept in the state directory; --replace overwrites a record of that name; --list names the records kept; --diff NAME answers what changed since NAME"},
+  {"wc","count the lines, words and bytes of an absolute file"},
 };
 
 
@@ -2368,6 +2375,1552 @@ run_sfoinfo(int argc, char *const argv[], int outfd, int errfd) {
 }
 
 
+static const char *const verify_entries[] = {
+  "app.pkg", "app.pbm", "app.json", "app.xml", "sce_sys/param.sfo",
+};
+
+
+static int
+verify_title_ok(const char *title) {
+  return title[0] && strcmp(title, ".") && strcmp(title, "..") &&
+         !strchr(title, '/');
+}
+
+
+static int
+verify_hex_digest(const char *text) {
+  size_t i;
+
+  if(strlen(text) != SHA256_HEX_LEN) {
+    return 0;
+  }
+  for(i=0; i<SHA256_HEX_LEN; i++) {
+    if(!((text[i] >= '0' && text[i] <= '9') || (text[i] >= 'a' && text[i] <= 'f'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+typedef struct {
+  const char *title;
+  const char *sha256;
+  int has_size;
+  size_t size;
+  int all;
+  int has_floor;
+  size_t floor;
+} verify_args_t;
+
+
+static int
+verify_parse(int argc, char *const argv[], verify_args_t *args, int errfd) {
+  int i;
+
+  memset(args, 0, sizeof(*args));
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(!strcmp(argv[1], "--all")) {
+    args->all = 1;
+  } else if(argv[1][0] == '-') {
+    say(errfd, "bad_option\n");
+    return 1;
+  } else {
+    args->title = argv[1];
+  }
+
+  for(i=2; i<argc; i++) {
+    if(args->all && !strcmp(argv[i], "--floor") && !args->has_floor && i+1 < argc &&
+       !parse_count(argv[i+1], &args->floor)) {
+      args->has_floor = 1;
+      i++;
+    } else if(!args->all && !strcmp(argv[i], "--size") && !args->has_size && i+1 < argc &&
+              !parse_count(argv[i+1], &args->size)) {
+      args->has_size = 1;
+      i++;
+    } else if(!args->all && !strcmp(argv[i], "--sha256") && !args->sha256 && i+1 < argc &&
+              verify_hex_digest(argv[i+1])) {
+      args->sha256 = argv[++i];
+    } else if(argv[i][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    } else {
+      say(errfd, "bad_argument\n");
+      return 1;
+    }
+  }
+
+  if(!args->all && !verify_title_ok(args->title)) {
+    say(errfd, "bad_argument\n");
+    return 1;
+  }
+  return 0;
+}
+
+
+static void
+verify_entry(const char *app, const char *entry, char *line) {
+  char path[PATH_MAX];
+  struct stat st;
+
+  if(snprintf(path, sizeof(path), "%s/%s", app, entry) >= (int)sizeof(path) ||
+     lstat(path, &st) || !S_ISREG(st.st_mode)) {
+    snprintf(line, OUT_LINE_CAP, "finding missing %s", entry);
+  } else if(st.st_size == 0) {
+    snprintf(line, OUT_LINE_CAP, "finding empty %s", entry);
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok %s", entry);
+  }
+}
+
+
+// The smallest licence file name in user/license that names the title.
+static int
+verify_find_licence(const char *root, const char *title, char *name, size_t size) {
+  char dir[PATH_MAX];
+  char needle[PATH_MAX];
+  struct dirent *entry;
+  DIR *handle;
+  int found = 0;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/license", root) >= (int)sizeof(dir) ||
+     snprintf(needle, sizeof(needle), "-%s_", title) >= (int)sizeof(needle) ||
+     !(handle=opendir(dir))) {
+    return 0;
+  }
+  while((entry=readdir(handle))) {
+    size_t len = strlen(entry->d_name);
+
+    if(strncmp(entry->d_name, "fake", 4) ||
+       strcmp(entry->d_name + len - 4, ".rif") ||
+       !strstr(entry->d_name, needle)) {
+      continue;
+    }
+    if(!found || strcmp(entry->d_name, name) < 0) {
+      snprintf(name, size, "%s", entry->d_name);
+      found = 1;
+    }
+  }
+  closedir(handle);
+  return found;
+}
+
+
+static int
+verify_licence_is(const char *licence, const char *content) {
+  size_t len = strlen(licence);
+
+  return strlen(content) == len - 8 && !strncmp(content, licence + 4, len - 8);
+}
+
+
+static int
+sfo_find(const unsigned char *buf, uint64_t size, const char *key, char *value,
+         size_t cap) {
+  uint32_t keys = le32(buf + 8);
+  uint32_t data = le32(buf + 12);
+  uint32_t count = le32(buf + 16);
+  uint32_t i;
+
+  for(i=0; i<count; i++) {
+    uint64_t offset = SFO_HEADER + (uint64_t)i * SFO_ENTRY;
+    const unsigned char *entry;
+    const unsigned char *nul;
+    const unsigned char *text;
+    uint64_t key_start;
+    uint64_t val_start;
+    uint32_t val_len;
+    size_t len;
+
+    if(offset + SFO_ENTRY > size) {
+      return 1;
+    }
+    entry = buf + offset;
+    key_start = (uint64_t)keys + le16(entry);
+    val_len = le32(entry + 4);
+    val_start = (uint64_t)data + le32(entry + 12);
+    if(key_start >= size || val_start + val_len > size) {
+      return 1;
+    }
+    nul = memchr(buf + key_start, 0, (size_t)(size - key_start));
+    if(!nul) {
+      return 1;
+    }
+    if(strcmp((const char *)buf + key_start, key)) {
+      continue;
+    }
+    if(entry[3] != SFO_TYPE_STR) {
+      return 1;
+    }
+    text = buf + val_start;
+    nul = memchr(text, 0, val_len);
+    len = nul ? (size_t)(nul - text) : val_len;
+    if(len >= cap) {
+      return 1;
+    }
+    memcpy(value, text, len);
+    value[len] = '\0';
+    return 0;
+  }
+  return 1;
+}
+
+
+static int
+sfo_string(const char *path, const char *key, char *value, size_t cap) {
+  unsigned char *buf;
+  struct stat st;
+  ssize_t n;
+  int rc = 1;
+  int fd;
+
+  if((fd=open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    return 1;
+  }
+  if(fstat(fd, &st) || st.st_size < SFO_HEADER || st.st_size > SFO_MAX_SIZE ||
+     !(buf=malloc((size_t)st.st_size))) {
+    close(fd);
+    return 1;
+  }
+  n = fill(fd, (char *)buf, (size_t)st.st_size);
+  close(fd);
+  if(n == st.st_size && le32(buf) == SFO_MAGIC) {
+    rc = sfo_find(buf, (uint64_t)st.st_size, key, value, cap);
+  }
+  free(buf);
+  return rc;
+}
+
+
+static int
+verify_sha256(const char *path, char hex[SHA256_HEX_LEN + 1], uint64_t *bytes) {
+  unsigned char digest[SHA256_DIGEST_LEN];
+  char buf[IO_CHUNK];
+  sha256_t hash;
+  uint64_t total = 0;
+  ssize_t n;
+  int err;
+  int fd;
+
+  if((fd=open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    return errno;
+  }
+  sha256_init(&hash);
+  for(;;) {
+    n = fill(fd, buf, sizeof(buf));
+    if(n < 0) {
+      err = errno;
+      close(fd);
+      return err;
+    }
+    if(n == 0) {
+      break;
+    }
+    sha256_update(&hash, buf, (size_t)n);
+    total += (uint64_t)n;
+  }
+  close(fd);
+
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+  *bytes = total;
+  return 0;
+}
+
+
+/**
+ * The checks of the title at app, one line each in lines, counted in total.
+ * A size or hash is compared only when the caller names one, and a file over
+ * VERIFY_CEILING is never read for its hash. A hash that cannot be read is
+ * reported and answers 1.
+ **/
+static int
+verify_title_checks(const char *root, const char *app, const verify_args_t *args,
+                    char lines[VERIFY_LINES][OUT_LINE_CAP], size_t *total, int errfd) {
+  /* A licence is one directory entry, so its name and not a path bounds it. */
+  char licence[VERIFY_NAME_CAP];
+  char content[PATH_MAX];
+  char path[PATH_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  struct stat st;
+  uint64_t hashed;
+  size_t count = 0;
+  size_t i;
+  char *line;
+  int rc;
+
+  for(i=0; i<sizeof(verify_entries)/sizeof(verify_entries[0]); i++) {
+    verify_entry(app, verify_entries[i], lines[count++]);
+  }
+
+  line = lines[count++];
+  if(snprintf(path, sizeof(path), "%s/user/appmeta/%s", root, args->title) >= (int)sizeof(path) ||
+     lstat(path, &st)) {
+    snprintf(line, OUT_LINE_CAP, "finding missing appmeta");
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok appmeta");
+  }
+
+  line = lines[count++];
+  if(!verify_find_licence(root, args->title, licence, sizeof(licence))) {
+    snprintf(line, OUT_LINE_CAP, "finding licence_missing %s", args->title);
+  } else {
+    snprintf(line, OUT_LINE_CAP, "ok licence");
+    line = lines[count++];
+    if(snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app) >= (int)sizeof(path) ||
+       sfo_string(path, "CONTENT_ID", content, sizeof(content))) {
+      snprintf(line, OUT_LINE_CAP, "finding missing content_id");
+    } else if(!verify_licence_is(licence, content)) {
+      snprintf(line, OUT_LINE_CAP, "finding licence_mismatch %s", licence);
+    } else {
+      snprintf(line, OUT_LINE_CAP, "ok content_id");
+    }
+  }
+
+  if(args->has_size || args->sha256) {
+    if(snprintf(path, sizeof(path), "%s/app.pkg", app) >= (int)sizeof(path)) {
+      say(errfd, "bad_path\n");
+      return 1;
+    }
+    if(!lstat(path, &st) && S_ISREG(st.st_mode)) {
+      if(args->has_size) {
+        line = lines[count++];
+        if((unsigned long long)st.st_size == (unsigned long long)args->size) {
+          snprintf(line, OUT_LINE_CAP, "ok app.pkg size");
+        } else {
+          snprintf(line, OUT_LINE_CAP, "finding size_mismatch app.pkg %lld",
+                   (long long)st.st_size);
+        }
+      }
+      if(args->sha256) {
+        line = lines[count++];
+        if((unsigned long long)st.st_size > VERIFY_CEILING) {
+          snprintf(line, OUT_LINE_CAP, "too_large_to_verify app.pkg");
+        } else if((rc=verify_sha256(path, hex, &hashed))) {
+          report("verify", path, errfd, rc);
+          return 1;
+        } else if(strcmp(hex, args->sha256)) {
+          snprintf(line, OUT_LINE_CAP, "finding hash_mismatch app.pkg");
+        } else {
+          snprintf(line, OUT_LINE_CAP, "ok app.pkg sha256");
+        }
+      }
+    }
+  }
+
+  *total = count;
+  return 0;
+}
+
+
+const char *const *
+runner_title_entries(size_t *count) {
+  *count = sizeof(verify_entries)/sizeof(verify_entries[0]);
+  return verify_entries;
+}
+
+
+/** The part of a title that a finding of its checks names. **/
+const char *
+runner_title_part(const char *finding) {
+  static const struct {
+    const char *kind;
+    const char *part;
+  } parts[] = {
+    {"missing app.pkg", "package"},
+    {"empty app.pkg", "package"},
+    {"missing app.pbm", "package"},
+    {"empty app.pbm", "package"},
+    {"missing app.json", "package"},
+    {"empty app.json", "package"},
+    {"missing app.xml", "package"},
+    {"empty app.xml", "package"},
+    {"size_mismatch app.pkg", "package"},
+    {"hash_mismatch app.pkg", "package"},
+    {"missing sce_sys/param.sfo", "sfo"},
+    {"empty sce_sys/param.sfo", "sfo"},
+    {"missing content_id", "sfo"},
+    {"missing appmeta", "appmeta"},
+    {"licence_missing", "licence"},
+    {"licence_mismatch", "licence"},
+  };
+  size_t i;
+
+  for(i=0; i<sizeof(parts)/sizeof(parts[0]); i++) {
+    if(!strncmp(finding, parts[i].kind, strlen(parts[i].kind))) {
+      return parts[i].part;
+    }
+  }
+  /* A finding added later is its own part, never mistaken for a missing package. */
+  return "unknown";
+}
+
+
+int
+runner_title_missing(const char *root, const char *title, const char **part) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  char app[PATH_MAX];
+  verify_args_t args;
+  size_t count = 0;
+  size_t i;
+
+  memset(&args, 0, sizeof(args));
+  args.title = title;
+  if(snprintf(app, sizeof(app), "%s/user/app/%s", root, title) >= (int)sizeof(app) ||
+     verify_title_checks(root, app, &args, lines, &count, -1)) {
+    *part = "package";
+    return 1;
+  }
+  for(i=0; i<count; i++) {
+    if(!strncmp(lines[i], "finding ", sizeof("finding ") - 1)) {
+      *part = runner_title_part(lines[i] + sizeof("finding ") - 1);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+int
+runner_package_fact(const char *path, uint64_t *bytes, char hex[SHA256_HEX_LEN + 1]) {
+  struct stat st;
+
+  if(lstat(path, &st) || !S_ISREG(st.st_mode)) {
+    return 1;
+  }
+  *bytes = (uint64_t)st.st_size;
+  if((unsigned long long)st.st_size > VERIFY_CEILING) {
+    return 2;
+  }
+  return verify_sha256(path, hex, bytes) ? 1 : 0;
+}
+
+
+static void
+verify_finding(int outfd, const char *kind, const char *detail) {
+  say(outfd, "finding ");
+  say(outfd, kind);
+  say(outfd, " ");
+  say(outfd, detail);
+  say(outfd, "\n");
+}
+
+
+// A finding of one title names the title after its kind. licence_missing
+// already names its title as its detail, so it keeps that one name.
+static void
+verify_title_finding(int outfd, const char *title, const char *line) {
+  const char *kind = line + sizeof("finding ") - 1;
+  size_t kind_len = strcspn(kind, " ");
+
+  if(kind_len == sizeof("licence_missing") - 1 &&
+     !strncmp(kind, "licence_missing", kind_len)) {
+    say(outfd, line);
+    say(outfd, "\n");
+    return;
+  }
+  say(outfd, "finding ");
+  put(outfd, kind, kind_len);
+  say(outfd, " ");
+  say(outfd, title);
+  say(outfd, " ");
+  say(outfd, kind + kind_len + 1);
+  say(outfd, "\n");
+}
+
+
+// Whether an installed title, a directory under user/app, is named by licence.
+static int
+verify_licence_named(const char *root, const char *licence) {
+  char dir[PATH_MAX];
+  char app[PATH_MAX];
+  char needle[PATH_MAX];
+  struct dirent *entry;
+  struct stat st;
+  DIR *apps;
+  int found = 0;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/app", root) >= (int)sizeof(dir) ||
+     !(apps=opendir(dir))) {
+    return 0;
+  }
+  while(!found && (entry=readdir(apps))) {
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+       snprintf(needle, sizeof(needle), "-%s_", entry->d_name) >= (int)sizeof(needle) ||
+       !strstr(licence, needle)) {
+      continue;
+    }
+    found = snprintf(app, sizeof(app), "%s/%s", dir, entry->d_name) < (int)sizeof(app) &&
+            !lstat(app, &st) && S_ISDIR(st.st_mode);
+  }
+  closedir(apps);
+  return found;
+}
+
+
+static size_t
+verify_orphan_licences(const char *root, int titles_listed, int outfd) {
+  char dir[PATH_MAX];
+  struct dirent *entry;
+  DIR *licences;
+  size_t findings = 0;
+  size_t len;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/license", root) >= (int)sizeof(dir)) {
+    return 0;
+  }
+  if(!(licences=opendir(dir))) {
+    if(errno == ENOENT) {
+      return 0;
+    }
+    verify_finding(outfd, "unsupported", "licences");
+    return 1;
+  }
+  if(!titles_listed) {
+    closedir(licences);
+    return 0;
+  }
+  while((entry=readdir(licences))) {
+    len = strlen(entry->d_name);
+    if(strncmp(entry->d_name, "fake", 4) || strcmp(entry->d_name + len - 4, ".rif") ||
+       verify_licence_named(root, entry->d_name)) {
+      continue;
+    }
+    verify_finding(outfd, "licence_orphan", entry->d_name);
+    findings++;
+  }
+  closedir(licences);
+  return findings;
+}
+
+
+static size_t
+verify_orphan_staging(const char *root, int outfd) {
+  char dir[PATH_MAX];
+  char stage[PATH_MAX];
+  char app[PATH_MAX];
+  struct dirent *entry;
+  struct stat st;
+  DIR *staging;
+  size_t findings = 0;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/staging", root) >= (int)sizeof(dir)) {
+    return 0;
+  }
+  if(!(staging=opendir(dir))) {
+    if(errno == ENOENT) {
+      return 0;
+    }
+    verify_finding(outfd, "unsupported", "staging");
+    return 1;
+  }
+  while((entry=readdir(staging))) {
+    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+       snprintf(stage, sizeof(stage), "%s/%s", dir, entry->d_name) >= (int)sizeof(stage) ||
+       lstat(stage, &st) || !S_ISDIR(st.st_mode)) {
+      continue;
+    }
+    if(snprintf(app, sizeof(app), "%s/user/app/%s", root, entry->d_name) < (int)sizeof(app) &&
+       !lstat(app, &st) && S_ISDIR(st.st_mode)) {
+      continue;
+    }
+    verify_finding(outfd, "staging_orphan", entry->d_name);
+    findings++;
+  }
+  closedir(staging);
+  return findings;
+}
+
+
+static size_t
+verify_space(const char *root, size_t floor, int outfd) {
+  char path[PATH_MAX];
+  char bytes[32];
+  struct statvfs vfs;
+  unsigned long long available;
+
+  if(snprintf(path, sizeof(path), "%s/user", root) >= (int)sizeof(path) ||
+     statvfs(path, &vfs)) {
+    verify_finding(outfd, "unsupported", "space");
+    return 1;
+  }
+  available = (unsigned long long)vfs.f_bavail * vfs.f_frsize;
+  if(available >= (unsigned long long)floor) {
+    return 0;
+  }
+  snprintf(bytes, sizeof(bytes), "%llu", available);
+  verify_finding(outfd, "space_below", bytes);
+  return 1;
+}
+
+
+/**
+ * verify --all [--floor N]: the checks of every installed title, then the
+ * console-wide findings. A clean console answers one line. Findings are
+ * answered in the order the console lists its titles.
+ **/
+static int
+run_verify_all(const char *root, const verify_args_t *args, int outfd, int errfd) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  char dir[PATH_MAX];
+  char app[PATH_MAX];
+  verify_args_t title;
+  struct dirent *entry;
+  struct stat st;
+  size_t findings = 0;
+  size_t count;
+  size_t i;
+  int titles_listed = 1;
+  DIR *apps;
+
+  if(snprintf(dir, sizeof(dir), "%s/user/app", root) >= (int)sizeof(dir)) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  if(!(apps=opendir(dir))) {
+    if(errno != ENOENT) {
+      titles_listed = 0;
+      verify_finding(outfd, "unsupported", "titles");
+      findings++;
+    }
+  } else {
+    while((entry=readdir(apps))) {
+      if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+         snprintf(app, sizeof(app), "%s/%s", dir, entry->d_name) >= (int)sizeof(app) ||
+         lstat(app, &st) || !S_ISDIR(st.st_mode)) {
+        continue;
+      }
+      memset(&title, 0, sizeof(title));
+      title.title = entry->d_name;
+      if(verify_title_checks(root, app, &title, lines, &count, errfd)) {
+        closedir(apps);
+        return 1;
+      }
+      for(i=0; i<count; i++) {
+        if(!strncmp(lines[i], "finding ", 8)) {
+          verify_title_finding(outfd, entry->d_name, lines[i]);
+          findings++;
+        }
+      }
+    }
+    closedir(apps);
+  }
+
+  findings += verify_orphan_licences(root, titles_listed, outfd);
+  findings += verify_orphan_staging(root, outfd);
+  if(args->has_floor) {
+    findings += verify_space(root, args->floor, outfd);
+  }
+
+  say(outfd, findings ? "not_whole console\n" : "whole console\n");
+  return findings ? 1 : 0;
+}
+
+
+/**
+ * verify TITLE [--size N] [--sha256 HEX] or verify --all [--floor N]: answer
+ * one line per check, then whole or not_whole.
+ **/
+static int
+run_verify(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char lines[VERIFY_LINES][OUT_LINE_CAP];
+  verify_args_t args;
+  char app[PATH_MAX];
+  struct stat st;
+  size_t count = 0;
+  size_t i;
+  int whole = 1;
+
+  if(verify_parse(argc, argv, &args, errfd)) {
+    return 1;
+  }
+  if(args.all) {
+    return run_verify_all(root, &args, outfd, errfd);
+  }
+  if(snprintf(app, sizeof(app), "%s/user/app/%s", root, args.title) >= (int)sizeof(app)) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  if(lstat(app, &st) || !S_ISDIR(st.st_mode)) {
+    say(outfd, "not_installed ");
+    say(outfd, args.title);
+    say(outfd, "\n");
+    return 1;
+  }
+  if(refuse_protected(app, errfd)) {
+    return STATUS_PROTECTED;
+  }
+  if(verify_title_checks(root, app, &args, lines, &count, errfd)) {
+    return 1;
+  }
+
+  for(i=0; i<count; i++) {
+    if(strncmp(lines[i], "ok ", 3)) {
+      whole = 0;
+    }
+    say(outfd, lines[i]);
+    say(outfd, "\n");
+  }
+  say(outfd, whole ? "whole " : "not_whole ");
+  say(outfd, args.title);
+  say(outfd, "\n");
+  return whole ? 0 : 1;
+}
+
+
+#define TRACE_KEEP 8
+#define TRACE_LIST_MAX 16
+#define TRACE_NAME_MAX 32
+#define TRACE_FIELD_RAW 256
+#define TRACE_FIELD_OUT 128
+#define TRACE_LINE_CAP 512
+#define TRACE_RECORD_CAP (32UL * 1024)
+#define TRACE_FIELDS_MAX 96
+#define TRACE_KEY_MAX (TRACE_FIELD_OUT + 16)
+#define TRACE_SECTIONS 5
+#define TRACE_FREE_SLACK (16ULL * 1024ULL * 1024ULL)
+#define TRACE_BOOT_SLACK 1ULL
+
+#define TRACE_ANY 0
+#define TRACE_DIRS 1
+#define TRACE_FILES 2
+
+struct trace_names {
+  size_t total;
+  size_t count;
+  char names[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+};
+
+struct trace_mounts {
+  size_t total;
+  size_t count;
+  char targets[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+  char sources[TRACE_LIST_MAX][TRACE_FIELD_RAW];
+};
+
+struct trace_scan {
+  struct trace_mounts mounts;
+  struct trace_names titles;
+  struct trace_names metadata;
+  struct trace_names licences;
+  char running[TRACE_LIST_MAX][PAYLOAD_NAME_MAX + 1];
+};
+
+struct trace_record {
+  char *text;
+  size_t len;
+  int failed;
+};
+
+struct trace_field {
+  char key[TRACE_KEY_MAX];
+  char value[TRACE_FIELD_OUT + 1];
+};
+
+struct trace_fields {
+  size_t count;
+  struct trace_field items[TRACE_FIELDS_MAX];
+};
+
+static const char *const trace_counts[TRACE_SECTIONS] = {
+  "mounts", "titles", "metadata", "licences", "running"
+};
+static const char *const trace_entries[TRACE_SECTIONS] = {
+  "mount", "title", "metadata", "licence", "running"
+};
+
+
+static int
+trace_name_ok(const char *name) {
+  size_t i;
+  size_t len = strlen(name);
+
+  if(len == 0 || len > TRACE_NAME_MAX || !strcmp(name, ".") || !strcmp(name, "..")) {
+    return 0;
+  }
+  for(i=0; i<len; i++) {
+    unsigned char c = (unsigned char)name[i];
+
+    if(c < 0x21 || c > 0x7e || c == '/' || c == '\\') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+// A copy that cannot overflow its buffer, and never writes past the end.
+static void
+trace_copy(char *out, size_t cap, const char *in) {
+  size_t len = strlen(in);
+
+  if(len >= cap) {
+    len = cap - 1;
+  }
+  memcpy(out, in, len);
+  out[len] = '\0';
+}
+
+
+// Keeps the smallest TRACE_LIST_MAX names in order and counts every name.
+static void
+trace_names_add(struct trace_names *list, const char *name) {
+  size_t at = list->count;
+
+  list->total++;
+  if(list->count == TRACE_LIST_MAX) {
+    if(strcmp(name, list->names[TRACE_LIST_MAX - 1]) >= 0) {
+      return;
+    }
+    at = TRACE_LIST_MAX - 1;
+  } else {
+    list->count++;
+  }
+  while(at > 0 && strcmp(name, list->names[at - 1]) < 0) {
+    trace_copy(list->names[at], TRACE_FIELD_RAW, list->names[at - 1]);
+    at--;
+  }
+  trace_copy(list->names[at], TRACE_FIELD_RAW, name);
+}
+
+
+static void
+trace_scan(struct trace_names *list, const char *dir, int want) {
+  char path[PATH_MAX];
+  struct dirent *ent;
+  struct stat st;
+  DIR *handle;
+
+  if(!(handle=opendir(dir))) {
+    return;
+  }
+  while((ent = readdir(handle))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >= (int)sizeof(path)) {
+      continue;
+    }
+    if(want != TRACE_ANY) {
+      if(lstat(path, &st)) {
+        continue;
+      }
+      if(want == TRACE_DIRS && !S_ISDIR(st.st_mode)) {
+        continue;
+      }
+      if(want == TRACE_FILES && !S_ISREG(st.st_mode)) {
+        continue;
+      }
+    }
+    trace_names_add(list, ent->d_name);
+  }
+  closedir(handle);
+}
+
+
+// Sums the regular files under path; a link is never followed.
+static unsigned long long
+trace_tree_bytes(const char *path) {
+  char child[PATH_MAX];
+  unsigned long long total = 0;
+  struct dirent *ent;
+  struct stat st;
+  DIR *handle;
+
+  if(lstat(path, &st)) {
+    return 0;
+  }
+  if(S_ISREG(st.st_mode)) {
+    return (unsigned long long)st.st_size;
+  }
+  if(!S_ISDIR(st.st_mode) || !(handle=opendir(path))) {
+    return 0;
+  }
+  while((ent = readdir(handle))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+      continue;
+    }
+    if(snprintf(child, sizeof(child), "%s/%s", path, ent->d_name) >= (int)sizeof(child)) {
+      continue;
+    }
+    total += trace_tree_bytes(child);
+  }
+  closedir(handle);
+  return total;
+}
+
+
+static void
+trace_mount_add(void *ctx, const char *target, const char *source) {
+  struct trace_mounts *mounts = ctx;
+
+  mounts->total++;
+  if(mounts->count < TRACE_LIST_MAX) {
+    trace_copy(mounts->targets[mounts->count], TRACE_FIELD_RAW, target);
+    trace_copy(mounts->sources[mounts->count], TRACE_FIELD_RAW, source);
+    mounts->count++;
+  }
+}
+
+
+// Escapes what a record line cannot carry raw: spaces, controls, non-ASCII and %.
+static void
+trace_escape(char out[TRACE_FIELD_OUT + 1], const char *src) {
+  size_t used = 0;
+  size_t i;
+
+  for(i=0; src[i]; i++) {
+    unsigned char c = (unsigned char)src[i];
+    char piece[4];
+    size_t n = 1;
+
+    if(c > 0x20 && c < 0x7f && c != '%') {
+      piece[0] = (char)c;
+    } else {
+      snprintf(piece, sizeof(piece), "%%%02X", (unsigned)c);
+      n = 3;
+    }
+    if(used + n >= TRACE_FIELD_OUT) {
+      break;
+    }
+    memcpy(out + used, piece, n);
+    used += n;
+  }
+  out[used] = '\0';
+}
+
+
+static void
+trace_put(struct trace_record *record, const char *text) {
+  size_t len = strlen(text);
+
+  if(record->failed || len > TRACE_RECORD_CAP - record->len) {
+    record->failed = 1;
+    return;
+  }
+  memcpy(record->text + record->len, text, len);
+  record->len += len;
+  record->text[record->len] = '\0';
+}
+
+
+static int
+trace_build(const char *root, struct trace_scan *scan, struct trace_record *record) {
+  char line[TRACE_LINE_CAP];
+  char path[PATH_MAX];
+  char first[TRACE_FIELD_OUT + 1];
+  char second[TRACE_FIELD_OUT + 1];
+  unsigned long long uptime;
+  unsigned long long bytes;
+  struct statvfs vfs;
+  size_t running;
+  size_t i;
+  time_t now;
+
+  if((now=time(NULL)) == (time_t)-1 || readers_uptime(&uptime) ||
+     statvfs(root, &vfs) || readers_mounts(trace_mount_add, &scan->mounts)) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "%s/user/app", root);
+  trace_scan(&scan->titles, path, TRACE_DIRS);
+  snprintf(path, sizeof(path), "%s/user/appmeta", root);
+  trace_scan(&scan->metadata, path, TRACE_ANY);
+  snprintf(path, sizeof(path), "%s/user/license", root);
+  trace_scan(&scan->licences, path, TRACE_FILES);
+  running = runs_names(scan->running, TRACE_LIST_MAX);
+
+  snprintf(line, sizeof(line), "clock %lld\n", (long long)now);
+  trace_put(record, line);
+  snprintf(line, sizeof(line), "uptime %llu\n", uptime);
+  trace_put(record, line);
+  snprintf(line, sizeof(line), "free %llu\n",
+           (unsigned long long)vfs.f_bavail * vfs.f_frsize);
+  trace_put(record, line);
+
+  snprintf(line, sizeof(line), "mounts %zu\n", scan->mounts.total);
+  trace_put(record, line);
+  for(i=0; i<scan->mounts.count; i++) {
+    trace_escape(first, scan->mounts.targets[i]);
+    trace_escape(second, scan->mounts.sources[i]);
+    snprintf(line, sizeof(line), "mount %s %s\n", first, second);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "titles %zu\n", scan->titles.total);
+  trace_put(record, line);
+  for(i=0; i<scan->titles.count; i++) {
+    snprintf(path, sizeof(path), "%s/user/app/%s", root, scan->titles.names[i]);
+    bytes = trace_tree_bytes(path);
+    trace_escape(first, scan->titles.names[i]);
+    snprintf(line, sizeof(line), "title %s %llu\n", first, bytes);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "metadata %zu\n", scan->metadata.total);
+  trace_put(record, line);
+  for(i=0; i<scan->metadata.count; i++) {
+    trace_escape(first, scan->metadata.names[i]);
+    snprintf(line, sizeof(line), "metadata %s\n", first);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "licences %zu\n", scan->licences.total);
+  trace_put(record, line);
+  for(i=0; i<scan->licences.count; i++) {
+    trace_escape(first, scan->licences.names[i]);
+    snprintf(line, sizeof(line), "licence %s\n", first);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "running %zu\n", running);
+  trace_put(record, line);
+  for(i=0; i<running && i<TRACE_LIST_MAX; i++) {
+    snprintf(line, sizeof(line), "running %s\n", scan->running[i]);
+    trace_put(record, line);
+  }
+
+  snprintf(line, sizeof(line), "boot %lld\n", (long long)now - (long long)uptime);
+  trace_put(record, line);
+  return record->failed ? -1 : 0;
+}
+
+
+static int
+trace_write_file(const char *path, const char *data, size_t len) {
+  size_t done = 0;
+  int fd;
+
+  if((fd=open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644)) < 0) {
+    return -1;
+  }
+  while(done < len) {
+    ssize_t put = write(fd, data + done, len - done);
+
+    if(put < 0 && errno == EINTR) {
+      continue;
+    }
+    if(put <= 0) {
+      close(fd);
+      unlink(path);
+      return -1;
+    }
+    done += (size_t)put;
+  }
+  if(fsync(fd) || close(fd)) {
+    unlink(path);
+    return -1;
+  }
+  return 0;
+}
+
+
+// A name copied whole or not at all: a truncated name is not that name.
+static int
+trace_name_set(char *out, const char *name) {
+  size_t len = strlen(name);
+
+  if(len > TRACE_NAME_MAX) {
+    return -1;
+  }
+  memcpy(out, name, len + 1);
+  return 0;
+}
+
+
+// The order file, not file times, says which record is oldest: times can tie.
+static int
+trace_remember(const char *base, const char *records, const char *name) {
+  char text[(TRACE_KEEP + 1) * (TRACE_NAME_MAX + 2)];
+  char path[PATH_MAX];
+  char tmp[PATH_MAX];
+  char line[TRACE_NAME_MAX + 2];
+  struct {
+    size_t count;
+    char names[TRACE_KEEP + 1][TRACE_NAME_MAX + 1];
+  } order;
+  size_t used = 0;
+  FILE *file;
+  size_t i;
+
+  memset(&order, 0, sizeof(order));
+  if(snprintf(path, sizeof(path), "%s/order", base) >= (int)sizeof(path)) {
+    return -1;
+  }
+  if((file=fopen(path, "r"))) {
+    while(order.count < TRACE_KEEP && fgets(line, sizeof(line), file)) {
+      line[strcspn(line, "\n")] = '\0';
+      if(line[0] && strcmp(line, name) && !trace_name_set(order.names[order.count], line)) {
+        order.count++;
+      }
+    }
+    fclose(file);
+  }
+  if(trace_name_set(order.names[order.count], name)) {
+    return -1;
+  }
+  order.count++;
+
+  while(order.count > TRACE_KEEP) {
+    if(snprintf(path, sizeof(path), "%s/%s", records, order.names[0]) >= (int)sizeof(path)) {
+      return -1;
+    }
+    if(unlink(path) && errno != ENOENT) {
+      return -1;
+    }
+    memmove(order.names[0], order.names[1], (order.count - 1) * sizeof(order.names[0]));
+    order.count--;
+  }
+
+  for(i=0; i<order.count; i++) {
+    used += (size_t)snprintf(text + used, sizeof(text) - used, "%s\n", order.names[i]);
+  }
+  if(snprintf(tmp, sizeof(tmp), "%s/order.tmp", base) >= (int)sizeof(tmp)) {
+    return -1;
+  }
+  if(trace_write_file(tmp, text, used)) {
+    return -1;
+  }
+  if(snprintf(path, sizeof(path), "%s/order", base) >= (int)sizeof(path)) {
+    unlink(tmp);
+    return -1;
+  }
+  if(rename(tmp, path)) {
+    unlink(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+
+// Returns 0 when stored, 1 when the name is kept and replace is not set, -1 on failure.
+static int
+trace_store(const char *root, const char *name, const char *text, size_t len, int replace) {
+  char base[PATH_MAX];
+  char records[PATH_MAX];
+  char tmp[PATH_MAX];
+  char final[PATH_MAX];
+  struct stat st;
+
+  if(snprintf(base, sizeof(base), "%s/data/ariel/traces", root) >= (int)sizeof(base) ||
+     snprintf(records, sizeof(records), "%s/records", base) >= (int)sizeof(records) ||
+     snprintf(tmp, sizeof(tmp), "%s/.%s.tmp", base, name) >= (int)sizeof(tmp) ||
+     snprintf(final, sizeof(final), "%s/%s", records, name) >= (int)sizeof(final)) {
+    return -1;
+  }
+  if((mkdir(base, 0755) && errno != EEXIST) || (mkdir(records, 0755) && errno != EEXIST)) {
+    return -1;
+  }
+  if(!lstat(final, &st) && !replace) {
+    return 1;
+  }
+  if(trace_write_file(tmp, text, len) || rename(tmp, final)) {
+    unlink(tmp);
+    return -1;
+  }
+  return trace_remember(base, records, name);
+}
+
+
+static int
+trace_capture(const char *root, struct trace_record *record) {
+  struct trace_scan *scan;
+  int rc;
+
+  record->text = malloc(TRACE_RECORD_CAP + 1);
+  scan = calloc(1, sizeof(*scan));
+  if(!record->text || !scan) {
+    free(record->text);
+    free(scan);
+    record->text = NULL;
+    return -1;
+  }
+  record->len = 0;
+  record->failed = 0;
+  record->text[0] = '\0';
+  rc = trace_build(root, scan, record);
+  free(scan);
+  if(rc) {
+    free(record->text);
+    record->text = NULL;
+  }
+  return rc;
+}
+
+
+// Returns 0 and the text, 1 when no record is kept under the path, -1 on failure.
+static int
+trace_read_record(const char *path, char **text) {
+  struct stat st;
+  size_t done = 0;
+  ssize_t got;
+  int fd;
+
+  if((fd=open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+    return errno == ENOENT ? 1 : -1;
+  }
+  if(fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > (off_t)TRACE_RECORD_CAP) {
+    close(fd);
+    return -1;
+  }
+  *text = malloc((size_t)st.st_size + 1);
+  if(!*text) {
+    close(fd);
+    return -1;
+  }
+  while(done < (size_t)st.st_size) {
+    got = read(fd, *text + done, (size_t)st.st_size - done);
+    if(got < 0 && errno == EINTR) {
+      continue;
+    }
+    if(got <= 0) {
+      break;
+    }
+    done += (size_t)got;
+  }
+  close(fd);
+  if(done < (size_t)st.st_size) {
+    free(*text);
+    *text = NULL;
+    return -1;
+  }
+  (*text)[done] = '\0';
+  return 0;
+}
+
+
+static int
+trace_section(const char *word, const char *const names[]) {
+  int i;
+
+  for(i=0; i<TRACE_SECTIONS; i++) {
+    if(!strcmp(word, names[i])) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+static int
+trace_fields_add(struct trace_fields *fields, const char *key, const char *value) {
+  struct trace_field *field;
+
+  if(fields->count == TRACE_FIELDS_MAX) {
+    return -1;
+  }
+  field = &fields->items[fields->count++];
+  snprintf(field->key, sizeof(field->key), "%s", key);
+  snprintf(field->value, sizeof(field->value), "%s", value);
+  return 0;
+}
+
+
+// Each list opens with its count; the lines after it are its entries. Clock and uptime are never compared.
+static int
+trace_fields_parse(const char *text, struct trace_fields *fields) {
+  char line[TRACE_LINE_CAP];
+  char key[TRACE_KEY_MAX];
+  int counted[TRACE_SECTIONS];
+  const char *cursor = text;
+  const char *end;
+  char *word;
+  char *rest;
+  char *value;
+  int section;
+  size_t len;
+
+  memset(counted, 0, sizeof(counted));
+  while(*cursor) {
+    end = strchr(cursor, '\n');
+    len = end ? (size_t)(end - cursor) : strlen(cursor);
+    if(len >= sizeof(line)) {
+      return -1;
+    }
+    memcpy(line, cursor, len);
+    line[len] = '\0';
+    cursor += end ? len + 1 : len;
+
+    word = line;
+    rest = strchr(line, ' ');
+    if(rest) {
+      *rest++ = '\0';
+    } else {
+      rest = line + len;
+    }
+    if(!strcmp(word, "clock") || !strcmp(word, "uptime")) {
+      continue;
+    }
+    if(!strcmp(word, "free") || !strcmp(word, "boot")) {
+      if(trace_fields_add(fields, word, rest)) {
+        return -1;
+      }
+      continue;
+    }
+    section = trace_section(word, trace_counts);
+    if(section >= 0 && !counted[section]) {
+      counted[section] = 1;
+      if(trace_fields_add(fields, word, rest)) {
+        return -1;
+      }
+      continue;
+    }
+    section = trace_section(word, trace_entries);
+    if(section < 0) {
+      continue;
+    }
+    if(section <= 1) {
+      value = strchr(rest, ' ');
+      if(!value) {
+        continue;
+      }
+      *value++ = '\0';
+    } else {
+      value = "present";
+    }
+    if(snprintf(key, sizeof(key), "%s %s", word, rest) >= (int)sizeof(key)) {
+      return -1;
+    }
+    if(trace_fields_add(fields, key, value)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+
+static const struct trace_field *
+trace_field_find(const struct trace_fields *fields, const char *key) {
+  size_t i;
+
+  for(i=0; i<fields->count; i++) {
+    if(!strcmp(fields->items[i].key, key)) {
+      return &fields->items[i];
+    }
+  }
+  return NULL;
+}
+
+
+// Free space moves with the record's own writes, and boot is derived from two whole-second readings.
+static int
+trace_moved(const char *key, const char *before, const char *after) {
+  unsigned long long a = strtoull(before, NULL, 10);
+  unsigned long long b = strtoull(after, NULL, 10);
+  unsigned long long slack;
+
+  if(!strcmp(key, "free")) {
+    slack = TRACE_FREE_SLACK;
+  } else if(!strcmp(key, "boot")) {
+    slack = TRACE_BOOT_SLACK;
+  } else {
+    return strcmp(before, after) != 0;
+  }
+  return (a > b ? a - b : b - a) > slack;
+}
+
+
+static void
+trace_say_change(int outfd, const char *key, const char *before, const char *after) {
+  say(outfd, key);
+  say(outfd, " ");
+  say(outfd, before);
+  say(outfd, " ");
+  say(outfd, after);
+  say(outfd, "\n");
+}
+
+
+static size_t
+trace_fields_diff(const struct trace_fields *before, const struct trace_fields *after, int outfd) {
+  const struct trace_field *old;
+  const struct trace_field *now;
+  size_t changed = 0;
+  size_t i;
+
+  for(i=0; i<before->count; i++) {
+    old = &before->items[i];
+    now = trace_field_find(after, old->key);
+    if(!now) {
+      trace_say_change(outfd, old->key, old->value, "absent");
+      changed++;
+    } else if(trace_moved(old->key, old->value, now->value)) {
+      trace_say_change(outfd, old->key, old->value, now->value);
+      changed++;
+    }
+  }
+  for(i=0; i<after->count; i++) {
+    if(!trace_field_find(before, after->items[i].key)) {
+      trace_say_change(outfd, after->items[i].key, "absent", after->items[i].value);
+      changed++;
+    }
+  }
+  return changed;
+}
+
+
+static int
+run_trace_list(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char dir[PATH_MAX];
+  struct trace_names *names;
+  size_t i;
+
+  if(argc > 2) {
+    say(errfd, argv[2][0] == '-' ? "bad_option\n" : "bad_argument\n");
+    return 1;
+  }
+  names = calloc(1, sizeof(*names));
+  if(!names) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  snprintf(dir, sizeof(dir), "%s/data/ariel/traces/records", root);
+  trace_scan(names, dir, TRACE_FILES);
+  for(i=0; i<names->count; i++) {
+    say(outfd, "record ");
+    say(outfd, names->names[i]);
+    say(outfd, "\n");
+  }
+  free(names);
+  return 0;
+}
+
+
+static int
+run_trace_diff(const char *root, int argc, char *const argv[], int outfd, int errfd) {
+  char path[PATH_MAX];
+  struct trace_record now;
+  struct trace_fields *before = NULL;
+  struct trace_fields *after = NULL;
+  char *kept = NULL;
+  size_t changed = 0;
+  char count[32];
+  int rc = 0;
+
+  if(argc < 3) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[2][0] == '-') {
+    say(errfd, "bad_option\n");
+    return 1;
+  }
+  if(!trace_name_ok(argv[2])) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+  if(argc > 3) {
+    say(errfd, argv[3][0] == '-' ? "bad_option\n" : "bad_argument\n");
+    return 1;
+  }
+
+  snprintf(path, sizeof(path), "%s/data/ariel/traces/records/%s", root, argv[2]);
+  rc = trace_read_record(path, &kept);
+  if(rc == 1) {
+    say(errfd, "trace_missing ");
+    say(errfd, argv[2]);
+    say(errfd, "\n");
+    return 95;
+  }
+  if(rc || trace_capture(root, &now)) {
+    free(kept);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  before = calloc(1, sizeof(*before));
+  after = calloc(1, sizeof(*after));
+  if(!before || !after || trace_fields_parse(kept, before) ||
+     trace_fields_parse(now.text, after)) {
+    rc = 1;
+  } else {
+    changed = trace_fields_diff(before, after, outfd);
+    if(changed == 0) {
+      say(outfd, "trace_unchanged\n");
+    } else {
+      snprintf(count, sizeof(count), "changed %zu\n", changed);
+      say(outfd, count);
+    }
+  }
+  free(kept);
+  free(now.text);
+  free(before);
+  free(after);
+  if(rc) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+  return 0;
+}
+
+
+static int
+run_trace(platform_t *platform, int argc, char *const argv[], int outfd, int errfd) {
+  struct trace_record record;
+  int replace = 0;
+  int rc;
+  int i;
+
+  if(argc >= 2 && !strcmp(argv[1], "--list")) {
+    return run_trace_list(platform->fs_root, argc, argv, outfd, errfd);
+  }
+  if(argc >= 2 && !strcmp(argv[1], "--diff")) {
+    return run_trace_diff(platform->fs_root, argc, argv, outfd, errfd);
+  }
+  if(argc < 2) {
+    say(errfd, "missing_operand\n");
+    return 1;
+  }
+  if(argv[1][0] == '-') {
+    say(errfd, "bad_option\n");
+    return 1;
+  }
+  for(i=2; i<argc; i++) {
+    if(!strcmp(argv[i], "--replace") && !replace) {
+      replace = 1;
+    } else if(argv[i][0] == '-') {
+      say(errfd, "bad_option\n");
+      return 1;
+    } else {
+      say(errfd, "bad_argument\n");
+      return 1;
+    }
+  }
+  if(!trace_name_ok(argv[1])) {
+    say(errfd, "bad_path\n");
+    return 1;
+  }
+
+  if(trace_capture(platform->fs_root, &record)) {
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  rc = trace_store(platform->fs_root, argv[1], record.text, record.len, replace);
+  if(rc == 1) {
+    free(record.text);
+    say(errfd, "trace_exists ");
+    say(errfd, argv[1]);
+    say(errfd, "\n");
+    return 96;
+  }
+  if(rc) {
+    free(record.text);
+    say(errfd, "operation_failed\n");
+    return 1;
+  }
+
+  say_bytes(outfd, record.text, record.len);
+  free(record.text);
+  say(outfd, "recorded ");
+  say(outfd, argv[1]);
+  say(outfd, "\n");
+  return 0;
+}
+
+
 typedef int (*file_command_fn)(int argc, char *const argv[], int outfd,
                                int errfd);
 
@@ -2575,6 +4128,16 @@ runner_dispatch(platform_t *platform, int argc, char *const argv[], int outfd,
 
   if(!strcmp(argv[0], "sfoinfo")) {
     *status = run_sfoinfo(argc, argv, outfd, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "verify")) {
+    *status = run_verify(platform->fs_root, argc, argv, outfd, errfd);
+    return 0;
+  }
+
+  if(!strcmp(argv[0], "trace")) {
+    *status = run_trace(platform, argc, argv, outfd, errfd);
     return 0;
   }
 

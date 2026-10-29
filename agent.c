@@ -146,6 +146,9 @@ static const char approval_stale[] =
 static const char key_refused[] =
   "key_refused\n"
   "exit 1\n";
+static const char no_anchor[] =
+  "no_anchor\n"
+  "exit 1\n";
 static const char key_failed[] =
   "key_failed\n"
   "exit 1\n";
@@ -163,7 +166,6 @@ static const char shots_done[] =
 static const char shots_failed[] =
   "shots_failed\n"
   "exit 1\n";
-
 /** The answer to an approval that could not be requested: a frozen console says so. **/
 static const char *
 approval_refused(void) {
@@ -1022,7 +1024,8 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
     audit_reply(fd, facts->command, "refused", target, "-", unknown);
     return 0;
   case STORE_GATE_KEYRING:
-    audit_reply(fd, facts->command, "refused", target, "-", key_refused);
+    audit_reply(fd, facts->command, "refused", target, "-",
+                store_anchor_missing() ? no_anchor : key_refused);
     return 0;
   case STORE_GATE_FROZEN:
     audit_reply(fd, facts->command, "refused", target, "-", frozen_reply);
@@ -1789,6 +1792,13 @@ key_rotate_command(agent_t *agent, int fd, int role, const char *hex) {
 
   command = role == STORE_KEY_ROLE_RECOVERY ? "key.rotate-recovery"
                                             : "key.rotate";
+  // A build with no anchor refuses the key before the key's own merits are
+  // judged: there is no keyring to rotate, and key_refused would send the
+  // owner to look for a keyring problem that is not there.
+  if(store_anchor_missing()) {
+    audit_reply(fd, command, "refused", "keyring", "-", no_anchor);
+    return;
+  }
   if(store_key_check(hex)) {
     audit_reply(fd, command, "refused", "keyring", "-", key_refused);
     return;
@@ -1836,7 +1846,7 @@ key_adopt_command(agent_t *agent, int fd) {
   uint32_t generation = 0;
 
   if(agent->platform->anchor(agent->platform, primary, recovery)) {
-    audit_reply(fd, command, "refused", "keyring", "-", key_refused);
+    audit_reply(fd, command, "refused", "keyring", "-", no_anchor);
     return;
   }
 
@@ -3765,23 +3775,39 @@ payload_logs(int fd, const char *name) {
 }
 
 
+/** One command on the platform, with its status but no exit line yet. **/
+static int
+run_command_status(agent_t *agent, int fd, int argc, char *argv[],
+                   runner_session_t *session, int *status) {
+  argv[argc] = NULL;
+
+  return !agent->platform->run(agent->platform, argc, argv, fd, fd, session,
+                               status);
+}
+
+
+/** The exit line of one command's status. **/
+static void
+exit_answer(int fd, int status) {
+  char answer[32];
+  int len = snprintf(answer, sizeof(answer), "exit %d\n", status);
+
+  if(len > 0) {
+    write_all(fd, answer, (size_t)len);
+  }
+}
+
+
 /** One command, one connection: output and diagnostics both go to fd. **/
 static int
 run_command(agent_t *agent, int fd, int argc, char *argv[],
             runner_session_t *session) {
-  char answer[32];
   int status = 0;
-  int len;
 
-  argv[argc] = NULL;
-
-  if(agent->platform->run(agent->platform, argc, argv, fd, fd, session,
-                          &status)) {
+  if(!run_command_status(agent, fd, argc, argv, session, &status)) {
     return 0;
   }
-
-  len = snprintf(answer, sizeof(answer), "exit %d\n", status);
-  write_all(fd, answer, (size_t)len);
+  exit_answer(fd, status);
 
   return 1;
 }
@@ -4685,34 +4711,47 @@ autoload_change(agent_t *agent, int fd, int add, const char *name,
 
 /**
  * One built-in, asked of the owner before it runs. Its arguments after the
- * target are bound as text, so a grant for one set does not run another. Once signed,
- * the built-in runs with its arguments and its done record comes first.
+ * target are bound as text, so a grant for one set does not run another. Once
+ * signed, the built-in runs with its arguments and its done record comes
+ * first. Returns 1 when it ran, with its exit status in status, and 0 when the
+ * answer was written here.
  **/
-static void
-builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
-            approval_facts_t *facts) {
+static int
+builtin_run_status(agent_t *agent, int fd, int argc, char *argv[], int first,
+                   approval_facts_t *facts, int *status) {
   approval_challenge_t challenge;
+  int arg_error = builtin_args(argc, argv, first, facts);
 
-  {
-    int arg_error = builtin_args(argc, argv, first, facts);
-
-    if(arg_error) {
-      audit_reply(fd, argv[0], "refused", "-", "-",
-                  arg_error == -2 ? bad_path : bad_argument);
-      return;
-    }
+  if(arg_error) {
+    audit_reply(fd, argv[0], "refused", "-", "-",
+                arg_error == -2 ? bad_path : bad_argument);
+    return 0;
   }
   facts->argc = (uint64_t)argc;
   if(!gate_pass(agent, fd, facts, &challenge)) {
-    return;
+    return 0;
   }
 
   if(audit_line(argv[0], "done", facts->target, challenge.id)) {
     reply(fd, audit_failed);
-    return;
+    return 0;
   }
-  if(!run_command(agent, fd, argc, argv, NULL)) {
+  if(!run_command_status(agent, fd, argc, argv, NULL, status)) {
     reply(fd, spawn_failed);
+    return 0;
+  }
+  return 1;
+}
+
+
+/** One built-in whose own exit status is its answer. **/
+static void
+builtin_run(agent_t *agent, int fd, int argc, char *argv[], int first,
+            approval_facts_t *facts) {
+  int status;
+
+  if(builtin_run_status(agent, fd, argc, argv, first, facts, &status)) {
+    exit_answer(fd, status);
   }
 }
 
@@ -5198,18 +5237,114 @@ shots_command(agent_t *agent, int fd, int argc, char *argv[]) {
 out:
   free(shots);
 }
+
+
+/** An install is asynchronous and a connection ends at 60 s: wait below
+    that deadline for the app directory rather than trust the call's return. **/
+#define PKG_INSTALL_WAIT_MS 45000L
+
+
+/** An install that did not finish names the title and the part missing. **/
+static void
+pkg_install_incomplete(int fd, const char *title, const char *part) {
+  char answer[256];
+  int len = snprintf(answer, sizeof(answer),
+                     "install_incomplete %s %s\nexit 1\n", title, part);
+
+  if(len > 0) {
+    write_all(fd, answer, (size_t)len);
+  }
+}
+
+
+/**
+ * pkg_install's ending, after the owner's grant. The install call returns once
+ * the request is accepted, not once the app is there, so the title's app
+ * directory is waited for, then its parts are checked. A finished install
+ * names the title, the bytes and the SHA-256 of the package it installed. The
+ * owner signed the operand as it was written; the payload is given the local
+ * path a file URI names.
+ **/
+static void
+pkg_install_command(agent_t *agent, int fd, int argc, char *argv[],
+                    approval_facts_t *facts, const char *path) {
+  char title[FILEOPS_TITLE_MAX + 1];
+  char hex[SHA256_HEX_LEN + 1];
+  char answer[256];
+  const char *part = "package";
+  uint64_t bytes = 0;
+  int status;
+  int len;
+  int named;
+
+  argv[1] = (char *)path;
+  if(!builtin_run_status(agent, fd, argc, argv, 2, facts, &status)) {
+    return;
+  }
+
+  named = !fileops_title_id(path, title, sizeof(title));
+  if(!named) {
+    snprintf(title, sizeof(title), "-");
+  }
+  if(status != 0 || !named ||
+     agent->platform->install_result(agent->platform, title,
+                                     PKG_INSTALL_WAIT_MS) != 1) {
+    pkg_install_incomplete(fd, title, "package");
+    return;
+  }
+  if(runner_title_missing(agent->platform->fs_root, title, &part)) {
+    pkg_install_incomplete(fd, title, part);
+    return;
+  }
+
+  switch(runner_package_fact(path, &bytes, hex)) {
+  case 0:
+    break;
+  case 2:
+    snprintf(hex, sizeof(hex), "-");
+    break;
+  default:
+    pkg_install_incomplete(fd, title, "package");
+    return;
+  }
+  len = snprintf(answer, sizeof(answer), "installed %s %llu %s\nexit 0\n",
+                 title, (unsigned long long)bytes, hex);
+  if(len > 0) {
+    write_all(fd, answer, (size_t)len);
+  }
+}
+
+
 static void
 builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
+  char local[PATH_MAX];
   approval_facts_t facts;
+  const char *path;
   int rc;
 
   if(argc < 2) {
     audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
     return;
   }
+  path = argv[1];
+
+  // pkg_install takes a package as a path or as the file URI its usage
+  // documents. The check and the payload see the local path; the owner sees
+  // the operand as written, so a grant covers that URI and no other.
+  if(!strcmp(argv[0], "pkg_install")) {
+    // The operand as written is the target the owner signs, so it is the
+    // operand that must fit the target the encoder can carry, not only the
+    // path a URI reduces to.
+    if(fileops_local_path(argv[1], local, sizeof(local)) ||
+       strlen(argv[1]) > APPROVAL_TARGET_MAX) {
+      audit_reply(fd, argv[0], "refused", argv[1], "-", bad_path);
+      return;
+    }
+    path = local;
+  }
 
   memset(&facts, 0, sizeof(facts));
-  rc = fileops_builtin_check(agent->platform->fs_root, argv[1], &facts);
+  rc = fileops_builtin_check(agent->platform->fs_root, path, &facts);
   if(rc != FILEOPS_OK) {
     file_outcome(fd, argv[0], argv[1], "-", rc);
     return;
@@ -5217,6 +5352,10 @@ builtin_file_command(agent_t *agent, int fd, int argc, char *argv[]) {
 
   snprintf(facts.command, sizeof(facts.command), "%s", argv[0]);
   snprintf(facts.target, sizeof(facts.target), "%s", argv[1]);
+  if(!strcmp(argv[0], "pkg_install")) {
+    pkg_install_command(agent, fd, argc, argv, &facts, path);
+    return;
+  }
   builtin_run(agent, fd, argc, argv, 2, &facts);
 }
 

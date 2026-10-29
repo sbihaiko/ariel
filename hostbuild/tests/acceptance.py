@@ -1164,6 +1164,8 @@ ADOPT_AUDIT_TITLE = ("key adopt-anchor keeps the consumed nonces and the audit "
                      "log")
 ADOPT_MATCH_TITLE = ("key adopt-anchor is refused, without a challenge, while "
                      "the anchor matches")
+NO_ANCHOR_TITLE = ("a build that pins no anchor answers no_anchor, and key "
+                   "adopt-anchor cannot seed it")
 
 # The durable steps of a rotation, each with the generation that is active
 # once Ariel restarts: a prepared rotation rolls back, the rest roll forward.
@@ -1464,6 +1466,18 @@ HOST_ROOT_SCENARIOS = {
     "nothing is written",
     "tar refuses Ariel's own objects, and a member that names one, through "
     "any alias, without asking",
+    "pkg_install answers the app directory the title names, so an install "
+    "that does not complete never answers exit 0",
+    "pkg_install names the missing part one at a time, and a finished install "
+    "names the title, bytes and SHA-256 of its source",
+    "pkg_install exits 0 with a dash for the hash of a finished install over "
+    "the ceiling, and leaves the source alone",
+    "pkg_install with a name that carries no title ID answers '-' as the "
+    "title",
+    "pkg_install answers package when a finished install's source cannot be "
+    "re-read",
+    "pkg_install takes a file URI, signs it as written, and does not run "
+    "another target on that grant",
 }
 
 
@@ -1939,6 +1953,198 @@ def scenario_console_read_check_matches_cat(server):
         assert faulty.files == {}, (
             "a failed check must still remove its own file, left %r"
             % sorted(faulty.files))
+
+
+PKG_FIXTURE_BODY = b"known-good package body\n" * 16
+
+
+class FakePackageConsole:
+    """A fake agent port with one installed title and its licence.
+
+    write, rm and pkg_install are gated: each answers 75 with a challenge until
+    the owner's grant is recorded, then runs once when it is sent again. An
+    install of a title with no licence creates one; an install of a title
+    whose licence is gone answers install_incomplete licence. The flags break
+    one behavior each, and each must fail its check: broken_ending answers a
+    dash for the hash, removes_source deletes the source, keeps_licence leaves
+    the licence when rm is sent.
+    """
+
+    GATED = ("write", "rm", "pkg_install")
+
+    def __init__(self, broken_ending=False, removes_source=False,
+                 keeps_licence=False):
+        self.broken_ending = broken_ending
+        self.removes_source = removes_source
+        self.keeps_licence = keeps_licence
+        self.files = {}
+        self.licences = set()
+        self.titles = set()
+        self.pending = {}
+        self.granted = set()
+        self.asked = 0
+
+    def exchange(self, command, body=None, token=None):
+        words = command.split()
+        if words[:2] == ["approval", "grant"]:
+            self.granted.add(self.pending.pop(words[2]))
+            return ["approval_granted %s" % words[2], "exit 0"]
+        if command in self.granted:
+            self.granted.discard(command)
+            return self.run(words, body)
+        if words[0] in self.GATED:
+            self.asked += 1
+            approval = "a-%d" % self.asked
+            self.pending[approval] = command
+            return ["approval_required %s" % approval,
+                    "challenge %s 00" % approval, "exit 75"]
+        return self.run(words, body)
+
+    def run(self, words, body):
+        if words[0] == "write":
+            digest = hashlib.sha256(body or b"").hexdigest()
+            if body is None or len(body) != int(words[2]) or digest != words[3]:
+                return ["upload_mismatch", "exit 81"]
+            self.files[words[1]] = body
+            return ["exit 0"]
+        if words[0] == "stat":
+            if words[1] in self.files:
+                return ["%s: %d bytes" % (words[1], len(self.files[words[1]])),
+                        "exit 0"]
+            return ["no_such_file", "exit 1"]
+        if words[0] == "ls":
+            return ["-rw-r--r-- 0 %s" % licence.rsplit("/", 1)[1]
+                    for licence in sorted(self.licences)
+                    if licence.rsplit("/", 1)[0] == words[1]] + ["exit 0"]
+        if words[0] == "rm":
+            self.files.pop(words[-1], None)
+            if not self.keeps_licence:
+                self.licences.discard(words[-1])
+            return ["exit 0"]
+        return self.install(words[1])
+
+    def install(self, path):
+        title = os.path.basename(path).split("-", 1)[0]
+        if path not in self.files:
+            return ["install_incomplete %s package" % title, "exit 1"]
+        licensed = any("-%s_" % title in os.path.basename(licence)
+                       for licence in self.licences)
+        if title in self.titles and not licensed:
+            return ["install_incomplete %s licence" % title, "exit 1"]
+        self.titles.add(title)
+        if not licensed:
+            self.licences.add("/user/license/fakeUP9000-%s_00.rif" % title)
+        data = self.files[path]
+        if self.removes_source:
+            del self.files[path]
+        digest = "-" if self.broken_ending else hashlib.sha256(data).hexdigest()
+        return ["installed %s %d %s" % (title, len(data), digest), "exit 0"]
+
+
+@contextlib.contextmanager
+def pkg_fixture_env(path):
+    """Point PS5_PKG_FIXTURE at path, or unset it when path is None, for the block."""
+    saved = os.environ.pop("PS5_PKG_FIXTURE", None)
+    if path is not None:
+        os.environ["PS5_PKG_FIXTURE"] = path
+    try:
+        yield
+    finally:
+        os.environ.pop("PS5_PKG_FIXTURE", None)
+        if saved is not None:
+            os.environ["PS5_PKG_FIXTURE"] = saved
+
+
+@contextlib.contextmanager
+def pkg_fixture_file():
+    """A known-good fixture named for its title, with PS5_PKG_FIXTURE pointing at it."""
+    directory = tempfile.mkdtemp(prefix="ariel-pkg-fixture-")
+    path = os.path.join(directory, "CUSA04730-fixture.pkg")
+    try:
+        with open(path, "wb") as handle:
+            handle.write(PKG_FIXTURE_BODY)
+        with pkg_fixture_env(path):
+            yield path
+    finally:
+        shutil.rmtree(directory)
+
+
+def scenario_console_pkg_install_ends_installed_and_keeps_source(server):
+    """The installed check passes on the line a finished install names, and fails on any other."""
+    del server  # the fake console stands in for the agent port
+
+    import console
+
+    names = [check.__name__ for _title, check in console.CHECKS]
+    assert "check_pkg_install_installed_line" in names, (
+        "console mode must check the installed line of a finished install")
+
+    with pkg_fixture_file():
+        fake = FakePackageConsole()
+        console.check_pkg_install_installed_line(
+            fake_console_session(console, fake), None)
+        assert fake.files == {}, (
+            "a passing check must remove its own copy, left %r"
+            % sorted(fake.files))
+
+        for faulty in (FakePackageConsole(broken_ending=True),
+                       FakePackageConsole(removes_source=True)):
+            try:
+                console.check_pkg_install_installed_line(
+                    fake_console_session(console, faulty), None)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(
+                    "an install that names a dash or drops its source must fail")
+
+
+def scenario_console_pkg_install_licence_check_answers_licence(server):
+    """The licence check passes when the install names the licence missing, and fails otherwise."""
+    del server  # the fake console stands in for the agent port
+
+    import console
+
+    names = [check.__name__ for _title, check in console.CHECKS]
+    assert "check_pkg_install_licence_missing" in names, (
+        "console mode must check that an install without its licence says so")
+
+    with pkg_fixture_file():
+        console.check_pkg_install_licence_missing(
+            fake_console_session(console, FakePackageConsole()), None)
+        try:
+            console.check_pkg_install_licence_missing(
+                fake_console_session(console, FakePackageConsole(
+                    keeps_licence=True)), None)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "a licence that rm leaves in place must fail the licence check")
+
+
+def scenario_console_pkg_install_checks_skip_without_a_fixture(server):
+    """Both pkg_install checks skip, naming the variable, before they ask the owner."""
+    del server  # the fake console must see nothing
+
+    import console
+
+    for path in (None, os.path.join(tempfile.gettempdir(), "no-such-fixture.pkg")):
+        with pkg_fixture_env(path):
+            for check in (console.check_pkg_install_installed_line,
+                          console.check_pkg_install_licence_missing):
+                fake = FakePackageConsole()
+                try:
+                    check(fake_console_session(console, fake), None)
+                except console.Skipped as err:
+                    assert "PS5_PKG_FIXTURE" in str(err), (
+                        "a skip must name the variable, got %r" % str(err))
+                else:
+                    raise AssertionError(
+                        "%s must skip without a fixture" % check.__name__)
+                assert fake.asked == 0 and fake.files == {}, (
+                    "%s must not touch the console before it skips"
+                    % check.__name__)
 
 
 def scenario_console_gated_asks_wait_out_busy(server):
@@ -4394,8 +4600,13 @@ OSTYPE = {"Darwin": ("kern.ostype", "Darwin"),
 
 def sfo_bytes(title):
     """A PARAM.SFO with one string entry, laid out as bundles/core/sfo.h says."""
-    key = b"TITLE\0"
-    value = title.encode("ascii") + b"\0"
+    return sfo_string_bytes("TITLE", title)
+
+
+def sfo_string_bytes(name, text):
+    """A PARAM.SFO with one string entry called name, laid out as bundles/core/sfo.h says."""
+    key = name.encode("ascii") + b"\0"
+    value = text.encode("ascii") + b"\0"
     keys_offset = 20 + 16
     data_offset = keys_offset + len(key)
     return (struct.pack("<IIIII", 0x46535000, 0x101, keys_offset, data_offset, 1)
@@ -7103,6 +7314,34 @@ def assert_refused_everything(server):
         assert_refused_without_asking(server, command)
 
 
+def scenario_no_anchor_refuses_approvals(server):
+    """A payload built without ARIEL_PUBKEY names the build, not the keyring.
+
+    key_refused covers an owner's problem: a keyring that is empty or under
+    another anchor, which key adopt-anchor exists to fix. A build with no
+    anchor is not that, and the adopt command cannot fix it either, so the
+    two states must answer different words.
+    """
+    del server  # the anchor is fixed at start, so this needs an Ariel of its own
+    bare = Server(SERVER_BINARY, env={"ARIEL_HOST_ANCHOR_NONE": "1",
+                                      "ARIEL_HOST_NONCE_SEED": "noanchor"})
+    try:
+        for command in ("env PATH", ADOPT_COMMAND, "reboot",
+                        "key rotate " + public_key(bare, SECOND_PRIMARY_KEY)):
+            lines = run_command(bare, command)
+            assert lines == ["no_anchor", "exit 1"], (
+                "%r on a build with no anchor must answer no_anchor and exit "
+                "1, got %r" % (command, lines))
+        assert run_command(bare, "pwd") == ["/", "exit 0"], (
+            "a build with no anchor must still answer the read-only commands")
+        assert ("key.adopt-anchor.refused", "keyring") in [
+            event[:2] for event in audit_events(bare)], (
+            "a refused adopt on a build with no anchor must reach the audit "
+            "log")
+    finally:
+        bare.stop()
+
+
 def scenario_keyring_missing_refuses_approvals(server):
     """A recorded generation 1 with the keyring gone refuses every approval,
     and the build's own keys do not come back in the keyring's place."""
@@ -7297,6 +7536,15 @@ def scenario_ps5_pubkey_needs_recovery(server):
     assert "ARIEL_RECOVERY_PUBKEY" not in paired.stderr, (
         "a build that pins both keys must not be refused for the pair, got %r"
         % paired.stderr)
+    # make test deploys, and a payload with no anchor refuses every gated
+    # command on the console it lands on, so the deploy is refused first.
+    deploy = subprocess.run(
+        ["make", "-n", "-f", os.path.join(repo_dir(), "Makefile"),
+         "PS5_PAYLOAD_SDK=/nonexistent", "ARIEL_DEPLOY=yes", "test"],
+        capture_output=True, text=True)
+    assert deploy.returncode != 0 and "unanchored" in deploy.stderr, (
+        "the PS5 makefile must refuse to deploy an unanchored payload, got %r"
+        % deploy.stderr)
 
 
 def scenario_recovery_pubkey_is_documented(server):
@@ -8227,6 +8475,212 @@ def scenario_builtin_grant_runs_once_on_host(server):
             if AUDIT_LINE.match(event) and event.split()[3] == approval]
     assert ours == ["launch.request", "grant", "launch.done"], (
         "the audit log must show the request, the grant and the run: %r" % ours)
+
+
+APP_TITLE = "CUSA04730"
+APP_TITLE_URI = "CUSA27976"
+
+
+def app_dir(server, title=APP_TITLE):
+    """The app directory the title's own parameter file names, under the root."""
+    return os.path.join(server.root, "user", "app", title)
+
+
+PKG_CONTENT_ID = "UP9000-CUSA04730_00-0000000000000001"
+PKG_CEILING = 256 * 1024 * 1024
+
+
+def granted_pkg_install(server, pkg):
+    """Grant one pkg_install of pkg and return its reply lines."""
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % pkg, "pkg_install", pkg)
+    sign_and_grant(server, approval, challenge)
+    return run_command(server, "pkg_install %s" % pkg)
+
+
+def lay_down(path, data=b"part\n"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
+@builtin_scenario
+def scenario_pkg_install_never_answers_zero_without_the_app(server):
+    """A command whose install does not complete never answers exit 0.
+
+    The host's virtual platform accepts the install and installs nothing, as
+    the console's asynchronous call does. The command answers the app
+    directory the title's parameter file names, so a no-op is a non-zero
+    answer and the directory's appearance is the only exit 0.
+    """
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"pkg\n")
+    lines = granted_pkg_install(server, pkg)
+    assert lines[-1] != "exit 0", (
+        "an install with no app directory must never answer exit 0, got %r"
+        % (lines,))
+    assert lines == ["install_incomplete %s package" % APP_TITLE, "exit 1"], (
+        "an install that did not complete must name the missing part and "
+        "answer exit 1, got %r" % (lines,))
+
+
+@builtin_scenario
+def scenario_pkg_install_names_the_missing_part(server):
+    """An install that did not finish names the part missing, one part at a time.
+
+    The parts are the package, the parameter file, the metadata entry and the
+    licence, in the order a title's own checks find them. A finished install
+    ends with the title, the byte count and the SHA-256 of the package it
+    installed, and the source package is still there, unchanged.
+    """
+    data = b"package body\n" * 64
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", data)
+    app = app_dir(server)
+    os.makedirs(app)
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s package" % APP_TITLE, "exit 1"], (
+        "an empty app directory is a missing package")
+
+    for entry in ("app.pkg", "app.pbm", "app.json", "app.xml"):
+        lay_down(os.path.join(app, entry))
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s sfo" % APP_TITLE, "exit 1"], (
+        "a package without its parameter file is missing the parameter file")
+
+    lay_down(os.path.join(app, "sce_sys", "param.sfo"),
+             sfo_string_bytes("CONTENT_ID", PKG_CONTENT_ID))
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s appmeta" % APP_TITLE, "exit 1"], (
+        "a title without its metadata entry is missing the metadata entry")
+
+    lay_down(os.path.join(server.root, "user", "appmeta", APP_TITLE))
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete %s licence" % APP_TITLE, "exit 1"], (
+        "a title without its licence is missing the licence")
+
+    lay_down(os.path.join(server.root, "user", "license",
+                          "fake%s.rif" % PKG_CONTENT_ID))
+    digest = hashlib.sha256(data).hexdigest()
+    assert granted_pkg_install(server, pkg) == [
+        "installed %s %d %s" % (APP_TITLE, len(data), digest), "exit 0"], (
+        "a finished install must name the title, the bytes and the SHA-256 "
+        "of the package it installed")
+    with open(pkg, "rb") as handle:
+        assert handle.read() == data, (
+            "an install must never change or delete its source package")
+
+
+@builtin_scenario
+def scenario_pkg_install_too_large_to_verify(server):
+    """A finished install over the hash ceiling exits 0 and names no hash.
+
+    The package is not read for its hash, so the hash field is a dash; the
+    title and the byte count are still named, and the install still exits 0.
+    The source is left alone.
+    """
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"pkg\n")
+    os.truncate(pkg, PKG_CEILING + 1)
+    app = app_dir(server)
+    for entry in ("app.pkg", "app.pbm", "app.json", "app.xml"):
+        lay_down(os.path.join(app, entry))
+    lay_down(os.path.join(app, "sce_sys", "param.sfo"),
+             sfo_string_bytes("CONTENT_ID", PKG_CONTENT_ID))
+    lay_down(os.path.join(server.root, "user", "appmeta", APP_TITLE))
+    lay_down(os.path.join(server.root, "user", "license",
+                          "fake%s.rif" % PKG_CONTENT_ID))
+    assert granted_pkg_install(server, pkg) == [
+        "installed %s %d -" % (APP_TITLE, PKG_CEILING + 1), "exit 0"], (
+        "a finished install over the hash ceiling must name its bytes with "
+        "no hash and exit 0")
+    assert os.path.getsize(pkg) == PKG_CEILING + 1, (
+        "an install must never change or delete its source package")
+
+
+@builtin_scenario
+def scenario_pkg_install_without_a_title_names_no_title(server):
+    """A package whose name carries no title ID answers its missing part with no title."""
+    pkg = write_scratch(server, "bad.iso", b"pkg\n")
+    assert granted_pkg_install(server, pkg) == [
+        "install_incomplete - package", "exit 1"], (
+        "a name with no title ID must answer install_incomplete with '-' as "
+        "the title and the package as the part")
+
+
+def lay_down_finished_title(server):
+    """Lay down every part of a finished install of APP_TITLE under the root."""
+    app = app_dir(server)
+    for entry in ("app.pkg", "app.pbm", "app.json", "app.xml"):
+        lay_down(os.path.join(app, entry))
+    lay_down(os.path.join(app, "sce_sys", "param.sfo"),
+             sfo_string_bytes("CONTENT_ID", PKG_CONTENT_ID))
+    lay_down(os.path.join(server.root, "user", "appmeta", APP_TITLE))
+    lay_down(os.path.join(server.root, "user", "license",
+                          "fake%s.rif" % PKG_CONTENT_ID))
+
+
+@builtin_scenario
+def scenario_pkg_install_unreadable_source_answers_package(server):
+    """A finished install whose source cannot be re-read answers package as the missing part.
+
+    The grant binds the source's identity and not its mode, so the mode can be
+    cleared after the grant. A root user reads through any mode, so the
+    scenario does not run as root.
+    """
+    if os.geteuid() == 0:
+        print("skipped as root: a file mode cannot stop root from reading")
+        return
+    pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"package body\n")
+    lay_down_finished_title(server)
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % pkg, "pkg_install", pkg)
+    sign_and_grant(server, approval, challenge)
+    os.chmod(pkg, 0)
+    try:
+        assert run_command(server, "pkg_install %s" % pkg) == [
+            "install_incomplete %s package" % APP_TITLE, "exit 1"], (
+            "a source that cannot be re-read after the install must answer "
+            "install_incomplete with the package as the part")
+    finally:
+        os.chmod(pkg, 0o644)
+
+
+def scenario_pkg_install_ending_is_documented(server):
+    """The exit-code registry names the ending's words and the parts it can name."""
+    del server  # the registry is read, not the port
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for text in ("`installed <TITLE> <bytes> <sha256>`",
+                 "`install_incomplete <TITLE> <part>`",
+                 "`installed <TITLE> <bytes> -`",
+                 "`package`", "`licence`", "`appmeta`", "`sfo`", "`unknown`"):
+        assert text in registry, (
+            "docs/exit-codes.md must document %s before pkg_install answers it"
+            % text)
+    assert not re.search(r"^\| 94 \|.*install_incomplete", registry, re.M), (
+        "install_incomplete must have one number in the registry, not two")
+
+
+@builtin_scenario
+def scenario_pkg_install_file_uri_is_gated_as_written(server):
+    """A file URI is accepted at the gate, signed as written, and not another target."""
+    pkg = write_scratch(server, APP_TITLE_URI + "-game.pkg", b"pkg\n")
+    uri = "file://" + pkg
+    approval, challenge = builtin_approval(
+        server, "pkg_install %s" % uri, "pkg_install", uri)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "pkg_install %s" % uri) == [
+        "install_incomplete %s package" % APP_TITLE_URI, "exit 1"], (
+        "the URI must reach the payload and answer its measured fact")
+
+    # The grant named the URI, so the bare path it reduces to is another
+    # target: it asks again rather than running on that grant.
+    builtin_approval(server, "pkg_install %s" % pkg, "pkg_install", pkg)
+
+    assert run_command(server, "pkg_install file://relative.pkg") == [
+        "bad_path", "exit 1"], (
+        "a file URI whose path is not absolute must answer bad_path at once")
+    assert run_command(server, "pkg_install relative.pkg") == [
+        "relative_path", "exit 1"], (
+        "a bare relative path must still answer relative_path")
 
 
 @builtin_scenario
@@ -10899,6 +11353,7 @@ SCENARIOS = [
      CLOCK_REASON),
     (ADOPT_MATCH_TITLE, scenario_adopt_anchor_refused_when_anchor_matches,
      False),
+    (NO_ANCHOR_TITLE, scenario_no_anchor_refuses_approvals, False),
     ("the PS5 makefile refuses an owner key pinned without its recovery key",
      scenario_ps5_pubkey_needs_recovery, None),
     ("the README and the quick start document ARIEL_RECOVERY_PUBKEY",
@@ -10939,6 +11394,26 @@ SCENARIOS = [
      scenario_builtins_ask_before_they_run, HOST_ROOT_REASON),
     ("a granted built-in on the host answers not available once and audits "
      "the grant and the run", scenario_builtin_grant_runs_once_on_host, True),
+    ("pkg_install answers the app directory the title names, so an install "
+     "that does not complete never answers exit 0",
+     scenario_pkg_install_never_answers_zero_without_the_app, HOST_ROOT_REASON),
+    ("pkg_install names the missing part one at a time, and a finished install "
+     "names the title, bytes and SHA-256 of its source",
+     scenario_pkg_install_names_the_missing_part, HOST_ROOT_REASON),
+    ("pkg_install exits 0 with a dash for the hash of a finished install over "
+     "the ceiling, and leaves the source alone",
+     scenario_pkg_install_too_large_to_verify, HOST_ROOT_REASON),
+    ("pkg_install with a name that carries no title ID answers '-' as the "
+     "title",
+     scenario_pkg_install_without_a_title_names_no_title, HOST_ROOT_REASON),
+    ("pkg_install answers package when a finished install's source cannot be "
+     "re-read",
+     scenario_pkg_install_unreadable_source_answers_package, HOST_ROOT_REASON),
+    ("pkg_install's ending and its parts are documented in exit-codes.md",
+     scenario_pkg_install_ending_is_documented, None),
+    ("pkg_install takes a file URI, signs it as written, and does not run "
+     "another target on that grant",
+     scenario_pkg_install_file_uri_is_gated_as_written, HOST_ROOT_REASON),
     ("a built-in run with another argument answers approval_stale and exit 78",
      scenario_builtin_arguments_are_bound, True),
     ("a built-in with a missing operand, a relative path or a bad value "
@@ -11006,6 +11481,15 @@ SCENARIOS = [
      None),
     ("console mode's read check matches cat and the header's size and hash",
      scenario_console_read_check_matches_cat, None),
+    ("console mode's installed check passes on the finished install's line and "
+     "fails on a dash or a dropped source",
+     scenario_console_pkg_install_ends_installed_and_keeps_source, None),
+    ("console mode's licence check passes when the install names the licence "
+     "missing and fails when the licence stays",
+     scenario_console_pkg_install_licence_check_answers_licence, None),
+    ("console mode's pkg_install checks skip, naming PS5_PKG_FIXTURE, without "
+     "a fixture and before they ask the owner",
+     scenario_console_pkg_install_checks_skip_without_a_fixture, None),
     ("a crash in prepared leaves the old version in payload list after restart",
      scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
     ("a crash in committed leaves the new version in payload list after restart",
@@ -12096,6 +12580,12 @@ FREEZE_RECORD_CRASH_TITLE = ("a crash at each durable step of the freeze "
 FREEZE_UNFREEZE_CRASH_TITLE = ("a crash at each durable step of a key "
                                "unfreeze leaves the console frozen or "
                                "unfrozen, never between")
+FREEZE_UNFREEZE_NO_REPORT_TITLE = ("the fault injected into a key unfreeze "
+                                   "ends the host with an exit status, not a "
+                                   "signal macOS writes a crash report for")
+FREEZE_UNFREEZE_FAILED_TITLE = ("a key unfreeze whose keyring transaction "
+                                "cannot be written answers key_failed, and "
+                                "the host keeps serving")
 
 
 def freeze_file(server):
@@ -12398,6 +12888,65 @@ def scenario_freeze_unfreeze_crash(server):
             keys.stop()
 
 
+def scenario_freeze_unfreeze_no_report(server):
+    """The injected fault ends the host without a signal macOS records.
+
+    A crash-recovery test needs the process to stop after a step, with nothing
+    flushed after it. SIGABRT does that, but it also makes macOS write an
+    .ips report per run, which is the noise #129 filed.
+    """
+    del server
+    keys = Server(SERVER_BINARY, env={
+        "ARIEL_HOST_NONCE_SEED": "freeze-unfreeze-report"})
+    try:
+        install_payload(keys, "crashreport", healthy_build("crashreport"))
+        set_freeze(keys)
+        assert run_payload(keys, "crashreport") == FROZEN_REPLY
+        keys.env = {FAULT_ENV: "prepared"}
+        keys.restart()
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        command_until_crash(keys, "key unfreeze")
+        code = keys.proc.returncode
+        assert code > 0, (
+            "the injected fault must end the host with a plain exit status; "
+            "%d is signal %d, which macOS writes a crash report for"
+            % (code, -code))
+    finally:
+        keys.stop()
+
+
+def scenario_freeze_unfreeze_failed_transaction(server):
+    """A keyring transaction that cannot be written is an error reply.
+
+    The keyring's temporary path is a directory, so the unfreeze cannot write
+    it. The failed transaction must answer key_failed and leave the host
+    serving, with the freeze still recorded in the keyring.
+    """
+    del server
+    keys = Server(SERVER_BINARY, env={
+        "ARIEL_HOST_NONCE_SEED": "freeze-unfreeze-failed"})
+    try:
+        install_payload(keys, "failunfreeze", healthy_build("failunfreeze"))
+        set_freeze(keys)
+        assert run_payload(keys, "failunfreeze") == FROZEN_REPLY
+        tmp = os.path.join(keys.root, "data", "ariel", "keyring.tmp")
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.mkdir(tmp)
+        approval, challenge = request_unfreeze(keys)
+        sign_and_grant_with(keys, approval, challenge, RECOVERY_KEY)
+        assert run_command(keys, "key unfreeze") == ["key_failed", "exit 1"], (
+            "a keyring transaction that cannot be written must answer "
+            "key_failed and exit 1")
+        assert keys.proc.poll() is None, (
+            "a failed transaction must not end the host")
+        assert run_command(keys, "env PATH") == FROZEN_REPLY, (
+            "a failed unfreeze must leave the keyring frozen")
+    finally:
+        keys.stop()
+
+
 FREEZE_SCENARIOS = [
     (FREEZE_NEW_TITLE, scenario_freeze_refuses_new_approvals, HOST_ROOT_REASON),
     (FREEZE_COMMIT_TITLE, scenario_freeze_refuses_commit_granted_before_it,
@@ -12416,18 +12965,27 @@ FREEZE_SCENARIOS = [
     (FREEZE_RACE_TITLE, scenario_freeze_racing_admissions, CLOCK_REASON),
     (FREEZE_RECORD_CRASH_TITLE, scenario_freeze_record_crash, FAULT_REASON),
     (FREEZE_UNFREEZE_CRASH_TITLE, scenario_freeze_unfreeze_crash, FAULT_REASON),
+    (FREEZE_UNFREEZE_NO_REPORT_TITLE, scenario_freeze_unfreeze_no_report,
+     FAULT_REASON),
+    (FREEZE_UNFREEZE_FAILED_TITLE, scenario_freeze_unfreeze_failed_transaction,
+     HOST_ROOT_REASON),
 ]
 
 CLOCK_SCENARIOS.update({FREEZE_COMMIT_TITLE, FREEZE_DELETE_TITLE,
                         FREEZE_SLOTS_TITLE, FREEZE_PRIMARY_TITLE,
-                        FREEZE_RACE_TITLE, FREEZE_UNFREEZE_CRASH_TITLE})
+                        FREEZE_RACE_TITLE, FREEZE_UNFREEZE_CRASH_TITLE,
+                        FREEZE_UNFREEZE_NO_REPORT_TITLE,
+                        FREEZE_UNFREEZE_FAILED_TITLE})
 HOST_ROOT_SCENARIOS.update({FREEZE_NEW_TITLE, FREEZE_COMMIT_TITLE,
                             FREEZE_RUN_TITLE, FREEZE_DELETE_TITLE,
                             FREEZE_RESTART_TITLE, FREEZE_SLOTS_TITLE,
                             FREEZE_ROTATE_TITLE, FREEZE_PRIMARY_TITLE,
                             FREEZE_RACE_TITLE, FREEZE_RECORD_CRASH_TITLE,
-                            FREEZE_UNFREEZE_CRASH_TITLE})
-FAULT_SCENARIOS.update({FREEZE_RECORD_CRASH_TITLE, FREEZE_UNFREEZE_CRASH_TITLE})
+                            FREEZE_UNFREEZE_CRASH_TITLE,
+                            FREEZE_UNFREEZE_NO_REPORT_TITLE,
+                            FREEZE_UNFREEZE_FAILED_TITLE})
+FAULT_SCENARIOS.update({FREEZE_RECORD_CRASH_TITLE, FREEZE_UNFREEZE_CRASH_TITLE,
+                        FREEZE_UNFREEZE_NO_REPORT_TITLE})
 HOST_RESTART_SCENARIOS.add(FREEZE_RESTART_TITLE)
 
 SCENARIOS.extend(FREEZE_SCENARIOS)
@@ -14540,6 +15098,801 @@ FTP_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in FTP_SCENARIOS)
 SCENARIOS.extend(FTP_SCENARIOS)
+
+
+VERIFY_CEILING_BYTES = 256 * 1024 * 1024
+VERIFY_CHECKS = ("app.pkg", "app.pbm", "app.json", "app.xml", "sce_sys/param.sfo",
+                 "appmeta", "licence", "content_id")
+VERIFY_PACKAGE = b"verify package\n"
+VERIFY_WORDS = ("whole", "not_whole", "not_installed", "too_large_to_verify",
+                "bad_argument", "bad_option", "missing_operand")
+VERIFY_KINDS = ("missing", "empty", "licence_missing", "licence_mismatch",
+                "size_mismatch", "hash_mismatch", "licence_orphan",
+                "staging_orphan", "space_below", "unsupported")
+
+
+def verify_content_id(title):
+    return "UP2611-%s_00" % title
+
+
+def write_verify_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
+def make_verify_title(server, title, licences=None, content_key="CONTENT_ID"):
+    """A title laid out as verify reads it: its entries, its appmeta and its licences."""
+    if licences is None:
+        licences = (verify_content_id(title),)
+    app = os.path.join(server.root, "user", "app", title)
+    write_verify_file(os.path.join(app, "app.pkg"), VERIFY_PACKAGE)
+    for name in ("app.pbm", "app.json", "app.xml"):
+        write_verify_file(os.path.join(app, name), name.encode("ascii") + b"\n")
+    write_verify_file(os.path.join(app, "sce_sys", "param.sfo"),
+                      sfo_string_bytes(content_key, verify_content_id(title)))
+    os.makedirs(os.path.join(server.root, "user", "appmeta", title), exist_ok=True)
+    for content_id in licences:
+        write_verify_file(
+            os.path.join(server.root, "user", "license", "fake%s.rif" % content_id),
+            b"licence\n")
+    return app
+
+
+def verify_app_path(server, title, *parts):
+    return os.path.join(server.root, "user", "app", title, *parts)
+
+
+def verify_reply(title, findings=None, drop=(), extra=()):
+    """The reply verify owes: one line per check, then the status and the exit."""
+    findings = findings or {}
+    lines = [findings.get(check, "ok %s" % check)
+             for check in VERIFY_CHECKS if check not in drop]
+    lines.extend(extra)
+    whole = all(line.startswith("ok ") for line in lines)
+    lines.append(("whole %s" if whole else "not_whole %s") % title)
+    lines.append("exit 0" if whole else "exit 1")
+    return lines
+
+
+OTHER_SHA256 = hashlib.sha256(b"not the package\n").hexdigest()
+
+
+def zero_sha256(size):
+    digest = hashlib.sha256()
+    block = bytes(1024 * 1024)
+    remaining = size
+    while remaining:
+        step = min(len(block), remaining)
+        digest.update(block[:step])
+        remaining -= step
+    return digest.hexdigest()
+
+
+def scenario_verify_whole_title_answers_every_check(server):
+    title = "CUSA90101"
+    make_verify_title(server, title)
+    assert run_command(server, "verify %s" % title) == [
+        "ok app.pkg", "ok app.pbm", "ok app.json", "ok app.xml",
+        "ok sce_sys/param.sfo", "ok appmeta", "ok licence", "ok content_id",
+        "whole %s" % title, "exit 0"]
+
+
+def scenario_verify_missing_entry_is_a_finding(server):
+    title = "CUSA90102"
+    make_verify_title(server, title)
+    os.remove(verify_app_path(server, title, "app.xml"))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"app.xml": "finding missing app.xml"})
+
+
+def scenario_verify_empty_entry_is_a_finding(server):
+    title = "CUSA90103"
+    make_verify_title(server, title)
+    write_verify_file(verify_app_path(server, title, "app.json"), b"")
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"app.json": "finding empty app.json"})
+
+
+def scenario_verify_missing_metadata_is_a_finding(server):
+    title = "CUSA90104"
+    make_verify_title(server, title)
+    os.rmdir(os.path.join(server.root, "user", "appmeta", title))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"appmeta": "finding missing appmeta"})
+
+
+def scenario_verify_absent_licence_is_a_finding(server):
+    title = "CUSA90105"
+    make_verify_title(server, title, licences=("UP2611-CUSA90199_00",))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"licence": "finding licence_missing %s" % title},
+        drop=("content_id",)), (
+        "a licence for another title must not count as this title's licence")
+
+
+def scenario_verify_licence_mismatch_is_a_finding(server):
+    title = "CUSA90106"
+    make_verify_title(server, title, licences=("UP9999-%s_00" % title,))
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"content_id": "finding licence_mismatch fakeUP9999-%s_00.rif" % title})
+
+
+def scenario_verify_compares_against_the_parameter_file(server):
+    title = "CUSA90107"
+    make_verify_title(server, title, licences=("UP2611-%s_00" % title,),
+                      content_key="TITLE")
+    assert run_command(server, "verify %s" % title) == verify_reply(
+        title, {"content_id": "finding missing content_id"})
+
+
+def scenario_verify_size_named_by_the_caller(server):
+    title = "CUSA90108"
+    make_verify_title(server, title)
+    size = len(VERIFY_PACKAGE)
+    assert run_command(server, "verify %s --size %d" % (title, size)) == verify_reply(
+        title, extra=("ok app.pkg size",))
+    assert run_command(server, "verify %s --size %d" % (title, size + 1)) == verify_reply(
+        title, extra=("finding size_mismatch app.pkg %d" % size,))
+
+
+def scenario_verify_hash_computed_only_when_named(server):
+    title = "CUSA90109"
+    make_verify_title(server, title)
+    digest = hashlib.sha256(VERIFY_PACKAGE).hexdigest()
+    assert run_command(server, "verify %s --sha256 %s" % (title, digest)) == verify_reply(
+        title, extra=("ok app.pkg sha256",))
+    assert run_command(server, "verify %s --sha256 %s" % (title, OTHER_SHA256)) == (
+        verify_reply(title, extra=("finding hash_mismatch app.pkg",)))
+
+
+def scenario_verify_oversize_answers_the_ceiling_word(server):
+    title = "CUSA90110"
+    make_verify_title(server, title)
+    os.truncate(verify_app_path(server, title, "app.pkg"), VERIFY_CEILING_BYTES + 1)
+    assert run_command(server, "verify %s" % title) == verify_reply(title), (
+        "a file over the ceiling must not be hashed when no hash is named")
+    assert run_command(server, "verify %s --sha256 %s" % (
+        title, OTHER_SHA256)) == verify_reply(
+        title, extra=("too_large_to_verify app.pkg",))
+
+
+def scenario_verify_hashes_a_file_at_the_ceiling(server):
+    title = "CUSA90111"
+    make_verify_title(server, title)
+    app_pkg = verify_app_path(server, title, "app.pkg")
+    os.truncate(app_pkg, 0)
+    os.truncate(app_pkg, VERIFY_CEILING_BYTES)
+    assert run_command(server, "verify %s --sha256 %s" % (
+        title, zero_sha256(VERIFY_CEILING_BYTES))) == verify_reply(
+        title, extra=("ok app.pkg sha256",))
+
+
+def scenario_verify_not_installed_answers_its_word(server):
+    title = "CUSA90198"
+    assert run_command(server, "verify %s" % title) == [
+        "not_installed %s" % title, "exit 1"]
+
+
+def scenario_verify_bad_arguments_answer_without_checking(server):
+    title = "CUSA90112"
+    make_verify_title(server, title)
+    digest = hashlib.sha256(VERIFY_PACKAGE).hexdigest()
+    cases = (
+        ("verify", ["missing_operand", "exit 1"]),
+        ("verify --size 1", ["bad_option", "exit 1"]),
+        ("verify %s --bogus" % title, ["bad_option", "exit 1"]),
+        ("verify %s --size" % title, ["bad_option", "exit 1"]),
+        ("verify %s --size 12x" % title, ["bad_option", "exit 1"]),
+        ("verify %s --size 1 --size 2" % title, ["bad_option", "exit 1"]),
+        ("verify %s --sha256 ABC" % title, ["bad_option", "exit 1"]),
+        ("verify %s --sha256 %s" % (title, digest.upper()), ["bad_option", "exit 1"]),
+        ("verify %s extra" % title, ["bad_argument", "exit 1"]),
+        ("verify ../etc", ["bad_argument", "exit 1"]),
+    )
+    for command, expected in cases:
+        assert run_command(server, command) == expected, (
+            "%r must answer %r" % (command, expected))
+
+
+def tree_state(root):
+    state = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            info = os.lstat(path)
+            state[path] = (info.st_mode, info.st_size, info.st_mtime_ns)
+    return state
+
+
+def scenario_verify_needs_no_approval_and_changes_nothing(server):
+    title = "CUSA90113"
+    make_verify_title(server, title)
+    user_root = os.path.join(server.root, "user")
+    before = tree_state(user_root)
+    lines = run_command(server, "verify %s --size %d" % (title, len(VERIFY_PACKAGE)))
+    assert lines[-1] == "exit 0" and not any(
+        line.startswith("approval_required") for line in lines), (
+        "verify must answer at once, without a challenge, got %r" % lines)
+    assert tree_state(user_root) == before, "verify must change nothing on disk"
+
+
+def scenario_verify_words_are_documented(server):
+    lines = run_command(server, "help")
+    listed = {line.split(" ")[0] for line in lines[:-1]}
+    assert "verify" in listed, "help must list verify, got %r" % lines
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for word in VERIFY_WORDS:
+        assert "`%s`" % word in registry, (
+            "docs/exit-codes.md must name %s before verify answers it" % word)
+    for kind in VERIFY_KINDS:
+        assert "- `%s`:" % kind in registry, (
+            "docs/exit-codes.md must define the finding kind %s" % kind)
+    assert "256 MiB" in registry, (
+        "docs/exit-codes.md must record the hash ceiling of verify")
+    assert "verify --all" in registry, "docs/exit-codes.md must describe verify --all"
+    assert "`--floor`" in registry, "docs/exit-codes.md must name the free-space floor"
+
+
+def verify_all_findings_reply(lines, findings):
+    """The reply verify --all owes: the findings in any order, then the status and the exit."""
+    if not findings:
+        assert lines == ["whole console", "exit 0"], (
+            "a clean console answers one line and exit 0, got %r" % lines)
+        return
+    assert lines[-2:] == ["not_whole console", "exit 1"], (
+        "a console with findings answers not_whole and exit 1, got %r" % lines)
+    assert sorted(lines[:-2]) == sorted(findings), (
+        "verify --all must answer %r, got %r" % (findings, lines[:-2]))
+
+
+def scenario_verify_all_clean_console_answers_one_line(server):
+    del server  # each console is a root of its own, so no other scenario's title is swept
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90301")
+        make_verify_title(fresh, "CUSA90302")
+        write_verify_file(os.path.join(fresh.root, "user", "license", "notes.txt"),
+                          b"not a licence\n")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [])
+        assert run_command(fresh, "verify --all --floor 0") == ["whole console", "exit 0"], (
+            "a floor of zero bytes cannot be below, so it must add no finding")
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_checks_every_title_and_names_each_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90311")
+        make_verify_title(fresh, "CUSA90312")
+        make_verify_title(fresh, "CUSA90313", licences=("UP9999-CUSA90313_00",))
+        make_verify_title(fresh, "CUSA90314")
+        os.remove(verify_app_path(fresh, "CUSA90312", "app.xml"))
+        write_verify_file(verify_app_path(fresh, "CUSA90314", "app.json"), b"")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding missing CUSA90312 app.xml",
+            "finding licence_mismatch CUSA90313 fakeUP9999-CUSA90313_00.rif",
+            "finding empty CUSA90314 app.json",
+        ])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_orphan_licence_is_a_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90321")
+        write_verify_file(os.path.join(fresh.root, "user", "license",
+                                       "fakeUP2611-CUSA90399_00.rif"), b"licence\n")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding licence_orphan fakeUP2611-CUSA90399_00.rif"])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_orphan_staging_is_a_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90331")
+        os.makedirs(os.path.join(fresh.root, "user", "staging", "CUSA90332"))
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding staging_orphan CUSA90332"])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_space_below_floor_is_a_finding(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90341")
+        lines = run_command(fresh, "verify --all --floor %d" % (1 << 62))
+        assert len(lines) == 3 and re.fullmatch(r"finding space_below \d+", lines[0]), (
+            "a floor above the free space must answer space_below, got %r" % lines)
+        assert lines[1:] == ["not_whole console", "exit 1"], (
+            "a console below its floor answers not_whole, got %r" % lines)
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_unsupported_fact_is_not_a_pass(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90351")
+        license_dir = os.path.join(fresh.root, "user", "license")
+        shutil.rmtree(license_dir)
+        write_verify_file(license_dir, b"the licence store is not a directory here\n")
+        verify_all_findings_reply(run_command(fresh, "verify --all"), [
+            "finding licence_missing CUSA90351",
+            "finding unsupported licences"])
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_refuses_bad_options_before_checking(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        title = "CUSA90361"
+        make_verify_title(fresh, title)
+        digest = hashlib.sha256(VERIFY_PACKAGE).hexdigest()
+        cases = (
+            ("verify --all extra", ["bad_argument", "exit 1"]),
+            ("verify --all --all", ["bad_option", "exit 1"]),
+            ("verify --all --size 1", ["bad_option", "exit 1"]),
+            ("verify --all --sha256 %s" % digest, ["bad_option", "exit 1"]),
+            ("verify --all --floor", ["bad_option", "exit 1"]),
+            ("verify --all --floor 12x", ["bad_option", "exit 1"]),
+            ("verify --all --floor 1 --floor 2", ["bad_option", "exit 1"]),
+            ("verify %s --floor 1" % title, ["bad_option", "exit 1"]),
+        )
+        for command, expected in cases:
+            assert run_command(fresh, command) == expected, (
+                "%r must answer %r" % (command, expected))
+    finally:
+        fresh.stop()
+
+
+def scenario_verify_all_needs_no_approval_and_changes_nothing(server):
+    del server
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA90371")
+        os.makedirs(os.path.join(fresh.root, "user", "staging", "CUSA90372"))
+        user_root = os.path.join(fresh.root, "user")
+        before = tree_state(user_root)
+        lines = run_command(fresh, "verify --all --floor 1")
+        assert lines[-2] in ("whole console", "not_whole console") and not any(
+            line.startswith("approval_required") for line in lines), (
+            "verify --all must answer at once, without a challenge, got %r" % lines)
+        assert tree_state(user_root) == before, "verify --all must change nothing on disk"
+    finally:
+        fresh.stop()
+
+
+VERIFY_SCENARIOS = [
+    ("verify answers ok for every check and whole, exit 0 on a whole title",
+     scenario_verify_whole_title_answers_every_check, HOST_ROOT_REASON),
+    ("verify answers missing for a required entry that is absent",
+     scenario_verify_missing_entry_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers empty for a required entry of zero bytes",
+     scenario_verify_empty_entry_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers missing for an absent appmeta entry",
+     scenario_verify_missing_metadata_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers licence_missing, and another title's licence does not count",
+     scenario_verify_absent_licence_is_a_finding, HOST_ROOT_REASON),
+    ("verify answers licence_mismatch when the licence's content ID differs",
+     scenario_verify_licence_mismatch_is_a_finding, HOST_ROOT_REASON),
+    ("verify compares the licence with the title's PARAM.SFO, and answers missing "
+     "when that file has no CONTENT_ID", scenario_verify_compares_against_the_parameter_file,
+     HOST_ROOT_REASON),
+    ("verify compares a size the caller names, and answers size_mismatch for another",
+     scenario_verify_size_named_by_the_caller, HOST_ROOT_REASON),
+    ("verify computes a hash only when one is named, and answers hash_mismatch",
+     scenario_verify_hash_computed_only_when_named, HOST_ROOT_REASON),
+    ("verify answers too_large_to_verify above the hash ceiling, and hashes only "
+     "when a hash is named", scenario_verify_oversize_answers_the_ceiling_word,
+     HOST_ROOT_REASON),
+    ("verify hashes a file exactly at the hash ceiling",
+     scenario_verify_hashes_a_file_at_the_ceiling, HOST_ROOT_REASON),
+    ("verify answers not_installed for an absent title, exit 1",
+     scenario_verify_not_installed_answers_its_word, HOST_ROOT_REASON),
+    ("verify refuses bad options, arguments and titles before checking",
+     scenario_verify_bad_arguments_answer_without_checking, HOST_ROOT_REASON),
+    ("verify needs no approval and changes nothing on disk",
+     scenario_verify_needs_no_approval_and_changes_nothing, HOST_ROOT_REASON),
+    ("verify is listed by help, and its words and finding kinds are documented",
+     scenario_verify_words_are_documented, HOST_ROOT_REASON),
+    ("verify --all answers whole console and exit 0 for a clean console",
+     scenario_verify_all_clean_console_answers_one_line, HOST_ROOT_REASON),
+    ("verify --all checks every title and names each finding by its title and kind",
+     scenario_verify_all_checks_every_title_and_names_each_finding, HOST_ROOT_REASON),
+    ("verify --all answers licence_orphan for a licence that names no installed title",
+     scenario_verify_all_orphan_licence_is_a_finding, HOST_ROOT_REASON),
+    ("verify --all answers staging_orphan for a staging directory with no app",
+     scenario_verify_all_orphan_staging_is_a_finding, HOST_ROOT_REASON),
+    ("verify --all answers space_below when free space is under the named floor",
+     scenario_verify_all_space_below_floor_is_a_finding, HOST_ROOT_REASON),
+    ("verify --all answers unsupported for a fact the console does not expose, not a pass",
+     scenario_verify_all_unsupported_fact_is_not_a_pass, HOST_ROOT_REASON),
+    ("verify --all refuses bad options and arguments before checking",
+     scenario_verify_all_refuses_bad_options_before_checking, HOST_ROOT_REASON),
+    ("verify --all needs no approval and changes nothing on disk",
+     scenario_verify_all_needs_no_approval_and_changes_nothing, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in VERIFY_SCENARIOS)
+SCENARIOS.extend(VERIFY_SCENARIOS)
+
+
+TRACE_FIELDS = ("clock", "uptime", "free", "mounts", "titles", "metadata",
+                "licences", "running", "boot")
+TRACE_FIELD_OF = {"mount": "mounts", "title": "titles", "licence": "licences"}
+TRACE_KEEP = 8
+TRACE_LIST_MAX = 16
+TRACE_REPLY_CAP = 64 * 1024
+
+
+def trace_records_dir(server):
+    return os.path.join(server.root, "data", "ariel", "traces", "records")
+
+
+def trace_record_bytes(server, name):
+    with open(os.path.join(trace_records_dir(server), name), "rb") as handle:
+        return handle.read()
+
+
+def trace_fields_seen(lines):
+    """The field of each run of lines, in order, up to the status lines."""
+    fields = []
+    for line in lines:
+        head = line.split(" ", 1)[0]
+        if head in ("recorded", "exit", "trace_exists", "bad_path"):
+            break
+        field = TRACE_FIELD_OF.get(head, head)
+        if not fields or fields[-1] != field:
+            fields.append(field)
+    return fields
+
+
+def scenario_trace_answers_the_fixed_field_set_in_order(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        title = "CUSA91001"
+        app = make_verify_title(fresh, title)
+        lines = run_command(fresh, "trace baseline")
+        assert lines[-2:] == ["recorded baseline", "exit 0"], (
+            "trace must record its name and answer exit 0, got %r" % lines[-3:])
+        assert trace_fields_seen(lines) == list(TRACE_FIELDS), (
+            "the fields must come in the fixed order, got %r" % trace_fields_seen(lines))
+        size = sum(os.path.getsize(os.path.join(folder, name))
+                   for folder, _, names in os.walk(app) for name in names)
+        assert "titles 1" in lines and "title %s %d" % (title, size) in lines, (
+            "the title and its size must be answered, got %r" % lines)
+        assert "metadata 1" in lines and "metadata %s" % title in lines, (
+            "the metadata entry must be answered, got %r" % lines)
+        licence = "fake%s.rif" % verify_content_id(title)
+        assert "licences 1" in lines and "licence %s" % licence in lines, (
+            "the licence must be answered, got %r" % lines)
+        assert "running 0" in lines, "no payload runs, got %r" % lines
+        mounts = [line for line in lines if line.startswith("mount ")]
+        counts = [line for line in lines if line.startswith("mounts ")]
+        assert len(counts) == 1 and len(mounts) <= TRACE_LIST_MAX, (
+            "the mounts must be one count line with at most %d entries, got %r"
+            % (TRACE_LIST_MAX, lines))
+        assert int(counts[0].split(" ")[1]) >= len(mounts), (
+            "the count gives the total, so it cannot be under the list, got %r" % lines)
+        free = [line for line in lines if line.startswith("free ")]
+        assert len(free) == 1 and int(free[0].split(" ")[1]) > 0, (
+            "free space must be a positive byte count, got %r" % free)
+        clock = int(next(line for line in lines if line.startswith("clock ")).split(" ")[1])
+        uptime = int(next(line for line in lines if line.startswith("uptime ")).split(" ")[1])
+        boot = int(next(line for line in lines if line.startswith("boot ")).split(" ")[1])
+        assert abs((clock - uptime) - boot) <= 2, (
+            "the boot marker must be the time the uptime began, got %r" % lines)
+        assert server_token_absent(fresh, lines), "the record must not carry the token"
+    finally:
+        fresh.stop()
+
+
+def server_token_absent(server, lines):
+    return server.token not in "\n".join(lines)
+
+
+def scenario_trace_stores_the_record_and_answers_it_in_full(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91002")
+        lines = run_command(fresh, "trace copy")
+        assert lines[-1] == "exit 0", "trace must answer exit 0, got %r" % lines
+        assert trace_record_bytes(fresh, "copy") == ("\n".join(lines[:-2]) + "\n").encode("ascii"), (
+            "the record kept in the state directory must be the record answered on the wire")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_record_survives_a_restart(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        assert run_command(fresh, "trace keep")[-1] == "exit 0"
+        before = trace_record_bytes(fresh, "keep")
+        fresh.restart()
+        assert trace_record_bytes(fresh, "keep") == before, (
+            "a restart must leave the record as it was written")
+        assert run_command(fresh, "trace keep") == ["trace_exists keep", "exit 96"], (
+            "a record kept across a restart must still be there")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_refuses_a_bad_name_with_bad_path(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        bad = ("trace ../x", "trace a/b", "trace .", "trace ..", 'trace ""',
+               'trace "a b"', 'trace "a\tb"', "trace " + "a" * 33,
+               "trace a\\b", "trace a\x7fb")
+        for command in bad:
+            assert run_command(fresh, command) == ["bad_path", "exit 1"], (
+                "%r must be refused with bad_path" % command)
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a refused name must write no record")
+        assert run_command(fresh, "trace " + "a" * 32)[-1] == "exit 0", (
+            "a name of 32 bytes is the longest accepted")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_refuses_an_existing_name_unless_replaced(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91005")
+        assert run_command(fresh, "trace basis")[-2:] == ["recorded basis", "exit 0"]
+        first = trace_record_bytes(fresh, "basis")
+        write_verify_file(os.path.join(fresh.root, "user", "license", "fakeEXTRA.rif"),
+                          b"licence\n")
+        assert run_command(fresh, "trace basis") == ["trace_exists basis", "exit 96"], (
+            "an existing name must be refused without --replace")
+        assert trace_record_bytes(fresh, "basis") == first, (
+            "a refused name must keep its record unchanged")
+        lines = run_command(fresh, "trace basis --replace")
+        assert lines[-1] == "exit 0" and "licences 2" in lines, (
+            "--replace must write the new record, got %r" % lines[-2:])
+        assert trace_record_bytes(fresh, "basis") != first, (
+            "--replace must change the kept record")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_keeps_a_fixed_number_and_drops_the_oldest(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        for index in range(TRACE_KEEP + 1):
+            assert run_command(fresh, "trace n%d" % index)[-1] == "exit 0"
+        assert len(os.listdir(trace_records_dir(fresh))) == TRACE_KEEP, (
+            "exactly %d records must be kept" % TRACE_KEEP)
+        assert run_command(fresh, "trace n1") == ["trace_exists n1", "exit 96"], (
+            "the second record is kept: only the oldest is dropped")
+        assert run_command(fresh, "trace n0")[-1] == "exit 0", (
+            "the oldest record must have been dropped, so its name is free")
+        assert run_command(fresh, "trace n8") == ["trace_exists n8", "exit 96"], (
+            "the newest record must be kept")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_bounds_the_answer_for_many_directories(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        apps = os.path.join(fresh.root, "user", "app")
+        for index in range(1000):
+            write_verify_file(os.path.join(apps, "CUSA%05d" % (92000 + index), "app.pkg"),
+                              b"x\n")
+        lines = run_command(fresh, "trace many", timeout=30.0)
+        assert lines[-1] == "exit 0" and "titles 1000" in lines, (
+            "a console with a thousand titles must still answer, got %r" % lines[-3:])
+        shown = [line for line in lines if line.startswith("title ")]
+        assert len(shown) == TRACE_LIST_MAX, (
+            "at most %d titles are listed, got %d" % (TRACE_LIST_MAX, len(shown)))
+        assert shown[0].startswith("title CUSA92000 "), (
+            "the listed titles are the first in name order, got %r" % shown[0])
+        reply = sum(len(line) + 1 for line in lines)
+        assert reply < TRACE_REPLY_CAP, "the answer must stay under the output cap"
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_holds_no_secret_and_needs_no_approval(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91008")
+        user_root = os.path.join(fresh.root, "user")
+        before = tree_state(user_root)
+        lines = run_command(fresh, "trace clean")
+        assert lines[-1] == "exit 0", "trace must answer exit 0, got %r" % lines
+        assert not any("approval" in line or line.startswith("challenge") for line in lines), (
+            "trace must need no approval and carry no approval state, got %r" % lines)
+        assert fresh.token.encode("ascii") not in trace_record_bytes(fresh, "clean"), (
+            "the record must not carry the access token")
+        assert tree_state(user_root) == before, "trace must change nothing the owner owns"
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_refuses_bad_options_and_arguments(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        for command, expected in (
+                ("trace", ["missing_operand", "exit 1"]),
+                ("trace x extra", ["bad_argument", "exit 1"]),
+                ("trace x --bogus", ["bad_option", "exit 1"]),
+                ("trace x --replace --replace", ["bad_option", "exit 1"])):
+            assert run_command(fresh, command) == expected, (
+                "%r must answer %r" % (command, expected))
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a refused trace must write no record")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_is_listed_and_documented(server):
+    lines = run_command(server, "help")
+    listed = {line.split(" ")[0] for line in lines[:-1]}
+    assert "trace" in listed, "help must list trace, got %r" % lines
+    with open(os.path.join(repo_dir(), "docs", "exit-codes.md")) as handle:
+        registry = handle.read()
+    for field in TRACE_FIELDS:
+        assert "`%s`" % field in registry, (
+            "docs/exit-codes.md must document the trace field %s" % field)
+    assert "`--replace`" in registry, "docs/exit-codes.md must name --replace"
+    assert "keeps the %d newest" % TRACE_KEEP in registry, (
+        "docs/exit-codes.md must state how many records are kept")
+    assert "at most %d entries" % TRACE_LIST_MAX in registry, (
+        "docs/exit-codes.md must state the bound of each list")
+    for form in ("`trace --list`", "`trace --diff", "`trace_unchanged`", "`trace_missing`"):
+        assert form in registry, "docs/exit-codes.md must document %s" % form
+
+
+def scenario_trace_list_names_the_records_in_order(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        assert run_command(fresh, "trace --list") == ["exit 0"], (
+            "trace --list must answer nothing when no record is kept")
+        for name in ("beta", "alpha", "gamma"):
+            assert run_command(fresh, "trace " + name)[-1] == "exit 0"
+        assert run_command(fresh, "trace --list") == [
+            "record alpha", "record beta", "record gamma", "exit 0"], (
+            "trace --list must name the records kept, in name order")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_diff_answers_the_line_that_names_a_removed_licence(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        title = "CUSA91010"
+        make_verify_title(fresh, title)
+        assert run_command(fresh, "trace basis")[-1] == "exit 0"
+        licence = "fake%s.rif" % verify_content_id(title)
+        os.remove(os.path.join(fresh.root, "user", "license", licence))
+        lines = run_command(fresh, "trace --diff basis")
+        assert lines[-1] == "exit 0", "the delta must end with its status, got %r" % lines
+        # A busy Linux host can mount or unmount something between two
+        # snapshots; that is the host's change, not the one under test.
+        body = [line for line in lines[:-1] if not line.startswith("mount ")]
+        assert body == ["licences 1 0", "licence %s present absent" % licence,
+                        "changed %d" % (len(lines) - 2)], (
+            "the delta must answer exactly the changed fields, got %r" % lines)
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_diff_answers_trace_unchanged_when_nothing_moved(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        make_verify_title(fresh, "CUSA91011")
+        assert run_command(fresh, "trace basis")[-1] == "exit 0"
+        before = trace_record_bytes(fresh, "basis")
+        lines = run_command(fresh, "trace --diff basis")
+        # A busy Linux host can mount or unmount something between two
+        # snapshots, and the spec has a delta name a changed mount. What
+        # this holds to, quiet host or not: nothing but the host's own
+        # mounts may move, and the count is the lines it answered.
+        moved = [line for line in lines if not line.startswith("mount ")]
+        if lines[0] == "trace_unchanged":
+            assert lines == ["trace_unchanged", "exit 0"], (
+                "a delta with nothing changed must answer the single word, got %r" % lines)
+        else:
+            assert moved == ["changed %d" % (len(lines) - 2), "exit 0"], (
+                "only the host's mounts may move on a quiet tree, got %r" % lines)
+        assert trace_record_bytes(fresh, "basis") == before, (
+            "trace --diff must not rewrite the record it compares")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_diff_answers_trace_missing_for_an_unknown_name(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        assert run_command(fresh, "trace --diff nope") == ["trace_missing nope", "exit 95"], (
+            "a name that is not kept must answer trace_missing")
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a missing name must write no record")
+    finally:
+        fresh.stop()
+
+
+def scenario_trace_list_and_diff_refuse_bad_options_and_arguments(server):
+    del server  # each snapshot is taken from a root of its own
+    fresh = Server(SERVER_BINARY)
+    try:
+        for command, expected in (
+                ("trace --list x", ["bad_argument", "exit 1"]),
+                ("trace --list --replace", ["bad_option", "exit 1"]),
+                ("trace --diff", ["missing_operand", "exit 1"]),
+                ("trace --diff ../x", ["bad_path", "exit 1"]),
+                ("trace --diff x extra", ["bad_argument", "exit 1"]),
+                ("trace --diff x --replace", ["bad_option", "exit 1"]),
+                ("trace --diff --list", ["bad_option", "exit 1"])):
+            assert run_command(fresh, command) == expected, (
+                "%r must answer %r" % (command, expected))
+        assert not os.path.exists(trace_records_dir(fresh)), (
+            "a refused --list or --diff must write no record")
+    finally:
+        fresh.stop()
+
+
+TRACE_SCENARIOS = [
+    ("trace answers the fixed field set in order, with its values",
+     scenario_trace_answers_the_fixed_field_set_in_order, HOST_ROOT_REASON),
+    ("trace keeps the record in the state directory and answers it in full",
+     scenario_trace_stores_the_record_and_answers_it_in_full, HOST_ROOT_REASON),
+    ("trace's record survives a restart of the payload",
+     scenario_trace_record_survives_a_restart, HOST_ROOT_REASON),
+    ("trace refuses a bad name with bad_path and writes nothing",
+     scenario_trace_refuses_a_bad_name_with_bad_path, HOST_ROOT_REASON),
+    ("trace refuses an existing name unless --replace is given",
+     scenario_trace_refuses_an_existing_name_unless_replaced, HOST_ROOT_REASON),
+    ("trace keeps a fixed number of records and drops the oldest",
+     scenario_trace_keeps_a_fixed_number_and_drops_the_oldest, HOST_ROOT_REASON),
+    ("trace bounds its answer for a console with many titles",
+     scenario_trace_bounds_the_answer_for_many_directories, HOST_ROOT_REASON),
+    ("trace holds no secret and needs no approval",
+     scenario_trace_holds_no_secret_and_needs_no_approval, HOST_ROOT_REASON),
+    ("trace refuses bad options and arguments before writing",
+     scenario_trace_refuses_bad_options_and_arguments, HOST_ROOT_REASON),
+    ("trace is listed by help, and its fields and bounds are documented",
+     scenario_trace_is_listed_and_documented, HOST_ROOT_REASON),
+    ("trace --list names the records kept in name order, and nothing when there are none",
+     scenario_trace_list_names_the_records_in_order, HOST_ROOT_REASON),
+    ("trace --diff answers the one line that names a removed licence, and the count",
+     scenario_trace_diff_answers_the_line_that_names_a_removed_licence, HOST_ROOT_REASON),
+    ("trace --diff answers trace_unchanged when nothing changed, and rewrites nothing",
+     scenario_trace_diff_answers_trace_unchanged_when_nothing_moved, HOST_ROOT_REASON),
+    ("trace --diff answers trace_missing for a name that is not kept",
+     scenario_trace_diff_answers_trace_missing_for_an_unknown_name, HOST_ROOT_REASON),
+    ("trace --list and --diff refuse bad options and arguments before reading",
+     scenario_trace_list_and_diff_refuse_bad_options_and_arguments, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _, _ in TRACE_SCENARIOS)
+SCENARIOS.extend(TRACE_SCENARIOS)
 
 
 def main():

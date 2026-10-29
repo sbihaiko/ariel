@@ -8,6 +8,7 @@ LDLIBS += -pthread
 BIN  := ariel-host
 SIGNER := ariel-sign
 CANONICAL_TEST := canonical_test
+TITLE_PART_TEST := title_part_test
 
 # The platform port, the agent protocol, the store and the token are shared
 # with the PS5 build, so they live at the repository root.
@@ -21,7 +22,7 @@ SHARED_OBJS := $(notdir $(SHARED_SRCS:.c=.o))
 SRCS := main.c platform_host.c readers_host.c vcontroller.c testclock.c
 OBJS := $(SRCS:.c=.o) $(SHARED_OBJS) sha256.o tweetnacl.o
 
-all: $(BIN) $(SIGNER) $(CANONICAL_TEST)
+all: $(BIN) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 
 $(BIN): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
@@ -58,12 +59,17 @@ $(SIGNER): signer.o approval_signer.o sha256.o tweetnacl.o
 $(CANONICAL_TEST): tests/canonical_test.c approval.o tweetnacl.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+# The install part of each finding, read from the runner the host build links.
+$(TITLE_PART_TEST): tests/title_part_test.c $(filter-out main.o,$(OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 clean:
 	rm -f $(OBJS) $(BIN) signer.o approval_signer.o $(SIGNER) \
-	      $(CANONICAL_TEST)
+	      $(CANONICAL_TEST) $(TITLE_PART_TEST)
 
-test: $(BIN) $(SIGNER) $(CANONICAL_TEST)
+test: $(BIN) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 	./$(CANONICAL_TEST)
+	./$(TITLE_PART_TEST)
 	sh tests/deploy_guard.sh
 	sh ../tools/install/test-install.sh
 	python3 tests/acceptance.py ./$(BIN)

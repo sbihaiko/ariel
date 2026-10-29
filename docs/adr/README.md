@@ -22,3 +22,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0013](0013-the-connection-stack-is-a-budget.md) | The connection stack is a budget every recursive walk fits inside |
 | [0014](0014-the-session-prefix-and-the-resolved-path.md) | The `@` prefix names a session, and a path resolves before the gate |
 | [0015](0015-the-gate-is-one-command.md) | The gate is one command, and it names each half |
+| [0016](0016-a-change-is-complete-when-its-own-signal-says-so.md) | A change is complete when its own signal says so, never when its files stop growing |

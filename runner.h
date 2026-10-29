@@ -17,7 +17,10 @@ along with this program; see the file COPYING. If not, see
 #ifndef ARIEL_RUNNER_H
 #define ARIEL_RUNNER_H
 
+#include <stdint.h>
+
 #include "platform.h"
+#include "sha256.h"
 
 /** The most bytes of output one answer carries, the cut marker included
     (ADR-0012). A reader cuts past it. **/
@@ -44,5 +47,31 @@ int runner_run(platform_t *platform, int argc, char *const argv[], int outfd,
  **/
 int runner_resolve(const runner_session_t *session, const char *path,
                    char *out, size_t size, int errfd);
+
+/**
+ * The part of the installed title at root/user/app/<title> that is missing:
+ * package, sfo, appmeta or licence, the first finding its checks make. Returns
+ * 1 with part set, or 0 when the title is whole.
+ **/
+int runner_title_missing(const char *root, const char *title, const char **part);
+
+/**
+ * The install part a verify finding names, given the text after "finding ".
+ **/
+const char *runner_title_part(const char *finding);
+
+/**
+ * The entries of a title's directory that its checks report as missing or empty.
+ **/
+const char *const *runner_title_entries(size_t *count);
+
+/**
+ * The byte count of the regular file at path, and its SHA-256 read once. Returns
+ * 0 with both set, 1 when path is not a regular file or cannot be read, and 2
+ * with only the byte count set when it is over the verify ceiling, which is not
+ * read.
+ **/
+int runner_package_fact(const char *path, uint64_t *bytes,
+                        char hex[SHA256_HEX_LEN + 1]);
 
 #endif /* ARIEL_RUNNER_H */

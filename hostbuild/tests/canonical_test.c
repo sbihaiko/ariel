@@ -124,6 +124,19 @@ main(void) {
   other.target = "//etc/passwd";
   refused(&other, "a doubled leading slash is refused");
 
+  // A file URI is a local path with its scheme in front, so it encodes as
+  // written and its path part is held to the rules of a path.
+  other.target = "file:///data/a.pkg";
+  expect(encode(&other, out, sizeof(out)) > 0 && strstr(out,
+         "target=file%3A%2F%2F%2Fdata%2Fa.pkg\n"),
+         "a file URI target encodes as written, every unsafe byte escaped");
+  other.target = "file://data/a.pkg";
+  refused(&other, "a file URI with a relative path part is refused");
+  other.target = "file:///data//a.pkg";
+  refused(&other, "an empty segment in a file URI's path is refused");
+  other.target = "file:///data/../a.pkg";
+  refused(&other, "a '..' in a file URI's path is refused");
+
   // Printable ASCII the word rule used to refuse is now carried, escaped
   // as %XX in uppercase so the encoding is injective. '.' is an ordinary
   // byte inside a segment; only '.' and '..' as a whole segment climb.

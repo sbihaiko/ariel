@@ -27,6 +27,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -59,6 +60,10 @@ along with this program; see the file COPYING. If not, see
 #include "platform_ps5.h"
 #include "runner.h"
 #include "store.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /** One prompt fits one notification. **/
 #define PROMPT_MAX 256
@@ -605,6 +610,41 @@ ps5_system_act(platform_t *self, const approval_facts_t *facts) {
 }
 
 
+/**
+ * The install call returns once the request is accepted, so the app
+ * directory it produces is waited for. nanosleep is a cancellation point:
+ * the connection's deadline ends the wait, and the watchdog answers
+ * timed_out rather than this returning an answer of its own.
+ **/
+static int
+ps5_install_result(platform_t *self, const char *title_id, long timeout_ms) {
+  struct timespec pause = {0, 250 * 1000 * 1000};
+  struct stat st;
+  char path[PATH_MAX];
+  long waited = 0;
+
+  (void)self;
+
+  if(!title_id[0] ||
+     snprintf(path, sizeof(path), "/user/app/%s", title_id)
+     >= (int)sizeof(path)) {
+    return 0;
+  }
+  for(;;) {
+    if(!stat(path, &st)) {
+      return S_ISDIR(st.st_mode) ? 1 : 0;
+    }
+    if(waited >= timeout_ms) {
+      return 0;
+    }
+    if(nanosleep(&pause, NULL) && errno != EINTR) {
+      return -1;
+    }
+    waited += 250;
+  }
+}
+
+
 static int
 ps5_http_get(platform_t *self, const char *url, size_t max, http_sink_t sink,
              void *ctx, int *status, char *location, size_t size) {
@@ -643,6 +683,7 @@ static platform_t ps5_platform = {
   .process_signal = ps5_process_signal,
   .reboot = ps5_reboot,
   .system_act = ps5_system_act,
+  .install_result = ps5_install_result,
 };
 
 

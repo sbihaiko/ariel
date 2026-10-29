@@ -40,8 +40,11 @@ along with this program; see the file COPYING. If not, see
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/mount.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#else
+#include <mntent.h>
 #endif
 
 #include "builtins.h"
@@ -325,8 +328,8 @@ run_dmesg(int argc, char *const argv[], int outfd, int errfd, int *status) {
 
 
 /* The host's uptime, in whole seconds. */
-static int
-host_uptime_seconds(unsigned long long *uptime) {
+int
+readers_uptime(unsigned long long *uptime) {
 #if defined(__APPLE__)
   struct timeval boot;
   size_t size = sizeof(boot);
@@ -353,6 +356,38 @@ host_uptime_seconds(unsigned long long *uptime) {
   }
   fclose(file);
   *uptime = (unsigned long long)seconds;
+  return 0;
+#endif
+}
+
+
+/* Each mounted filesystem's target and source, in the order the system lists them. */
+int
+readers_mounts(void (*emit)(void *ctx, const char *target, const char *source),
+               void *ctx) {
+#if defined(__APPLE__)
+  struct statfs *mounts;
+  int count;
+  int i;
+
+  if((count = getmntinfo(&mounts, MNT_NOWAIT)) <= 0) {
+    return -1;
+  }
+  for(i=0; i<count; i++) {
+    emit(ctx, mounts[i].f_mntonname, mounts[i].f_mntfromname);
+  }
+  return 0;
+#else
+  struct mntent *entry;
+  FILE *file;
+
+  if(!(file = setmntent("/proc/mounts", "r"))) {
+    return -1;
+  }
+  while((entry = getmntent(file))) {
+    emit(ctx, entry->mnt_dir, entry->mnt_fsname);
+  }
+  endmntent(file);
   return 0;
 #endif
 }
@@ -418,7 +453,7 @@ run_sysinfo(int json, int argc, char *const argv[], int outfd, int errfd,
     *status = 1;
     return 0;
   }
-  if(host_uptime_seconds(&uptime) || host_memory(&total, &free_bytes)) {
+  if(readers_uptime(&uptime) || host_memory(&total, &free_bytes)) {
     say(errfd, "not available on this platform\n");
     *status = 1;
     return 0;
@@ -562,6 +597,15 @@ readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
 
   if(!strcmp(argv[0], "sysctl")) {
     return run_sysctl(argc, argv, outfd, errfd, status);
+  }
+
+  if(!strcmp(argv[0], "pkg_install")) {
+    // The host has no installer. The console's call returns once the
+    // install is accepted, so the virtual platform does the same and
+    // installs nothing: whether the app directory appeared is what the
+    // test root holds, and the agent reads that itself.
+    *status = 0;
+    return 0;
   }
 
   if((argc == 1 && !strcmp(argv[0], "authid")) || builtin_gated(argv[0])) {

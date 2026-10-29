@@ -289,6 +289,18 @@ struct platform {
   int (*system_act)(platform_t *self, const approval_facts_t *facts);
 
   /**
+   * Wait for an accepted package install to produce its app directory: the
+   * directory the title's own parameter file names, /user/app/<title_id> on
+   * the console. Returns 1 when the directory is there, 0 when the wait
+   * ended without it, and -1 on a platform error. The console waits while
+   * the asynchronous install runs; the host, whose virtual platform installs
+   * nothing, answers at once from what the test root holds, so a scenario
+   * says whether the directory appeared by making it.
+   **/
+  int (*install_result)(platform_t *self, const char *title_id,
+                        long timeout_ms);
+
+  /**
    * Called at each named step of a store change, so a host build can end
    * Ariel there and a test can see what a restart recovers. NULL on the
    * console, where no fault is injected.

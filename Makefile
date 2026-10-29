@@ -51,6 +51,12 @@ ifneq ($(filter test,$(MAKECMDGOALS)),)
 ifneq ($(ARIEL_DEPLOY),yes)
     $(error make test sends ariel-ps5.elf to the console at $(PS5_HOST); run it with ARIEL_DEPLOY=yes to deploy on purpose)
 endif
+# A payload with no anchor refuses every gated command and cannot seed a
+# keyring, so it is never sent to a console: approvals would be impossible
+# until another build replaced it.
+ifeq ($(ARIEL_PUBKEY),)
+    $(error make test deploys an unanchored payload, which refuses every gated command; set ARIEL_PUBKEY and ARIEL_RECOVERY_PUBKEY)
+endif
 endif
 
 ifdef PS5_PAYLOAD_SDK
@@ -59,7 +65,7 @@ else
     $(error PS5_PAYLOAD_SDK is undefined)
 endif
 
-CFLAGS := -Wall -Werror
+CFLAGS := -Wall -Werror -O2
 
 SUBDIRS := bundles/core bundles/http2_get bundles/suspend \
            bundles/launch bundles/hbldr bundles/pkg_install

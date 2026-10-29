@@ -10,7 +10,12 @@ __pycache__/
 *.pyc
 hostbuild/ariel-sign
 hostbuild/canonical_test
+hostbuild/title_part_test
 .red-output.txt
 
 # Local tooling: agent worktrees and per-machine settings, never the repository's.
 .claude/
+runs/.hub/
+
+# The console hosts and the agent token, per machine; never committed.
+ariel.env

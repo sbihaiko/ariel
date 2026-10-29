@@ -281,6 +281,61 @@ fileops_builtin_check(const char *root, const char *path,
 }
 
 
+int
+fileops_local_path(const char *text, char *out, size_t size) {
+  static const char scheme[] = "file://";
+  size_t n = sizeof(scheme) - 1;
+
+  if(!strncmp(text, scheme, n)) {
+    text += n;
+    // The empty authority is the only one this takes: what follows the
+    // scheme is the path itself, which must then be absolute.
+    if(text[0] != '/') {
+      return -1;
+    }
+  }
+  if(snprintf(out, size, "%s", text) >= (int)size) {
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+fileops_title_id(const char *path, char *out, size_t size) {
+  const char *base = strrchr(path, '/');
+  const char *end;
+  size_t n;
+  size_t i;
+
+  base = base ? base + 1 : path;
+  end = strchr(base, '-');
+  if(!end) {
+    // A package without the usual "-..." suffix still names its title, so
+    // the .pkg extension is cut off instead.
+    end = base + strlen(base);
+    if((size_t)(end - base) > 4 && !strncmp(end - 4, ".pkg", 4)) {
+      end -= 4;
+    }
+  }
+  n = (size_t)(end - base);
+  if(!n || n > FILEOPS_TITLE_MAX || n >= size) {
+    return -1;
+  }
+  for(i = 0; i < n; i++) {
+    char c = base[i];
+
+    if(!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9'))) {
+      return -1;
+    }
+  }
+  memcpy(out, base, n);
+  out[n] = '\0';
+  return 0;
+}
+
+
 /** Whether the command sets attributes: chmod, chown or chgrp. **/
 static int
 attribute(const char *command) {

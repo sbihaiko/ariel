@@ -28,4 +28,15 @@ along with this program; see the file COPYING. If not, see
 int readers_run(int json, int argc, char *const argv[], int outfd, int errfd,
                 int *status);
 
+/** The console's uptime in whole seconds. Returns 0, or -1 when it is unknown. */
+int readers_uptime(unsigned long long *seconds);
+
+/**
+ * Call emit once for each mounted filesystem, in the platform's order, with
+ * its target and its source. Returns 0, or -1 when the mount table cannot be
+ * read.
+ **/
+int readers_mounts(void (*emit)(void *ctx, const char *target, const char *source),
+                   void *ctx);
+
 #endif /* ARIEL_READERS_H */

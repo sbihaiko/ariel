@@ -36,6 +36,7 @@ along with this program; see the file COPYING. If not, see
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -316,6 +317,11 @@ host_anchor(platform_t *self, unsigned char primary[APPROVAL_PUBKEY_LEN],
             unsigned char recovery[APPROVAL_PUBKEY_LEN]) {
   (void)self;
 
+  // ARIEL_HOST_ANCHOR_NONE starts a build that pins nothing, as a payload
+  // built without ARIEL_PUBKEY does. The host build only.
+  if(getenv("ARIEL_HOST_ANCHOR_NONE")) {
+    return -1;
+  }
   memcpy(primary, host_anchor_primary, APPROVAL_PUBKEY_LEN);
   memcpy(recovery, host_anchor_recovery, APPROVAL_PUBKEY_LEN);
   return 0;
@@ -825,9 +831,36 @@ host_system_act(platform_t *self, const approval_facts_t *facts) {
 
 
 /**
+ * The host has no installer. A granted install is accepted and installs
+ * nothing, exactly as the console's asynchronous call returns once it is
+ * accepted; a scenario says the app directory appeared by making it below
+ * the root, so the answer is what the root holds now.
+ **/
+static int
+host_install_result(platform_t *self, const char *title_id, long timeout_ms) {
+  char path[PATH_MAX];
+  struct stat st;
+
+  (void)timeout_ms;
+
+  if(!title_id[0] ||
+     snprintf(path, sizeof(path), "%s/user/app/%s", self->fs_root, title_id)
+     >= (int)sizeof(path)) {
+    return 0;
+  }
+  if(stat(path, &st)) {
+    return 0;
+  }
+  return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+
+
+/**
  * ARIEL_HOST_FAULT names the step at which this build ends itself. The
- * process aborts there, with nothing flushed after the step, so a restart
- * meets the store as the crash left it.
+ * process exits there, with nothing flushed after the step, so a restart
+ * meets the store as the crash left it. It leaves by _exit rather than
+ * abort: SIGABRT makes macOS write a crash report for every injected step of
+ * every test run, and a recovery test only needs the store left mid-change.
  **/
 static void
 host_fault(platform_t *self, const char *step) {
@@ -836,7 +869,7 @@ host_fault(platform_t *self, const char *step) {
   (void)self;
 
   if(want && !strcmp(want, step)) {
-    abort();
+    _exit(EXIT_FAILURE);
   }
 }
 
@@ -888,6 +921,7 @@ static platform_t host_platform = {
   .http_get = host_http_get,
   .run = host_run,
   .system_act = host_system_act,
+  .install_result = host_install_result,
   .fault = host_fault,
   .processes = host_processes,
   .process_start = host_process_start,
