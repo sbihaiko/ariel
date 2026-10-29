@@ -97,6 +97,41 @@ enough to be written down, because a client that assumes normal FTP gets a
 - Names on this console start with a dash (`-JOURNEY-.bin`), so a client that
   hands paths to a shell breaks on them.
 
+## Shutting down a frozen console without losing the storage
+
+Measured on 2026-10-29, on the same CFI-2014 at 11.20, after the screen froze
+with a game in the foreground. The console was **not** dead: the shell on 2323
+still answered and `ps` showed every payload alive. The freeze was the picture,
+not the system. Pulling the power there is the same shape as the four losses in
+[ps5-data-loss.md](ps5-data-loss.md) — writes in flight, power gone.
+
+The procedure, in this order:
+
+1. **`sync` first**, through `shsrv` on 2323. It answers with nothing, which is
+   success; a failure would print an error. This is the step that costs nothing
+   and is skipped by reflex.
+2. **Read the kernel log on 3232** and let the unmount finish. A clean shutdown
+   prints, in order: `AutoMounter ... fakeEjection`, `unmountExFat` naming each
+   device and its mount point (`/dev/da1s1` from `/mnt/usb0`, `/dev/da2s1` from
+   `/mnt/usb1`), `Notify PsmEvent OnUsbStorageUnmounted` for each, and
+   `end of usb suspend handler`. Wait for the last one before touching the power
+   button.
+3. **Hold the power button for about 10 seconds**, until it beeps twice, then
+   wait and power it on from the button.
+4. **Redo the entry chain**: the exploit is tethered, so nothing above survives.
+   Open `PINK00001` (WebKit Autoloader), which loads `autoload.txt` from
+   `/mnt/usb0/ps5_autoloader/` — `kstuff`, `shadowmountplus`, `ftpsrv`, `ariel`.
+
+There is no `reboot` in the shell. `help` on 2323 lists `suspend` and `kill`
+and nothing that restarts the machine, and `kill` on init is a panic reboot on
+a console with four recorded losses — not a recovery.
+
+What this does and does not claim: after the restart every port was closed
+until the autoloader ran again, which is the expected tethered behaviour. The
+procedure was not falsified against a console that would have lost data without
+it; it is written down because the alternative is a power cut with the cache
+dirty, and this console has four losses of that shape already.
+
 ## What the day showed
 
 No freeze, with the payloads loaded and unloaded between sessions — recorded in
