@@ -5519,6 +5519,17 @@ def scenario_ln_symlink_relative_target_is_bad_path(server):
     assert not os.path.lexists(link), "a refused ln -s must create nothing"
 
 
+def scenario_ln_symlink_refuses_a_target_through_a_directory_link(server):
+    """A target that reaches the state directory through a directory link answers protected."""
+    state = os.path.dirname(secret_path(server, "token"))
+    hop = write_path(server, "sym-hop")
+    make_link(hop, os.path.dirname(state), hard=False)
+    link = write_path(server, "sym-hop-link")
+    assert run_command(server, symlink_line(os.path.join(hop, "ariel", "token"), link)) == [
+        "protected", "exit 87"], "a target reached through a directory link must answer protected"
+    assert not os.path.lexists(link), "a refused ln -s must create nothing"
+
+
 def scenario_ln_symlink_is_no_transfer_source_or_write_target(server):
     """A link made by ln -s is refused as a source; no write or unzip goes through it."""
     target = make_transfer_file(server, "sym-src-target")
@@ -5539,7 +5550,9 @@ def scenario_ln_symlink_is_no_transfer_source_or_write_target(server):
 
     folder = unzip_destination(server, "sym-dir")
     folder_link = write_path(server, "sym-dir-link")
-    make_link(folder_link, folder, hard=False)
+    approval, challenge = transfer_request(server, symlink_line(folder, folder_link))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, symlink_line(folder, folder_link)) == ["exit 0"]
     archive = make_archive(server, "sym-archive", [("top.txt", b"top\n")])
     assert run_command(server, unzip_line(archive, folder_link)) == [
         "symbolic_link", "exit 1"], "unzip must refuse a link as its destination"
@@ -5599,6 +5612,27 @@ def scenario_mv_across_filesystems_copies_then_removes(server):
     run_with_server({"ARIEL_HOST_RENAME_EXDEV": "1"}, check)
 
 
+MOVE_RACE_BYTES = b"appeared after the check\n"
+
+
+def scenario_mv_never_replaces_a_destination_that_appears(server):
+    """A destination created after the check is kept: mv answers exists and replaces nothing."""
+    del server  # this scenario runs a server whose destination appears inside mv
+
+    def check(racing):
+        source = make_transfer_file(racing, "mv-race-src")
+        destination = write_path(racing, "mv-race-dst")
+        line = transfer_line("mv", source, destination)
+        approval, challenge = transfer_request(racing, line)
+        sign_and_grant(racing, approval, challenge)
+        assert run_command(racing, line) == ["exists", "exit 1"], (
+            "an mv whose destination appeared must answer exists")
+        assert read_bytes(destination) == MOVE_RACE_BYTES, "mv must keep the destination"
+        assert read_bytes(source) == TRANSFER_BYTES, "mv must keep the source"
+
+    run_with_server({"ARIEL_HOST_DEST_APPEARS": "1"}, check)
+
+
 SYMLINK_SCENARIOS = [
     ("ln -s makes a link once the owner signs; file names it; state stays protected",
      scenario_ln_symlink_creates_a_link_the_owner_signs, HOST_ROOT_REASON),
@@ -5612,6 +5646,10 @@ SYMLINK_SCENARIOS = [
      scenario_mv_in_one_filesystem_needs_no_hard_link, HOST_ROOT_REASON),
     ("mv across filesystems copies the bytes and then removes the source",
      scenario_mv_across_filesystems_copies_then_removes, HOST_ROOT_REASON),
+    ("ln -s refuses a target reached through a directory link into the state directory",
+     scenario_ln_symlink_refuses_a_target_through_a_directory_link, HOST_ROOT_REASON),
+    ("mv never replaces a destination that appears after the check",
+     scenario_mv_never_replaces_a_destination_that_appears, HOST_ROOT_REASON),
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _scenario, _reason in SYMLINK_SCENARIOS)
 
