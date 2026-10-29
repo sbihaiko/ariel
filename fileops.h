@@ -120,6 +120,26 @@ int fileops_transfer_act(const char *root, const char *command,
                          const approval_facts_t *expected);
 
 /**
+ * Check one symbolic link, ln -s TARGET PATH, without acting. target is the
+ * text the link will carry, so it is written into the link as it stands and
+ * never resolved against a session: it must be absolute. path is checked as
+ * the destination of a transfer, below a writable root and absent. A target
+ * that names a protected object is refused. The link's own kind, device and
+ * inode go into facts. Returns FILEOPS_OK or the refusal that stops it.
+ **/
+int fileops_symlink_check(const char *root, const char *target,
+                          const char *path, approval_facts_t *facts);
+
+/**
+ * Make the symbolic link whose text is target at path, after checking that
+ * target and path are still the ones expected names, in its target and its
+ * destination, and that path is still absent. Returns FILEOPS_OK,
+ * FILEOPS_CHANGED or the refusal.
+ **/
+int fileops_symlink_act(const char *root, const char *target, const char *path,
+                        const approval_facts_t *expected);
+
+/**
  * Check a recursive rm of path, the whole tree below it included, without
  * acting. Every entry must be a regular file or a directory: a link answers
  * FILEOPS_LINK, a link to a protected object or a protected entry answers

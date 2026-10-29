@@ -1216,6 +1216,9 @@ FAULT_SCENARIOS = {
     "back after restart",
     "a committed autoload edit whose list file is gone rolls forward at the "
     "next start",
+    # The host has no second file system to try a move across, so the build
+    # answers EXDEV for the rename when ARIEL_HOST_MOVE_EXDEV is set.
+    "mv across file systems copies and then removes the source",
 }
 
 # The scenarios that rewrite or remove the state file on the host's disk,
@@ -1438,6 +1441,13 @@ HOST_ROOT_SCENARIOS = {
     "cp, mv and ln audit each action and refusal, and audit tail shows them",
     "the challenge of cp names both paths, sha256 none and the source's "
     "identity",
+    "ln -s asks the owner, binds the link and its target text, then makes a "
+    "symbolic link that file names as one",
+    "ln -s refuses a relative target with bad_path and a protected one with "
+    "protected, and creates nothing",
+    "cp, mv, write, unzip, rm and chmod never follow a link made by ln -s",
+    "mv inside one file system renames, so the source is gone and the object "
+    "kept",
     "a system command on Ariel's token or outside the writable roots answers "
     "protected and exit 87 without asking",
     "unzip -l lists the members at once, and a file that is no zip answers "
@@ -5449,6 +5459,168 @@ def scenario_transfer_action_names_its_facts(server):
     assert "\ntarget=%s\n" % source in action, action
     assert "\ndestination=%s\n" % destination in action, action
     assert "\nsha256=none\n" in action, action
+
+
+# ---------------------------------------------------------------------------
+# Symbolic links (ln -s) and the move that renames (issue 137).
+# ---------------------------------------------------------------------------
+
+def symlink_line(target, path):
+    return "ln -s %s %s" % (target, path)
+
+
+def scenario_ln_s_makes_a_symbolic_link(server):
+    """ln -s asks the owner, binds the link and its target text, then makes a link."""
+    target = make_transfer_file(server, "xsym-target", b"symbolic bytes\n")
+    path = os.path.join(server.root, "data", "xsym-link")
+    line = symlink_line(target, path)
+
+    approval, challenge = transfer_request(server, line)
+    assert not os.path.lexists(path), "an unsigned ln -s must not run"
+    action = decoded_action(challenge_action(challenge))
+    assert action.startswith("ariel-action-v1\ncommand=ln\n"), action
+    assert "\ntarget=%s\n" % target in action, action
+    assert "\ndestination=%s\n" % path in action, action
+    assert "\nsha256=none\n" in action, action
+
+    sign_and_grant(server, approval, challenge)
+    lines = run_command(server, line)
+    assert lines == ["exit 0"], "a signed ln -s must run, got %r" % lines
+    assert os.path.islink(path), "ln -s must create a symbolic link"
+    assert os.readlink(path) == target, "the link's text must be its target"
+
+    assert run_command(server, "file " + path) == [
+        "%s: symbolic link" % path, "exit 0"], (
+        "file must name a symbolic link as a symbolic link")
+    lines = run_command(server, "cat " + path)
+    assert lines == ["symbolic bytes", "exit 0"], (
+        "cat must read through a link to a file, got %r" % (lines,))
+
+    assert run_command(server, transfer_line("ln", target, path)) == [
+        "exists", "exit 1"], (
+        "a hard link onto an existing link must answer exists, not replace it")
+    assert os.path.islink(path), "the refused hard link must leave the link alone"
+
+
+def scenario_ln_s_refuses_a_relative_or_protected_target(server):
+    """ln -s refuses a relative target as bad_path and a protected one as protected."""
+    make_transfer_file(server, "xsym-abs")
+    path = os.path.join(server.root, "data", "xsym-relative")
+    assert run_command(server, symlink_line("relative/target", path)) == [
+        "bad_path", "exit 1"], "a relative target must answer bad_path"
+    assert not os.path.lexists(path), "a refused ln -s must create nothing"
+
+    token = secret_path(server, "token")
+    protected = os.path.join(server.root, "data", "xsym-protected")
+    assert run_command(server, symlink_line(token, protected)) == [
+        "protected", "exit 87"], (
+        "a link to a protected object must answer protected")
+    assert run_command(server, symlink_line(os.path.dirname(token),
+                                            protected)) == [
+        "protected", "exit 87"], (
+        "a link to the state directory must answer protected")
+    alias = os.path.join(server.root, "data", "xsym-alias")
+    make_link(alias, token, hard=False)
+    assert run_command(server, symlink_line(alias, protected)) == [
+        "protected", "exit 87"], (
+        "a link to a link into a protected object must answer protected")
+    assert not os.path.lexists(protected), "a refused ln -s must create nothing"
+
+
+def scenario_a_symbolic_link_is_not_followed(server):
+    """cp, mv, write, unzip, rm and chmod look at a ln -s link, never through it."""
+    target = make_transfer_file(server, "xsym-body", b"linked body\n")
+    path = os.path.join(server.root, "data", "xsym-shy")
+    line = symlink_line(target, path)
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    lines = run_command(server, line)
+    assert lines == ["exit 0"], "the link must be made, got %r" % lines
+
+    destination = os.path.join(server.root, "data", "xsym-copy")
+    for command in ("cp", "mv"):
+        assert run_command(server, transfer_line(command, path, destination)) == [
+            "symbolic_link", "exit 1"], (
+            "%s must refuse a symbolic link as its source" % command)
+    assert not os.path.lexists(destination), (
+        "a refused transfer must create nothing")
+
+    assert write_frame(server, path, b"overwritten\n") == ["exists", "exit 1"], (
+        "write must not write through a link")
+    assert read_bytes(target) == b"linked body\n", (
+        "write must leave the link's target alone")
+
+    # A member that names an existing link in the destination refuses the
+    # whole archive: nothing is written through the link.
+    into = unzip_destination(server, "xsym-dest")
+    member = os.path.join(into, "xsym-shy")
+    approval, challenge = transfer_request(server, symlink_line(target, member))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, symlink_line(target, member)) == ["exit 0"], (
+        "a second signed ln -s must run")
+    archive = make_archive(server, "xsym.zip", [("xsym-shy", b"archive\n")])
+    lines = run_command(server, unzip_line(archive, into))
+    assert lines == ["exists", "exit 1"], (
+        "unzip must not write through a link, got %r" % (lines,))
+    assert read_bytes(target) == b"linked body\n", (
+        "unzip must leave the link's target alone")
+    assert os.path.islink(member), "unzip must leave the link alone"
+
+    assert run_command(server, "rm " + path) == ["symbolic_link", "exit 1"], (
+        "rm must never follow a link")
+    assert os.path.islink(path), "a refused rm must leave the link"
+    mode = stat.S_IMODE(os.lstat(target).st_mode)
+    assert run_command(server, "chmod 600 " + path) == [
+        "symbolic_link", "exit 1"], "chmod must never follow a link"
+    assert stat.S_IMODE(os.lstat(target).st_mode) == mode, (
+        "chmod must leave the link's target's mode alone")
+
+    alias = os.path.join(server.root, "data", "xsym-into-state")
+    make_link(alias, secret_path(server, "token"), hard=False)
+    assert_protected(server, "cat " + alias)
+
+
+def scenario_mv_renames_within_one_file_system(server):
+    """mv inside one file system renames: the source is gone and the object kept."""
+    source = make_transfer_file(server, "xmv-rename-src", b"rename bytes\n")
+    kept = os.path.join(server.root, "data", "xmv-rename-kept")
+    os.link(source, kept)
+    destination = os.path.join(server.root, "data", "xmv-rename-dst")
+    line = transfer_line("mv", source, destination)
+
+    approval, challenge = transfer_request(server, line)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], "a signed mv must run"
+    assert not os.path.lexists(source), "mv must remove the source name"
+    assert read_bytes(destination) == b"rename bytes\n", (
+        "the destination must carry the source's bytes")
+    assert os.path.samefile(destination, kept), (
+        "a move inside one file system must rename the object, not copy it")
+
+
+def scenario_mv_across_filesystems_copies_then_removes(server):
+    """mv across file systems, where the rename answers EXDEV, copies and removes."""
+    del server  # this scenario needs a server whose rename answers EXDEV
+    crossed = Server(SERVER_BINARY, env={"ARIEL_HOST_MOVE_EXDEV": "1"})
+    try:
+        source = make_transfer_file(crossed, "xmv-copy-src", b"copy bytes\n")
+        kept = os.path.join(crossed.root, "data", "xmv-copy-kept")
+        os.link(source, kept)
+        destination = os.path.join(crossed.root, "data", "xmv-copy-dst")
+        line = transfer_line("mv", source, destination)
+
+        approval, challenge = transfer_request(crossed, line)
+        sign_and_grant(crossed, approval, challenge)
+        assert run_command(crossed, line) == ["exit 0"], "a signed mv must run"
+        assert not os.path.lexists(source), "mv must remove the source name"
+        assert read_bytes(destination) == b"copy bytes\n", (
+            "a move across file systems must give the destination the bytes")
+        assert not os.path.samefile(destination, kept), (
+            "a move across file systems must copy: the destination is new")
+        assert read_bytes(kept) == b"copy bytes\n", (
+            "a copy-move must leave the other name of the source alone")
+    finally:
+        crossed.stop()
 
 
 WRITE_BYTES = b"written through the shell\n"
@@ -11004,6 +11176,18 @@ SCENARIOS = [
      scenario_transfer_actions_are_audited, HOST_ROOT_REASON),
     ("the challenge of cp names both paths, sha256 none and the source's "
      "identity", scenario_transfer_action_names_its_facts, HOST_ROOT_REASON),
+    ("ln -s asks the owner, binds the link and its target text, then makes a "
+     "symbolic link that file names as one",
+     scenario_ln_s_makes_a_symbolic_link, HOST_ROOT_REASON),
+    ("ln -s refuses a relative target with bad_path and a protected one with "
+     "protected, and creates nothing",
+     scenario_ln_s_refuses_a_relative_or_protected_target, HOST_ROOT_REASON),
+    ("cp, mv, write, unzip, rm and chmod never follow a link made by ln -s",
+     scenario_a_symbolic_link_is_not_followed, HOST_ROOT_REASON),
+    ("mv inside one file system renames, so the source is gone and the object "
+     "kept", scenario_mv_renames_within_one_file_system, HOST_ROOT_REASON),
+    ("mv across file systems copies and then removes the source",
+     scenario_mv_across_filesystems_copies_then_removes, FAULT_REASON),
     ("ls -l shows detail, ls -a adds the hidden entries, and ls -x is bad_option",
      scenario_ls_long_and_all, HOST_ROOT_REASON),
     ("grep -r searches a tree; -l names files, -c counts, -l wins over -c",

@@ -1186,6 +1186,50 @@ transfer_command(agent_t *agent, int fd, runner_session_t *session,
 
 
 /**
+ * ln -s TARGET PATH: a symbolic link at PATH whose text is TARGET. The target
+ * is written into the link as it stands, so it is not resolved against a
+ * session; the challenge binds it beside the link's path.
+ **/
+static void
+symlink_command(agent_t *agent, int fd, runner_session_t *session,
+                const char *target, const char *path) {
+  const char *root = agent->platform->fs_root;
+  char resolved_path[GATED_PATH_MAX];
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int rc;
+
+  if(!(path=session_operand(session, path, resolved_path,
+                            sizeof(resolved_path), fd))) {
+    return;
+  }
+
+  if(strlen(target) + strlen(path) + 1 > TRANSFER_SUBJECT_MAX) {
+    file_outcome(fd, "ln", "-", "-", FILEOPS_BAD_PATH);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_symlink_check(root, target, path, &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, "ln", subject_of(target, path, subject), "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "ln");
+  snprintf(facts.target, sizeof(facts.target), "%s", target);
+  snprintf(facts.dest, sizeof(facts.dest), "%s", path);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_symlink_act(root, target, path, &facts);
+  file_outcome(fd, "ln", subject_of(target, path, subject), challenge.id, rc);
+}
+
+
+/**
  * The options of the file commands. rm -r and cp -r take the tree below their
  * operands; any other option answers bad_option and asks nobody. Returns 1
  * when the line was answered here.
@@ -1201,6 +1245,21 @@ file_options(agent_t *agent, int fd, runner_session_t *session, int argc,
      strcmp(argv[0], "rmdir") && strcmp(argv[0], "touch") &&
      strcmp(argv[0], "mv") && strcmp(argv[0], "ln")) {
     return 0;
+  }
+
+  // ln -s TARGET PATH is the symbolic form: its target is not an option and
+  // is not resolved against a session, so the pair is counted here.
+  if(!strcmp(argv[0], "ln") && argc >= 2 && !strcmp(argv[1], "-s")) {
+    int operands = argc - 2;
+
+    if(operands < 2) {
+      audit_reply(fd, argv[0], "refused", "-", "-", missing_operand);
+    } else if(operands > 2) {
+      audit_reply(fd, argv[0], "refused", "-", "-", bad_argument);
+    } else {
+      symlink_command(agent, fd, session, argv[2], argv[3]);
+    }
+    return 1;
   }
 
   recursive = argc >= 2 && !strcmp(argv[1], "-r") &&

@@ -976,27 +976,88 @@ copy_entry(int sdir, const char *sleaf, const expected_object_t *expected,
 
 
 /**
- * Give the source's file a second name, then take the first one away. A
- * link never replaces an existing name, so an existing destination is kept.
- * The source is checked again before its name goes; a different object there
- * is taken back out of the destination.
+ * Rename the name sleaf in sdir to dleaf in ddir. Returns 0, or the errno of
+ * a refused rename. This console supports a rename where it refuses a hard
+ * link, so a move inside one file system is this call and nothing else.
+ **/
+static int
+rename_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
+#ifdef ARIEL_HOST_BUILD
+  // The host suite has no second file system to try a move across, so a
+  // build told to answer EXDEV here takes the fallback below as a console
+  // with two file systems does.
+  if(getenv("ARIEL_HOST_MOVE_EXDEV")) {
+    return EXDEV;
+  }
+#endif
+  return renameat(sdir, sleaf, ddir, dleaf) ? errno : 0;
+}
+
+
+/** Give sleaf in sdir the second name dleaf in ddir. Returns 0, or the errno. **/
+static int
+link_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
+#ifdef ARIEL_HOST_BUILD
+  // The same injected console has no hard link to offer across file systems:
+  // that is the refusal this console answers, and why a move across falls
+  // back to a copy.
+  if(getenv("ARIEL_HOST_MOVE_EXDEV")) {
+    return EPERM;
+  }
+#endif
+  return linkat(sdir, sleaf, ddir, dleaf, 0) ? errno : 0;
+}
+
+
+/**
+ * Move the name sleaf in sdir to dleaf in ddir. A rename does it when both
+ * names are on one file system. Only a rename refused with EXDEV falls back to
+ * two steps: the source is given the second name, by a hard link where the
+ * file system holds one and by a copy where it does not, and then the first
+ * name goes. Neither step replaces an existing name, so an existing
+ * destination is kept. The source is checked again before its name goes; a
+ * different object there is taken back out of the destination.
  **/
 static int
 move_entry(int sdir, const char *sleaf, const expected_object_t *expected,
            int ddir, const char *dleaf) {
   struct stat st;
-  int rc = FILEOPS_OK;
+  int err;
+  int rc;
 
-  if(linkat(sdir, sleaf, ddir, dleaf, 0)) {
-    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  if(fstatat(sdir, sleaf, &st, AT_SYMLINK_NOFOLLOW)) {
+    return errno == ENOENT ? FILEOPS_CHANGED : FILEOPS_FAILED;
+  }
+  if((uint64_t)st.st_dev != expected->dev ||
+     (uint64_t)st.st_ino != expected->ino) {
+    return FILEOPS_CHANGED;
   }
 
-  if(fstatat(sdir, sleaf, &st, AT_SYMLINK_NOFOLLOW) ||
-     (uint64_t)st.st_dev != expected->dev ||
-     (uint64_t)st.st_ino != expected->ino) {
-    rc = FILEOPS_CHANGED;
-  } else if(unlinkat(sdir, sleaf, 0)) {
-    rc = FILEOPS_FAILED;
+  err = rename_entry(sdir, sleaf, ddir, dleaf);
+  if(!err) {
+    return FILEOPS_OK;
+  }
+  if(err != EXDEV) {
+    return err == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+
+  err = link_entry(sdir, sleaf, ddir, dleaf);
+  if(!err) {
+    rc = FILEOPS_OK;
+  } else if(err == EEXIST) {
+    return FILEOPS_EXISTS;
+  } else {
+    rc = copy_entry(sdir, sleaf, expected, ddir, dleaf);
+  }
+
+  if(rc == FILEOPS_OK) {
+    if(fstatat(sdir, sleaf, &st, AT_SYMLINK_NOFOLLOW) ||
+       (uint64_t)st.st_dev != expected->dev ||
+       (uint64_t)st.st_ino != expected->ino) {
+      rc = FILEOPS_CHANGED;
+    } else if(unlinkat(sdir, sleaf, 0)) {
+      rc = FILEOPS_FAILED;
+    }
   }
 
   if(rc) {
@@ -1086,6 +1147,106 @@ fileops_transfer_act(const char *root, const char *command,
   }
 
   close(sdir);
+  close(ddir);
+  return rc;
+}
+
+
+/**
+ * Whether target, the text a symbolic link will carry, names a protected
+ * object. The parent directory is walked as a read of the target would walk
+ * it, and the entry at its last name is asked of entry_protected, which
+ * follows a link there: an alias of the token is the token.
+ **/
+static int
+symlink_target_check(const char *root, const char *target) {
+  const char *rel;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  rel = below(root, target);
+  if(!rel) {
+    // The link would name nothing this port can reach, and a read through it
+    // would answer protected: nothing is gained by making it.
+    return FILEOPS_PROTECTED;
+  }
+
+  rc = parent_open(root, rel, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    // A target whose directory cannot be walked names no object that exists,
+    // so a link to it is dangling rather than protected. A walk that stopped
+    // at a protected directory is the one refusal kept.
+    return rc == FILEOPS_PROTECTED ? FILEOPS_PROTECTED : FILEOPS_OK;
+  }
+
+  rc = entry_protected(dirfd, leaf) ? FILEOPS_PROTECTED : FILEOPS_OK;
+  close(dirfd);
+  return rc;
+}
+
+
+int
+fileops_symlink_check(const char *root, const char *target, const char *path,
+                      approval_facts_t *facts) {
+  char dleaf[PATH_MAX];
+  int ddir;
+  int rc;
+
+  // The target is copied into the link byte for byte, so it is not resolved
+  // against a session and it must be absolute, as every path on the port is.
+  if(target[0] != '/' || !approval_target_valid(target)) {
+    return FILEOPS_BAD_PATH;
+  }
+
+  rc = symlink_target_check(root, target);
+  if(rc) {
+    return rc;
+  }
+
+  // The link's own path is checked as the destination of a transfer: below a
+  // writable root, its directory not protected, and nothing there to replace.
+  rc = transfer_inspect(root, path, facts, &ddir, dleaf, sizeof(dleaf));
+  if(rc) {
+    return rc;
+  }
+  close(ddir);
+
+  return strcmp(facts->kind, "absent") ? FILEOPS_EXISTS : FILEOPS_OK;
+}
+
+
+int
+fileops_symlink_act(const char *root, const char *target, const char *path,
+                    const approval_facts_t *expected) {
+  approval_facts_t now;
+  char dleaf[PATH_MAX];
+  int ddir;
+  int rc;
+
+  // The signed action names the target text as its target and the link's own
+  // path as its destination, so both are the ones this call must still see.
+  if(strcmp(target, expected->target) || strcmp(path, expected->dest)) {
+    return FILEOPS_CHANGED;
+  }
+  rc = symlink_target_check(root, target);
+  if(rc) {
+    return rc;
+  }
+
+  memset(&now, 0, sizeof(now));
+  rc = transfer_inspect(root, path, &now, &ddir, dleaf, sizeof(dleaf));
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(now.kind, "absent") || now.dev != expected->dev ||
+     now.ino != expected->ino) {
+    close(ddir);
+    return FILEOPS_CHANGED;
+  }
+
+  rc = symlinkat(target, ddir, dleaf) ?
+       (errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED) : FILEOPS_OK;
   close(ddir);
   return rc;
 }

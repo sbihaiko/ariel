@@ -754,18 +754,32 @@ run_stat(int json, int argc, char *const argv[], int outfd, int errfd) {
 
 static int
 run_file(int argc, char *const argv[], int outfd, int errfd) {
+  char resolved[PATH_MAX];
   struct stat st;
   const char *kind;
-  int rc;
+  int err;
 
   if(argc != 2) {
     return bad_arguments("file", errfd);
   }
-  if((rc=stat_target("file", argv[1], errfd, &st))) {
-    return rc;
+  if(resolve_operand(argv[1], resolved, sizeof(resolved), errfd)) {
+    return 1;
+  }
+  if(refuse_protected(resolved, errfd)) {
+    return STATUS_PROTECTED;
   }
 
-  if(S_ISDIR(st.st_mode)) {
+  // lstat, so a name answers for itself: a symbolic link is one whether its
+  // target exists or not, and reading through it is what cat is for.
+  if(lstat(resolved, &st)) {
+    err = errno;
+    report("file", resolved, errfd, err);
+    return 1;
+  }
+
+  if(S_ISLNK(st.st_mode)) {
+    kind = "symbolic link";
+  } else if(S_ISDIR(st.st_mode)) {
     kind = "directory";
   } else if(S_ISREG(st.st_mode)) {
     kind = "regular file";
