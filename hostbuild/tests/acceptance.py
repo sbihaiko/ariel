@@ -1246,6 +1246,12 @@ RELEASE_FIXTURE_REASON = ("needs the fake release server and an allowlist the "
 HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console "
                        "would turn into a reboot")
 
+# A scenario that stubs the host build's platform: as the console build, which
+# has no restart route, or with removable volumes a computer does not mount.
+# Console mode cannot stub its own platform.
+HOST_STUB_REASON = ("needs the host build's platform port stubbed, which "
+                    "console mode cannot do")
+
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
@@ -1394,6 +1400,18 @@ HOST_RESTART_SCENARIOS = {
     "safe_boot_pending, exit 1, and asks nothing",
 }
 
+# The scenarios that stub the host build's platform, as the console build's or
+# with mounted volumes a computer does not have. A console's platform is the
+# console itself, so these never run there.
+HOST_STUB_SCENARIOS = {
+    "on the console build reboot answers reboot_unsupported, exit 1, and "
+    "asks nobody",
+    "shutdown answers 75 with a challenge carrying the mounted removable "
+    "volumes and its sha256",
+    "a granted shutdown answers shutting_down, is audited in order, and ends "
+    "the process",
+}
+
 # The scenarios that need the host test root: they write scratch files or
 # links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
@@ -1514,8 +1532,8 @@ def scenario_console_mode_plan(server):
 
     expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
                       | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS
-                      | HOST_RESTART_SCENARIOS | RELEASE_SCENARIOS
-                      | HOST_MACHINE_SCENARIOS)
+                      | HOST_RESTART_SCENARIOS | HOST_STUB_SCENARIOS
+                      | RELEASE_SCENARIOS | HOST_MACHINE_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
         "clock, the host test root, the fault injector or the host's files:"
@@ -2148,22 +2166,24 @@ def scenario_console_pkg_install_checks_skip_without_a_fixture(server):
 
 
 def scenario_console_gated_asks_wait_out_busy(server):
-    """reboot and a sysctl write wait out approval_busy before they assert 75."""
+    """A sysctl write waits out approval_busy before it asserts 75; reboot asks nobody."""
     del server  # the scripted link stands in for the agent port
 
+    command = "sysctl kern.ostype=Other"
     busy = ["approval_busy", "exit 76"]
-    for command in ("reboot", "sysctl kern.ostype=Other"):
-        console, link, _operator, session, events, _shown = scripted_session(
-            [busy, ["approval_required a-1", "challenge a-1 00", "exit 75"]])
-        console.ask_without_grant(session, command)
-        sent = [event for event in events if event[0] == "send"]
-        assert sent == [("send", command), ("send", command)], (
-            "%s must be sent again after approval_busy, sent %r"
-            % (command, sent))
-
-    console, link, _operator, session, _events, _shown = scripted_session(
+    console, link, _operator, session, events, _shown = scripted_session(
         [busy, ["approval_required a-1", "challenge a-1 00", "exit 75"]])
-    console.check_reboot_asks_the_owner(session, None)
+    console.ask_without_grant(session, command)
+    sent = [event for event in events if event[0] == "send"]
+    assert sent == [("send", command), ("send", command)], (
+        "%s must be sent again after approval_busy, sent %r"
+        % (command, sent))
+
+    # reboot is not gated on the console: it refuses before the owner is
+    # asked, so a busy notification gap never reaches it.
+    console, link, _operator, session, _events, _shown = scripted_session(
+        [["reboot_unsupported", "exit 1"]])
+    console.check_reboot_is_unsupported(session, None)
 
     # The suite leaves approvals pending by design (no console refusal), and
     # Ariel keeps at most PENDING_MAX open until each expires; the busy
@@ -9353,6 +9373,83 @@ def scenario_reboot_is_audited(server):
         "the reboot must be audited in order, got %r" % ours)
 
 
+def scenario_reboot_unsupported_on_the_console(server):
+    """The console build refuses reboot before anyone is asked to sign it.
+
+    No route from a payload restarts this console (docs/console-findings.md,
+    #135), so the platform port is stubbed as the console build's here.
+    """
+    del server  # the stub lives in this server's own platform port
+    console = Server(SERVER_BINARY, env={"ARIEL_HOST_CONSOLE_STUB": "1"})
+    try:
+        lines = run_command(console, "reboot")
+        assert lines == ["reboot_unsupported", "exit 1"], (
+            "a console's reboot must answer reboot_unsupported and exit 1, "
+            "got %r" % lines)
+        assert not any(line.startswith(("approval_required", "challenge"))
+                       for line in lines), (
+            "a console's reboot must make no challenge, got %r" % lines)
+        console.assert_no_line()
+        events = [line.split()[1] for line in audit_tail(console)
+                  if line != "exit 0"]
+        assert "reboot.unsupported" in events, (
+            "the refused reboot must be audited, got %r" % events)
+        assert "reboot.request" not in events, (
+            "reboot must ask nobody, so there is no request to audit, got %r"
+            % events)
+    finally:
+        console.stop()
+
+
+def scenario_shutdown_challenge_binds_the_mounts(server):
+    """shutdown's challenge names the mounted volumes it will unmount, in order."""
+    del server  # a computer mounts neither volume, so this server names them
+    console = Server(SERVER_BINARY,
+                     env={"ARIEL_HOST_MOUNTS": "/mnt/usb1,/mnt/usb0"})
+    try:
+        _approval, challenge = gate_request(console, "shutdown")
+        mounts = "/mnt/usb0,/mnt/usb1"
+        action = action_facts(challenge)
+        assert "command=shutdown" in action and "target=console" in action, (
+            "the challenge must name shutdown on the console, got %r" % action)
+        assert "option.mounts=%s" % mounts in action, (
+            "the challenge must carry the ordered mount list, got %r" % action)
+        assert ("sha256=%s" % hashlib.sha256(mounts.encode("ascii")).hexdigest()
+                in action), (
+            "the challenge must carry the hash of the mount list, got %r"
+            % action)
+        help_lines = run_command(console, "help")
+        listed = {line.split(" ")[0] for line in help_lines[:-1]}
+        missing = sorted({"shutdown", "reboot", "suspend"} - listed)
+        assert not missing, (
+            "help must name shutdown, reboot and suspend, missing %r from %r"
+            % (missing, help_lines))
+    finally:
+        console.stop()
+
+
+def scenario_shutdown_granted_answers_shutting_down(server):
+    """A granted shutdown answers shutting_down and is audited before it runs."""
+    del server  # the granted shutdown ends Ariel's process, so it owns one
+    console = Server(SERVER_BINARY, env={"ARIEL_HOST_MOUNTS": "/mnt/usb1"})
+    try:
+        approval, challenge = gate_request(console, "shutdown")
+        sign_and_grant(console, approval, challenge)
+        assert send_command(console, "shutdown") == [
+            "shutting_down", "exit 0"], (
+            "a granted shutdown must answer shutting_down and exit 0")
+        assert console.proc.wait(timeout=START_TIMEOUT) == 0, (
+            "the shutdown ends Ariel's process, as it ends every connection "
+            "on the console")
+        lines = read_audit_log(console).decode("ascii").splitlines()
+        ours = [line.split()[1] for line in lines
+                if line.split()[3:4] == [approval]]
+        assert ours == ["shutdown.request", "grant", "shutdown.done"], (
+            "the shutdown must be audited in order, got %r" % ours)
+    finally:
+        console.stop()
+
+
 # The one-shot timeout a payload gets until payload config sets one.
 DEFAULT_HEALTH_MS = 30_000
 
@@ -11470,8 +11567,8 @@ SCENARIOS = [
      "push", scenario_console_quick_start_waits_for_the_gap, None),
     ("console mode activates only builds the console can run",
      scenario_console_checks_push_runnable_builds, None),
-    ("console mode's reboot and sysctl write wait out approval_busy",
-     scenario_console_gated_asks_wait_out_busy, None),
+    ("console mode's sysctl write waits out approval_busy and its reboot "
+     "asks nobody", scenario_console_gated_asks_wait_out_busy, None),
     ("console mode's stale autoload check installs both names before it asks",
      scenario_console_stale_check_installs_both_names, None),
     ("console mode's audit check allows appended lines and refuses a removed "
@@ -11592,6 +11689,15 @@ SCENARIOS = [
      scenario_reboot_signature_wrong_action, None),
     ("a granted reboot is audited as its request, grant and done",
      scenario_reboot_is_audited, HOST_RESTART_REASON),
+    ("on the console build reboot answers reboot_unsupported, exit 1, and "
+     "asks nobody", scenario_reboot_unsupported_on_the_console,
+     HOST_STUB_REASON),
+    ("shutdown answers 75 with a challenge carrying the mounted removable "
+     "volumes and its sha256", scenario_shutdown_challenge_binds_the_mounts,
+     HOST_STUB_REASON),
+    ("a granted shutdown answers shutting_down, is audited in order, and ends "
+     "the process", scenario_shutdown_granted_answers_shutting_down,
+     HOST_STUB_REASON),
 
 
     ("a one-shot that exits nonzero after commit is replaced by the previous "

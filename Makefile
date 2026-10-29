@@ -100,9 +100,11 @@ platform_ps5.o: CFLAGS += -DARIEL_PUBKEY_HEX=\"$(ARIEL_PUBKEY)\" \
                           -DARIEL_RECOVERY_PUBKEY_HEX=\"$(ARIEL_RECOVERY_PUBKEY)\" \
                           -DARIEL_CONSOLE_ID=\"$(ARIEL_CONSOLE_ID)\"
 
+# libSceSystemService carries sceShellCoreUtilRequestShutdown, the console's
+# own shutdown path (#135).
 ariel-ps5.elf: shsrv.o platform_ps5.o readers_ps5.o $(ARIEL_OBJS) elfldr.o \
                pt.o notify.o sha256.o
-	$(CC) -lkernel_sys -o $@ $^
+	$(CC) -lkernel_sys -lSceSystemService -o $@ $^
 
 sh.elf: sh.o builtin.o elfldr.o pt.o libtelnet.o
 	$(CC) -lkernel_sys -o $@ $^ \

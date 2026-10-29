@@ -107,11 +107,14 @@ not the system. Pulling the power there is the same shape as the four losses in
 
 The procedure, in this order:
 
-1. **Ask Ariel to restart the console**, on 2324: `reboot`. It is gated, so the
-   owner signs the boot list the restart will run, and the kernel restarts the
-   machine instead of the power being cut. This is the clean route, and it is
-   only unavailable when the agent itself is dead — the case where the shell
-   answering is no longer evidence of anything.
+1. **Ask Ariel to shut the console down through its own path**, on 2324:
+   `shutdown`. It is gated, so the owner signs the ordered list of mounted
+   removable volumes it will unmount and that list's SHA-256, and the console's
+   own shutdown unmounts them, runs the `/user` cleaner and powers off instead
+   of the power being cut. This is the clean route, and it is only unavailable
+   when the agent itself is dead — the case where the shell answering is no
+   longer evidence of anything. There is no route that restarts the machine:
+   the steps below cover what is left when `shutdown` cannot run.
 2. **With no agent but a live shell, `sync`** through `shsrv` on 2323. It
    answers with nothing, which is success; a failure would print an error. This
    is the step that costs nothing and is skipped by reflex, and it is the one
@@ -134,15 +137,20 @@ The procedure, in this order:
 
 There is no `reboot` in the shell. `help` on 2323 lists `suspend` and `kill`
 and nothing that restarts the machine, and `kill` on init is a panic reboot on
-a console with four recorded losses — not a recovery. The shell's `sync` is
-still worth having when the agent is gone, because it is the only step of this
-list that a dead agent cannot do for us.
+a console with four recorded losses — not a recovery. `reboot` on 2324 is no
+route either: the console build answers `reboot_unsupported` with exit 1 and
+asks nobody, because the probe recorded in [console-findings.md](console-findings.md)
+(#135) measured that each restart call it tried either returned 0 and did
+nothing or was refused, and that `reboot(2)` only reaches standby — the shell's
+own `suspend` is the honest standby route. The shell's `sync` is still worth
+having when the agent is gone, because it is the only step of this list that a
+dead agent cannot do for us.
 
-What this does and does not claim: after the restart every port was closed
-until the autoloader ran again, which is the expected tethered behaviour. The
-procedure was not falsified against a console that would have lost data without
-it; it is written down because the alternative is a power cut with the cache
-dirty, and this console has four losses of that shape already.
+What this does and does not claim: after the console came back up, every port
+was closed until the autoloader ran again, which is the expected tethered
+behaviour. The procedure was not falsified against a console that would have
+lost data without it; it is written down because the alternative is a power cut
+with the cache dirty, and this console has four losses of that shape already.
 
 ## What the day showed
 

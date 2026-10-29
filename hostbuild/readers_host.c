@@ -361,10 +361,45 @@ readers_uptime(unsigned long long *uptime) {
 }
 
 
+/**
+ * ARIEL_HOST_MOUNTS adds mount points to the list, as a comma-separated list,
+ * so a scenario can show what a console with a stick in it holds: a computer
+ * mounts neither /mnt/usb0 nor /mnt/usb1. The host build only.
+ **/
+static void
+host_mount_stub(void (*emit)(void *ctx, const char *target,
+                             const char *source), void *ctx) {
+  char list[256];
+  char *p;
+  const char *value = getenv("ARIEL_HOST_MOUNTS");
+
+  if(!value || !*value || strlen(value) >= sizeof(list)) {
+    return;
+  }
+  snprintf(list, sizeof(list), "%s", value);
+
+  for(p=list; *p; ) {
+    char *comma = strchr(p, ',');
+
+    if(comma) {
+      *comma = '\0';
+    }
+    if(*p) {
+      emit(ctx, p, "stub");
+    }
+    if(!comma) {
+      break;
+    }
+    p = comma + 1;
+  }
+}
+
+
 /* Each mounted filesystem's target and source, in the order the system lists them. */
 int
 readers_mounts(void (*emit)(void *ctx, const char *target, const char *source),
                void *ctx) {
+  host_mount_stub(emit, ctx);
 #if defined(__APPLE__)
   struct statfs *mounts;
   int count;
