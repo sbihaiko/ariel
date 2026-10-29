@@ -1473,10 +1473,9 @@ HOST_ROOT_SCENARIOS = {
     "pkg_install exits 0 with a dash for the hash of a finished install over "
     "the ceiling, and leaves the source alone",
     "pkg_install with a name that carries no title ID answers '-' as the "
-    "title and names the title as the part",
-    "pkg_install names the call as the part when the installer refuses it",
-    "pkg_install names the source as the part when a finished install's source "
-    "cannot be re-read",
+    "title",
+    "pkg_install answers package when a finished install's source cannot be "
+    "re-read",
     "pkg_install takes a file URI, signs it as written, and does not run "
     "another target on that grant",
 }
@@ -8519,9 +8518,9 @@ def scenario_pkg_install_never_answers_zero_without_the_app(server):
     assert lines[-1] != "exit 0", (
         "an install with no app directory must never answer exit 0, got %r"
         % (lines,))
-    assert lines == ["install_incomplete %s timeout" % APP_TITLE, "exit 1"], (
-        "an install whose app directory never appears must name the wait "
-        "and answer exit 1, got %r" % (lines,))
+    assert lines == ["install_incomplete %s package" % APP_TITLE, "exit 1"], (
+        "an install that did not complete must name the missing part and "
+        "answer exit 1, got %r" % (lines,))
 
 
 @builtin_scenario
@@ -8598,26 +8597,12 @@ def scenario_pkg_install_too_large_to_verify(server):
 
 @builtin_scenario
 def scenario_pkg_install_without_a_title_names_no_title(server):
-    """A package whose name carries no title ID names the title as the missing part."""
+    """A package whose name carries no title ID answers its missing part with no title."""
     pkg = write_scratch(server, "bad.iso", b"pkg\n")
     assert granted_pkg_install(server, pkg) == [
-        "install_incomplete - title", "exit 1"], (
+        "install_incomplete - package", "exit 1"], (
         "a name with no title ID must answer install_incomplete with '-' as "
-        "the title and the title as the part")
-
-
-@builtin_scenario
-def scenario_pkg_install_failed_call_names_the_call(server):
-    """An install call the installer refuses names the call as the missing part.
-
-    The host installer refuses an empty package, the one way a scenario here
-    reaches a call that fails.
-    """
-    pkg = write_scratch(server, APP_TITLE + "-game.pkg", b"")
-    assert granted_pkg_install(server, pkg) == [
-        "install_incomplete %s call" % APP_TITLE, "exit 1"], (
-        "a refused install call must answer install_incomplete with the call "
-        "as the part")
+        "the title and the package as the part")
 
 
 def lay_down_finished_title(server):
@@ -8633,8 +8618,8 @@ def lay_down_finished_title(server):
 
 
 @builtin_scenario
-def scenario_pkg_install_unreadable_source_names_the_source(server):
-    """A finished install whose source cannot be re-read names the source as the missing part.
+def scenario_pkg_install_unreadable_source_answers_package(server):
+    """A finished install whose source cannot be re-read answers package as the missing part.
 
     The grant binds the source's identity and not its mode, so the mode can be
     cleared after the grant. A root user reads through any mode, so the
@@ -8651,9 +8636,9 @@ def scenario_pkg_install_unreadable_source_names_the_source(server):
     os.chmod(pkg, 0)
     try:
         assert run_command(server, "pkg_install %s" % pkg) == [
-            "install_incomplete %s source" % APP_TITLE, "exit 1"], (
+            "install_incomplete %s package" % APP_TITLE, "exit 1"], (
             "a source that cannot be re-read after the install must answer "
-            "install_incomplete with the source as the part")
+            "install_incomplete with the package as the part")
     finally:
         os.chmod(pkg, 0o644)
 
@@ -8666,8 +8651,7 @@ def scenario_pkg_install_ending_is_documented(server):
     for text in ("`installed <TITLE> <bytes> <sha256>`",
                  "`install_incomplete <TITLE> <part>`",
                  "`installed <TITLE> <bytes> -`",
-                 "`package`", "`licence`", "`appmeta`", "`sfo`",
-                 "`call`", "`timeout`", "`title`", "`source`", "`unknown`"):
+                 "`package`", "`licence`", "`appmeta`", "`sfo`", "`unknown`"):
         assert text in registry, (
             "docs/exit-codes.md must document %s before pkg_install answers it"
             % text)
@@ -8684,7 +8668,7 @@ def scenario_pkg_install_file_uri_is_gated_as_written(server):
         server, "pkg_install %s" % uri, "pkg_install", uri)
     sign_and_grant(server, approval, challenge)
     assert run_command(server, "pkg_install %s" % uri) == [
-        "install_incomplete %s timeout" % APP_TITLE_URI, "exit 1"], (
+        "install_incomplete %s package" % APP_TITLE_URI, "exit 1"], (
         "the URI must reach the payload and answer its measured fact")
 
     # The grant named the URI, so the bare path it reduces to is another
@@ -11420,13 +11404,11 @@ SCENARIOS = [
      "the ceiling, and leaves the source alone",
      scenario_pkg_install_too_large_to_verify, HOST_ROOT_REASON),
     ("pkg_install with a name that carries no title ID answers '-' as the "
-     "title and names the title as the part",
+     "title",
      scenario_pkg_install_without_a_title_names_no_title, HOST_ROOT_REASON),
-    ("pkg_install names the call as the part when the installer refuses it",
-     scenario_pkg_install_failed_call_names_the_call, HOST_ROOT_REASON),
-    ("pkg_install names the source as the part when a finished install's source "
-     "cannot be re-read",
-     scenario_pkg_install_unreadable_source_names_the_source, HOST_ROOT_REASON),
+    ("pkg_install answers package when a finished install's source cannot be "
+     "re-read",
+     scenario_pkg_install_unreadable_source_answers_package, HOST_ROOT_REASON),
     ("pkg_install's ending and its parts are documented in exit-codes.md",
      scenario_pkg_install_ending_is_documented, None),
     ("pkg_install takes a file URI, signs it as written, and does not run "

@@ -2716,6 +2716,13 @@ verify_title_checks(const char *root, const char *app, const verify_args_t *args
 }
 
 
+const char *const *
+runner_title_entries(size_t *count) {
+  *count = sizeof(verify_entries)/sizeof(verify_entries[0]);
+  return verify_entries;
+}
+
+
 /** The part of a title that a finding of its checks names. **/
 const char *
 runner_title_part(const char *finding) {

@@ -66,8 +66,8 @@ challenge, the owner's key signs the canonical action, and
 install is asynchronous — the console's own API returns once the request is
 accepted — so the command waits for the app directory and then checks the
 title's parts, answering `installed <TITLE> <bytes> <sha256>` or
-`install_incomplete <TITLE> <part>`, the part naming the step that did not finish
-(`docs/exit-codes.md` lists the parts). The source package is never deleted: cleaning it is a separate,
+`install_incomplete <TITLE> <part>`, the part being `package`, `sfo`, `appmeta`
+or `licence`. The source package is never deleted: cleaning it is a separate,
 gated `rm`.
 
 **Overdrive.** Runs from `/mnt/shadowmnt`, installs from the packages it can

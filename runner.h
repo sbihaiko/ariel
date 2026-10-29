@@ -61,6 +61,11 @@ int runner_title_missing(const char *root, const char *title, const char **part)
 const char *runner_title_part(const char *finding);
 
 /**
+ * The entries of a title's directory that its checks report as missing or empty.
+ **/
+const char *const *runner_title_entries(size_t *count);
+
+/**
  * The byte count of the regular file at path, and its SHA-256 read once. Returns
  * 0 with both set, 1 when path is not a regular file or cannot be read, and 2
  * with only the byte count set when it is over the verify ceiling, which is not
