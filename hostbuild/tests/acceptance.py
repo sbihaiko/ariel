@@ -1953,6 +1953,198 @@ def scenario_console_read_check_matches_cat(server):
             % sorted(faulty.files))
 
 
+PKG_FIXTURE_BODY = b"known-good package body\n" * 16
+
+
+class FakePackageConsole:
+    """A fake agent port with one installed title and its licence.
+
+    write, rm and pkg_install are gated: each answers 75 with a challenge until
+    the owner's grant is recorded, then runs once when it is sent again. An
+    install of a title with no licence creates one; an install of a title
+    whose licence is gone answers install_incomplete licence. The flags break
+    one behavior each, and each must fail its check: broken_ending answers a
+    dash for the hash, removes_source deletes the source, keeps_licence leaves
+    the licence when rm is sent.
+    """
+
+    GATED = ("write", "rm", "pkg_install")
+
+    def __init__(self, broken_ending=False, removes_source=False,
+                 keeps_licence=False):
+        self.broken_ending = broken_ending
+        self.removes_source = removes_source
+        self.keeps_licence = keeps_licence
+        self.files = {}
+        self.licences = set()
+        self.titles = set()
+        self.pending = {}
+        self.granted = set()
+        self.asked = 0
+
+    def exchange(self, command, body=None, token=None):
+        words = command.split()
+        if words[:2] == ["approval", "grant"]:
+            self.granted.add(self.pending.pop(words[2]))
+            return ["approval_granted %s" % words[2], "exit 0"]
+        if command in self.granted:
+            self.granted.discard(command)
+            return self.run(words, body)
+        if words[0] in self.GATED:
+            self.asked += 1
+            approval = "a-%d" % self.asked
+            self.pending[approval] = command
+            return ["approval_required %s" % approval,
+                    "challenge %s 00" % approval, "exit 75"]
+        return self.run(words, body)
+
+    def run(self, words, body):
+        if words[0] == "write":
+            digest = hashlib.sha256(body or b"").hexdigest()
+            if body is None or len(body) != int(words[2]) or digest != words[3]:
+                return ["upload_mismatch", "exit 81"]
+            self.files[words[1]] = body
+            return ["exit 0"]
+        if words[0] == "stat":
+            if words[1] in self.files:
+                return ["%s: %d bytes" % (words[1], len(self.files[words[1]])),
+                        "exit 0"]
+            return ["no_such_file", "exit 1"]
+        if words[0] == "ls":
+            return ["-rw-r--r-- 0 %s" % licence.rsplit("/", 1)[1]
+                    for licence in sorted(self.licences)
+                    if licence.rsplit("/", 1)[0] == words[1]] + ["exit 0"]
+        if words[0] == "rm":
+            self.files.pop(words[-1], None)
+            if not self.keeps_licence:
+                self.licences.discard(words[-1])
+            return ["exit 0"]
+        return self.install(words[1])
+
+    def install(self, path):
+        title = os.path.basename(path).split("-", 1)[0]
+        if path not in self.files:
+            return ["install_incomplete %s package" % title, "exit 1"]
+        licensed = any("-%s_" % title in os.path.basename(licence)
+                       for licence in self.licences)
+        if title in self.titles and not licensed:
+            return ["install_incomplete %s licence" % title, "exit 1"]
+        self.titles.add(title)
+        if not licensed:
+            self.licences.add("/user/license/fakeUP9000-%s_00.rif" % title)
+        data = self.files[path]
+        if self.removes_source:
+            del self.files[path]
+        digest = "-" if self.broken_ending else hashlib.sha256(data).hexdigest()
+        return ["installed %s %d %s" % (title, len(data), digest), "exit 0"]
+
+
+@contextlib.contextmanager
+def pkg_fixture_env(path):
+    """Point PS5_PKG_FIXTURE at path, or unset it when path is None, for the block."""
+    saved = os.environ.pop("PS5_PKG_FIXTURE", None)
+    if path is not None:
+        os.environ["PS5_PKG_FIXTURE"] = path
+    try:
+        yield
+    finally:
+        os.environ.pop("PS5_PKG_FIXTURE", None)
+        if saved is not None:
+            os.environ["PS5_PKG_FIXTURE"] = saved
+
+
+@contextlib.contextmanager
+def pkg_fixture_file():
+    """A known-good fixture named for its title, with PS5_PKG_FIXTURE pointing at it."""
+    directory = tempfile.mkdtemp(prefix="ariel-pkg-fixture-")
+    path = os.path.join(directory, "CUSA04730-fixture.pkg")
+    try:
+        with open(path, "wb") as handle:
+            handle.write(PKG_FIXTURE_BODY)
+        with pkg_fixture_env(path):
+            yield path
+    finally:
+        shutil.rmtree(directory)
+
+
+def scenario_console_pkg_install_ends_installed_and_keeps_source(server):
+    """The installed check passes on the line a finished install names, and fails on any other."""
+    del server  # the fake console stands in for the agent port
+
+    import console
+
+    names = [check.__name__ for _title, check in console.CHECKS]
+    assert "check_pkg_install_installed_line" in names, (
+        "console mode must check the installed line of a finished install")
+
+    with pkg_fixture_file():
+        fake = FakePackageConsole()
+        console.check_pkg_install_installed_line(
+            fake_console_session(console, fake), None)
+        assert fake.files == {}, (
+            "a passing check must remove its own copy, left %r"
+            % sorted(fake.files))
+
+        for faulty in (FakePackageConsole(broken_ending=True),
+                       FakePackageConsole(removes_source=True)):
+            try:
+                console.check_pkg_install_installed_line(
+                    fake_console_session(console, faulty), None)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(
+                    "an install that names a dash or drops its source must fail")
+
+
+def scenario_console_pkg_install_licence_check_answers_licence(server):
+    """The licence check passes when the install names the licence missing, and fails otherwise."""
+    del server  # the fake console stands in for the agent port
+
+    import console
+
+    names = [check.__name__ for _title, check in console.CHECKS]
+    assert "check_pkg_install_licence_missing" in names, (
+        "console mode must check that an install without its licence says so")
+
+    with pkg_fixture_file():
+        console.check_pkg_install_licence_missing(
+            fake_console_session(console, FakePackageConsole()), None)
+        try:
+            console.check_pkg_install_licence_missing(
+                fake_console_session(console, FakePackageConsole(
+                    keeps_licence=True)), None)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "a licence that rm leaves in place must fail the licence check")
+
+
+def scenario_console_pkg_install_checks_skip_without_a_fixture(server):
+    """Both pkg_install checks skip, naming the variable, before they ask the owner."""
+    del server  # the fake console must see nothing
+
+    import console
+
+    for path in (None, os.path.join(tempfile.gettempdir(), "no-such-fixture.pkg")):
+        with pkg_fixture_env(path):
+            for check in (console.check_pkg_install_installed_line,
+                          console.check_pkg_install_licence_missing):
+                fake = FakePackageConsole()
+                try:
+                    check(fake_console_session(console, fake), None)
+                except console.Skipped as err:
+                    assert "PS5_PKG_FIXTURE" in str(err), (
+                        "a skip must name the variable, got %r" % str(err))
+                else:
+                    raise AssertionError(
+                        "%s must skip without a fixture" % check.__name__)
+                assert fake.asked == 0 and fake.files == {}, (
+                    "%s must not touch the console before it skips"
+                    % check.__name__)
+
+
 def scenario_console_gated_asks_wait_out_busy(server):
     """reboot and a sysctl write wait out approval_busy before they assert 75."""
     del server  # the scripted link stands in for the agent port
@@ -11246,6 +11438,15 @@ SCENARIOS = [
      None),
     ("console mode's read check matches cat and the header's size and hash",
      scenario_console_read_check_matches_cat, None),
+    ("console mode's installed check passes on the finished install's line and "
+     "fails on a dash or a dropped source",
+     scenario_console_pkg_install_ends_installed_and_keeps_source, None),
+    ("console mode's licence check passes when the install names the licence "
+     "missing and fails when the licence stays",
+     scenario_console_pkg_install_licence_check_answers_licence, None),
+    ("console mode's pkg_install checks skip, naming PS5_PKG_FIXTURE, without "
+     "a fixture and before they ask the owner",
+     scenario_console_pkg_install_checks_skip_without_a_fixture, None),
     ("a crash in prepared leaves the old version in payload list after restart",
      scenario_crash_in_prepared_leaves_old_version, FAULT_REASON),
     ("a crash in committed leaves the new version in payload list after restart",

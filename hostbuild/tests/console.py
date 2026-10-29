@@ -69,6 +69,10 @@ class ConsoleError(AssertionError):
     """The console and the harness disagree, or the owner cannot continue."""
 
 
+class Skipped(Exception):
+    """A check that cannot run on this machine; its message names what it needs."""
+
+
 def document_path():
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, "..", "..", "docs", "quick-start.md")
@@ -393,6 +397,85 @@ def check_pkg_install_names_the_missing_part(session, context):
             "missing part and exit 1, got %r" % lines)
         assert session.link.exchange("stat " + path)[-1:] == ["exit 0"], (
             "a refused install must leave its source package in place")
+    finally:
+        remove_throwaway(session, path)
+
+
+PKG_FIXTURE_ENV = "PS5_PKG_FIXTURE"
+PKG_FIXTURE_TITLE = re.compile(r"[A-Za-z0-9]+\Z")
+
+
+def pkg_fixture():
+    """The known-good package PS5_PKG_FIXTURE names: its file name, title and bytes."""
+    path = os.environ.get(PKG_FIXTURE_ENV, "").strip()
+    if not path:
+        raise Skipped("needs a small known-good .pkg: set %s to its path"
+                      % PKG_FIXTURE_ENV)
+    if not os.path.isfile(path):
+        raise Skipped("%s names no file: %s" % (PKG_FIXTURE_ENV, path))
+    name = os.path.basename(path)
+    title = name.split("-", 1)[0]
+    if "-" not in name or not PKG_FIXTURE_TITLE.match(title):
+        raise ConsoleError(
+            "the fixture's name must begin with its title ID and a dash, got %r"
+            % name)
+    with open(path, "rb") as handle:
+        return name, title, handle.read()
+
+
+def upload_fixture(session, path, data):
+    command = "write %s %d %s" % (
+        path, len(data), hashlib.sha256(data).hexdigest())
+    run_gated_file_command(session, command, body=data)
+    assert session.link.exchange(command, body=data) == ["exit 0"], (
+        "a signed write of the fixture must run")
+
+
+def check_pkg_install_installed_line(session, context):
+    """A signed pkg_install of the fixture ends installed TITLE BYTES SHA-256, source kept."""
+    del context
+    name, title, data = pkg_fixture()
+    path = "/data/" + name
+    try:
+        upload_fixture(session, path, data)
+        install = "pkg_install " + path
+        run_gated_file_command(session, install)
+        digest = hashlib.sha256(data).hexdigest()
+        lines = session.link.exchange(install)
+        assert lines == ["installed %s %d %s" % (title, len(data), digest),
+                         "exit 0"], (
+            "a finished install must name its title, bytes and SHA-256, got %r"
+            % lines)
+        assert session.link.exchange("stat " + path)[-1:] == ["exit 0"], (
+            "a finished install must leave its source package in place")
+    finally:
+        remove_throwaway(session, path)
+
+
+def check_pkg_install_licence_missing(session, context):
+    """A pkg_install of a title whose licence is gone answers install_incomplete TITLE licence."""
+    del context
+    name, title, data = pkg_fixture()
+    path = "/data/" + name
+    install = "pkg_install " + path
+    try:
+        upload_fixture(session, path, data)
+        run_gated_file_command(session, install)
+        assert session.link.exchange(install)[-1:] == ["exit 0"], (
+            "the fixture must install before its licence is removed")
+        licences = [entry for entry in listing(session, "/user/license")
+                    if "-%s_" % title in entry]
+        assert len(licences) == 1, (
+            "the installed title must hold one licence, got %r" % licences)
+        command = "rm /user/license/" + licences[0]
+        run_gated_file_command(session, command)
+        assert session.link.exchange(command) == ["exit 0"], (
+            "a signed rm of the licence must run")
+        run_gated_file_command(session, install)
+        assert session.link.exchange(install) == [
+            "install_incomplete %s licence" % title, "exit 1"], (
+            "a title whose licence is gone must name the licence as the "
+            "missing part and exit 1")
     finally:
         remove_throwaway(session, path)
 
@@ -1106,6 +1189,12 @@ CHECKS = [
     ("a signed pkg_install of a file that is not a package names its title and "
      "the missing part, exit 1, and leaves the file in place",
      check_pkg_install_names_the_missing_part),
+    ("a signed pkg_install of the known-good fixture ends installed TITLE BYTES "
+     "SHA-256 and keeps its source, skipped without PS5_PKG_FIXTURE",
+     check_pkg_install_installed_line),
+    ("a signed pkg_install of a title whose licence the owner removed answers "
+     "install_incomplete TITLE licence, skipped without PS5_PKG_FIXTURE",
+     check_pkg_install_licence_missing),
     ("cp -r copies a throwaway tree after the owner signs, the copy lists the "
      "source's entries, rm -r removes the copy, and both paths are removed",
      check_recursive_copy_and_remove),
@@ -1210,6 +1299,9 @@ def run(host, scenarios, operator=None, connect=None):
         print("\nRUN  %s" % title)
         try:
             check(session, context)
+        except Skipped as err:
+            results.append((title, None, str(err)))
+            print("SKIP %s: %s" % (title, err))
         except Exception as err:  # noqa: BLE001 - a failed check is a report
             results.append((title, False, "%s: %s" % (type(err).__name__, err)))
             print("FAIL %s: %s: %s" % (title, type(err).__name__, err))
@@ -1245,9 +1337,11 @@ def main(scenarios, argv):
         print("\nconsole mode stopped by the owner", file=sys.stderr)
         return 130
 
-    failed = [result for result in results if not result[1]]
+    failed = [result for result in results if result[1] is False]
     if failed:
         print("\n%d console check(s) failed" % len(failed))
         return 1
-    print("\nall %d console checks passed" % len(results))
+    skipped_checks = [result for result in results if result[1] is None]
+    print("\n%d console check(s) passed, %d skipped"
+          % (len(results) - len(skipped_checks), len(skipped_checks)))
     return 0
