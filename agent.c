@@ -1194,6 +1194,48 @@ transfer_command(agent_t *agent, int fd, runner_session_t *session,
 
 
 /**
+ * ln -s TARGET PATH: a symbolic link at PATH whose text is TARGET, taken as it
+ * is written. Only PATH is resolved against the session's directory.
+ **/
+static void
+symlink_command(agent_t *agent, int fd, runner_session_t *session,
+                const char *target, const char *path) {
+  const char *root = agent->platform->fs_root;
+  char resolved[GATED_PATH_MAX];
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int rc;
+
+  if(!(path=session_operand(session, path, resolved, sizeof(resolved), fd))) {
+    return;
+  }
+
+  if(strlen(target) + strlen(path) + 1 > TRANSFER_SUBJECT_MAX) {
+    file_outcome(fd, "ln", "-", "-", FILEOPS_BAD_PATH);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_symlink_check(root, target, path, &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, "ln", subject_of(target, path, subject), "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "ln.symlink");
+  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  snprintf(facts.dest, sizeof(facts.dest), "%s", target);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_symlink_act(root, target, path);
+  file_outcome(fd, "ln", subject_of(target, path, subject), challenge.id, rc);
+}
+
+
+/**
  * The options of the file commands. rm -r and cp -r take the tree below their
  * operands; any other option answers bad_option and asks nobody. Returns 1
  * when the line was answered here.
@@ -1208,6 +1250,9 @@ file_options(agent_t *agent, int fd, runner_session_t *session, int argc,
   if(!cp && strcmp(argv[0], "rm") && strcmp(argv[0], "mkdir") &&
      strcmp(argv[0], "rmdir") && strcmp(argv[0], "touch") &&
      strcmp(argv[0], "mv") && strcmp(argv[0], "ln")) {
+    return 0;
+  }
+  if(argc == 4 && !strcmp(argv[0], "ln") && !strcmp(argv[1], "-s")) {
     return 0;
   }
 
@@ -5792,6 +5837,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
   if(argc == 3 && (!strcmp(argv[0], "cp") || !strcmp(argv[0], "mv") ||
                    !strcmp(argv[0], "ln"))) {
     transfer_command(agent, fd, context, argv[0], argv[1], argv[2], 0);
+    return;
+  }
+
+  if(argc == 4 && !strcmp(argv[0], "ln") && !strcmp(argv[1], "-s")) {
+    symlink_command(agent, fd, context, argv[2], argv[3]);
     return;
   }
 

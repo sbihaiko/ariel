@@ -758,6 +758,7 @@ run_stat(int json, int argc, char *const argv[], int outfd, int errfd) {
 static int
 run_file(int argc, char *const argv[], int outfd, int errfd) {
   struct stat st;
+  struct stat entry;
   const char *kind;
   int rc;
 
@@ -766,6 +767,12 @@ run_file(int argc, char *const argv[], int outfd, int errfd) {
   }
   if((rc=stat_target("file", argv[1], errfd, &st))) {
     return rc;
+  }
+
+  if(!lstat(argv[1], &entry) && S_ISLNK(entry.st_mode)) {
+    say(outfd, argv[1]);
+    say(outfd, ": symbolic link\n");
+    return 0;
   }
 
   if(S_ISDIR(st.st_mode)) {

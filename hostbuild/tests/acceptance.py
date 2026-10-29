@@ -5471,6 +5471,151 @@ def scenario_transfer_action_names_its_facts(server):
     assert "\nsha256=none\n" in action, action
 
 
+def symlink_line(target, path):
+    return "ln -s %s %s" % (target, path)
+
+
+def run_with_server(env, check):
+    """Run check on a server of its own, started with env, and stop it after."""
+    server = Server(SERVER_BINARY, env=env)
+    try:
+        check(server)
+    finally:
+        server.stop()
+
+
+def scenario_ln_symlink_creates_a_link_the_owner_signs(server):
+    """ln -s asks first and makes the link once signed; file names it and state is protected."""
+    target = make_transfer_file(server, "sym-target")
+    link = write_path(server, "sym-link")
+    line = symlink_line(target, link)
+
+    approval, challenge = transfer_request(server, line)
+    assert not os.path.lexists(link), "an unsigned ln -s must not run"
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], "a signed ln -s must run"
+    assert os.path.islink(link) and os.readlink(link) == target, (
+        "ln -s must make a symbolic link whose text is the target")
+    assert run_command(server, "file " + link) == [
+        link + ": symbolic link", "exit 0"], "file must name a link as a symbolic link"
+
+    token = secret_path(server, "token")
+    state_link = write_path(server, "sym-state")
+    assert run_command(server, symlink_line(token, state_link)) == [
+        "protected", "exit 87"], "a link that names Ariel's state must answer protected"
+    assert not os.path.lexists(state_link), "a refused ln -s must create nothing"
+
+    secret_link = write_path(server, "sym-secret")
+    make_link(secret_link, token, hard=False)
+    assert_protected(server, "cat " + secret_link)
+    assert_protected(server, "file " + secret_link)
+
+
+def scenario_ln_symlink_relative_target_is_bad_path(server):
+    """ln -s with a relative target answers bad_path before it asks anyone."""
+    link = write_path(server, "sym-relative")
+    assert run_command(server, symlink_line("relative/target", link)) == [
+        "bad_path", "exit 1"], "a relative symlink target must answer bad_path"
+    assert not os.path.lexists(link), "a refused ln -s must create nothing"
+
+
+def scenario_ln_symlink_is_no_transfer_source_or_write_target(server):
+    """A link made by ln -s is refused as a source; no write or unzip goes through it."""
+    target = make_transfer_file(server, "sym-src-target")
+    link = write_path(server, "sym-src-link")
+    approval, challenge = transfer_request(server, symlink_line(target, link))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, symlink_line(target, link)) == ["exit 0"]
+
+    copy = write_path(server, "sym-src-copy")
+    for command in TRANSFERS:
+        assert run_command(server, transfer_line(command, link, copy)) == [
+            "symbolic_link", "exit 1"], "%s must refuse a link as its source" % command
+    assert not os.path.lexists(copy), "a refused link must copy nothing"
+
+    assert write_frame(server, link, WRITE_BYTES) == ["exists", "exit 1"], (
+        "a write onto a link must not write through it")
+    assert read_bytes(target) == TRANSFER_BYTES, "the link's target must not change"
+
+    folder = unzip_destination(server, "sym-dir")
+    folder_link = write_path(server, "sym-dir-link")
+    make_link(folder_link, folder, hard=False)
+    archive = make_archive(server, "sym-archive", [("top.txt", b"top\n")])
+    assert run_command(server, unzip_line(archive, folder_link)) == [
+        "symbolic_link", "exit 1"], "unzip must refuse a link as its destination"
+    assert tree(folder) == [], "unzip must write nothing through a link"
+
+
+def scenario_ln_symlink_unsupported_creates_nothing(server):
+    """A filesystem that cannot hold a link answers link_unsupported and creates nothing."""
+    del server  # this scenario runs a server whose filesystem refuses links
+
+    def check(unsupported):
+        target = make_transfer_file(unsupported, "sym-unsup-target")
+        link = write_path(unsupported, "sym-unsup-link")
+        line = symlink_line(target, link)
+        approval, challenge = transfer_request(unsupported, line)
+        sign_and_grant(unsupported, approval, challenge)
+        assert run_command(unsupported, line) == [
+            "link_unsupported", "exit 1"], "a signed ln -s must answer link_unsupported"
+        assert not os.path.lexists(link), "link_unsupported must leave nothing behind"
+
+    run_with_server({"ARIEL_HOST_NO_SYMLINK": "1"}, check)
+
+
+def scenario_mv_in_one_filesystem_needs_no_hard_link(server):
+    """A same-filesystem mv renames the source, on a filesystem that refuses hard links."""
+    del server  # this scenario runs a server whose filesystem refuses hard links
+
+    def check(no_links):
+        source = make_transfer_file(no_links, "mv-src")
+        destination = write_path(no_links, "mv-dst")
+        line = transfer_line("mv", source, destination)
+        approval, challenge = transfer_request(no_links, line)
+        sign_and_grant(no_links, approval, challenge)
+        assert run_command(no_links, line) == ["exit 0"], (
+            "a same-filesystem mv must succeed where hard links are refused")
+        assert not os.path.lexists(source), "mv must remove the source name"
+        assert read_bytes(destination) == TRANSFER_BYTES, "mv must keep the bytes"
+
+    run_with_server({"ARIEL_HOST_NO_LINK": "1"}, check)
+
+
+def scenario_mv_across_filesystems_copies_then_removes(server):
+    """When rename answers EXDEV, mv copies the bytes and then removes the source."""
+    del server  # this scenario runs a server whose rename answers EXDEV
+
+    def check(across):
+        source = make_transfer_file(across, "mv-xdev-src")
+        destination = write_path(across, "mv-xdev-dst")
+        line = transfer_line("mv", source, destination)
+        approval, challenge = transfer_request(across, line)
+        sign_and_grant(across, approval, challenge)
+        assert run_command(across, line) == ["exit 0"], (
+            "an EXDEV mv must copy and remove")
+        assert not os.path.lexists(source), "an EXDEV mv must remove the source"
+        assert read_bytes(destination) == TRANSFER_BYTES, "an EXDEV mv must copy the bytes"
+
+    run_with_server({"ARIEL_HOST_RENAME_EXDEV": "1"}, check)
+
+
+SYMLINK_SCENARIOS = [
+    ("ln -s makes a link once the owner signs; file names it; state stays protected",
+     scenario_ln_symlink_creates_a_link_the_owner_signs, HOST_ROOT_REASON),
+    ("ln -s with a relative target answers bad_path before asking",
+     scenario_ln_symlink_relative_target_is_bad_path, HOST_ROOT_REASON),
+    ("a link made by ln -s is no transfer source, and writes and unzip do not go through it",
+     scenario_ln_symlink_is_no_transfer_source_or_write_target, HOST_ROOT_REASON),
+    ("ln -s on a filesystem without links answers link_unsupported and creates nothing",
+     scenario_ln_symlink_unsupported_creates_nothing, HOST_ROOT_REASON),
+    ("mv in one filesystem succeeds without a hard link and removes the source",
+     scenario_mv_in_one_filesystem_needs_no_hard_link, HOST_ROOT_REASON),
+    ("mv across filesystems copies the bytes and then removes the source",
+     scenario_mv_across_filesystems_copies_then_removes, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _scenario, _reason in SYMLINK_SCENARIOS)
+
+
 WRITE_BYTES = b"written through the shell\n"
 WRITE_CAP = 64 * 1024 * 1024
 
@@ -15999,6 +16144,7 @@ TRACE_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in TRACE_SCENARIOS)
 SCENARIOS.extend(TRACE_SCENARIOS)
+SCENARIOS.extend(SYMLINK_SCENARIOS)
 
 
 def main():

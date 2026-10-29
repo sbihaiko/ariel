@@ -1128,6 +1128,8 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[1].key = "timeout";
       options[1].value = text[0];
       action->noptions = 2;
+    } else if(!strcmp(facts->command, "ln.symlink")) {
+      action->noptions = 0;
     } else if(facts->kind[0]) {
       size_t n = 0;
 
