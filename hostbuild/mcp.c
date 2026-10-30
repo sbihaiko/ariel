@@ -47,6 +47,9 @@ enum mcp_kind {
   ARG_STRING,
   ARG_INTEGER,
   ARG_LOCAL,
+  // A switch the caller turns on with true: the flag joins the command only
+  // when the value is true, and its value is never written, as ln -s.
+  ARG_BOOLEAN,
   // A token of the command that comes from this table, not from the caller, as
   // kind=one-shot. It has no member in the tool's schema.
   ARG_FIXED
@@ -113,6 +116,43 @@ static const mcp_arg_t write_args[] = {
   { NULL, ARG_STRING, 0, NULL }
 };
 
+// The commands that move one name onto another: cp and mv read source then
+// path, and ln links target at path the same way.
+static const mcp_arg_t transfer_args[] = {
+  { "source", ARG_STRING, 1, NULL },
+  { "path", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t mode_args[] = {
+  { "mode", ARG_STRING, 1, NULL },
+  { "path", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t owner_args[] = {
+  { "owner", ARG_STRING, 1, NULL },
+  { "path", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+static const mcp_arg_t group_args[] = {
+  { "group", ARG_STRING, 1, NULL },
+  { "path", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+// ln is one command on the console, so one tool: symbolic true adds -s, and a
+// hard link is the same tool without it.
+// The switch comes first because the console reads `ln -s TARGET PATH`: the
+// flag leads the line, and the two operands follow it.
+static const mcp_arg_t link_args[] = {
+  { "symbolic", ARG_BOOLEAN, 0, "-s" },
+  { "target", ARG_STRING, 1, NULL },
+  { "path", ARG_STRING, 1, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
 static const mcp_arg_t install_args[] = {
   { "name", ARG_STRING, 1, NULL },
   { "repo", ARG_STRING, 1, NULL },
@@ -152,6 +192,15 @@ static const mcp_tool_t mcp_tools[] = {
   { "ariel_ifconfig", "Show the console's network interfaces.", MCP_READ, "ifconfig", no_args },
   { "ariel_ping", "Ping an address from the console.", MCP_READ, "ping", ping_args },
   { "ariel_mkdir", "Create a directory on the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "mkdir", path_args },
+  { "ariel_rmdir", "Remove an empty directory on the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "rmdir", path_args },
+  { "ariel_rm", "Remove a file on the console. A symbolic link is removed and the object it names is left alone. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "rm", path_args },
+  { "ariel_touch", "Create an empty file on the console, or update an existing one's timestamps. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "touch", path_args },
+  { "ariel_cp", "Copy a file on the console from source to path. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "cp", transfer_args },
+  { "ariel_mv", "Move or rename a file on the console from source to path. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "mv", transfer_args },
+  { "ariel_chmod", "Set a file's mode on the console, in octal as 0755. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "chmod", mode_args },
+  { "ariel_chown", "Set a file's owner on the console, as a decimal user id. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "chown", owner_args },
+  { "ariel_chgrp", "Set a file's group on the console, as a decimal group id. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "chgrp", group_args },
+  { "ariel_ln", "Link target at path on the console. symbolic true makes a symbolic link, which is the only kind this console holds; a hard link answers the console's refusal. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "ln", link_args },
   { "ariel_read", "Read a byte range of a file on the console. With local_path, an absolute path on this host, the server writes the range to that file and answers its path, size and hash, never the bytes.", MCP_READ, "read", read_args },
   { "ariel_payload_push", "Push a payload to the console. The server reads the bytes of local_path, an absolute path on this host, and streams them to the console. An upload that stops moving for 59 seconds is cut by the console, not by this server, and the console's word answers, such as upload_mismatch or staging_full. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "payload push", push_args },
   { "ariel_write", "Write a file on the console from local_path, an absolute path on this host that the server reads and streams to the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "write", write_args },
@@ -667,6 +716,20 @@ build_command(const mcp_tool_t *row, const char *as, const char *ae,
       continue;
     }
 
+    if(arg->kind == ARG_BOOLEAN) {
+      // A switch writes only its flag, and only when true: false leaves the
+      // command as the tool's own word.
+      if((ve - vs) == 4 && !memcmp(vs, "true", 4)) {
+        if(append(cmd, " ", 1) || append(cmd, arg->flag, strlen(arg->flag))) {
+          snprintf(why, why_len, "invalid params: the command is too long");
+          return -1;
+        }
+      } else if(!((ve - vs) == 5 && !memcmp(vs, "false", 5))) {
+        snprintf(why, why_len, "invalid params: %s must be true or false", arg->key);
+        return -1;
+      }
+      continue;
+    }
     if(arg->flag && (append(cmd, " ", 1) || append(cmd, arg->flag, strlen(arg->flag)))) {
       snprintf(why, why_len, "invalid params: the command is too long");
       return -1;
@@ -1479,7 +1542,8 @@ write_schema(FILE *out, const mcp_tool_t *row) {
       continue;
     }
     fprintf(out, "%s\"%s\":{\"type\":\"%s\"}", sep, arg->key,
-            arg->kind == ARG_INTEGER ? "integer" : "string");
+            arg->kind == ARG_INTEGER ? "integer" :
+            arg->kind == ARG_BOOLEAN ? "boolean" : "string");
     sep = ",";
   }
   fprintf(out, "%s\"session\":{\"type\":\"string\"}", sep);

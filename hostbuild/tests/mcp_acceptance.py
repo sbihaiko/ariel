@@ -903,6 +903,17 @@ CHANGE_ROWS = [
     ("ariel_autoload_safe_boot", []),
     ("ariel_shutdown", []),
     ("ariel_suspend", []),
+    # Issue #148: the commands that change the file system.
+    ("ariel_mkdir", ["path"]),
+    ("ariel_rmdir", ["path"]),
+    ("ariel_rm", ["path"]),
+    ("ariel_touch", ["path"]),
+    ("ariel_cp", ["source", "path"]),
+    ("ariel_mv", ["source", "path"]),
+    ("ariel_chmod", ["mode", "path"]),
+    ("ariel_chown", ["owner", "path"]),
+    ("ariel_chgrp", ["group", "path"]),
+    ("ariel_ln", ["target", "path", "symbolic"]),
 ]
 
 # The ariel-host binary the suite was given, for a scenario that needs a console
@@ -1073,6 +1084,150 @@ def scenario_shutdown_asks_then_the_console_goes_off(binary, console):
         dedicated.stop()
 
 
+# Issue #148: the commands that change the file system. Each row is a write
+# gated through the same handshake, and the console's protection rule holds
+# through every one: a path under Ariel's state directory answers protected
+# (87) even with an approval.
+
+def change_path(console, leaf):
+    """An absent entry under the console's data directory."""
+    path = os.path.join(console.root, "data", leaf)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.lexists(path):
+        os.unlink(path)
+    return path
+
+
+def run_change(binary, console, name, arguments):
+    """Open the approval, grant it, and resubmit: the console's own answer."""
+    shown = open_change(binary, console, name, arguments)
+    grant_change(binary, console, name, shown)
+    return call_tool(binary, console, name, arguments)
+
+
+def scenario_rmdir_removes_an_empty_directory(binary, console):
+    path = change_path(console, "mcp-rmdir")
+    os.makedirs(path)
+    again = run_change(binary, console, "ariel_rmdir", {"path": path})
+    assert again["isError"] is False, again
+    assert not os.path.exists(path), "the directory must be gone"
+
+
+def scenario_touch_creates_the_file(binary, console):
+    path = change_path(console, "mcp-touch")
+    again = run_change(binary, console, "ariel_touch", {"path": path})
+    assert again["isError"] is False, again
+    assert os.path.isfile(path), "touch must create the file"
+
+
+def scenario_rm_removes_a_symbolic_link_and_leaves_its_target(binary, console):
+    target = change_path(console, "mcp-rm-target")
+    write_fixture(console, "data/mcp-rm-target", b"kept\n")
+    link = change_path(console, "mcp-rm-link")
+    os.symlink(target, link)
+    again = run_change(binary, console, "ariel_rm", {"path": link})
+    assert again["isError"] is False, again
+    assert not os.path.lexists(link), "the link must be gone"
+    with open(target, "rb") as handle:
+        assert handle.read() == b"kept\n", "the object the link named must stay"
+
+
+def scenario_cp_copies_the_source(binary, console):
+    source = change_path(console, "mcp-cp-source")
+    destination = change_path(console, "mcp-cp-copy")
+    write_fixture(console, "data/mcp-cp-source", b"copy me\n")
+    again = run_change(binary, console, "ariel_cp",
+                       {"source": source, "path": destination})
+    assert again["isError"] is False, again
+    with open(destination, "rb") as handle:
+        assert handle.read() == b"copy me\n", "the copy must hold the source's bytes"
+    with open(source, "rb") as handle:
+        assert handle.read() == b"copy me\n", "a copy leaves the source in place"
+
+
+def scenario_mv_renames_the_name(binary, console):
+    source = change_path(console, "mcp-mv-source")
+    destination = change_path(console, "mcp-mv-moved")
+    write_fixture(console, "data/mcp-mv-source", b"move me\n")
+    again = run_change(binary, console, "ariel_mv",
+                       {"source": source, "path": destination})
+    assert again["isError"] is False, again
+    assert not os.path.lexists(source), "mv must move the name"
+    with open(destination, "rb") as handle:
+        assert handle.read() == b"move me\n", "the moved name must hold the bytes"
+
+
+def scenario_chmod_sets_the_mode(binary, console):
+    path = change_path(console, "mcp-chmod")
+    write_fixture(console, "data/mcp-chmod", b"mode\n")
+    os.chmod(path, 0o644)
+    again = run_change(binary, console, "ariel_chmod",
+                       {"mode": "0600", "path": path})
+    assert again["isError"] is False, again
+    assert os.stat(path).st_mode & 0o777 == 0o600, oct(os.stat(path).st_mode)
+
+
+def scenario_ln_creates_a_symbolic_link(binary, console):
+    target = change_path(console, "mcp-ln-target")
+    link = change_path(console, "mcp-ln-link")
+    write_fixture(console, "data/mcp-ln-target", b"link me\n")
+    again = run_change(binary, console, "ariel_ln",
+                       {"target": target, "path": link, "symbolic": True})
+    assert again["isError"] is False, again
+    assert os.path.islink(link), "symbolic true must create a symbolic link"
+    assert os.readlink(link) == target, os.readlink(link)
+
+
+def scenario_ln_takes_a_boolean_and_refuses_anything_else(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    schema = by_name["ariel_ln"]["inputSchema"]
+    assert schema["properties"]["symbolic"] == {"type": "boolean"}, schema
+    replies, _ = session(binary, console, [INITIALIZE, request(2, "tools/call", {
+        "name": "ariel_ln",
+        "arguments": {"target": "/data/a", "path": "/data/b", "symbolic": 1}})])
+    error = replies[1]["error"]
+    assert replies[1]["id"] == 2 and error["code"] == -32602, replies[1]
+    assert "symbolic" in error["message"], replies[1]
+
+
+def scenario_chown_and_chgrp_ask_the_owner_first(binary, console):
+    """The ids are the caller's; the host may refuse the change, not the ask."""
+    path = change_path(console, "mcp-owner")
+    write_fixture(console, "data/mcp-owner", b"owner\n")
+    for name, arguments in (
+            ("ariel_chown", {"owner": str(os.getuid()), "path": path}),
+            ("ariel_chgrp", {"group": str(os.getgid()), "path": path})):
+        shown = open_change(binary, console, name, arguments)
+        grant_change(binary, console, name, shown)
+
+
+def scenario_state_directory_is_protected_through_every_change_tool(binary, console):
+    protected = os.path.join(console.root, "data", "ariel")
+    inside = os.path.join(protected, "staging")
+    destination = change_path(console, "mcp-protected-destination")
+    cases = [
+        ("ariel_rmdir", {"path": inside}),
+        ("ariel_rm", {"path": os.path.join(protected, "token")}),
+        ("ariel_touch", {"path": os.path.join(protected, "token")}),
+        ("ariel_cp", {"source": os.path.join(protected, "token"),
+                      "path": destination}),
+        ("ariel_mv", {"source": os.path.join(protected, "token"),
+                      "path": destination}),
+        ("ariel_chmod", {"mode": "0644", "path": os.path.join(protected, "token")}),
+        ("ariel_chown", {"owner": "0", "path": os.path.join(protected, "token")}),
+        ("ariel_chgrp", {"group": "0", "path": os.path.join(protected, "token")}),
+        ("ariel_ln", {"target": os.path.join(protected, "token"),
+                      "path": destination, "symbolic": True}),
+    ]
+    for name, arguments in cases:
+        console.fresh()
+        result = call_tool(binary, console, name, arguments)
+        assert result["isError"] is True, (name, result)
+        shown = result["structuredContent"]
+        assert shown["exit"] == 87 and shown["word"] == "protected", (name, shown)
+        console.assert_no_line(timeout=0.4)
+
+
 SCENARIOS = [
     ("initialize answers the ADR-0017 revision and serverInfo ariel",
      scenario_initialize_names_the_revision_and_server),
@@ -1196,6 +1351,26 @@ SCENARIOS = [
      scenario_payload_run_runs_the_installed_build),
     ("ariel_shutdown asks the owner, then the console answers and stays off",
      scenario_shutdown_asks_then_the_console_goes_off),
+    ("ariel_rmdir asks the owner, then removes the empty directory",
+     scenario_rmdir_removes_an_empty_directory),
+    ("ariel_touch asks the owner, then creates the file",
+     scenario_touch_creates_the_file),
+    ("ariel_rm on a symbolic link removes the link and leaves its target",
+     scenario_rm_removes_a_symbolic_link_and_leaves_its_target),
+    ("ariel_cp asks the owner, then copies the source",
+     scenario_cp_copies_the_source),
+    ("ariel_mv asks the owner, then renames the name",
+     scenario_mv_renames_the_name),
+    ("ariel_chmod asks the owner, then sets the mode",
+     scenario_chmod_sets_the_mode),
+    ("ariel_ln with symbolic true creates a symbolic link",
+     scenario_ln_creates_a_symbolic_link),
+    ("ariel_ln's symbolic is a boolean and anything else is invalid params",
+     scenario_ln_takes_a_boolean_and_refuses_anything_else),
+    ("ariel_chown and ariel_chgrp ask the owner first",
+     scenario_chown_and_chgrp_ask_the_owner_first),
+    ("a path under the state directory answers protected 87 through every file change tool",
+     scenario_state_directory_is_protected_through_every_change_tool),
 ]
 for _name, _keys in READ_ROWS:
     SCENARIOS.append((
