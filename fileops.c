@@ -577,13 +577,16 @@ precondition(const char *command, const char *kind) {
   if(absent) {
     return FILEOPS_NO_FILE;
   }
-  if(link) {
-    return FILEOPS_LINK;
+  // A link is removed as the name it is; unlink never follows it, so the
+  // object it names is left alone. identity() has already refused a link that
+  // leads to a protected object.
+  if(link || file) {
+    return FILEOPS_OK;
   }
   if(dir) {
     return FILEOPS_IS_DIR;
   }
-  return file ? FILEOPS_OK : FILEOPS_NOT_FILE;
+  return FILEOPS_NOT_FILE;
 }
 
 

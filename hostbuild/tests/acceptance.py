@@ -1439,6 +1439,8 @@ HOST_ROOT_SCENARIOS = {
     "through a hard link",
     "writes outside /data, /user and /mnt/usb* answer protected and exit 87 "
     "without asking, and so does Ariel's token",
+    "rm removes a symbolic link and leaves its target, and a link to a "
+    "protected object answers protected",
     "a file replaced after approval answers approval_stale and exit 78",
     "a file replaced after a chmod approval answers approval_stale and keeps "
     "its mode",
@@ -5039,6 +5041,25 @@ def scenario_file_commands_need_the_owner(server):
     assert run_command(server, "rm " + target) == ["exit 0"], (
         "a signed rm must run")
     assert stat_exit(server, target) == "exit 1", "rm must remove the file"
+
+
+def scenario_rm_removes_a_link_and_leaves_its_target(server):
+    """rm removes a symbolic link as a name, and never the object it names."""
+    target = make_file(server, "rm-link-target", 0o644)
+    link = os.path.join(server.root, "data", "rm-link")
+    make_link(link, target, hard=False)
+
+    approval, challenge = gate_request(server, "rm " + link)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "rm " + link) == ["exit 0"], (
+        "a signed rm of a symbolic link must run")
+    assert not os.path.lexists(link), "the link must be gone"
+    assert os.path.exists(target), "the object the link named must stay"
+
+    alias = os.path.join(server.root, "data", "rm-link-protected")
+    make_link(alias, secret_path(server, "token"), hard=False)
+    assert_protected(server, "rm " + alias)
+    assert os.path.lexists(alias), "a refused rm must leave the link"
 
 
 def scenario_file_replaced_after_approval_answers_78(server):
@@ -11241,6 +11262,9 @@ SCENARIOS = [
      scenario_no_system_change_on_agent_port, None),
     ("mkdir, rmdir, touch and rm run only after the owner signs, once each",
      scenario_file_commands_need_the_owner, True),
+    ("rm removes a symbolic link and leaves its target, and a link to a "
+     "protected object answers protected",
+     scenario_rm_removes_a_link_and_leaves_its_target, HOST_ROOT_REASON),
     ("a file replaced after approval answers approval_stale and exit 78",
      scenario_file_replaced_after_approval_answers_78, HOST_ROOT_REASON),
     ("a command nothing implements asks the owner and then does nothing",
