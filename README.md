@@ -40,6 +40,58 @@ Ariel builds like shsrv, with the [ps5-payload-sdk](https://github.com/ps5-paylo
 
 On the console, [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) must be running on 9021; it runs each payload as a process of its own, so a crashing payload does not take the loader down. Ariel stops any running shsrv and takes its place. The telnet shell still answers on port 2323 exactly like upstream, and `help` lists its commands. Payloads in a folder on the `PATH` (`/user/homebrew/bin` and `/mnt/usb0/homebrew/bin`) run directly; homebrew that needs audio or video is launched through `hbldr`, and `hbdbg` starts it under gdb. Inherited from shsrv, the shell is not attached to a TTY, so homebrew that changes terminal properties will not work.
 
+### Using the console from an agent
+
+`ariel-mcp` is the host-side MCP server: one binary per machine, with no checkout and no toolchain. A machine that has never seen this repository runs the block below in order, with the console address and the access token the owner gives in place of `<console address>` and `<token>`. `<home>` is the output of `echo $HOME`, because TOML does not expand it.
+
+1. Download the binary for this machine from the stable release address:
+
+   ```sh
+   case "$(uname -s)-$(uname -m)" in
+     Darwin-arm64) asset=ariel-mcp-macos-arm64 ;;
+     Darwin-x86_64) asset=ariel-mcp-macos-x86_64 ;;
+     Linux-x86_64) asset=ariel-mcp-linux-x86_64 ;;
+     *) echo "no ariel-mcp binary for $(uname -s) $(uname -m)" >&2; exit 1 ;;
+   esac
+   curl -fL -o "$HOME/ariel-mcp" "https://github.com/sbihaiko/ariel/releases/latest/download/$asset"
+   ```
+
+2. Make it executable:
+
+   ```sh
+   chmod +x "$HOME/ariel-mcp"
+   ```
+
+3. Register it with Claude Code:
+
+   ```sh
+   claude mcp add -s user ariel -e PS5_HOST=<console address> -e ARIEL_TOKEN=<token> -- "$HOME/ariel-mcp"
+   ```
+
+4. Register it with Codex by appending this table to `~/.codex/config.toml`:
+
+   ```toml
+   [mcp_servers.ariel]
+   command = "<home>/ariel-mcp"
+   env = { PS5_HOST = "<console address>", ARIEL_TOKEN = "<token>" }
+   ```
+
+5. Prove it works. This is the last step:
+
+   ```sh
+   "$HOME/ariel-mcp" --check --host <console address> --token <token>
+   ```
+
+   On success it prints one line and exits 0:
+
+   ```console
+   ariel-mcp: console <console address>:2324 accepted the token
+   ```
+
+   A refused token or an unreachable console exits 1 with one `ariel-mcp:` line that names what failed.
+
+The surface gives no signing, no capture and no restart. The server holds no key and never signs: a change that needs approval returns a challenge, and the owner signs it on their own machine. It gives no screen capture: `shots` copies an image the console's Create button already wrote. It gives no restart: there is no reboot tool, and `reboot` on the console answers `reboot_unsupported`. Claude Code and Codex are the two clients this section covers.
+
 ### The agent port
 
 The agent port is 2324, raw TCP with no telnet negotiation, so a binary upload arrives intact. Every connection starts with `auth <token>`, the token Ariel shows on the console at first start; then one command per connection, no prompts, and every reply ends with an `exit <status>` line, so agents reach it one shot at a time, e.g. `printf 'auth %s\nls --json /data\n' "$ARIEL_TOKEN" | nc ps5 2324`. A command called gated below needs the owner's signature before it runs; the design is in [Safety model](#safety-model).
