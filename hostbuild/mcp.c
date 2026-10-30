@@ -46,7 +46,10 @@ enum mcp_class {
 enum mcp_kind {
   ARG_STRING,
   ARG_INTEGER,
-  ARG_LOCAL
+  ARG_LOCAL,
+  // A token of the command that comes from this table, not from the caller, as
+  // kind=one-shot. It has no member in the tool's schema.
+  ARG_FIXED
 };
 
 typedef struct {
@@ -110,6 +113,23 @@ static const mcp_arg_t write_args[] = {
   { NULL, ARG_STRING, 0, NULL }
 };
 
+static const mcp_arg_t install_args[] = {
+  { "name", ARG_STRING, 1, NULL },
+  { "repo", ARG_STRING, 1, NULL },
+  { "asset", ARG_STRING, 1, NULL },
+  { "tag", ARG_STRING, 0, NULL },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
+// The console supports one kind of one-shot check, so the kind is fixed here
+// and only the timeout is the caller's.
+static const mcp_arg_t config_args[] = {
+  { "name", ARG_STRING, 1, NULL },
+  { "kind", ARG_FIXED, 0, "kind=one-shot" },
+  { "timeout", ARG_INTEGER, 1, "timeout=" },
+  { NULL, ARG_STRING, 0, NULL }
+};
+
 // The tool table is the whole surface: tools/list and tools/call both read it.
 // A NULL name ends it. A row's word is the console command it runs.
 static const mcp_tool_t mcp_tools[] = {
@@ -135,6 +155,14 @@ static const mcp_tool_t mcp_tools[] = {
   { "ariel_read", "Read a byte range of a file on the console. With local_path, an absolute path on this host, the server writes the range to that file and answers its path, size and hash, never the bytes.", MCP_READ, "read", read_args },
   { "ariel_payload_push", "Push a payload to the console. The server reads the bytes of local_path, an absolute path on this host, and streams them to the console. An upload that stops moving for 59 seconds is cut by the console, not by this server, and the console's word answers, such as upload_mismatch or staging_full. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "payload push", push_args },
   { "ariel_write", "Write a file on the console from local_path, an absolute path on this host that the server reads and streams to the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "write", write_args },
+  { "ariel_autoload_show", "Show the console's boot list.", MCP_READ, "autoload show", no_args },
+  { "ariel_payload_run", "Run an installed payload on the console in the foreground and answer its output and status. A build is approved when it is committed, so a run of an installed build asks nobody.", MCP_WRITE, "payload run --wait", name_args },
+  { "ariel_payload_install", "Install a payload from a release the console's allowlist names, fetching it to the console. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "payload install", install_args },
+  { "ariel_payload_rollback", "Roll an installed payload back to the build it replaced. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "payload rollback", name_args },
+  { "ariel_payload_config", "Set an installed payload's one-shot health-check timeout, in seconds. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "payload config", config_args },
+  { "ariel_autoload_safe_boot", "Set the boot list aside so the next boot loads nothing but Ariel. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "autoload safe-boot", no_args },
+  { "ariel_shutdown", "Shut the console down through its own path. The console stays off until someone presses the button; nothing here turns it back on. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "shutdown", no_args },
+  { "ariel_suspend", "Suspend the console into standby. The console suspends and does not restart; a build with no standby route answers not available on this platform. The owner signs the challenge first; then call again with approval_id and signature.", MCP_WRITE, "suspend", no_args },
   { NULL, NULL, MCP_READ, NULL, NULL }
 };
 
@@ -575,6 +603,16 @@ whole_integer(const char *p, const char *end) {
 }
 
 
+/* A flag that ends in '=' binds its value with no space, as timeout=30; any
+   other flag is a token of its own, as -c 1. */
+static int
+glued_flag(const char *flag) {
+  size_t n = flag ? strlen(flag) : 0;
+
+  return n > 0 && flag[n - 1] == '=';
+}
+
+
 static int
 build_command(const mcp_tool_t *row, const char *as, const char *ae,
               struct command *cmd, char *why, size_t why_len) {
@@ -609,6 +647,13 @@ build_command(const mcp_tool_t *row, const char *as, const char *ae,
     if(arg->kind == ARG_LOCAL) {
       continue;
     }
+    if(arg->kind == ARG_FIXED) {
+      if(append(cmd, " ", 1) || append(cmd, arg->flag, strlen(arg->flag))) {
+        snprintf(why, why_len, "invalid params: the command is too long");
+        return -1;
+      }
+      continue;
+    }
     found = object_member(as, ae, arg->key, &vs, &ve, NULL);
     if(found < 0) {
       snprintf(why, why_len, "invalid params: arguments must be an object");
@@ -640,7 +685,8 @@ build_command(const mcp_tool_t *row, const char *as, const char *ae,
         snprintf(why, why_len, "invalid params: %s must be a whole number", arg->key);
         return -1;
       }
-      if(append(cmd, " ", 1) || append(cmd, vs, (size_t)(ve - vs))) {
+      if((!glued_flag(arg->flag) && append(cmd, " ", 1)) ||
+         append(cmd, vs, (size_t)(ve - vs))) {
         snprintf(why, why_len, "invalid params: the command is too long");
         return -1;
       }
@@ -1429,6 +1475,9 @@ write_schema(FILE *out, const mcp_tool_t *row) {
 
   fputs("{\"type\":\"object\",\"properties\":{", out);
   for(arg = row->args; arg->key; arg++) {
+    if(arg->kind == ARG_FIXED) {
+      continue;
+    }
     fprintf(out, "%s\"%s\":{\"type\":\"%s\"}", sep, arg->key,
             arg->kind == ARG_INTEGER ? "integer" : "string");
     sep = ",";

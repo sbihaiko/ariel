@@ -15390,6 +15390,10 @@ SCENARIOS.extend(FTP_SCENARIOS)
 
 
 VERIFY_CEILING_BYTES = 256 * 1024 * 1024
+# Hashing the whole ceiling takes seconds of this machine's time even alone, and
+# a machine running other suites at the same time takes longer; the wait for the
+# answer is sized to the work, not to the usual command.
+VERIFY_HASH_TIMEOUT = 120.0
 VERIFY_CHECKS = ("app.pkg", "app.pbm", "app.json", "app.xml", "sce_sys/param.sfo",
                  "appmeta", "licence", "content_id")
 VERIFY_PACKAGE = b"verify package\n"
@@ -15553,7 +15557,8 @@ def scenario_verify_hashes_a_file_at_the_ceiling(server):
     os.truncate(app_pkg, 0)
     os.truncate(app_pkg, VERIFY_CEILING_BYTES)
     assert run_command(server, "verify %s --sha256 %s" % (
-        title, zero_sha256(VERIFY_CEILING_BYTES))) == verify_reply(
+        title, zero_sha256(VERIFY_CEILING_BYTES)),
+        timeout=VERIFY_HASH_TIMEOUT) == verify_reply(
         title, extra=("ok app.pkg sha256",))
 
 

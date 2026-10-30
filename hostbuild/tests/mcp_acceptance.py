@@ -243,6 +243,7 @@ READ_ROWS = [
     ("ariel_ifconfig", []),
     ("ariel_ping", ["address"]),
     ("ariel_read", ["path", "offset", "limit", "local_path"]),
+    ("ariel_autoload_show", []),
 ]
 # Paths are absolute on the host, so fixtures live under the harness's root and
 # the arguments name them by "{root}".
@@ -267,6 +268,7 @@ READ_CALLS = {
     "ariel_ping": {"address": "127.0.0.1", "count": 1, "wait": 200},
     "ariel_read": {"path": "{root}/mcp-read/hello.txt",
                    "local_path": "{root}/mcp-read/hello.copy"},
+    "ariel_autoload_show": {},
 }
 
 
@@ -889,6 +891,188 @@ def scenario_missing_local_file_is_a_tool_failure(binary, console):
     assert missing in result["content"][0]["text"], result
 
 
+# Issue #146: the change tools. Each one's first call opens the owner's
+# approval and the same call with the signed challenge completes it. No tool is
+# named reboot: a restart from a payload was measured not to exist (SPEC #136).
+# The rows are named here from the SPEC, not read back from the server.
+CHANGE_ROWS = [
+    ("ariel_payload_run", ["name"]),
+    ("ariel_payload_install", ["name", "repo", "asset", "tag"]),
+    ("ariel_payload_rollback", ["name"]),
+    ("ariel_payload_config", ["name", "timeout"]),
+    ("ariel_autoload_safe_boot", []),
+    ("ariel_shutdown", []),
+    ("ariel_suspend", []),
+]
+
+# The ariel-host binary the suite was given, for a scenario that needs a console
+# of its own: a granted shutdown ends the console's process.
+CONSOLE_BINARY = "./ariel-host"
+
+
+def scenario_change_rows_are_listed_as_changes(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    for name, keys in CHANGE_ROWS:
+        tool = by_name[name]
+        assert tool["description"].strip(), tool
+        assert tool["annotations"] == {
+            "readOnlyHint": False, "destructiveHint": True}, tool
+        schema = tool["inputSchema"]
+        assert schema["type"] == "object", tool
+        for key in keys + ["session", "approval_id", "signature"]:
+            assert key in schema["properties"], (name, key, schema)
+
+
+def scenario_no_tool_is_named_reboot(binary, console):
+    """tools/list carries no restart: only the console's shutdown and suspend."""
+    names = [tool["name"] for tool in listed_tools(binary, console)]
+    assert [name for name in names if "reboot" in name.lower()] == [], names
+
+
+def scenario_shutdown_says_the_console_stays_off(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    description = by_name["ariel_shutdown"]["description"]
+    assert "stays off" in description, description
+    assert "button" in description, description
+
+
+def scenario_suspend_says_it_suspends_and_not_restarts(binary, console):
+    by_name = {tool["name"]: tool for tool in listed_tools(binary, console)}
+    description = by_name["ariel_suspend"]["description"]
+    assert "suspend" in description.lower(), description
+    assert "does not restart" in description, description
+
+
+def open_change(binary, console, name, arguments):
+    """Ask a change tool on a clean table, and drain the owner's prompt."""
+    console.fresh()
+    result = call_tool(binary, console, name, arguments)
+    prompt = console.next_line(timeout=10.0)
+    assert prompt and prompt.startswith("prompt "), prompt
+    shown = result["structuredContent"]
+    assert result["isError"] is True and shown["exit"] == 75, result
+    assert APPROVAL_ID.fullmatch(shown.get("approval_id") or ""), result
+    # An install answers the staging it made before it asks, so the console's
+    # approval line is what this checks, not the first word of the answer.
+    assert ("approval_required %s\n" % shown["approval_id"]
+            in result["content"][0]["text"]), result
+    assert shown["challenge"].startswith(
+        "challenge %s " % shown["approval_id"]), result
+    assert "ariel-sign sign <owner.key>" in shown["next"], result
+    return shown
+
+
+def grant_change(binary, console, name, shown):
+    """Sign the challenge and pass it back: the console answers the grant."""
+    envelope = acceptance.sign_challenge(console, shown["challenge"])
+    result = call_tool(binary, console, name, {
+        "approval_id": shown["approval_id"], "signature": envelope})
+    assert result["isError"] is False, result
+    assert result["content"][0]["text"] == (
+        "approval_granted %s\n" % shown["approval_id"]), result
+    assert result["structuredContent"] == {"exit": 0, "truncated": False}, result
+
+
+def scenario_suspend_asks_then_answers_the_platform_word(binary, console):
+    """A granted suspend runs the built-in and the host names its own refusal."""
+    shown = open_change(binary, console, "ariel_suspend", {})
+    grant_change(binary, console, "ariel_suspend", shown)
+    again = call_tool(binary, console, "ariel_suspend", {})
+    assert again["isError"] is True, again
+    assert again["content"][0]["text"] == "not available on this platform\n", again
+    assert again["structuredContent"]["exit"] == 1, again
+
+
+def scenario_autoload_safe_boot_asks_then_answers_the_console(binary, console):
+    """A granted safe-boot sets the boot list aside; a second one must wait."""
+    shown = open_change(binary, console, "ariel_autoload_safe_boot", {})
+    grant_change(binary, console, "ariel_autoload_safe_boot", shown)
+    again = call_tool(binary, console, "ariel_autoload_safe_boot", {})
+    assert again["isError"] is False, again
+    assert again["content"][0]["text"] == "autoload safe-boot\n", again
+    assert again["structuredContent"] == {"exit": 0, "truncated": False}, again
+    pending = call_tool(binary, console, "ariel_autoload_safe_boot", {})
+    assert pending["isError"] is True, pending
+    assert pending["content"][0]["text"] == "safe_boot_pending\n", pending
+    assert pending["structuredContent"]["word"] == "safe_boot_pending", pending
+
+
+def scenario_payload_config_asks_then_answers_the_console(binary, console):
+    """A granted config names the payload, the one-shot kind and the timeout."""
+    acceptance.install_payload(
+        console, "cfg", acceptance.healthy_build("cfg"))
+    shown = open_change(binary, console, "ariel_payload_config",
+                        {"name": "cfg", "timeout": 30})
+    grant_change(binary, console, "ariel_payload_config", shown)
+    again = call_tool(binary, console, "ariel_payload_config",
+                      {"name": "cfg", "timeout": 30})
+    assert again["isError"] is False, again
+    assert again["content"][0]["text"] == (
+        "configured cfg kind=one-shot timeout=30\n"), again
+
+
+def scenario_payload_rollback_asks_then_answers_the_console(binary, console):
+    """A granted rollback restores the build the newer one replaced."""
+    previous = acceptance.install_payload(
+        console, "roll", acceptance.healthy_build("roll-a"))
+    acceptance.install_payload(console, "roll", acceptance.healthy_build("roll-b"))
+    shown = open_change(binary, console, "ariel_payload_rollback",
+                        {"name": "roll"})
+    grant_change(binary, console, "ariel_payload_rollback", shown)
+    again = call_tool(binary, console, "ariel_payload_rollback",
+                      {"name": "roll"})
+    assert again["isError"] is False, again
+    assert again["content"][0]["text"] == "rolled_back roll %s\n" % previous, again
+
+
+def scenario_payload_install_asks_then_answers_the_console(binary, console):
+    """A granted install answers the grant; the console staged the release."""
+    fixture = acceptance.InstallFixture(
+        acceptance.healthy_build(acceptance.INSTALL_NAME))
+    try:
+        server = fixture.server
+        shown = open_change(binary, server, "ariel_payload_install", {
+            "name": acceptance.INSTALL_NAME, "repo": acceptance.INSTALL_REPO,
+            "asset": acceptance.INSTALL_ASSET})
+        grant_change(binary, server, "ariel_payload_install", shown)
+        assert fixture.fake.requests, (
+            "an install must fetch the release the allowlist names")
+    finally:
+        fixture.close()
+
+
+def scenario_payload_run_runs_the_installed_build(binary, console):
+    """A run executes the committed build; the commit was the approval.
+
+    The console gates a build when it is committed, and approving a build also
+    approves running it (Stage 1). A run of an installed build therefore asks
+    nobody: this tool is a change, but its prompt happened at the commit.
+    """
+    acceptance.install_payload(
+        console, "runs", acceptance.healthy_build("runs"))
+    result = call_tool(binary, console, "ariel_payload_run", {"name": "runs"})
+    assert result["isError"] is False, result
+    text = result["content"][0]["text"]
+    assert "Hello from runs!" in text, text
+    assert text.endswith("status 0\n"), text
+
+
+def scenario_shutdown_asks_then_the_console_goes_off(binary, console):
+    """A granted shutdown answers, and the console's process ends: it stays off."""
+    dedicated = acceptance.Server(CONSOLE_BINARY)
+    try:
+        shown = open_change(binary, dedicated, "ariel_shutdown", {})
+        grant_change(binary, dedicated, "ariel_shutdown", shown)
+        result = call_tool(binary, dedicated, "ariel_shutdown", {})
+        assert result["isError"] is False, result
+        assert result["content"][0]["text"] == "shutting_down\n", result
+        assert result["structuredContent"] == {"exit": 0, "truncated": False}, result
+        assert dedicated.proc.wait(timeout=10) == 0, (
+            "a shutdown must end the console's process")
+    finally:
+        dedicated.stop()
+
+
 SCENARIOS = [
     ("initialize answers the ADR-0017 revision and serverInfo ariel",
      scenario_initialize_names_the_revision_and_server),
@@ -990,6 +1174,28 @@ SCENARIOS = [
      scenario_relative_local_path_is_refused_before_the_console),
     ("a missing local file is a tool failure that names the file",
      scenario_missing_local_file_is_a_tool_failure),
+    ("every change row is listed with a destructive class, its keys and the approval arguments",
+     scenario_change_rows_are_listed_as_changes),
+    ("tools/list carries no tool named reboot",
+     scenario_no_tool_is_named_reboot),
+    ("ariel_shutdown's description says the console stays off until a button is pressed",
+     scenario_shutdown_says_the_console_stays_off),
+    ("ariel_suspend's description says it suspends and does not restart",
+     scenario_suspend_says_it_suspends_and_not_restarts),
+    ("ariel_suspend asks the owner, then the host answers not available on this platform",
+     scenario_suspend_asks_then_answers_the_platform_word),
+    ("ariel_autoload_safe_boot asks the owner, then sets the boot list aside",
+     scenario_autoload_safe_boot_asks_then_answers_the_console),
+    ("ariel_payload_config asks the owner, then applies the one-shot timeout",
+     scenario_payload_config_asks_then_answers_the_console),
+    ("ariel_payload_rollback asks the owner, then restores the previous build",
+     scenario_payload_rollback_asks_then_answers_the_console),
+    ("ariel_payload_install asks the owner after fetching the release",
+     scenario_payload_install_asks_then_answers_the_console),
+    ("ariel_payload_run runs the committed build without a new prompt",
+     scenario_payload_run_runs_the_installed_build),
+    ("ariel_shutdown asks the owner, then the console answers and stays off",
+     scenario_shutdown_asks_then_the_console_goes_off),
 ]
 for _name, _keys in READ_ROWS:
     SCENARIOS.append((
@@ -999,9 +1205,12 @@ for _name, _keys in READ_ROWS:
 
 
 def main():
+    global CONSOLE_BINARY
+
     args = sys.argv[1:]
     binary = args[0] if args else "./ariel-mcp"
     host_binary = args[1] if len(args) > 1 else "./ariel-host"
+    CONSOLE_BINARY = host_binary
     console = acceptance.Server(host_binary)
     try:
         for title, scenario in SCENARIOS:
