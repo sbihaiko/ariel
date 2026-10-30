@@ -4,6 +4,7 @@
 *.elf.inc
 *.a
 hostbuild/ariel-host
+hostbuild/ariel-mcp
 /data/
 
 __pycache__/

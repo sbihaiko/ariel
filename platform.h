@@ -59,6 +59,8 @@ along with this program; see the file COPYING. If not, see
  * lands in the session's map and the owner signs that scope.
  * A PS5 built-in fills arg with its arguments after the target, as text.
  * For a run, argc counts the arguments after its name and arg holds each one.
+ * A shutdown fills arg[0] with the ordered list of mounted removable volumes
+ * it will unmount, and sha256 with the hash of that list.
  **/
 
 /** The most arguments a run can sign, and each one's longest value. **/
@@ -330,10 +332,30 @@ struct platform {
   int (*process_signal)(platform_t *self, int32_t pid, int sig);
 
   /**
-   * Restart the console once the owner has approved a reboot. On success it
+   * Restart this machine once the owner has approved a reboot. On success it
    * does not return. Returns -1 when the restart cannot be started.
+   *
+   * NULL when the platform has no restart route. No call from a payload
+   * restarts this console: reboot(2) puts it in standby and the three request
+   * calls answer success and change nothing (docs/console-findings.md, #135).
+   * The console build therefore leaves this NULL, and the reboot command
+   * answers reboot_unsupported without asking anyone. Only the host build,
+   * whose restart re-execs Ariel and runs the boot list, has one.
    **/
   int (*reboot)(platform_t *self);
+
+  /**
+   * Request the console's own orderly shutdown once the owner has approved
+   * it: the system unmounts the removable volumes, runs the /user cleaner and
+   * powers the console off. The call ends the connection with it, and on
+   * success it does not return (docs/console-findings.md, #135).
+   *
+   * The host build has no console to power off, so it ends Ariel's own
+   * process, as a console's shutdown ends every connection there. Returns 0
+   * when the request was accepted, and -1 when the shutdown cannot be
+   * started.
+   **/
+  int (*shutdown)(platform_t *self);
 
   /**
    * Fetch url over plain HTTP without following redirects. The reply status

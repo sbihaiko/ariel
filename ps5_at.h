@@ -1,6 +1,6 @@
 /* PS5 libc's *at() stubs return the errno in rax and leave errno unchanged.
    The host libc returns -1 and sets errno. store.c and fileops.c keep calling
-   openat, mkdirat, unlinkat, renameat, fstatat and linkat; this header is what
+   openat, mkdirat, unlinkat, renameat, fstatat, linkat and symlinkat; this header is what
    makes those calls POSIX on the PS5 build. */
 #ifndef PS5_AT_H
 #define PS5_AT_H
@@ -77,6 +77,11 @@ ariel_linkat(int oldfd, const char *old, int newfd, const char *new, int flag) {
   return (int)ret;
 }
 
+static inline int
+ariel_symlinkat(const char *target, int newfd, const char *new) {
+  return (int)ariel_syscall(SYS_symlinkat, (long)target, newfd, (long)new, 0);
+}
+
 #define ARIEL_OPENAT_DISP(_1, _2, _3, _4, NAME, ...) NAME
 #define openat(...) \
   ARIEL_OPENAT_DISP(__VA_ARGS__, ariel_openat4, ariel_openat3)(__VA_ARGS__)
@@ -88,6 +93,8 @@ ariel_linkat(int oldfd, const char *old, int newfd, const char *new, int flag) {
   ariel_fstatat((fd), (path), (st), (flag))
 #define linkat(oldfd, old, newfd, new, flag) \
   ariel_linkat((oldfd), (old), (newfd), (new), (flag))
+#define symlinkat(target, newfd, new) \
+  ariel_symlinkat((target), (newfd), (new))
 
 #endif /* !ARIEL_HOST_BUILD */
 

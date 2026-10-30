@@ -891,6 +891,22 @@ host_reboot(platform_t *self) {
 }
 
 
+/**
+ * The host has no console to power off, so a granted shutdown ends Ariel's own
+ * process, as the console's shutdown ends every connection there. The answer
+ * and its audit line are written before this call, so nothing has to survive
+ * it.
+ **/
+static int
+host_shutdown(platform_t *self) {
+  (void)self;
+
+  fflush(stdout);
+  fflush(stderr);
+  _exit(EXIT_SUCCESS);
+}
+
+
 static int
 host_http_get(platform_t *self, const char *url, size_t max, http_sink_t sink,
               void *ctx, int *status, char *location, size_t size) {
@@ -928,6 +944,7 @@ static platform_t host_platform = {
   .process_critical = host_process_critical,
   .process_signal = host_process_signal,
   .reboot = host_reboot,
+  .shutdown = host_shutdown,
 };
 
 
@@ -967,6 +984,12 @@ platform_host(const char *dir, const char *fs_root, const char *exe) {
   snprintf(run_dir, sizeof(run_dir), "%s", dir);
   snprintf(exe_path, sizeof(exe_path), "%s", exe);
   host_platform.fs_root = fs_root;
+
+  // ARIEL_HOST_CONSOLE_STUB starts this build with the platform port stubbed
+  // as the console build's: no route from a payload restarts this machine, so
+  // the port has no reboot and the command answers reboot_unsupported. The
+  // host build only, like the test clock and the virtual controller.
+  host_platform.reboot = getenv("ARIEL_HOST_CONSOLE_STUB") ? NULL : host_reboot;
 
   // Read the descriptor bound here, before any connection thread exists:
   // the child after fork sweeps descriptors up to it and may not call

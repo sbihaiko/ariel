@@ -81,7 +81,8 @@ $(SUBDIRS):
 
 .NOTPARALLEL:
 
-all: ariel-ps5.elf sh.elf controller-spike.elf primitives-probe.elf network-spike.elf
+all: ariel-ps5.elf sh.elf controller-spike.elf primitives-probe.elf network-spike.elf \
+     system-spike.elf
 
 # The agent protocol, the store and the token are shared with the host
 # build, which compiles the same sources from hostbuild/.
@@ -99,9 +100,11 @@ platform_ps5.o: CFLAGS += -DARIEL_PUBKEY_HEX=\"$(ARIEL_PUBKEY)\" \
                           -DARIEL_RECOVERY_PUBKEY_HEX=\"$(ARIEL_RECOVERY_PUBKEY)\" \
                           -DARIEL_CONSOLE_ID=\"$(ARIEL_CONSOLE_ID)\"
 
+# libSceSystemService carries sceShellCoreUtilRequestShutdown, the console's
+# own shutdown path (#135).
 ariel-ps5.elf: shsrv.o platform_ps5.o readers_ps5.o $(ARIEL_OBJS) elfldr.o \
                pt.o notify.o sha256.o
-	$(CC) -lkernel_sys -o $@ $^
+	$(CC) -lkernel_sys -lSceSystemService -o $@ $^
 
 sh.elf: sh.o builtin.o elfldr.o pt.o libtelnet.o
 	$(CC) -lkernel_sys -o $@ $^ \
@@ -135,6 +138,12 @@ share-spike.elf: share_spike.o notify.o
 # linked into ariel-ps5.elf; the operator sends it to elfldr on its own.
 network-spike.elf: network_spike.o notify.o
 	$(CC) -lkernel_sys -o $@ $^
+
+# The system spike is a separate payload, answering issue #135. It is never
+# linked into ariel-ps5.elf; the operator sends it to elfldr on its own, one
+# candidate per run, because a candidate that works takes the console with it.
+system-spike.elf: system_spike.o
+	$(CC) -lkernel_sys -lSceSystemService -lSceSysCore -o $@ $^
 
 # The primitives probe is a separate payload. It is never linked into
 # ariel-ps5.elf; the operator sends it to elfldr on its own. ps5_at.h is a

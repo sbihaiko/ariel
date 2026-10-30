@@ -966,7 +966,9 @@ value_key(const char *command) {
  * exec is an action on its program, with the hash of its bytes, its argument
  * count and the hash of its arguments. env and export name one variable, so
  * they have no options, and an export inside a session also carries the
- * scope the value lands in, option.scope=session.
+ * scope the value lands in, option.scope=session. A shutdown is an action on
+ * the console with the ordered list of mounted removable volumes it will
+ * unmount, option.mounts, beside that list's hash.
  * A reptyr is an action on its pid with its start, and a PS5 built-in also
  * carries its arguments after the target as text, arg1 first, so the owner
  * reads them. A run is an action on its path with the hash, kind and
@@ -1042,6 +1044,16 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
     options[1].key = "recovery";
     options[1].value = facts->arg[1];
     action->noptions = 2;
+  } else if(!strcmp(facts->command, "shutdown")) {
+    // The owner approves the act, not a boot list: what the console loses is
+    // the removable volumes it will unmount, named in order beside its hash.
+    action->command = facts->command;
+    action->target = facts->target;
+    action->destination = NULL;
+    action->sha256 = facts->sha256;
+    options[0].key = "mounts";
+    options[0].value = facts->arg[0];
+    action->noptions = 1;
   } else if(facts->target[0]) {
     action->command = facts->command;
     action->target = facts->target;
@@ -1116,6 +1128,8 @@ action_build(const approval_facts_t *facts, approval_action_t *action,
       options[1].key = "timeout";
       options[1].value = text[0];
       action->noptions = 2;
+    } else if(!strcmp(facts->command, "ln.symlink")) {
+      action->noptions = 0;
     } else if(facts->kind[0]) {
       size_t n = 0;
 
@@ -1368,6 +1382,10 @@ store_approval_request(const approval_facts_t *facts,
     snprintf(prompt, promptlen,
              "reboot the console with boot list sha256 %s will run",
              facts->sha256);
+  } else if(slot->gated && !strcmp(facts->command, "shutdown")) {
+    snprintf(prompt, promptlen,
+             "shutdown unmounts %s and takes the console down "
+             "(list sha256 %s)", facts->arg[0], facts->sha256);
   } else if(slot->gated && strcmp(facts->command, "payload.install")) {
     snprintf(prompt, promptlen, "%s %s%s%s will run", facts->command,
              facts->target, facts->dest[0] ? " " : "", facts->dest);

@@ -6,6 +6,7 @@ CFLAGS += -pthread -I.. -I. -DARIEL_HOST_BUILD=1
 LDLIBS += -pthread
 
 BIN  := ariel-host
+MCP  := ariel-mcp
 SIGNER := ariel-sign
 CANONICAL_TEST := canonical_test
 TITLE_PART_TEST := title_part_test
@@ -22,10 +23,20 @@ SHARED_OBJS := $(notdir $(SHARED_SRCS:.c=.o))
 SRCS := main.c platform_host.c readers_host.c vcontroller.c testclock.c
 OBJS := $(SRCS:.c=.o) $(SHARED_OBJS) sha256.o tweetnacl.o
 
-all: $(BIN) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
+all: $(BIN) $(MCP) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 
 $(BIN): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+# The MCP server holds no key and carries no ARIEL_PUBKEY (ADR-0017). Its
+# serverInfo.version is the newest release tag, read the same way the tests read it.
+MCP_OBJS := mcp_main.o mcp.o mcp_link.o sha256.o
+MCP_VERSION := $(or $(patsubst v%,%,$(shell git tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -n 1)),0.0.0-unversioned)
+$(MCP): $(MCP_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(MCP_OBJS) $(LDLIBS)
+
+mcp.o: mcp.c mcp.h
+	$(CC) $(CFLAGS) -DMCP_SERVER_VERSION=\"$(MCP_VERSION)\" -c -o $@ $<
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -65,13 +76,15 @@ $(TITLE_PART_TEST): tests/title_part_test.c $(filter-out main.o,$(OBJS))
 
 clean:
 	rm -f $(OBJS) $(BIN) signer.o approval_signer.o $(SIGNER) \
-	      $(CANONICAL_TEST) $(TITLE_PART_TEST)
+	      $(CANONICAL_TEST) $(TITLE_PART_TEST) $(MCP) $(MCP_OBJS)
 
-test: $(BIN) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
+test: $(BIN) $(MCP) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 	./$(CANONICAL_TEST)
 	./$(TITLE_PART_TEST)
 	sh tests/deploy_guard.sh
 	sh ../tools/install/test-install.sh
 	python3 tests/acceptance.py ./$(BIN)
+	python3 tests/mcp_acceptance.py ./$(MCP) ./$(BIN)
+	python3 tests/release_workflow_acceptance.py ./$(MCP)
 
 .PHONY: all clean test

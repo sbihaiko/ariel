@@ -93,11 +93,14 @@ static const struct {
   {"ps", "list the processes"},
   {"pwd", "print the working directory"},
   {"read", "print a range of an absolute file, with its size and SHA-256"},
+  {"reboot", "answer reboot_unsupported: no route from a payload restarts this console"},
   {"sfoinfo", "print the entries of an absolute PARAM.SFO"},
   {"sha256sum", "print the SHA-256 of an absolute file"},
+  {"shutdown", "shut the console down through its own path"},
   {"sleep", "pause for up to 60 seconds"},
   {"stat", "print the size, mode and inode of an absolute path"},
   {"sum", "print the BSD checksum of an absolute file"},
+  {"suspend", "suspend the console rather than restart it: the standby route"},
   {"sync", "write cached data to disk"},
   {"sysctl", "print a kernel parameter"},
   {"sysinfo", "print the sysname, release, machine, uptime and memory"},
@@ -755,6 +758,7 @@ run_stat(int json, int argc, char *const argv[], int outfd, int errfd) {
 static int
 run_file(int argc, char *const argv[], int outfd, int errfd) {
   struct stat st;
+  struct stat entry;
   const char *kind;
   int rc;
 
@@ -763,6 +767,12 @@ run_file(int argc, char *const argv[], int outfd, int errfd) {
   }
   if((rc=stat_target("file", argv[1], errfd, &st))) {
     return rc;
+  }
+
+  if(!lstat(argv[1], &entry) && S_ISLNK(entry.st_mode)) {
+    say(outfd, argv[1]);
+    say(outfd, ": symbolic link\n");
+    return 0;
   }
 
   if(S_ISDIR(st.st_mode)) {

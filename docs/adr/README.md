@@ -23,3 +23,5 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0014](0014-the-session-prefix-and-the-resolved-path.md) | The `@` prefix names a session, and a path resolves before the gate |
 | [0015](0015-the-gate-is-one-command.md) | The gate is one command, and it names each half |
 | [0016](0016-a-change-is-complete-when-its-own-signal-says-so.md) | A change is complete when its own signal says so, never when its files stop growing |
+| [0017](0017-the-mcp-server-is-a-host-process-that-never-signs.md) | The MCP server is a host process that never signs |
+| [0018](0018-a-pending-approval-answers-its-id-alone.md) | A repeat request for a pending approval answers its ID alone |

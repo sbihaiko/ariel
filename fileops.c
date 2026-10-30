@@ -577,13 +577,16 @@ precondition(const char *command, const char *kind) {
   if(absent) {
     return FILEOPS_NO_FILE;
   }
-  if(link) {
-    return FILEOPS_LINK;
+  // A link is removed as the name it is; unlink never follows it, so the
+  // object it names is left alone. identity() has already refused a link that
+  // leads to a protected object.
+  if(link || file) {
+    return FILEOPS_OK;
   }
   if(dir) {
     return FILEOPS_IS_DIR;
   }
-  return file ? FILEOPS_OK : FILEOPS_NOT_FILE;
+  return FILEOPS_NOT_FILE;
 }
 
 
@@ -976,33 +979,219 @@ copy_entry(int sdir, const char *sleaf, const expected_object_t *expected,
 
 
 /**
- * Give the source's file a second name, then take the first one away. A
- * link never replaces an existing name, so an existing destination is kept.
- * The source is checked again before its name goes; a different object there
- * is taken back out of the destination.
+ * The host suite's stand-in for a call the filesystem refuses, named by an
+ * environment variable. The console build never refuses one here.
+ **/
+static int
+host_refuses(const char *name) {
+#ifdef ARIEL_HOST_BUILD
+  return getenv(name) != NULL;
+#else
+  (void)name;
+  return 0;
+#endif
+}
+
+
+/**
+ * The host suite's stand-in for an object that appears at the destination
+ * after the check: it creates dleaf with a line of text when the variable is
+ * set. The console build never creates one here.
+ **/
+static void
+host_appears(int dirfd, const char *leaf) {
+#ifdef ARIEL_HOST_BUILD
+  int fd;
+
+  if(getenv("ARIEL_HOST_DEST_APPEARS") &&
+     (fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                  0644)) >= 0) {
+    write_full(fd, "appeared after the check\n", strlen("appeared after the check\n"));
+    close(fd);
+  }
+#else
+  (void)dirfd;
+  (void)leaf;
+#endif
+}
+
+
+static int
+link_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
+  if(host_refuses("ARIEL_HOST_NO_LINK")) {
+    errno = EPERM;
+    return -1;
+  }
+  return linkat(sdir, sleaf, ddir, dleaf, 0);
+}
+
+
+static int
+rename_entry(int sdir, const char *sleaf, int ddir, const char *dleaf) {
+  if(host_refuses("ARIEL_HOST_RENAME_EXDEV")) {
+    errno = EXDEV;
+    return -1;
+  }
+  return renameat(sdir, sleaf, ddir, dleaf);
+}
+
+
+static int
+symlink_entry(const char *target, int dirfd, const char *leaf) {
+  if(host_refuses("ARIEL_HOST_NO_SYMLINK")) {
+    errno = EOPNOTSUPP;
+    return -1;
+  }
+  return symlinkat(target, dirfd, leaf);
+}
+
+
+/** Whether the entry leaf in dirfd is the object expected names. **/
+static int
+is_object(int dirfd, const char *leaf, const expected_object_t *expected) {
+  struct stat st;
+
+  return !fstatat(dirfd, leaf, &st, AT_SYMLINK_NOFOLLOW) &&
+         (uint64_t)st.st_dev == expected->dev &&
+         (uint64_t)st.st_ino == expected->ino;
+}
+
+
+/**
+ * Create the empty file leaf in dirfd exclusively, and record the object it
+ * is. A name already taken answers FILEOPS_EXISTS and nothing there changes.
+ **/
+static int
+reserve_entry(int dirfd, const char *leaf, expected_object_t *reserved) {
+  struct stat st;
+  int fd;
+
+  fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                           O_CLOEXEC, 0600);
+  if(fd < 0) {
+    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
+  }
+  if(fstat(fd, &st)) {
+    close(fd);
+    unlinkat(dirfd, leaf, 0);
+    return FILEOPS_FAILED;
+  }
+  close(fd);
+  reserved->dev = (uint64_t)st.st_dev;
+  reserved->ino = (uint64_t)st.st_ino;
+  return FILEOPS_OK;
+}
+
+
+/** Remove the entry leaf in dirfd, but only while it is still the object. **/
+static void
+remove_if(int dirfd, const char *leaf, const expected_object_t *expected) {
+  if(is_object(dirfd, leaf, expected)) {
+    unlinkat(dirfd, leaf, 0);
+  }
+}
+
+
+/**
+ * Move an object that was taken from the source name by mistake back there.
+ * The source name is reserved first, so a name taken since then is not
+ * replaced; if it is taken, the object stays at the destination.
+ **/
+static void
+put_back(int sdir, const char *sleaf, int ddir, const char *dleaf) {
+  expected_object_t mine;
+
+  if(reserve_entry(sdir, sleaf, &mine)) {
+    return;
+  }
+  if(renameat(ddir, dleaf, sdir, sleaf)) {
+    remove_if(sdir, sleaf, &mine);
+  }
+}
+
+
+/**
+ * Give the source's file its new name in one rename, so the object is never
+ * under two names. The destination name is first reserved with an exclusive
+ * create, so an object already there is kept: the rename can only replace the
+ * empty reservation. A rename across file systems answers EXDEV, and then the
+ * reservation is removed and the object copied and its source name removed.
+ * The source is checked again after the rename; a different object is put
+ * back. A process that can write the destination directory could still
+ * replace the reservation between its last check and the rename.
  **/
 static int
 move_entry(int sdir, const char *sleaf, const expected_object_t *expected,
            int ddir, const char *dleaf) {
-  struct stat st;
-  int rc = FILEOPS_OK;
+  expected_object_t reserved;
+  int err;
+  int rc;
 
-  if(linkat(sdir, sleaf, ddir, dleaf, 0)) {
-    return errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED;
-  }
-
-  if(fstatat(sdir, sleaf, &st, AT_SYMLINK_NOFOLLOW) ||
-     (uint64_t)st.st_dev != expected->dev ||
-     (uint64_t)st.st_ino != expected->ino) {
-    rc = FILEOPS_CHANGED;
-  } else if(unlinkat(sdir, sleaf, 0)) {
-    rc = FILEOPS_FAILED;
-  }
-
+  host_appears(ddir, dleaf);
+  rc = reserve_entry(ddir, dleaf, &reserved);
   if(rc) {
-    unlinkat(ddir, dleaf, 0);
+    return rc;
   }
-  return rc;
+  if(!is_object(ddir, dleaf, &reserved)) {
+    return FILEOPS_CHANGED;
+  }
+
+  if(!rename_entry(sdir, sleaf, ddir, dleaf)) {
+    if(!is_object(ddir, dleaf, expected)) {
+      put_back(sdir, sleaf, ddir, dleaf);
+      return FILEOPS_CHANGED;
+    }
+    return FILEOPS_OK;
+  }
+  err = errno;
+  remove_if(ddir, dleaf, &reserved);
+  if(err != EXDEV) {
+    return FILEOPS_FAILED;
+  }
+
+  rc = copy_entry(sdir, sleaf, expected, ddir, dleaf);
+  if(rc) {
+    return rc;
+  }
+  if(!is_object(sdir, sleaf, expected)) {
+    unlinkat(ddir, dleaf, 0);
+    return FILEOPS_CHANGED;
+  }
+  if(unlinkat(sdir, sleaf, 0)) {
+    unlinkat(ddir, dleaf, 0);
+    return FILEOPS_FAILED;
+  }
+  return FILEOPS_OK;
+}
+
+
+/**
+ * Check the object a symbolic link names, as the kernel reaches it. The walk
+ * refuses a target that crosses a link, so the target is also followed by
+ * stat: a protected object answers FILEOPS_PROTECTED, and a target that does
+ * not exist is no object to protect and the link may hold its text.
+ **/
+static int
+link_target_check(const char *root, const char *target) {
+  approval_facts_t found;
+  struct stat st;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  memset(&found, 0, sizeof(found));
+  rc = inspect(root, target, &found, &dirfd, leaf, sizeof(leaf), 0);
+  if(rc == FILEOPS_PROTECTED) {
+    return FILEOPS_PROTECTED;
+  }
+  if(!rc) {
+    close(dirfd);
+  }
+
+  if(!stat(target, &st) && protected_stat(&st)) {
+    return FILEOPS_PROTECTED;
+  }
+  return FILEOPS_OK;
 }
 
 
@@ -1081,12 +1270,69 @@ fileops_transfer_act(const char *root, const char *command,
   } else if(!strcmp(command, "mv")) {
     rc = move_entry(sdir, sleaf, &object, ddir, dleaf);
   } else {
-    rc = linkat(sdir, sleaf, ddir, dleaf, 0) ?
+    rc = link_entry(sdir, sleaf, ddir, dleaf) ?
          (errno == EEXIST ? FILEOPS_EXISTS : FILEOPS_FAILED) : FILEOPS_OK;
   }
 
   close(sdir);
   close(ddir);
+  return rc;
+}
+
+
+int
+fileops_symlink_check(const char *root, const char *target,
+                      const char *path, approval_facts_t *facts) {
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  if(target[0] != '/' || !approval_target_valid(target)) {
+    return FILEOPS_BAD_PATH;
+  }
+
+  rc = transfer_inspect(root, path, facts, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  close(dirfd);
+
+  if(strcmp(facts->kind, "absent")) {
+    return FILEOPS_EXISTS;
+  }
+  return link_target_check(root, target);
+}
+
+
+int
+fileops_symlink_act(const char *root, const char *target, const char *path) {
+  approval_facts_t now;
+  char leaf[PATH_MAX];
+  int dirfd;
+  int rc;
+
+  rc = link_target_check(root, target);
+  if(rc) {
+    return rc;
+  }
+
+  memset(&now, 0, sizeof(now));
+  rc = transfer_inspect(root, path, &now, &dirfd, leaf, sizeof(leaf));
+  if(rc) {
+    return rc;
+  }
+  if(strcmp(now.kind, "absent")) {
+    close(dirfd);
+    return FILEOPS_EXISTS;
+  }
+
+  if(symlink_entry(target, dirfd, leaf)) {
+    rc = errno == EEXIST ? FILEOPS_EXISTS :
+         errno == EOPNOTSUPP ? FILEOPS_LINK_UNSUPPORTED : FILEOPS_FAILED;
+  } else {
+    rc = FILEOPS_OK;
+  }
+  close(dirfd);
   return rc;
 }
 
@@ -2189,6 +2435,8 @@ fileops_word(int rc) {
     return "bad_member";
   case FILEOPS_BAD_OPTION:
     return "bad_option";
+  case FILEOPS_LINK_UNSUPPORTED:
+    return "link_unsupported";
   default:
     return "ok";
   }

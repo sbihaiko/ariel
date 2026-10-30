@@ -71,7 +71,9 @@ Domain terms of Ariel. Use these words, in this sense, in code, tests, issues an
 - **Console suite**: the scenarios that need no test clock, run against a real console when `PS5_HOST` is set.
 - **Platform port**: the one interface between Ariel's logic and the OS, with a PS5 and a host implementation.
 - **Test clock**: the host-only clock the suite moves instead of waiting.
-- **Simulated reboot**: on the host build, a granted `reboot` that restarts Ariel's process and runs the autoload entries, as a boot does.
+- **Simulated reboot**: on the host build, a granted `reboot` that restarts Ariel's process and runs the autoload entries, as a boot does. The console build has no restart route and answers `reboot_unsupported` (exit 1) without asking (#135).
+- **Shutdown**: the gated `shutdown` command, which asks the console's own path (`sceShellCoreUtilRequestShutdown`) to unmount its removable volumes, run the `/user` cleaner and power off (#135). The owner signs the ordered list of mounted volumes (`/mnt/usb0`, `/mnt/usb1`, or `none`) and its SHA-256, and Ariel never claims the console is off or came back on.
+- **Standby route**: the shell's `suspend` built-in, which suspends the console rather than restarting it. It is the honest name for what `reboot(2)` did on this firmware, and the command the table points at for a standby.
 - **Crash restart**: a restart of Ariel that runs no autoload entry and restarts no payload.
 
 ## Verification

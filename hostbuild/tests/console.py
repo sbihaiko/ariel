@@ -1094,12 +1094,17 @@ def ask_without_grant(session, command):
     return lines
 
 
-def check_reboot_asks_the_owner(session, context):
-    """reboot without a grant answers 75 and asks the owner, and restarts nothing."""
+def check_reboot_is_unsupported(session, context):
+    """reboot answers reboot_unsupported and exit 1, and asks nobody.
+
+    No route from a payload restarts this console (docs/console-findings.md,
+    #135), so the console build makes no challenge at all.
+    """
     del context
-    lines = ask_without_grant(session, "reboot")
-    assert not any(line.startswith("rebooting") for line in lines), (
-        "a reboot without a grant must not restart the console")
+    lines = session.link.exchange("reboot")
+    assert lines == ["reboot_unsupported", "exit 1"], (
+        "a console's reboot must answer reboot_unsupported and exit 1, got %r"
+        % lines)
 
 
 def check_autoload_edit_applies_after_grant(session, context):
@@ -1248,8 +1253,8 @@ CHECKS = [
     ("env, export and exec refuse a bad name, a relative or missing path and "
      "the token without asking, and audit each refusal",
      check_env_export_exec_refusals),
-    ("reboot answers 75 with a challenge and restarts nothing without a grant",
-     check_reboot_asks_the_owner),
+    ("reboot answers reboot_unsupported and exit 1 on the console, asking nobody",
+     check_reboot_is_unsupported),
     ("the read-only commands on the console's root and data directory exit 0",
      check_read_only_on_console),
     ("the token, approval state, nonces and keyring answer protected and exit "

@@ -46,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #define FILEOPS_ESCAPE    22
 #define FILEOPS_BAD_MEMBER 23
 #define FILEOPS_BAD_OPTION 24
+#define FILEOPS_LINK_UNSUPPORTED 25
 
 /** The longest title ID a package's own name carries. **/
 #define FILEOPS_TITLE_MAX 15
@@ -118,6 +119,23 @@ int fileops_transfer_check(const char *root, const char *source,
 int fileops_transfer_act(const char *root, const char *command,
                          const char *source, const char *destination,
                          const approval_facts_t *expected);
+
+/**
+ * Check one symbolic link, ln -s, without acting: target is the text the link
+ * holds and path the new name. target must be absolute, or the answer is
+ * FILEOPS_BAD_PATH. A target that names a protected object answers
+ * FILEOPS_PROTECTED; path must not exist. The new name's kind goes into facts.
+ **/
+int fileops_symlink_check(const char *root, const char *target,
+                          const char *path, approval_facts_t *facts);
+
+/**
+ * Perform one symbolic link after checking the target and that path is still
+ * absent. Returns FILEOPS_OK, FILEOPS_EXISTS, FILEOPS_LINK_UNSUPPORTED when the
+ * filesystem cannot hold a link, or the refusal that stops it.
+ **/
+int fileops_symlink_act(const char *root, const char *target,
+                        const char *path);
 
 /**
  * Check a recursive rm of path, the whole tree below it included, without

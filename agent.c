@@ -46,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #include "fileops.h"
 #include "http.h"
 #include "protected.h"
+#include "readers.h"
 #include "release.h"
 #include "runner.h"
 #include "runs.h"
@@ -158,6 +159,13 @@ static const char frozen_reply[] =
 static const char suspended_reply[] =
   "suspended\n"
   "exit 90\n";
+/** The console build's answer to reboot: no route from a payload restarts it. **/
+static const char reboot_unsupported[] =
+  "reboot_unsupported\n"
+  "exit 1\n";
+static const char shutdown_failed[] =
+  "shutdown_failed\n"
+  "exit 1\n";
 static const char no_shots[] =
   "no_shots\n"
   "exit 1\n";
@@ -876,6 +884,18 @@ challenge_reply(int fd, const approval_challenge_t *challenge) {
 }
 
 
+/** The approval is already asked: its id alone, without a second challenge. **/
+static void
+pending_reply(int fd, const approval_challenge_t *challenge) {
+  char answer[APPROVAL_ID_MAX + 64];
+  int len;
+
+  len = snprintf(answer, sizeof(answer), "approval_required %s\nexit 75\n",
+                 challenge->id);
+  write_all(fd, answer, (size_t)len);
+}
+
+
 /** The answer for one file command's outcome: its word and exit, or ok. **/
 static void
 outcome_text(int rc, char *out, size_t size) {
@@ -1010,7 +1030,7 @@ gate_pass_with(agent_t *agent, int fd, const approval_facts_t *facts,
   case STORE_GATE_GO:
     return 1;
   case STORE_GATE_PENDING:
-    challenge_reply(fd, challenge);
+    pending_reply(fd, challenge);
     return 0;
   case STORE_GATE_STALE:
     audit_reply(fd, facts->command, "stale", target, challenge->id,
@@ -1186,6 +1206,48 @@ transfer_command(agent_t *agent, int fd, runner_session_t *session,
 
 
 /**
+ * ln -s TARGET PATH: a symbolic link at PATH whose text is TARGET, taken as it
+ * is written. Only PATH is resolved against the session's directory.
+ **/
+static void
+symlink_command(agent_t *agent, int fd, runner_session_t *session,
+                const char *target, const char *path) {
+  const char *root = agent->platform->fs_root;
+  char resolved[GATED_PATH_MAX];
+  char subject[TRANSFER_SUBJECT_MAX + 1];
+  approval_challenge_t challenge;
+  approval_facts_t facts;
+  int rc;
+
+  if(!(path=session_operand(session, path, resolved, sizeof(resolved), fd))) {
+    return;
+  }
+
+  if(strlen(target) + strlen(path) + 1 > TRANSFER_SUBJECT_MAX) {
+    file_outcome(fd, "ln", "-", "-", FILEOPS_BAD_PATH);
+    return;
+  }
+
+  memset(&facts, 0, sizeof(facts));
+  rc = fileops_symlink_check(root, target, path, &facts);
+  if(rc != FILEOPS_OK) {
+    file_outcome(fd, "ln", subject_of(target, path, subject), "-", rc);
+    return;
+  }
+
+  snprintf(facts.command, sizeof(facts.command), "%s", "ln.symlink");
+  snprintf(facts.target, sizeof(facts.target), "%s", path);
+  snprintf(facts.dest, sizeof(facts.dest), "%s", target);
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  rc = fileops_symlink_act(root, target, path);
+  file_outcome(fd, "ln", subject_of(target, path, subject), challenge.id, rc);
+}
+
+
+/**
  * The options of the file commands. rm -r and cp -r take the tree below their
  * operands; any other option answers bad_option and asks nobody. Returns 1
  * when the line was answered here.
@@ -1200,6 +1262,9 @@ file_options(agent_t *agent, int fd, runner_session_t *session, int argc,
   if(!cp && strcmp(argv[0], "rm") && strcmp(argv[0], "mkdir") &&
      strcmp(argv[0], "rmdir") && strcmp(argv[0], "touch") &&
      strcmp(argv[0], "mv") && strcmp(argv[0], "ln")) {
+    return 0;
+  }
+  if(argc == 4 && !strcmp(argv[0], "ln") && !strcmp(argv[1], "-s")) {
     return 0;
   }
 
@@ -4064,9 +4129,128 @@ out:
 }
 
 
+/** The longest text of the removable volumes a shutdown names. **/
+#define SHUTDOWN_MOUNTS_MAX 64
+
+/** The two removable volumes a shutdown unmounts, in the order it names them. **/
+static const char *const shutdown_volumes[] = {
+  "/mnt/usb0",
+  "/mnt/usb1",
+};
+
+/** Which of them the mount table holds. **/
+struct shutdown_scan {
+  int mounted[2];
+};
+
+
+static void
+shutdown_mount_scan(void *ctx, const char *target, const char *source) {
+  struct shutdown_scan *scan = ctx;
+  size_t i;
+
+  (void)source;
+
+  for(i=0; i<sizeof(shutdown_volumes)/sizeof(shutdown_volumes[0]); i++) {
+    if(!strcmp(target, shutdown_volumes[i])) {
+      scan->mounted[i] = 1;
+    }
+  }
+}
+
+
+/**
+ * The ordered list of mounted removable volumes a shutdown will unmount:
+ * "/mnt/usb0", "/mnt/usb1", both in that order, or "none". The order is the
+ * volumes' own, never the mount table's, so one list always hashes the same.
+ * Returns 0, or -1 when the mount table cannot be read.
+ **/
+static int
+shutdown_mounts(char *out, size_t size) {
+  struct shutdown_scan scan;
+  size_t pos = 0;
+  size_t i;
+  int n;
+
+  memset(&scan, 0, sizeof(scan));
+  if(readers_mounts(shutdown_mount_scan, &scan)) {
+    return -1;
+  }
+
+  out[0] = '\0';
+  for(i=0; i<sizeof(shutdown_volumes)/sizeof(shutdown_volumes[0]); i++) {
+    if(!scan.mounted[i]) {
+      continue;
+    }
+    n = snprintf(out + pos, size - pos, "%s%s", pos ? "," : "",
+                 shutdown_volumes[i]);
+    if(n < 0 || (size_t)n >= size - pos) {
+      return -1;
+    }
+    pos += (size_t)n;
+  }
+  if(!pos) {
+    snprintf(out, size, "%s", "none");
+  }
+  return 0;
+}
+
+
+/**
+ * shutdown: the owner signs the mounted removable volumes this console will
+ * unmount. The console's own path then does the whole shutdown, which ends
+ * the connection with it, so the answer and its audit line come first. The
+ * console has not been asked to come back on, and nothing here says it did.
+ **/
+static void
+shutdown_command(agent_t *agent, int fd) {
+  char mounts[SHUTDOWN_MOUNTS_MAX];
+  char hex[SHA256_HEX_LEN + 1];
+  unsigned char digest[SHA256_DIGEST_LEN];
+  approval_facts_t facts;
+  approval_challenge_t challenge;
+  sha256_t hash;
+
+  if(shutdown_mounts(mounts, sizeof(mounts))) {
+    // The owner cannot be asked to sign a list that could not be read.
+    audit_reply(fd, "shutdown", "failed", "console", "-", shutdown_failed);
+    return;
+  }
+
+  sha256_init(&hash);
+  sha256_update(&hash, mounts, strlen(mounts));
+  sha256_final(&hash, digest);
+  sha256_hex(digest, hex);
+
+  memset(&facts, 0, sizeof(facts));
+  snprintf(facts.command, sizeof(facts.command), "%s", "shutdown");
+  snprintf(facts.target, sizeof(facts.target), "%s", "console");
+  snprintf(facts.sha256, sizeof(facts.sha256), "%s", hex);
+  snprintf(facts.arg[0], sizeof(facts.arg[0]), "%s", mounts);
+
+  if(!gate_pass(agent, fd, &facts, &challenge)) {
+    return;
+  }
+
+  if(audit_line("shutdown", "done", "console", challenge.id)) {
+    reply(fd, audit_failed);
+    return;
+  }
+  reply(fd, "shutting_down\nexit 0\n");
+  if(agent->platform->shutdown(agent->platform)) {
+    audit_line("shutdown", "failed", "console", challenge.id);
+  }
+}
+
+
 /**
  * reboot: the owner signs the boot list the restart will run. The answer and
  * its audit line come before the restart, which replaces this process.
+ *
+ * Only the host build has a restart route. On the console no call from a
+ * payload restarts the machine (docs/console-findings.md, #135), so the
+ * command refuses before anyone is asked, makes no challenge and calls
+ * nothing.
  **/
 static void
 reboot_command(agent_t *agent, int fd) {
@@ -4076,6 +4260,12 @@ reboot_command(agent_t *agent, int fd) {
   approval_facts_t facts;
   approval_challenge_t challenge;
   sha256_t hash;
+
+  if(!agent->platform->reboot) {
+    audit_reply(fd, "reboot", "unsupported", "console", "-",
+                reboot_unsupported);
+    return;
+  }
 
   if(store_autoload_show(text, sizeof(text)) < 0) {
     reply(fd, list_failed);
@@ -5662,6 +5852,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
     return;
   }
 
+  if(argc == 4 && !strcmp(argv[0], "ln") && !strcmp(argv[1], "-s")) {
+    symlink_command(agent, fd, context, argv[2], argv[3]);
+    return;
+  }
+
   if(argc >= 1 && !strcmp(argv[0], "tar")) {
     tar_command(agent, fd, context, argc, argv);
     return;
@@ -5747,6 +5942,11 @@ handle_command(agent_t *agent, int fd, int wake, char *line) {
 
   if(argc == 1 && !strcmp(argv[0], "reboot")) {
     reboot_command(agent, fd);
+    return;
+  }
+
+  if(argc == 1 && !strcmp(argv[0], "shutdown")) {
+    shutdown_command(agent, fd);
     return;
   }
 

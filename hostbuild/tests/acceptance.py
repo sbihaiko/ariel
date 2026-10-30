@@ -1246,6 +1246,12 @@ RELEASE_FIXTURE_REASON = ("needs the fake release server and an allowlist the "
 HOST_RESTART_REASON = ("needs a restart of Ariel's own process, which a console "
                        "would turn into a reboot")
 
+# A scenario that stubs the host build's platform: as the console build, which
+# has no restart route, or with removable volumes a computer does not mount.
+# Console mode cannot stub its own platform.
+HOST_STUB_REASON = ("needs the host build's platform port stubbed, which "
+                    "console mode cannot do")
+
 # The scenarios whose behavior is defined by moving the host test clock.
 # This list comes from the SPEC's time-dependent cases, not from the code.
 CLOCK_SCENARIOS = {
@@ -1394,6 +1400,18 @@ HOST_RESTART_SCENARIOS = {
     "safe_boot_pending, exit 1, and asks nothing",
 }
 
+# The scenarios that stub the host build's platform, as the console build's or
+# with mounted volumes a computer does not have. A console's platform is the
+# console itself, so these never run there.
+HOST_STUB_SCENARIOS = {
+    "on the console build reboot answers reboot_unsupported, exit 1, and "
+    "asks nobody",
+    "shutdown answers 75 with a challenge carrying the mounted removable "
+    "volumes and its sha256",
+    "a granted shutdown answers shutting_down, is audited in order, and ends "
+    "the process",
+}
+
 # The scenarios that need the host test root: they write scratch files or
 # links there, and the token, approval state and nonces live there.
 HOST_ROOT_SCENARIOS = {
@@ -1421,6 +1439,8 @@ HOST_ROOT_SCENARIOS = {
     "through a hard link",
     "writes outside /data, /user and /mnt/usb* answer protected and exit 87 "
     "without asking, and so does Ariel's token",
+    "rm removes a symbolic link and leaves its target, and a link to a "
+    "protected object answers protected",
     "a file replaced after approval answers approval_stale and exit 78",
     "a file replaced after a chmod approval answers approval_stale and keeps "
     "its mode",
@@ -1514,8 +1534,8 @@ def scenario_console_mode_plan(server):
 
     expected_skips = (CLOCK_SCENARIOS | HOST_ROOT_SCENARIOS | FAULT_SCENARIOS
                       | HOST_FILE_SCENARIOS | HOST_FIXTURE_SCENARIOS
-                      | HOST_RESTART_SCENARIOS | RELEASE_SCENARIOS
-                      | HOST_MACHINE_SCENARIOS)
+                      | HOST_RESTART_SCENARIOS | HOST_STUB_SCENARIOS
+                      | RELEASE_SCENARIOS | HOST_MACHINE_SCENARIOS)
     assert set(skipped) == expected_skips, (
         "console mode must skip exactly the scenarios that need the test "
         "clock, the host test root, the fault injector or the host's files:"
@@ -2148,22 +2168,24 @@ def scenario_console_pkg_install_checks_skip_without_a_fixture(server):
 
 
 def scenario_console_gated_asks_wait_out_busy(server):
-    """reboot and a sysctl write wait out approval_busy before they assert 75."""
+    """A sysctl write waits out approval_busy before it asserts 75; reboot asks nobody."""
     del server  # the scripted link stands in for the agent port
 
+    command = "sysctl kern.ostype=Other"
     busy = ["approval_busy", "exit 76"]
-    for command in ("reboot", "sysctl kern.ostype=Other"):
-        console, link, _operator, session, events, _shown = scripted_session(
-            [busy, ["approval_required a-1", "challenge a-1 00", "exit 75"]])
-        console.ask_without_grant(session, command)
-        sent = [event for event in events if event[0] == "send"]
-        assert sent == [("send", command), ("send", command)], (
-            "%s must be sent again after approval_busy, sent %r"
-            % (command, sent))
-
-    console, link, _operator, session, _events, _shown = scripted_session(
+    console, link, _operator, session, events, _shown = scripted_session(
         [busy, ["approval_required a-1", "challenge a-1 00", "exit 75"]])
-    console.check_reboot_asks_the_owner(session, None)
+    console.ask_without_grant(session, command)
+    sent = [event for event in events if event[0] == "send"]
+    assert sent == [("send", command), ("send", command)], (
+        "%s must be sent again after approval_busy, sent %r"
+        % (command, sent))
+
+    # reboot is not gated on the console: it refuses before the owner is
+    # asked, so a busy notification gap never reaches it.
+    console, link, _operator, session, _events, _shown = scripted_session(
+        [["reboot_unsupported", "exit 1"]])
+    console.check_reboot_is_unsupported(session, None)
 
     # The suite leaves approvals pending by design (no console refusal), and
     # Ariel keeps at most PENDING_MAX open until each expires; the busy
@@ -5021,6 +5043,25 @@ def scenario_file_commands_need_the_owner(server):
     assert stat_exit(server, target) == "exit 1", "rm must remove the file"
 
 
+def scenario_rm_removes_a_link_and_leaves_its_target(server):
+    """rm removes a symbolic link as a name, and never the object it names."""
+    target = make_file(server, "rm-link-target", 0o644)
+    link = os.path.join(server.root, "data", "rm-link")
+    make_link(link, target, hard=False)
+
+    approval, challenge = gate_request(server, "rm " + link)
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, "rm " + link) == ["exit 0"], (
+        "a signed rm of a symbolic link must run")
+    assert not os.path.lexists(link), "the link must be gone"
+    assert os.path.exists(target), "the object the link named must stay"
+
+    alias = os.path.join(server.root, "data", "rm-link-protected")
+    make_link(alias, secret_path(server, "token"), hard=False)
+    assert_protected(server, "rm " + alias)
+    assert os.path.lexists(alias), "a refused rm must leave the link"
+
+
 def scenario_file_replaced_after_approval_answers_78(server):
     """A file replaced after the owner signs answers approval_stale and survives."""
     target = os.path.join(server.root, "data", "stale-file")
@@ -5449,6 +5490,189 @@ def scenario_transfer_action_names_its_facts(server):
     assert "\ntarget=%s\n" % source in action, action
     assert "\ndestination=%s\n" % destination in action, action
     assert "\nsha256=none\n" in action, action
+
+
+def symlink_line(target, path):
+    return "ln -s %s %s" % (target, path)
+
+
+def run_with_server(env, check):
+    """Run check on a server of its own, started with env, and stop it after."""
+    server = Server(SERVER_BINARY, env=env)
+    try:
+        check(server)
+    finally:
+        server.stop()
+
+
+def scenario_ln_symlink_creates_a_link_the_owner_signs(server):
+    """ln -s asks first and makes the link once signed; file names it and state is protected."""
+    target = make_transfer_file(server, "sym-target")
+    link = write_path(server, "sym-link")
+    line = symlink_line(target, link)
+
+    approval, challenge = transfer_request(server, line)
+    assert not os.path.lexists(link), "an unsigned ln -s must not run"
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, line) == ["exit 0"], "a signed ln -s must run"
+    assert os.path.islink(link) and os.readlink(link) == target, (
+        "ln -s must make a symbolic link whose text is the target")
+    assert run_command(server, "file " + link) == [
+        link + ": symbolic link", "exit 0"], "file must name a link as a symbolic link"
+
+    token = secret_path(server, "token")
+    state_link = write_path(server, "sym-state")
+    assert run_command(server, symlink_line(token, state_link)) == [
+        "protected", "exit 87"], "a link that names Ariel's state must answer protected"
+    assert not os.path.lexists(state_link), "a refused ln -s must create nothing"
+
+    secret_link = write_path(server, "sym-secret")
+    make_link(secret_link, token, hard=False)
+    assert_protected(server, "cat " + secret_link)
+    assert_protected(server, "file " + secret_link)
+
+
+def scenario_ln_symlink_relative_target_is_bad_path(server):
+    """ln -s with a relative target answers bad_path before it asks anyone."""
+    link = write_path(server, "sym-relative")
+    assert run_command(server, symlink_line("relative/target", link)) == [
+        "bad_path", "exit 1"], "a relative symlink target must answer bad_path"
+    assert not os.path.lexists(link), "a refused ln -s must create nothing"
+
+
+def scenario_ln_symlink_refuses_a_target_through_a_directory_link(server):
+    """A target that reaches the state directory through a directory link answers protected."""
+    state = os.path.dirname(secret_path(server, "token"))
+    hop = write_path(server, "sym-hop")
+    make_link(hop, os.path.dirname(state), hard=False)
+    link = write_path(server, "sym-hop-link")
+    assert run_command(server, symlink_line(os.path.join(hop, "ariel", "token"), link)) == [
+        "protected", "exit 87"], "a target reached through a directory link must answer protected"
+    assert not os.path.lexists(link), "a refused ln -s must create nothing"
+
+
+def scenario_ln_symlink_is_no_transfer_source_or_write_target(server):
+    """A link made by ln -s is refused as a source; no write or unzip goes through it."""
+    target = make_transfer_file(server, "sym-src-target")
+    link = write_path(server, "sym-src-link")
+    approval, challenge = transfer_request(server, symlink_line(target, link))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, symlink_line(target, link)) == ["exit 0"]
+
+    copy = write_path(server, "sym-src-copy")
+    for command in TRANSFERS:
+        assert run_command(server, transfer_line(command, link, copy)) == [
+            "symbolic_link", "exit 1"], "%s must refuse a link as its source" % command
+    assert not os.path.lexists(copy), "a refused link must copy nothing"
+
+    assert write_frame(server, link, WRITE_BYTES) == ["exists", "exit 1"], (
+        "a write onto a link must not write through it")
+    assert read_bytes(target) == TRANSFER_BYTES, "the link's target must not change"
+
+    folder = unzip_destination(server, "sym-dir")
+    folder_link = write_path(server, "sym-dir-link")
+    approval, challenge = transfer_request(server, symlink_line(folder, folder_link))
+    sign_and_grant(server, approval, challenge)
+    assert run_command(server, symlink_line(folder, folder_link)) == ["exit 0"]
+    archive = make_archive(server, "sym-archive", [("top.txt", b"top\n")])
+    assert run_command(server, unzip_line(archive, folder_link)) == [
+        "symbolic_link", "exit 1"], "unzip must refuse a link as its destination"
+    assert tree(folder) == [], "unzip must write nothing through a link"
+
+
+def scenario_ln_symlink_unsupported_creates_nothing(server):
+    """A filesystem that cannot hold a link answers link_unsupported and creates nothing."""
+    del server  # this scenario runs a server whose filesystem refuses links
+
+    def check(unsupported):
+        target = make_transfer_file(unsupported, "sym-unsup-target")
+        link = write_path(unsupported, "sym-unsup-link")
+        line = symlink_line(target, link)
+        approval, challenge = transfer_request(unsupported, line)
+        sign_and_grant(unsupported, approval, challenge)
+        assert run_command(unsupported, line) == [
+            "link_unsupported", "exit 1"], "a signed ln -s must answer link_unsupported"
+        assert not os.path.lexists(link), "link_unsupported must leave nothing behind"
+
+    run_with_server({"ARIEL_HOST_NO_SYMLINK": "1"}, check)
+
+
+def scenario_mv_in_one_filesystem_needs_no_hard_link(server):
+    """A same-filesystem mv renames the source, on a filesystem that refuses hard links."""
+    del server  # this scenario runs a server whose filesystem refuses hard links
+
+    def check(no_links):
+        source = make_transfer_file(no_links, "mv-src")
+        destination = write_path(no_links, "mv-dst")
+        line = transfer_line("mv", source, destination)
+        approval, challenge = transfer_request(no_links, line)
+        sign_and_grant(no_links, approval, challenge)
+        assert run_command(no_links, line) == ["exit 0"], (
+            "a same-filesystem mv must succeed where hard links are refused")
+        assert not os.path.lexists(source), "mv must remove the source name"
+        assert read_bytes(destination) == TRANSFER_BYTES, "mv must keep the bytes"
+
+    run_with_server({"ARIEL_HOST_NO_LINK": "1"}, check)
+
+
+def scenario_mv_across_filesystems_copies_then_removes(server):
+    """When rename answers EXDEV, mv copies the bytes and then removes the source."""
+    del server  # this scenario runs a server whose rename answers EXDEV
+
+    def check(across):
+        source = make_transfer_file(across, "mv-xdev-src")
+        destination = write_path(across, "mv-xdev-dst")
+        line = transfer_line("mv", source, destination)
+        approval, challenge = transfer_request(across, line)
+        sign_and_grant(across, approval, challenge)
+        assert run_command(across, line) == ["exit 0"], (
+            "an EXDEV mv must copy and remove")
+        assert not os.path.lexists(source), "an EXDEV mv must remove the source"
+        assert read_bytes(destination) == TRANSFER_BYTES, "an EXDEV mv must copy the bytes"
+
+    run_with_server({"ARIEL_HOST_RENAME_EXDEV": "1"}, check)
+
+
+MOVE_RACE_BYTES = b"appeared after the check\n"
+
+
+def scenario_mv_never_replaces_a_destination_that_appears(server):
+    """A destination created after the check is kept: mv answers exists and replaces nothing."""
+    del server  # this scenario runs a server whose destination appears inside mv
+
+    def check(racing):
+        source = make_transfer_file(racing, "mv-race-src")
+        destination = write_path(racing, "mv-race-dst")
+        line = transfer_line("mv", source, destination)
+        approval, challenge = transfer_request(racing, line)
+        sign_and_grant(racing, approval, challenge)
+        assert run_command(racing, line) == ["exists", "exit 1"], (
+            "an mv whose destination appeared must answer exists")
+        assert read_bytes(destination) == MOVE_RACE_BYTES, "mv must keep the destination"
+        assert read_bytes(source) == TRANSFER_BYTES, "mv must keep the source"
+
+    run_with_server({"ARIEL_HOST_DEST_APPEARS": "1"}, check)
+
+
+SYMLINK_SCENARIOS = [
+    ("ln -s makes a link once the owner signs; file names it; state stays protected",
+     scenario_ln_symlink_creates_a_link_the_owner_signs, HOST_ROOT_REASON),
+    ("ln -s with a relative target answers bad_path before asking",
+     scenario_ln_symlink_relative_target_is_bad_path, HOST_ROOT_REASON),
+    ("a link made by ln -s is no transfer source, and writes and unzip do not go through it",
+     scenario_ln_symlink_is_no_transfer_source_or_write_target, HOST_ROOT_REASON),
+    ("ln -s on a filesystem without links answers link_unsupported and creates nothing",
+     scenario_ln_symlink_unsupported_creates_nothing, HOST_ROOT_REASON),
+    ("mv in one filesystem succeeds without a hard link and removes the source",
+     scenario_mv_in_one_filesystem_needs_no_hard_link, HOST_ROOT_REASON),
+    ("mv across filesystems copies the bytes and then removes the source",
+     scenario_mv_across_filesystems_copies_then_removes, HOST_ROOT_REASON),
+    ("ln -s refuses a target reached through a directory link into the state directory",
+     scenario_ln_symlink_refuses_a_target_through_a_directory_link, HOST_ROOT_REASON),
+    ("mv never replaces a destination that appears after the check",
+     scenario_mv_never_replaces_a_destination_that_appears, HOST_ROOT_REASON),
+]
+HOST_ROOT_SCENARIOS.update(title for title, _scenario, _reason in SYMLINK_SCENARIOS)
 
 
 WRITE_BYTES = b"written through the shell\n"
@@ -9353,6 +9577,83 @@ def scenario_reboot_is_audited(server):
         "the reboot must be audited in order, got %r" % ours)
 
 
+def scenario_reboot_unsupported_on_the_console(server):
+    """The console build refuses reboot before anyone is asked to sign it.
+
+    No route from a payload restarts this console (docs/console-findings.md,
+    #135), so the platform port is stubbed as the console build's here.
+    """
+    del server  # the stub lives in this server's own platform port
+    console = Server(SERVER_BINARY, env={"ARIEL_HOST_CONSOLE_STUB": "1"})
+    try:
+        lines = run_command(console, "reboot")
+        assert lines == ["reboot_unsupported", "exit 1"], (
+            "a console's reboot must answer reboot_unsupported and exit 1, "
+            "got %r" % lines)
+        assert not any(line.startswith(("approval_required", "challenge"))
+                       for line in lines), (
+            "a console's reboot must make no challenge, got %r" % lines)
+        console.assert_no_line()
+        events = [line.split()[1] for line in audit_tail(console)
+                  if line != "exit 0"]
+        assert "reboot.unsupported" in events, (
+            "the refused reboot must be audited, got %r" % events)
+        assert "reboot.request" not in events, (
+            "reboot must ask nobody, so there is no request to audit, got %r"
+            % events)
+    finally:
+        console.stop()
+
+
+def scenario_shutdown_challenge_binds_the_mounts(server):
+    """shutdown's challenge names the mounted volumes it will unmount, in order."""
+    del server  # a computer mounts neither volume, so this server names them
+    console = Server(SERVER_BINARY,
+                     env={"ARIEL_HOST_MOUNTS": "/mnt/usb1,/mnt/usb0"})
+    try:
+        _approval, challenge = gate_request(console, "shutdown")
+        mounts = "/mnt/usb0,/mnt/usb1"
+        action = action_facts(challenge)
+        assert "command=shutdown" in action and "target=console" in action, (
+            "the challenge must name shutdown on the console, got %r" % action)
+        assert "option.mounts=%s" % mounts in action, (
+            "the challenge must carry the ordered mount list, got %r" % action)
+        assert ("sha256=%s" % hashlib.sha256(mounts.encode("ascii")).hexdigest()
+                in action), (
+            "the challenge must carry the hash of the mount list, got %r"
+            % action)
+        help_lines = run_command(console, "help")
+        listed = {line.split(" ")[0] for line in help_lines[:-1]}
+        missing = sorted({"shutdown", "reboot", "suspend"} - listed)
+        assert not missing, (
+            "help must name shutdown, reboot and suspend, missing %r from %r"
+            % (missing, help_lines))
+    finally:
+        console.stop()
+
+
+def scenario_shutdown_granted_answers_shutting_down(server):
+    """A granted shutdown answers shutting_down and is audited before it runs."""
+    del server  # the granted shutdown ends Ariel's process, so it owns one
+    console = Server(SERVER_BINARY, env={"ARIEL_HOST_MOUNTS": "/mnt/usb1"})
+    try:
+        approval, challenge = gate_request(console, "shutdown")
+        sign_and_grant(console, approval, challenge)
+        assert send_command(console, "shutdown") == [
+            "shutting_down", "exit 0"], (
+            "a granted shutdown must answer shutting_down and exit 0")
+        assert console.proc.wait(timeout=START_TIMEOUT) == 0, (
+            "the shutdown ends Ariel's process, as it ends every connection "
+            "on the console")
+        lines = read_audit_log(console).decode("ascii").splitlines()
+        ours = [line.split()[1] for line in lines
+                if line.split()[3:4] == [approval]]
+        assert ours == ["shutdown.request", "grant", "shutdown.done"], (
+            "the shutdown must be audited in order, got %r" % ours)
+    finally:
+        console.stop()
+
+
 # The one-shot timeout a payload gets until payload config sets one.
 DEFAULT_HEALTH_MS = 30_000
 
@@ -10961,6 +11262,9 @@ SCENARIOS = [
      scenario_no_system_change_on_agent_port, None),
     ("mkdir, rmdir, touch and rm run only after the owner signs, once each",
      scenario_file_commands_need_the_owner, True),
+    ("rm removes a symbolic link and leaves its target, and a link to a "
+     "protected object answers protected",
+     scenario_rm_removes_a_link_and_leaves_its_target, HOST_ROOT_REASON),
     ("a file replaced after approval answers approval_stale and exit 78",
      scenario_file_replaced_after_approval_answers_78, HOST_ROOT_REASON),
     ("a command nothing implements asks the owner and then does nothing",
@@ -11470,8 +11774,8 @@ SCENARIOS = [
      "push", scenario_console_quick_start_waits_for_the_gap, None),
     ("console mode activates only builds the console can run",
      scenario_console_checks_push_runnable_builds, None),
-    ("console mode's reboot and sysctl write wait out approval_busy",
-     scenario_console_gated_asks_wait_out_busy, None),
+    ("console mode's sysctl write waits out approval_busy and its reboot "
+     "asks nobody", scenario_console_gated_asks_wait_out_busy, None),
     ("console mode's stale autoload check installs both names before it asks",
      scenario_console_stale_check_installs_both_names, None),
     ("console mode's audit check allows appended lines and refuses a removed "
@@ -11592,6 +11896,15 @@ SCENARIOS = [
      scenario_reboot_signature_wrong_action, None),
     ("a granted reboot is audited as its request, grant and done",
      scenario_reboot_is_audited, HOST_RESTART_REASON),
+    ("on the console build reboot answers reboot_unsupported, exit 1, and "
+     "asks nobody", scenario_reboot_unsupported_on_the_console,
+     HOST_STUB_REASON),
+    ("shutdown answers 75 with a challenge carrying the mounted removable "
+     "volumes and its sha256", scenario_shutdown_challenge_binds_the_mounts,
+     HOST_STUB_REASON),
+    ("a granted shutdown answers shutting_down, is audited in order, and ends "
+     "the process", scenario_shutdown_granted_answers_shutting_down,
+     HOST_STUB_REASON),
 
 
     ("a one-shot that exits nonzero after commit is replaced by the previous "
@@ -15101,6 +15414,10 @@ SCENARIOS.extend(FTP_SCENARIOS)
 
 
 VERIFY_CEILING_BYTES = 256 * 1024 * 1024
+# Hashing the whole ceiling takes seconds of this machine's time even alone, and
+# a machine running other suites at the same time takes longer; the wait for the
+# answer is sized to the work, not to the usual command.
+VERIFY_HASH_TIMEOUT = 120.0
 VERIFY_CHECKS = ("app.pkg", "app.pbm", "app.json", "app.xml", "sce_sys/param.sfo",
                  "appmeta", "licence", "content_id")
 VERIFY_PACKAGE = b"verify package\n"
@@ -15264,7 +15581,8 @@ def scenario_verify_hashes_a_file_at_the_ceiling(server):
     os.truncate(app_pkg, 0)
     os.truncate(app_pkg, VERIFY_CEILING_BYTES)
     assert run_command(server, "verify %s --sha256 %s" % (
-        title, zero_sha256(VERIFY_CEILING_BYTES))) == verify_reply(
+        title, zero_sha256(VERIFY_CEILING_BYTES)),
+        timeout=VERIFY_HASH_TIMEOUT) == verify_reply(
         title, extra=("ok app.pkg sha256",))
 
 
@@ -15893,6 +16211,7 @@ TRACE_SCENARIOS = [
 ]
 HOST_ROOT_SCENARIOS.update(title for title, _, _ in TRACE_SCENARIOS)
 SCENARIOS.extend(TRACE_SCENARIOS)
+SCENARIOS.extend(SYMLINK_SCENARIOS)
 
 
 def main():

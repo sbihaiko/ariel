@@ -46,7 +46,6 @@ along with this program; see the file COPYING. If not, see
 #include <ps5/klog.h>
 #include <ps5/kernel.h>
 #include <sys/mount.h>
-#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -583,11 +582,26 @@ ps5_process_signal(platform_t *self, int32_t pid, int sig) {
 }
 
 
+/**
+ * The console's own shutdown path, as system_spike.c calls it (#135): the SDK
+ * ships no header for the symbol, so it is declared here. The call takes no
+ * argument or one, and a pointer to a zeroed buffer is correct for both.
+ *
+ * There is no ps5_reboot: reboot(2) from a payload puts this console into
+ * standby rather than restarting it, and the three request calls answer
+ * success and change nothing, so the platform leaves the port's reboot NULL.
+ **/
+int sceShellCoreUtilRequestShutdown(void *arg);
+
+
 static int
-ps5_reboot(platform_t *self) {
+ps5_shutdown(platform_t *self) {
+  unsigned char arg[64];
+
   (void)self;
 
-  return reboot(RB_AUTOBOOT) ? -1 : 0;
+  memset(arg, 0, sizeof(arg));
+  return sceShellCoreUtilRequestShutdown(arg) ? -1 : 0;
 }
 
 
@@ -681,7 +695,8 @@ static platform_t ps5_platform = {
   .process_start = ps5_process_start,
   .process_critical = ps5_process_critical,
   .process_signal = ps5_process_signal,
-  .reboot = ps5_reboot,
+  // No restart route: .reboot stays NULL (docs/console-findings.md, #135).
+  .shutdown = ps5_shutdown,
   .system_act = ps5_system_act,
   .install_result = ps5_install_result,
 };
