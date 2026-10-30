@@ -4,7 +4,7 @@
 
 Ariel is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv), the telnet-like shell server for jailbroken PS5 consoles. It keeps everything shsrv does and grows it in one direction: letting an AI agent, such as Claude, inspect the console, download payloads from GitHub, run them and recover on its own when something crashes, without ever being able to leave the console in a broken state. Coding agents diagnose a system by running a command, reading the output and running the next one, and a jailbroken PS5 is a hostile place for that: there is no real Unix shell to run the agent on; shsrv was built for humans at a telnet prompt, with whitespace splitting, free-form output, no exit status and no pagination; getting a payload onto the console is manual, and a bad one can crash or hang the system; and everything lives in RAM, so a reboot wipes the jailbreak and every running payload. Ariel gives the agent one endpoint with a predictable, safe, recoverable interface.
 
-The target firmware is 11.20, and only 11.20 for now ([ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md)). One console is in hand, a CFI-2014 on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted, which is a decision with its own console run, not a patch; supporting several firmware versions costs a lab this project does not have. On that console Stages 1 to 5 are delivered, and the current release is [`stage-5.1`](https://github.com/sbihaiko/ariel/releases/tag/stage-5.1). Stage 6, network sight ([#111](https://github.com/sbihaiko/ariel/issues/111)), has `ifconfig` and `ping` built and `netstat` not built; the judging verbs of [#119](https://github.com/sbihaiko/ariel/issues/119) — `verify`, `verify --all`, `trace`, `trace --list` and `trace --diff` — are in the current tree; Stage 7, the MCP server, is not started. See [Progress](#progress), [What is being done](#what-is-being-done) and [What is missing](#what-is-missing).
+The target firmware is 11.20, and only 11.20 for now ([ADR-0011](docs/adr/0011-the-target-firmware-is-11-20.md)). One console is in hand, a CFI-2014 on 11.20, every validation run happens there, and a behaviour reported on another firmware is not a defect until that firmware is adopted, which is a decision with its own console run, not a patch; supporting several firmware versions costs a lab this project does not have. On that console Stages 1 to 5 are delivered, and the current release is [`stage-5.1`](https://github.com/sbihaiko/ariel/releases/tag/stage-5.1). Stage 6, network sight ([#111](https://github.com/sbihaiko/ariel/issues/111)), has `ifconfig` and `ping` built and `netstat` not built; the judging verbs of [#119](https://github.com/sbihaiko/ariel/issues/119) — `verify`, `verify --all`, `trace`, `trace --list` and `trace --diff` — are in the current tree; Stage 7, the MCP server ([#136](https://github.com/sbihaiko/ariel/issues/136)), is in the current tree too, with its release binaries built by the release workflow. See [Progress](#progress), [What is being done](#what-is-being-done) and [What is missing](#what-is-missing).
 
 ---
 
@@ -32,7 +32,7 @@ $ sh tools/install/ariel.sh <console address>
 
 It makes the two keys if they are not there, builds the payload with them pinned, sends it to port 9021, waits for the agent port, and leaves `ariel.env` holding `PS5_HOST` and `ARIEL_TOKEN`. `tools/install/ariel.command` is the same on a double-click on macOS and `tools/install/ariel.bat` on Windows, and `--check` says what it would do and sends nothing. Where the build happens depends on the machine ([#110](https://github.com/sbihaiko/ariel/issues/110)): a local LLVM means a local build, with the PS5 payload SDK downloaded on the way, and Docker is the fallback, building in a container that carries the SDK; an SDK already on the machine, with `PS5_PAYLOAD_SDK` set, is used as it is, and `ARIEL_BUILD=local` or `ARIEL_BUILD=docker` forces a route. Windows has no local route yet: `ariel.bat` runs `ariel.ps1`, which needs Docker Desktop running. The release carries those four scripts as its assets, and the payload is still built by you, with your keys.
 
-By hand it is four steps. Clone the `stage-5.1` tag and run `make -C hostbuild`, which builds the signer as well as the host target. Make two keys with `./hostbuild/ariel-sign keygen`, a primary that signs everyday approvals and a recovery key kept offline. Build the payload with both public keys pinned, `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`, 64 hex digits each and different, because setting `ARIEL_PUBKEY` alone stops the build as a build with one key would refuse every grant. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324. The release ships source only, and it has to: the console carries the public half of **your** pair, so a build pinned to anyone else's keys could only be approved by them.
+By hand it is four steps. Clone the repository and run `make -C hostbuild`, which builds the signer and `ariel-mcp` as well as the host target. Make two keys with `./hostbuild/ariel-sign keygen`, a primary that signs everyday approvals and a recovery key kept offline. Build the payload with both public keys pinned, `make ARIEL_PUBKEY=<primary> ARIEL_RECOVERY_PUBKEY=<recovery>`, 64 hex digits each and different, because setting `ARIEL_PUBKEY` alone stops the build as a build with one key would refuse every grant. Send `ariel-ps5.elf` to port 9021, read the access token on the console, and talk to the agent port on 2324. The release ships source only, and it has to: the console carries the public half of **your** pair, so a build pinned to anyone else's keys could only be approved by them.
 
 The gate is one command, `sh tools/gate.sh`: it builds the payload on whichever route the machine has (an exported `PS5_PAYLOAD_SDK` with LLVM, the SDK in `~/.local/share`, or a container from `tools/install/Dockerfile.sdk`), runs the host build and its headless acceptance suite, and names each half on its own line. A half it cannot run is reported `unavailable` and fails the gate, because a build that never happened is not a pass ([#118](https://github.com/sbihaiko/ariel/issues/118), [ADR-0015](docs/adr/0015-the-gate-is-one-command.md)).
 
@@ -42,55 +42,44 @@ On the console, [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr) 
 
 ### Using the console from an agent
 
-`ariel-mcp` is the host-side MCP server: one binary per machine, with no checkout and no toolchain. A machine that has never seen this repository runs the block below in order, with the console address and the access token the owner gives in place of `<console address>` and `<token>`. `<home>` is the output of `echo $HOME`, because TOML does not expand it.
+`ariel-mcp` is a host-side [MCP](https://modelcontextprotocol.io) server ([#136](https://github.com/sbihaiko/ariel/issues/136), [ADR-0017](docs/adr/0017-the-mcp-server-is-a-host-process-that-never-signs.md)). It speaks MCP over stdio to the client and the line protocol below over 2324 to the console, so it adds a transport and no payload code, no console port and no authority: every gate, audit and deadline stays the console's. One table in its source defines each tool, its schema and its class, and `tools/list` reports it, so an agent discovers what it may ask instead of being taught the grammar. The server holds no key and never signs.
 
-1. Download the binary for this machine from the stable release address:
+This block takes a machine with no checkout and no toolchain to a working tool surface, from a release that carries the binaries; until one is published, `make -C hostbuild` builds the same server from source. The last line needs the `ariel.env` the installer wrote, which holds `PS5_HOST` and `ARIEL_TOKEN`:
 
-   ```sh
-   case "$(uname -s)-$(uname -m)" in
-     Darwin-arm64) asset=ariel-mcp-macos-arm64 ;;
-     Darwin-x86_64) asset=ariel-mcp-macos-x86_64 ;;
-     Linux-x86_64) asset=ariel-mcp-linux-x86_64 ;;
-     *) echo "no ariel-mcp binary for $(uname -s) $(uname -m)" >&2; exit 1 ;;
-   esac
-   curl -fL -o "$HOME/ariel-mcp" "https://github.com/sbihaiko/ariel/releases/latest/download/$asset"
-   ```
+```sh
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  asset=ariel-mcp-macos-arm64 ;;
+  Darwin-x86_64) asset=ariel-mcp-macos-x86_64 ;;
+  Linux-x86_64)  asset=ariel-mcp-linux-x86_64 ;;
+  *) echo "no ariel-mcp binary for $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/ariel-mcp \
+  "https://github.com/sbihaiko/ariel/releases/latest/download/$asset"
+chmod +x ~/.local/bin/ariel-mcp
+claude mcp add -s user ariel -- ~/.local/bin/ariel-mcp --env-file ~/ariel.env
+```
 
-2. Make it executable:
+`-s user` registers the server for every project on the machine; without it the registration belongs to the directory the command runs in.
 
-   ```sh
-   chmod +x "$HOME/ariel-mcp"
-   ```
+For Codex, add this table to `~/.codex/config.toml`, replacing `<your home>` with your home directory, because Codex does not expand `~`:
 
-3. Register it with Claude Code:
+```toml
+[mcp_servers.ariel]
+command = "<your home>/.local/bin/ariel-mcp"
+args = ["--env-file", "<your home>/ariel.env"]
+```
 
-   ```sh
-   claude mcp add -s user ariel -e PS5_HOST=<console address> -e ARIEL_TOKEN=<token> -- "$HOME/ariel-mcp"
-   ```
+Then prove it before a client shows you a tool list:
 
-4. Register it with Codex by appending this table to `~/.codex/config.toml`:
+```console
+$ ~/.local/bin/ariel-mcp --check --env-file ~/ariel.env
+ariel-mcp: console 192.168.1.103:2324 accepted the token
+```
 
-   ```toml
-   [mcp_servers.ariel]
-   command = "<home>/ariel-mcp"
-   env = { PS5_HOST = "<console address>", ARIEL_TOKEN = "<token>" }
-   ```
+`--check` connects, authenticates and names the console it reached, so a wrong token and an unreachable console read differently; it never prints the token. `--list-tools` prints the surface without a client.
 
-5. Prove it works. This is the last step:
-
-   ```sh
-   "$HOME/ariel-mcp" --check --host <console address> --token <token>
-   ```
-
-   On success it prints one line and exits 0:
-
-   ```console
-   ariel-mcp: console <console address>:2324 accepted the token
-   ```
-
-   A refused token or an unreachable console exits 1 with one `ariel-mcp:` line that names what failed.
-
-The surface gives no signing, no capture and no restart. The server holds no key and never signs: a change that needs approval returns a challenge, and the owner signs it on their own machine. It gives no screen capture: `shots` copies an image the console's Create button already wrote. It gives no restart: there is no reboot tool, and `reboot` on the console answers `reboot_unsupported`. Claude Code and Codex are the two clients this section covers.
+What the surface does not give: it never signs, so a tool that changes the console answers `approval_required` with the challenge, and the owner signs it with `ariel-sign` and passes `approval_id` and `signature` back in the same call; it captures no screen, because no route on 11.20 returns an image; and it cannot restart the console, because no call from a payload does — `ariel_suspend` suspends and its description says so, and no tool is named `reboot`. Only Claude Code and Codex are covered here: there is no Windows binary and no Claude Desktop block.
 
 ### The agent port
 
@@ -167,11 +156,11 @@ The line formats, the JSON keys and every refusal word are fixed in the spec, so
 
 The probe came first and was a payload of its own, as the controller, capture and share spikes were: never linked into Ariel, run with the owner present, three probes from least to most risky (the interface list, the socket tables, the echo), a selector to run one alone, and a log under `/data` so a freeze is attributable. A failed probe is a result: the findings record the transcript, the command list says it is not built and gives the reason, and the stage closes either way — which is what happened to `netstat`. The console build answers from system calls, never a shell-out, and the host build reports its own machine, as `ps` and `sysinfo` do. There is no new exit status and no change to the approval design: `bad_option`, `bad_argument`, `missing_operand`, `operation_failed`, the platform refusal and `no_reply` carry every failure.
 
-## What is missing
-
 ### Stage 7 (optional): MCP
 
-Not started. The plan is to expose the same capabilities as an [MCP](https://modelcontextprotocol.io) server, so any MCP client (Claude Code, Claude Desktop, or a local agent) can connect with structured tools instead of parsing shell text. The planned tool families are processes, payloads, file system, system information, logs and network sight, the last covering `ifconfig` and `ping`, the two commands Stage 6 built. MCP is stateless since protocol version 2026-07-28, so a Stage 5 session ID is passed to each tool as an ordinary argument, as the specification recommends for server-minted handles. MCP tools that change the console would be marked destructive, so the client asks a human before even requesting approval.
+The spec is [#136](https://github.com/sbihaiko/ariel/issues/136), and the surface is delivered in the current tree: `ariel-mcp` speaks MCP over stdio on protocol revision `2026-07-28` ([ADR-0017](docs/adr/0017-the-mcp-server-is-a-host-process-that-never-signs.md)) and offers one tool per console command — the reads, the network sight of Stage 6, the file changes, the payload commands, `autoload`, `shutdown` and `suspend`. MCP is stateless since that revision, so a Stage 5 session is an ordinary `session` argument passed through as the `@<sid>` prefix. Each row declares `read` or `change`, the client sees it in `readOnlyHint` and `destructiveHint`, and the acceptance suite proves every read tool answers without asking. A tool that changes the console returns the `challenge`; the owner signs it and the same call with `approval_id` and `signature` runs the command. The release workflow builds `ariel-mcp-macos-arm64`, `ariel-mcp-macos-x86_64` and `ariel-mcp-linux-x86_64` and attaches them to every published release; they pin no key, carry no anchor and publish no payload. Until a release that carries them is published, the block above is the workflow's promise, not a download that exists. How a bare machine reaches the surface is in [Using the console from an agent](#using-the-console-from-an-agent).
+
+## What is missing
 
 ### Commands deliberately not built
 
@@ -193,7 +182,7 @@ The PS5's internal codename is **Prospero**, the sorcerer of Shakespeare's *The 
 
 The project's own documents are the [console findings](docs/console-findings.md), what the console allows with the error codes and addresses measured; the [console setup](docs/console-setup.md), how this console is jailbroken and how a package becomes an install; the [controller spike](docs/controller-spike.md), the payload that produced the pad measurements; and the [decisions](docs/adr/README.md), the architecture decision records. The upstream shell, ELF loader and SDK are linked where they are used above; the other ps5-payload-dev tools (GPLv3+) are [websrv](https://github.com/ps5-payload-dev/websrv), a homebrew launcher, ELF launcher and file browser over HTTP, and [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) and [klogsrv](https://github.com/ps5-payload-dev/klogsrv), the FTP server and kernel log server that are the usual companions for diagnostics.
 
-The two payload managers that served as design references are [ChronicLoader](https://github.com/StonedModder/ChronicLoader-PS5-Payload), whose SHA-256 state, timestamped backups and managed autoload inspired Stage 2, and [ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager), a web-based store, launcher and autoload manager; ChronicLoader ships as a binary, so no code is reused. [PS5LM](https://github.com/cobanov/PS5LM) runs LLMs locally on a jailbroken PS5 and could be a fully offline brain for an Ariel agent, and the [Model Context Protocol](https://modelcontextprotocol.io) is the standard Ariel will implement in Stage 7.
+The two payload managers that served as design references are [ChronicLoader](https://github.com/StonedModder/ChronicLoader-PS5-Payload), whose SHA-256 state, timestamped backups and managed autoload inspired Stage 2, and [ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager), a web-based store, launcher and autoload manager; ChronicLoader ships as a binary, so no code is reused. [PS5LM](https://github.com/cobanov/PS5LM) runs LLMs locally on a jailbroken PS5 and could be a fully offline brain for an Ariel agent, and the [Model Context Protocol](https://modelcontextprotocol.io) is the standard `ariel-mcp` implements in Stage 7.
 
 ## Legal
 
