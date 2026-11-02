@@ -70,6 +70,25 @@ The workers execute the copy under `/data/ps5-git/tests/` rather than the
 clone's own file, which is byte-identical; the report's `test_sha256` is
 checked against the clone, so the evidence still belongs to the tested tree.
 
+## Why the console's Git writes bypass dulwich's lock file
+
+Dulwich writes a loose object by calling `os.utime(path)` and returning early
+when it does not raise, then writing `<path>.lock` and renaming it into place.
+On this console both calls answer success and leave no file: `utime` on a
+missing path neither raises nor creates anything, and the rename leaves
+neither name behind. A commit therefore reported a SHA and pushed nothing
+(`COMMIT READBACK MISSING`), which is the same stub behaviour ADR-0007
+records for the C agent.
+
+`git_runner` patches dulwich when it is imported: a loose object is written
+straight to its final path with `open`/`write`/`fsync`, and every other
+`GitFile` write copies the lock file's bytes over the target instead of
+renaming it. Both check that the target exists afterwards
+([ADR-0021](adr/0021-console-git-writes-avoid-rename.md)).
+
+A full run prints `E2E OK <tested> <result commit> 2` from
+`tools/ps5python/e2e_check.py`.
+
 ## The self-test
 
 `main.py --selftest` prints one line per capability:

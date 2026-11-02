@@ -21,6 +21,65 @@ TOKEN_FILE = os.environ.get("PS5GIT_TOKEN_FILE", STATE + "/secrets/token")
 CA_FILE = os.environ.get("PS5GIT_CA_FILE", STATE + "/ca.pem")
 IDENTITY = b"ps5 <ps5@ariel.invalid>"
 
+
+def _install_file_workaround():
+    """Make dulwich's atomic-write path work on this filesystem.
+
+    Dulwich writes to <path>.lock and renames it into place. Here the rename
+    reports success and leaves both names missing, so a commit's loose object
+    is lost while the commit reports a SHA. This replaces the rename with a
+    read of the lock file and a plain write to the target (ADR-0007 records
+    the same `*at` behaviour on this filesystem).
+    """
+    from dulwich import file as dulwich_file
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._file.flush()
+        if self._fsync:
+            os.fsync(self._file.fileno())
+        self._file.close()
+        try:
+            dulwich_file.adjust_shared_perm(self._lockfilename, self._shared_perm)
+        except Exception:
+            pass
+        with open(self._lockfilename, "rb") as src:
+            data = src.read()
+        with open(self._filename, "wb") as dst:
+            dst.write(data)
+            dst.flush()
+            os.fsync(dst.fileno())
+        try:
+            os.remove(self._lockfilename)
+        except OSError:
+            pass
+        self._closed = True
+
+    dulwich_file._GitFile.close = close
+
+    from dulwich import object_store as dulwich_store
+    from dulwich.object_store import ObjectID
+
+    def add_object(self, obj):
+        # The store's own add_object calls os.utime(path) first and returns
+        # when it does not raise. Here os.utime answers success for a path
+        # that does not exist, so nothing is ever written. This writes the
+        # loose object directly, without the lock file or a rename.
+        obj_id = ObjectID(obj.get_id(self.object_format))
+        path = self._get_shafile_path(obj_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = obj.as_legacy_object(compression_level=self.loose_compression_level)
+        with open(path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+    dulwich_store.DiskObjectStore.add_object = add_object
+
+
+_install_file_workaround()
+
 # dulwich's clone finishes with a reset that writes a reflog entry, and it
 # resolves the committer before the fresh repo's config has a user. The
 # environment is checked first, so the identity is set here for every Git
@@ -34,11 +93,23 @@ for _mail in ("GIT_COMMITTER_EMAIL", "GIT_AUTHOR_EMAIL"):
 # falls back to USER/LOGNAME. This job runs without either.
 for _user in ("USER", "LOGNAME"):
     os.environ.setdefault(_user, "ps5")
+# Push goes through dulwich's urllib3 client, which does not read the
+# http.sslCAInfo setting on every path. The standard variables make every
+# TLS context in this process trust the pinned bundle.
+os.environ.setdefault("SSL_CERT_FILE", CA_FILE)
+os.environ.setdefault("REQUESTS_CA_BUNDLE", CA_FILE)
 
 
 def log(line):
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+    try:
+        with open(STATE + "/log/cpu-trace.txt", "a", encoding="utf-8") as f:
+            f.write(line.split("\n", 1)[0] + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
 
 
 def token():
@@ -225,7 +296,16 @@ def pull(directory, branch):
 def switch_to_results(repo, main_sha):
     refs = repo.get_refs()
     target = b"refs/heads/ps5/results"
+    usable = False
     if target in refs:
+        try:
+            repo[refs[target]]
+            usable = True
+        except KeyError:
+            # A refused run can leave the ref behind without its object.
+            log("RESULTS REF STALE " + refs[target].decode())
+            del repo.refs[target]
+    if usable:
         porcelain.checkout(repo, b"ps5/results")
     else:
         porcelain.checkout(repo, target=main_sha, new_branch=b"ps5/results")
@@ -255,13 +335,26 @@ def commit_results(directory, source, message):
     with open(dest, "wb") as f:
         f.write(data)
     porcelain.add(repo, paths=[rel.encode()])
+    # The hook runner calls subprocess without first checking that the hook
+    # file exists, and process creation is ENOTSUP on this platform. The
+    # hooks dict is per-repo and in memory, so the entries are dropped here.
+    for name in ("pre-commit", "commit-msg", "post-commit"):
+        repo.hooks.pop(name, None)
     sha = porcelain.commit(
         repo,
         message=message.encode(),
         author=IDENTITY,
         committer=IDENTITY,
+        # dulwich runs .git/hooks/pre-commit through subprocess; this platform
+        # has no process creation, so the hook is skipped by name, not caught.
+        no_verify=True,
     )
     log("COMMIT " + sha.decode())
+    try:
+        repo[sha]
+        log("COMMIT READBACK OK")
+    except KeyError:
+        log("COMMIT READBACK MISSING")
     try:
         porcelain.push(
             repo,
@@ -272,7 +365,9 @@ def commit_results(directory, source, message):
             config=config(),
         )
     except Exception as exc:  # noqa: BLE001 - the refusal is the signal; the commit stays
+        import traceback
         log("PUSH REFUSED %s: %s" % (type(exc).__name__, exc))
+        log(traceback.format_exc())
         porcelain.checkout(repo, b"main")
         return None
     log("PUSH OK " + sha.decode())

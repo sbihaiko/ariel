@@ -27,3 +27,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0018](0018-a-pending-approval-answers-its-id-alone.md) | A repeat request for a pending approval answers its ID alone |
 | [0019](0019-the-console-git-credential-is-owner-delivered.md) | The console's Git credential is owner-delivered and repository-scoped |
 | [0020](0020-console-jobs-are-launched-by-the-host.md) | The host launches console jobs; an app job never forks, threads or launches |
+| [0021](0021-console-git-writes-avoid-rename.md) | Console Git writes avoid rename and utime probes |

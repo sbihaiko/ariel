@@ -321,18 +321,22 @@ def run_loop(argv):
     import git_runner
 
     install_audit_hook()
+    trace("run entry " + " ".join(argv))
     run_id = argv[argv.index("--run-id") + 1] if "--run-id" in argv else None
     if not run_id:
+        trace("run fail --run-id is required")
         print("RUN FAIL --run-id is required")
         return 2
     result = STATE + "/results/cpu-" + run_id + ".json"
     if not os.path.isfile(result):
+        trace("run fail no report at " + result)
         print("RUN FAIL no report at " + result)
         return 1
     try:
         with open(STATE + "/state/clone.json", "r", encoding="utf-8") as f:
             clone = json.load(f)
-    except OSError:
+    except OSError as exc:
+        trace("run fail clone state %s" % exc)
         print("RUN FAIL no clone state; run --clone first")
         return 1
 
@@ -340,6 +344,7 @@ def run_loop(argv):
     tested = clone["tested"]
     test_path = os.path.join(repo_dir, "tests", "cpu_report.py")
     if not os.path.isfile(test_path):
+        trace("run fail missing test at " + tested)
         print("RUN FAIL missing tests/cpu_report.py at " + tested[:8])
         return 2
 
@@ -348,25 +353,39 @@ def run_loop(argv):
     with open(test_path, "rb") as f:
         test_sha = hashlib.sha256(f.read()).hexdigest()
     if report.get("status") != "ok":
+        trace("run fail report status %r" % report.get("status"))
         print("RUN FAIL report status is %s" % report.get("status"))
         return 1
     if report.get("test_sha256") != test_sha:
+        trace("run fail test sha %r vs %r" % (report.get("test_sha256"), test_sha))
         print("RUN FAIL report tests a different tree than the clone")
         return 1
     if report.get("tested_sha") != tested:
+        trace("run fail tested sha %r vs %r" % (report.get("tested_sha"), tested))
         print("RUN FAIL report tested %s, clone is %s" % (report.get("tested_sha"), tested))
         return 1
     available = (report.get("memory") or {}).get("mem_available_kb")
     if isinstance(available, int) and available < 200 * 1024:
+        trace("run fail memory %d KB" % available)
         print("RUN FAIL memory below 200 MB: %d KB" % available)
         return 1
 
-    sha = git_runner.commit_results(
-        repo_dir, result, "results: %s tested %s" % (run_id, tested[:8])
-    )
+    trace("run publish " + run_id)
+    try:
+        sha = git_runner.commit_results(
+            repo_dir, result, "results: %s tested %s" % (run_id, tested[:8])
+        )
+    except Exception as exc:  # noqa: BLE001 - the trace carries the reason
+        import traceback
+        trace("run crash %s: %s" % (type(exc).__name__, exc))
+        trace(traceback.format_exc())
+        print("RUN FAIL " + type(exc).__name__)
+        return 1
     if sha is None:
+        trace("run fail push refused")
         print("RUN FAIL push refused, the commit stays local")
         return 1
+    trace("run ok " + run_id + " " + sha.decode())
     print("RUN OK %s %s %s" % (run_id, tested, sha.decode()))
     return 0
 
