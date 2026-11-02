@@ -1,0 +1,131 @@
+diff --git a/tools/build_ps5.sh b/tools/build_ps5.sh
+index 7c44654..5d60646 100644
+--- a/tools/build_ps5.sh
++++ b/tools/build_ps5.sh
+@@ -62,9 +62,9 @@ if [ "$cache_tool" != none ]; then
+     fi
+     compiler=("$cache_tool" "${compiler[@]}")
+ fi
+-linker_args=()
++linker_args=(-Wl,--build-id=none)
+ if [ "${PS5_LINKER:-lld}" = mold ]; then
+-    linker_args=(-fuse-ld=mold)
++    linker_args=(-fuse-ld=mold -Wl,--build-id=none)
+ fi
+ compiler_string="${compiler[*]}"
+ 
+@@ -98,7 +98,8 @@ configure_ps5() {
+     CC="$compiler_string" \
+     CPP="$compiler_string -E" \
+     CPPFLAGS="-I$openssl_dir/include -I$libffi_dir/include -I$zlib_dir/include -I$sqlite_dir/include -I$bzip2_dir/include -I$xz_dir/include" \
+-    LDFLAGS="-L$openssl_dir/lib -lssl -lcrypto -L$libffi_dir/lib -lffi -L$zlib_dir/lib -lz -L$sqlite_dir/lib -lsqlite3 -L$bzip2_dir/lib -lbz2 -L$xz_dir/lib -llzma ${linker_args[*]}" \
++    LIBS="-L$root_dir/build/ps5/deps/libm/lib -lSceLibcInternal" \
++    LDFLAGS="-L$openssl_dir/lib -lssl -lcrypto -L$libffi_dir/lib -lffi -L$zlib_dir/lib -lz -L$sqlite_dir/lib -lsqlite3 -L$bzip2_dir/lib -lbz2 -L$xz_dir/lib -llzma ${linker_args[*]-}" \
+     LIBFFI_CFLAGS="-I$libffi_dir/include" \
+     LIBFFI_LIBS="-L$libffi_dir/lib -lffi" \
+     LIBSQLITE3_CFLAGS="-I$sqlite_dir/include" \
+@@ -459,7 +460,7 @@ build_launcher() {
+         return
+     fi
+     "${compiler[@]}" \
+-        "${linker_args[@]}" \
++        "${linker_args[@]-}" \
+         -DCPYTHON_PS5 \
+         -I"$root_dir/include" \
+         -I"$build_dir" \
+@@ -481,7 +482,7 @@ build_launcher() {
+         -L"$libffi_dir/lib" -lffi \
+         -L"$zlib_dir/lib" -lz \
+         -L"$xz_dir/lib" -llzma \
+-        -Wl,--wrap=clock_nanosleep -ldl -lpthread
++        -Wl,--wrap=clock_nanosleep -ldl -lpthread -lSceLibcInternal
+ }
+ 
+ build_web_launcher() {
+@@ -510,7 +511,7 @@ build_web_launcher() {
+         return
+     fi
+     "${compiler[@]}" \
+-        "${linker_args[@]}" \
++        "${linker_args[@]-}" \
+         -DCPYTHON_PS5 \
+         -I"$root_dir/include" \
+         -I"$hb_dir/include" \
+@@ -542,7 +543,7 @@ build_web_launcher() {
+         -L"$zlib_dir/lib" -lz \
+         -L"$xz_dir/lib" -llzma \
+         -L"$libffi_dir/lib" -lffi \
+-        -Wl,--wrap=clock_nanosleep -lmicrohttpd -ldl -lpthread
++        -Wl,--wrap=clock_nanosleep -lmicrohttpd -ldl -lpthread -lSceLibcInternal
+     cp "$web_launcher" "$web_test_launcher"
+     echo "Test launcher: $web_test_launcher"
+ }
+@@ -561,7 +562,7 @@ build_app_supervisor() {
+         return
+     fi
+     "${compiler[@]}" \
+-        "${linker_args[@]}" \
++        "${linker_args[@]-}" \
+         -DCPYTHON_PS5 \
+         -I"$root_dir/include" \
+         -I"$build_dir" \
+@@ -583,7 +584,7 @@ build_app_supervisor() {
+         -L"$libffi_dir/lib" -lffi \
+         -L"$zlib_dir/lib" -lz \
+         -L"$xz_dir/lib" -llzma \
+-        -Wl,--wrap=clock_nanosleep -ldl -lpthread
++        -Wl,--wrap=clock_nanosleep -ldl -lpthread -lSceLibcInternal
+     echo "Built $app_supervisor"
+ }
+ 
+diff --git a/tools/build_sqlite3_ps5.sh b/tools/build_sqlite3_ps5.sh
+index ca85e68..a78c4e1 100644
+--- a/tools/build_sqlite3_ps5.sh
++++ b/tools/build_sqlite3_ps5.sh
+@@ -40,7 +40,10 @@ if [ ! -f "$prefix/lib/libsqlite3.a" ] || [ "$source_dir/sqlite3.c" -nt "$prefix
+         -DSQLITE_OMIT_LOAD_EXTENSION=1 \
+         -DSQLITE_DEFAULT_MEMSTATUS=0 \
+         -I"$source_dir" -c "$source_dir/sqlite3.c" -o "$source_dir/sqlite3.o"
+-    ar rcs "$prefix/lib/libsqlite3.a" "$source_dir/sqlite3.o"
++    # The host ar writes an archive lld cannot read here; the SDK's own ar
++    # and ranlib are the ones that match the ELF objects.
++    "${AR:-$sdk_dir/bin/prospero-ar}" rcs "$prefix/lib/libsqlite3.a" "$source_dir/sqlite3.o"
++    "${RANLIB:-$sdk_dir/bin/prospero-ranlib}" "$prefix/lib/libsqlite3.a"
+     cp "$source_dir/sqlite3.h" "$prefix/include/sqlite3.h"
+     cp "$source_dir/sqlite3ext.h" "$prefix/include/sqlite3ext.h"
+ fi
+diff --git a/tools/build_xz_ps5.sh b/tools/build_xz_ps5.sh
+index 6c79e7d..f3c2546 100644
+--- a/tools/build_xz_ps5.sh
++++ b/tools/build_xz_ps5.sh
+@@ -42,6 +42,9 @@ if [ ! -f "$prefix/lib/liblzma.a" ]; then
+         AR="$sdk_dir/bin/prospero-ar" \
+         RANLIB="$sdk_dir/bin/prospero-ranlib" \
+         CFLAGS="-O2"
++    # A previous build may have left libtool metadata without the archive;
++    # clean makes the build state agree with what the prefix is missing.
++    make clean >/dev/null 2>&1 || true
+     make -j"${PS5_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+     mkdir -p "$prefix/include" "$prefix/lib"
+     cp src/liblzma/.libs/liblzma.a "$prefix/lib/liblzma.a"
+diff --git a/tools/build_zlib_ps5.sh b/tools/build_zlib_ps5.sh
+index a7f7837..050ba86 100644
+--- a/tools/build_zlib_ps5.sh
++++ b/tools/build_zlib_ps5.sh
+@@ -34,7 +34,15 @@ if [ ! -f "$prefix/lib/libz.a" ]; then
+     cd "$source_dir"
+     make distclean >/dev/null 2>&1 || true
+     CC="$CC" AR="$AR" RANLIB="$RANLIB" ./configure --static --prefix="$prefix"
+-    make -j"${PS5_JOBS:-$(nproc 2>/dev/null || echo 2)}"
++    # Only the static library: the sample programs do not link against the
++    # PS5 toolchain and would abort the build before libz.a is copied.
++    make -j"${PS5_JOBS:-$(nproc 2>/dev/null || echo 2)}" libz.a \
++        AR="$sdk_dir/bin/prospero-ar" RANLIB="$sdk_dir/bin/prospero-ranlib" \
++        ARFLAGS=rc
++    # make can already have produced an archive of the wrong flavour; the
++    # SDK's ar is the one whose output lld reads.
++    ( cd "$source_dir" && "$sdk_dir/bin/prospero-ar" rcs libz.a *.o \
++        && "$sdk_dir/bin/prospero-ranlib" libz.a )
+     # The SDK toolchain rewrites configure's install prefix as a target-root
+     # path.  Copy the static artefact explicitly into the workspace prefix so
+     # the CPython configure/link steps can consume it.
