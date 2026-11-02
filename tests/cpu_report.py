@@ -15,11 +15,25 @@ import threading
 import time
 
 BUFFER = b"ps5-cpu-report/" * 6553  # ~1 MiB
+TRACE_PATH = None
+
+
+def trace(message):
+    """Append one marker and make it durable: a hang leaves this file behind."""
+    if not TRACE_PATH:
+        return
+    fd = os.open(TRACE_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, (message + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 ROUNDS = 8192  # ~8 GiB of hashing per worker
 SAMPLES = []
 
 
 def worker(write_fd: int, rounds: int) -> None:
+    trace("child pid=%d start rounds=%d" % (os.getpid(), rounds))
     start = time.process_time()
     digest = hashlib.sha256()
     for i in range(rounds):
@@ -31,6 +45,7 @@ def worker(write_fd: int, rounds: int) -> None:
         "cpu_seconds": cpu,
         "result_digest": digest.hexdigest(),
     }
+    trace("child pid=%d end cpu=%.3f" % (os.getpid(), cpu))
     os.write(write_fd, (json.dumps(payload) + "\n").encode())
     os.close(write_fd)
     os._exit(0)
@@ -84,6 +99,13 @@ def main(argv):
     if "--out-dir" in argv:
         out_dir = argv[argv.index("--out-dir") + 1]
 
+    global TRACE_PATH
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        TRACE_PATH = os.path.join(out_dir, "cpu-%s.trace" % run_id)
+    except OSError:
+        TRACE_PATH = None
+
     stop = threading.Event()
     mem = []
     sampler = threading.Thread(target=sample_memory, args=(stop, mem), daemon=True)
@@ -94,6 +116,7 @@ def main(argv):
         expected.update(i.to_bytes(4, "little"))
     expected_digest = expected.hexdigest()
 
+    trace("parent pid=%d begin workers=%d rounds=%d" % (os.getpid(), workers, rounds))
     wall_start = time.monotonic()
     children = []
     for index in range(workers):
@@ -103,6 +126,7 @@ def main(argv):
             os.close(read_fd)
             worker(write_fd, rounds)
         os.close(write_fd)
+        trace("parent forked child=%d" % pid)
         children.append((pid, read_fd))
 
     sampler.start()
@@ -111,6 +135,7 @@ def main(argv):
     for pid, read_fd in children:
         data = read_all(read_fd)
         _, status = os.waitpid(pid, 0)
+        trace("parent reaped child=%d" % pid)
         statuses.append({"pid": pid, "exit_code": os.waitstatus_to_exitcode(status)})
         if data:
             result = json.loads(data.decode().strip())
