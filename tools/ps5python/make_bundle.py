@@ -102,7 +102,7 @@ def main(argv=None):
 
     app = os.path.join(out, "apps", "ps5-git")
     os.makedirs(app)
-    for name in ("app.json", "main.py"):
+    for name in ("app.json", "main.py", "git_runner.py"):
         shutil.copy2(os.path.join("ps5git", name), os.path.join(app, name))
     lib = os.path.join(app, "lib")
     os.makedirs(lib)

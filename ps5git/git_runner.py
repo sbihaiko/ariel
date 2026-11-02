@@ -28,16 +28,67 @@ def log(line):
 
 
 def token():
-    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-        value = f.read().strip()
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+    except OSError:
+        raise SystemExit("TOKEN REFUSED missing " + TOKEN_FILE)
     if not value:
         raise SystemExit("TOKEN REFUSED empty")
     return value
 
 
 def token_mode_ok():
-    mode = stat.S_IMODE(os.stat(TOKEN_FILE).st_mode)
+    try:
+        mode = stat.S_IMODE(os.stat(TOKEN_FILE).st_mode)
+    except OSError:
+        return False, "absent"
     return mode == 0o600, oct(mode)
+
+
+def _get_json(url):
+    import json
+    import ssl
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": "Bearer " + token(),
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ps5-git-spike",
+        },
+    )
+    ctx = ssl.create_default_context(cafile=CA_FILE)
+    with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
+        return json.loads(r.read().decode())
+
+
+MAX_PACKED_KB = 20 * 1024
+MAX_FILES = 2000
+MAX_EXPANDED_BYTES = 100 * 1024 * 1024
+
+
+def guard(owner_repo, branch="main"):
+    """Refuse a repository that does not fit the console, before any checkout."""
+    info = _get_json("https://api.github.com/repos/" + owner_repo)
+    packed = int(info.get("size") or 0)
+    if packed > MAX_PACKED_KB:
+        log("GUARD REFUSED repo too large packed=%dKB limit=%dKB" % (packed, MAX_PACKED_KB))
+        return 1
+    tree = _get_json(
+        "https://api.github.com/repos/%s/git/trees/%s?recursive=1" % (owner_repo, branch)
+    )
+    entries = [e for e in tree.get("tree", []) if e.get("type") == "blob"]
+    expanded = sum(int(e.get("size") or 0) for e in entries)
+    if len(entries) > MAX_FILES:
+        log("GUARD REFUSED too many files=%d limit=%d" % (len(entries), MAX_FILES))
+        return 1
+    if expanded > MAX_EXPANDED_BYTES:
+        log("GUARD REFUSED tree too large expanded=%d limit=%d" % (expanded, MAX_EXPANDED_BYTES))
+        return 1
+    log("GUARD OK packed=%dKB files=%d expanded=%d" % (packed, len(entries), expanded))
+    return 0
 
 
 def config():
@@ -89,14 +140,18 @@ def auth_check(owner_repo):
 
 
 def clone(url, target):
-    porcelain.clone(
-        url,
-        target,
-        branch=b"main",
-        username="x-access-token",
-        password=token(),
-        config=config(),
-    )
+    try:
+        porcelain.clone(
+            url,
+            target,
+            branch=b"main",
+            username="x-access-token",
+            password=token(),
+            config=config(),
+        )
+    except Exception as exc:  # noqa: BLE001 - the refusal is the signal
+        log("CLONE REFUSED %s: %s" % (type(exc).__name__, exc))
+        return 1
     repo = Repo(target)
     log("CLONE " + head(repo))
     return 0
@@ -105,17 +160,31 @@ def clone(url, target):
 def pull(directory, branch):
     repo = Repo(directory)
     before = head(repo)
-    ref = b"refs/heads/" + branch.encode()
-    porcelain.pull(
-        repo,
-        remote_location="origin",
-        refspecs=[ref + b":" + ref],
-        ff_only=True,
-        fast_forward=True,
-        username="x-access-token",
-        password=token(),
-        config=config(),
-    )
+    wanted = b"refs/heads/" + branch.encode()
+    target = repo.refs.read_ref(b"HEAD")
+    if not target.startswith(b"ref:") or target[5:] != wanted:
+        log("PULL REFUSED head is %s, not %s" % (target.decode(errors="replace"), wanted.decode()))
+        return 1
+    status = porcelain.status(repo)
+    if status.staged or status.unstaged or status.untracked:
+        log("PULL REFUSED tree is dirty staged=%d unstaged=%d untracked=%d"
+            % (len(status.staged), len(status.unstaged), len(status.untracked)))
+        return 1
+    try:
+        porcelain.pull(
+            repo,
+            remote_location="origin",
+            refspecs=[wanted + b":" + wanted],
+            ff_only=True,
+            fast_forward=True,
+            username="x-access-token",
+            password=token(),
+            config=config(),
+        )
+    except Exception as exc:  # noqa: BLE001 - the refusal is the signal
+        log("PULL REFUSED %s: %s" % (type(exc).__name__, exc))
+        porcelain.reset(repo, "hard", before)
+        return 1
     after = head(repo)
     porcelain.reset(repo, "hard", after)
     log("PULL %s..%s" % (before, after))
@@ -162,14 +231,19 @@ def commit_results(directory, source, message):
         committer=IDENTITY,
     )
     log("COMMIT " + sha.decode())
-    porcelain.push(
-        repo,
-        remote_location=remote_url,
-        refspecs=[b"refs/heads/ps5/results:refs/heads/ps5/results"],
-        username="x-access-token",
-        password=token(),
-        config=config(),
-    )
+    try:
+        porcelain.push(
+            repo,
+            remote_location=remote_url,
+            refspecs=[b"refs/heads/ps5/results:refs/heads/ps5/results"],
+            username="x-access-token",
+            password=token(),
+            config=config(),
+        )
+    except Exception as exc:  # noqa: BLE001 - the refusal is the signal; the commit stays
+        log("PUSH REFUSED %s: %s" % (type(exc).__name__, exc))
+        porcelain.checkout(repo, b"main")
+        return None
     log("PUSH OK " + sha.decode())
     porcelain.checkout(repo, b"main")
     return sha

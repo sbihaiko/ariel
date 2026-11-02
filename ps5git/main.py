@@ -18,7 +18,12 @@ import git_runner
 
 STATE = os.environ.get("PS5GIT_STATE", "/data/ps5-git")
 LOG = STATE + "/log"
-CA = STATE + "/ca.pem"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# The CA is the pinned certifi bundle, either installed into the state
+# directory or read straight from the app's own vendored copy.
+_CA_CHOICES = [STATE + "/ca.pem", os.path.join(APP_DIR, "lib", "certifi", "cacert.pem")]
+CA = next((p for p in _CA_CHOICES if os.path.isfile(p)), _CA_CHOICES[0])
 CA_BAD = STATE + "/ca-bad.pem"
 
 
@@ -30,6 +35,19 @@ def emit(lines, path=None):
             f.write(text)
     sys.stdout.write(text)
     sys.stdout.flush()
+
+
+BLOCKED = ("subprocess.Popen", "os.exec", "os.posix_spawn", "os.spawn")
+
+
+def install_audit_hook():
+    """Refuse process creation for the rest of the process, Git phase included."""
+
+    def hook(event, args):
+        if event in BLOCKED:
+            raise RuntimeError("blocked " + event)
+
+    sys.addaudithook(hook)
 
 
 def audit_probe():
@@ -101,20 +119,24 @@ def selftest(negative):
     except Exception as exc:  # noqa: BLE001
         lines.append("FORK FAIL %s: %s" % (type(exc).__name__, exc))
 
+    # A negative mode inverts the exit code on purpose: the handshake is meant
+    # to fail, so a refusal exits non-zero and an unexpected acceptance exits
+    # zero. The host reads the line, not only the code, and a job that accepts
+    # the wrong CA or hostname is the failure this pair exists to catch.
     if negative == "ca":
         try:
             tls_probe(CA_BAD)
         except ssl.SSLError as exc:
             lines.append("HTTPS FAIL verified unknown-ca %s" % exc.reason)
             emit(lines, LOG + "/selftest-negative-ca.txt")
-            return 0
+            return 1
         except Exception as exc:  # noqa: BLE001
             lines.append("HTTPS FAIL verified unknown-ca %s: %s" % (type(exc).__name__, exc))
             emit(lines, LOG + "/selftest-negative-ca.txt")
-            return 0
+            return 1
         lines.append("HTTPS FAIL accepted wrong CA")
         emit(lines, LOG + "/selftest-negative-ca.txt")
-        return 1
+        return 0
 
     if negative == "host":
         try:
@@ -122,14 +144,14 @@ def selftest(negative):
         except ssl.SSLError as exc:
             lines.append("HTTPS FAIL verified hostname-mismatch %s" % exc.reason)
             emit(lines, LOG + "/selftest-negative-host.txt")
-            return 0
+            return 1
         except Exception as exc:  # noqa: BLE001
             lines.append("HTTPS FAIL verified hostname-mismatch %s: %s" % (type(exc).__name__, exc))
             emit(lines, LOG + "/selftest-negative-host.txt")
-            return 0
+            return 1
         lines.append("HTTPS FAIL accepted wrong hostname")
         emit(lines, LOG + "/selftest-negative-host.txt")
-        return 1
+        return 0
 
     try:
         cert = tls_probe(CA)
@@ -155,11 +177,19 @@ def setting(name, default=None):
 
 
 def run_loop(argv):
+    install_audit_hook()
+    print("AUDIT OK subprocess blocked for the whole run")
     repo_dir = argv[argv.index("--dir") + 1] if "--dir" in argv else "/data/ps5-git-spike"
     remote = argv[argv.index("--remote") + 1] if "--remote" in argv else setting("remote")
     if not remote:
         print("RUN FAIL no remote configured")
         return 2
+    owner_repo = remote.rstrip("/")
+    if owner_repo.endswith(".git"):
+        owner_repo = owner_repo[:-4]
+    owner_repo = "/".join(owner_repo.rsplit("/", 2)[-2:])
+    if git_runner.guard(owner_repo) != 0:
+        return 1
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         if git_runner.clone(remote, repo_dir) != 0:
             return 1
@@ -200,6 +230,9 @@ def run_loop(argv):
     sha = git_runner.commit_results(
         repo_dir, result, "results: %s tested %s" % (run_id, tested[:8])
     )
+    if sha is None:
+        print("RUN FAIL push refused, the commit stays local")
+        return 1
     print("RUN OK %s %s %s" % (run_id, tested, sha.decode()))
     return 0
 
