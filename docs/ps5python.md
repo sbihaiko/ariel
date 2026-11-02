@@ -29,8 +29,14 @@ python3 tools/ps5python/deploy.py app ps5-git ps5git
 python3 tools/ps5python/bootstrap.py --build BUILD --state STATE
 python3 tools/ps5python/make_bundle.py --python-build CHECKOUT
 python3 tools/ps5python/check_bundle.py dist/ps5-python
+python3 tools/ps5python/compare_bundles.py dist/a dist/b
+python3 tools/ps5python/run_cpu.py --run-id manual1 --workers 2
 python3 tools/ps5python/e2e_check.py --repo sbihaiko/ps5-git-spike --run-id ID
 ```
+
+`run_cpu.py` launches the `--cpu` mode of the app, waits for the job, fetches
+the report over ftpsrv and judges it. Two steps still need the owner; they are
+written down in `docs/ps5python-owner-steps.md`.
 
 `bootstrap.py` uploads the runtime, the app and the state over ftpsrv and then
 starts the supervisor and the launcher. `make_bundle.py` assembles the
