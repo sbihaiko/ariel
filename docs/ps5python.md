@@ -46,43 +46,17 @@ a native library.
 
 ## The CPU test
 
-`tests/cpu_report.py` has two modes. `--index N` is one worker: it hashes a
-fixed buffer, records its CPU time, PID and digest, writes its JSON and exits.
-`--aggregate` launches the workers as app jobs through the launcher's
-`/api/launch`, waits for their `job_id`s in `/api/status`, checks distinct
-PIDs, exit 0 and matching digests, and writes `results/cpu-<run-id>.json`.
+`tests/cpu_report.py` runs as one job per worker. Each worker hashes a fixed
+buffer, records its PID, CPU time, digest and the monotonic start and end of
+its work, and writes its JSON. Worker 0 then polls for its sibling's file,
+checks PIDs, digests and overlap, and writes `results/cpu-<run-id>.json`.
 
-The app's `--cpu` mode is the aggregator; `--cpu-worker <path>` is the worker.
-The **host** launches the workers and then the aggregator: no app job forks and
-no app job launches another job, both of which are documented ways this console
-goes down ([ADR-0020](adr/0020-console-jobs-are-launched-by-the-host.md)). Each
-worker records its own monotonic start and end, so the report proves overlap
-without trusting the host's clock.
-
-## Why the console goes down
-
-Four runs took the console off the network, and the durable trace in
-`/data/ps5-git/log/cpu-trace.txt` says where each one stopped:
-
-| Probe | Shape | Where the trace ends |
-|---|---|---|
-| 1 | one job, one `os.fork`, pipe IPC | child finished, parent never reaped |
-| 2 | one job, one `os.fork`, file IPC | same place, so the pipe was innocent |
-| 3 | job launches jobs over the launcher API | mid-run, host loses 8090 |
-| 4 | host launches two workers, then an aggregator | both workers exit 0; the third job dies at its first line |
-
-Two console processes side by side completed cleanly in probe 4, so
-concurrency alone is survivable for a short burst. Upstream knows the shape
-anyway: `ps5-payload-dev/websrv` lists "Homebrew sometimes crashes when there
-is already a previous homebrew running", and its loader rewrites kernel
-process structures the previous process still references. The platform notes
-also record that only CPUs 9, 11, 13, 14 and 15 (affinity `0xea00`) are
-usable, that starving them shuts the console down, and that the exploit's own
-kernel stage sometimes hangs before any payload runs.
-
-So the test runs one job with two worker threads (ADR-0020), in a burst of
-about half a gigabyte per worker, and the host launches exactly one job at a
-time.
+The host launches both workers (`--cpu-worker <path> --index N`); no job
+launches another job, no job forks and no job creates a thread. All three are
+ways this console goes down, and the thread one is measured: an idle thread
+inside a job was enough ([ADR-0020](adr/0020-console-jobs-are-launched-by-the-host.md)).
+A run with the defaults reports `cpu_count=16`, two distinct PIDs, a ratio near
+1.95 and `CPU OK`.
 
 ## The self-test
 

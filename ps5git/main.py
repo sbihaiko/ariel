@@ -209,6 +209,36 @@ def run_cpu_test(test_path, tested, run_id, workers, extra=None):
     return result, ""
 
 
+def cpu_worker(argv):
+    """One worker job: run the test file's --index mode and nothing else.
+
+    The host launches one of these per worker. Nothing here forks, creates a
+    thread or launches another job: all three have taken this console down
+    (#153, ADR-0020).
+    """
+    install_audit_hook()
+    trace("cpu-worker entry " + " ".join(argv))
+    at = argv.index("--cpu-worker")
+    test_path = argv[at + 1]
+    if not os.path.isfile(test_path):
+        trace("cpu-worker missing " + test_path)
+        print("CPU FAIL missing test at " + test_path)
+        return 2
+    rest = argv[:at] + argv[at + 2:]
+    saved = sys.argv
+    sys.argv = [test_path] + rest
+    try:
+        runpy.run_path(test_path, run_name="__main__")
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        trace("cpu-worker exit %d" % code)
+        return code
+    finally:
+        sys.argv = saved
+    trace("cpu-worker exit 0")
+    return 0
+
+
 def cpu_loop(argv):
     """The local half of the CPU evidence: no Git, no credential."""
     install_audit_hook()
@@ -297,6 +327,8 @@ def run_loop(argv):
 
 
 def main(argv):
+    if "--cpu-worker" in argv:
+        return cpu_worker(argv)
     if "--cpu" in argv:
         return cpu_loop(argv)
     if "--run" in argv:

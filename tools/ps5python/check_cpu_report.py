@@ -17,7 +17,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEST = os.path.join(ROOT, "tests", "cpu_report.py")
 FORBIDDEN_CALLS = {"fork", "forkpty", "posix_spawn", "posix_spawnp", "spawnv", "spawnl"}
-FORBIDDEN_MODULES = {"subprocess", "urllib", "http", "socketserver"}
+FORBIDDEN_MODULES = {"subprocess", "urllib", "http", "socketserver", "threading", "_thread"}
 
 
 def check_source(source):
@@ -39,26 +39,29 @@ def check_source(source):
 
 
 def run_once():
+    """Two worker processes, as the console runs them: index 0 aggregates."""
     with tempfile.TemporaryDirectory() as out:
         env = dict(os.environ)
         env["PS5GIT_TRACE"] = os.path.join(out, "trace.txt")
-        proc = subprocess.run(
-            [sys.executable, TEST, "--run-id", "guard", "--workers", "2",
-             "--rounds", "1024", "--out-dir", out],
-            capture_output=True, text=True, env=env, check=False,
-        )
-        if proc.returncode != 0:
-            return ["the test exited %d: %s" % (proc.returncode, proc.stderr.strip()[-300:])]
+        procs = {}
+        for index in (1, 0):
+            procs[index] = subprocess.Popen(
+                [sys.executable, TEST, "--run-id", "guard", "--workers", "2",
+                 "--rounds", "1024", "--index", str(index), "--out-dir", out],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+        for index, proc in procs.items():
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                return ["worker %d exited %d: %s" % (index, proc.returncode, stderr.strip()[-300:])]
         with open(os.path.join(out, "cpu-guard.json"), "r", encoding="utf-8") as f:
             report = json.load(f)
     failures = list(report.get("failures") or [])
     if report.get("status") != "ok":
         failures.append("report status is %r" % report.get("status"))
-    ids = [w.get("thread_id") for w in report.get("workers", [])]
+    ids = [w.get("pid") for w in report.get("workers", [])]
     if len(ids) < 2 or len(set(ids)) != len(ids):
-        failures.append("worker thread ids are not distinct")
-    if len(set(w.get("pid") for w in report.get("workers", []))) != 1:
-        failures.append("more than one process ran the workers")
+        failures.append("worker pids are not distinct")
     return failures
 
 
@@ -74,7 +77,7 @@ def main():
         for line in failures:
             print("GUARD FAIL cpu_report " + line)
         return 1
-    print("GUARD OK cpu_report no fork, no launcher API, report is sound")
+    print("GUARD OK cpu_report no fork, no thread, no launcher API, report is sound")
     return 0
 
 
