@@ -60,6 +60,19 @@ are expected to fail the handshake: they print `HTTPS FAIL verified ...` and
 exit non-zero. An unexpected acceptance prints `accepted wrong` and exits
 zero, so the pair never reports success for the failure it exists to catch.
 
+## Build gotchas found on macOS
+
+- The upstream scripts assume Linux tooling. Run them with the GNUsed and
+  sha256sum shims on `PATH`, and with `/opt/homebrew/opt/llvm/bin` there too:
+  the `prospero-*` wrappers resolve `llvm-ar` and friends from `PATH`.
+- `make clean` in the CPython build directory empties the dependency
+  prefixes under `deps/*/lib`. Back those up before cleaning, or the next
+  link fails with `unable to find library -lssl` or `-lffi`.
+- The SDK ships no `libm`: an empty `libm.a` plus `-lSceLibcInternal` at the
+  end of each link is what makes `--with-libm=no` work.
+- zlib and sqlite must be archived with `prospero-ar`; the host `ar` writes an
+  archive lld cannot read, and it fails only at the final link.
+
 ## Dependencies
 
 Dulwich 1.2.20, urllib3 2.8.0 and certifi are fetched as sdists and checked
