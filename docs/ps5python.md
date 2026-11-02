@@ -59,6 +59,31 @@ goes down ([ADR-0020](adr/0020-console-jobs-are-launched-by-the-host.md)). Each
 worker records its own monotonic start and end, so the report proves overlap
 without trusting the host's clock.
 
+## Why the console goes down
+
+Four runs took the console off the network, and the durable trace in
+`/data/ps5-git/log/cpu-trace.txt` says where each one stopped:
+
+| Probe | Shape | Where the trace ends |
+|---|---|---|
+| 1 | one job, one `os.fork`, pipe IPC | child finished, parent never reaped |
+| 2 | one job, one `os.fork`, file IPC | same place, so the pipe was innocent |
+| 3 | job launches jobs over the launcher API | mid-run, host loses 8090 |
+| 4 | host launches two workers, then an aggregator | both workers exit 0; the third job dies at its first line |
+
+Two console processes side by side completed cleanly in probe 4, so
+concurrency alone is survivable for a short burst. Upstream knows the shape
+anyway: `ps5-payload-dev/websrv` lists "Homebrew sometimes crashes when there
+is already a previous homebrew running", and its loader rewrites kernel
+process structures the previous process still references. The platform notes
+also record that only CPUs 9, 11, 13, 14 and 15 (affinity `0xea00`) are
+usable, that starving them shuts the console down, and that the exploit's own
+kernel stage sometimes hangs before any payload runs.
+
+So the test runs one job with two worker threads (ADR-0020), in a burst of
+about half a gigabyte per worker, and the host launches exactly one job at a
+time.
+
 ## The self-test
 
 `main.py --selftest` prints one line per capability:
