@@ -25,3 +25,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0016](0016-a-change-is-complete-when-its-own-signal-says-so.md) | A change is complete when its own signal says so, never when its files stop growing |
 | [0017](0017-the-mcp-server-is-a-host-process-that-never-signs.md) | The MCP server is a host process that never signs |
 | [0018](0018-a-pending-approval-answers-its-id-alone.md) | A repeat request for a pending approval answers its ID alone |
+| [0019](0019-the-console-git-credential-is-owner-delivered.md) | The console's Git credential is owner-delivered and repository-scoped |
