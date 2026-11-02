@@ -77,6 +77,11 @@ to its race and not to any payload.
 
 ## Guard
 
-None yet. This rule is a draft until a named guard test exists; when one
-exists it will refuse a CPU test that imports `os.fork` or reaches the
-launcher's API.
+`tools/ps5python/check_cpu_report.py` reads `tests/cpu_report.py` as source
+and refuses an `os.fork`, a process-spawning call, or an import of the
+launcher's API, then runs the test on the host and refuses a report that is
+malformed, that shares one thread id, or that runs the workers in more than
+one process. It prints `GUARD OK` or `GUARD FAIL <reason>`.
+
+The rule is still a draft in CLAUDE.md until an automated guard invokes this
+script, but the behaviour it names is checked and green.
