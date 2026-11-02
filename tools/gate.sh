@@ -34,6 +34,31 @@ done
 
 say() { printf 'gate: %s\n' "$*"; }
 
+# One gate at a time. Both halves build with `make clean all` in the same
+# tree, so a second run deletes the binaries the first is executing and
+# reports red for a green commit (#157). A run waits for the holder, and takes
+# the lock over when the holder is gone (a lock without a live process is
+# what a killed run leaves behind).
+lock="$root/.gate.lock"
+lock_timeout=${ARIEL_GATE_LOCK_TIMEOUT:-3600}
+waited=0
+while ! mkdir "$lock" 2>/dev/null; do
+  holder=$(cat "$lock/pid" 2>/dev/null || true)
+  if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+    rm -rf "$lock"
+    continue
+  fi
+  if [ "$waited" -ge "$lock_timeout" ]; then
+    printf 'gate: another gate (pid %s) holds the lock after %ss\n' "$holder" "$lock_timeout" >&2
+    exit 4
+  fi
+  [ "$waited" -eq 0 ] && say "waiting for the gate at pid $holder"
+  sleep 1
+  waited=$((waited + 1))
+done
+printf '%s\n' "$$" > "$lock/pid"
+trap 'rm -rf "$lock"' EXIT INT TERM
+
 # The SDK drives the machine's own LLVM, which Homebrew keeps off the PATH.
 have_llvm() {
   command -v llvm-config >/dev/null 2>&1 && return 0

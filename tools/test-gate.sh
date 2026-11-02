@@ -40,6 +40,7 @@ if [ "$half" = hostbuild ]; then
   [ "${STUB_HOST_RC:-0}" = 0 ] && printf 'all 425 scenarios passed\n'
   exit "${STUB_HOST_RC:-0}"
 fi
+[ -n "${STUB_SLEEP:-}" ] && sleep "$STUB_SLEEP"
 exit "${STUB_PAYLOAD_RC:-0}"
 EOF
 
@@ -73,6 +74,7 @@ run_gate() {
       STUB_LOG="$work/log/calls" ${SDK:+PS5_PAYLOAD_SDK=$SDK} \
       ${HOST_RC:+STUB_HOST_RC=$HOST_RC} \
       ${PAYLOAD_RC:+STUB_PAYLOAD_RC=$PAYLOAD_RC} \
+      ${STUB_SLEEP:+STUB_SLEEP=$STUB_SLEEP} \
       sh "$repo/tools/gate.sh" "$@" 2>&1
 }
 
