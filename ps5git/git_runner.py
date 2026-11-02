@@ -21,6 +21,20 @@ TOKEN_FILE = os.environ.get("PS5GIT_TOKEN_FILE", STATE + "/secrets/token")
 CA_FILE = os.environ.get("PS5GIT_CA_FILE", STATE + "/ca.pem")
 IDENTITY = b"ps5 <ps5@ariel.invalid>"
 
+# dulwich's clone finishes with a reset that writes a reflog entry, and it
+# resolves the committer before the fresh repo's config has a user. The
+# environment is checked first, so the identity is set here for every Git
+# operation in this process.
+for _name in ("GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"):
+    os.environ.setdefault(_name, "ps5")
+for _mail in ("GIT_COMMITTER_EMAIL", "GIT_AUTHOR_EMAIL"):
+    os.environ.setdefault(_mail, "ps5@ariel.invalid")
+# dulwich's clone writes HEAD through a reflog entry and resolves the
+# committer without asking for a kind, which skips the GIT_* variables and
+# falls back to USER/LOGNAME. This job runs without either.
+for _user in ("USER", "LOGNAME"):
+    os.environ.setdefault(_user, "ps5")
+
 
 def log(line):
     sys.stdout.write(line + "\n")
@@ -141,14 +155,25 @@ def auth_check(owner_repo):
 
 def clone(url, target):
     try:
+        # No checkout: dulwich's checkout writes a reflog entry and resolves
+        # the committer through the fresh repo's config, which has no user yet
+        # and no passwd entry to fall back on. The identity is written into the
+        # repo, and the checkout is done by the reset that follows.
         porcelain.clone(
             url,
             target,
             branch=b"main",
+            checkout=False,
             username="x-access-token",
             password=token(),
             config=config(),
         )
+        repo = Repo(target)
+        repo_config = repo.get_config()
+        repo_config.set((b"user",), b"name", b"ps5")
+        repo_config.set((b"user",), b"email", b"ps5@ariel.invalid")
+        repo_config.write_to_path()
+        porcelain.reset(repo, "hard", b"refs/heads/main")
     except Exception as exc:  # noqa: BLE001 - the refusal is the signal
         log("CLONE REFUSED %s: %s" % (type(exc).__name__, exc))
         return 1

@@ -6,6 +6,7 @@ starts, process execution is blocked, fork and waitpid work, and TLS to GitHub
 verifies against the bundled CA. Git modes are added by later tickets.
 """
 
+import hashlib
 import json
 import os
 import runpy
@@ -266,23 +267,26 @@ def cpu_loop(argv):
     return 0
 
 
-def run_loop(argv):
-    # Imported here: the self-test must start even when the Git dependency is
-    # absent, and dulwich is only needed from the first Git step on.
+def owner_repo(remote):
+    name = remote.rstrip("/")
+    if name.endswith(".git"):
+        name = name[:-4]
+    return "/".join(name.rsplit("/", 2)[-2:])
+
+
+def clone_loop(argv):
+    """Clone or pull the fixture repo, and record the SHA that was tested."""
     import git_runner
 
     install_audit_hook()
+    trace("clone entry " + " ".join(argv))
     print("AUDIT OK subprocess blocked for the whole run")
     repo_dir = argv[argv.index("--dir") + 1] if "--dir" in argv else "/data/ps5-git-spike"
     remote = argv[argv.index("--remote") + 1] if "--remote" in argv else setting("remote")
     if not remote:
-        print("RUN FAIL no remote configured")
+        print("CLONE FAIL no remote configured")
         return 2
-    owner_repo = remote.rstrip("/")
-    if owner_repo.endswith(".git"):
-        owner_repo = owner_repo[:-4]
-    owner_repo = "/".join(owner_repo.rsplit("/", 2)[-2:])
-    if git_runner.guard(owner_repo) != 0:
+    if git_runner.guard(owner_repo(remote)) != 0:
         return 1
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         if git_runner.clone(remote, repo_dir) != 0:
@@ -290,32 +294,73 @@ def run_loop(argv):
     else:
         if git_runner.pull(repo_dir, "main") != 0:
             return 1
-
     tested = git_runner.head(git_runner.Repo(repo_dir))
-    run_id = argv[argv.index("--run-id") + 1] if "--run-id" in argv else None
-    if run_id is None:
-        run_id = "%s-%s-%06x" % (
-            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
-            tested[:8],
-            int.from_bytes(os.urandom(3), "big"),
-        )
-    workers = argv[argv.index("--workers") + 1] if "--workers" in argv else "2"
+    write_state(STATE + "/state/clone.json", {
+        "tested": tested, "dir": repo_dir, "remote": remote,
+    })
+    trace("clone ok " + tested)
+    print("CLONE OK %s %s" % (tested, repo_dir))
+    return 0
 
+
+def write_state(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def run_loop(argv):
+    """Publish the workers' report: commit it and push.
+
+    The host ran the workers, so this job only checks the report against the
+    cloned tree and publishes it. Nothing here starts a process.
+    """
+    import git_runner
+
+    install_audit_hook()
+    run_id = argv[argv.index("--run-id") + 1] if "--run-id" in argv else None
+    if not run_id:
+        print("RUN FAIL --run-id is required")
+        return 2
+    result = STATE + "/results/cpu-" + run_id + ".json"
+    if not os.path.isfile(result):
+        print("RUN FAIL no report at " + result)
+        return 1
+    try:
+        with open(STATE + "/state/clone.json", "r", encoding="utf-8") as f:
+            clone = json.load(f)
+    except OSError:
+        print("RUN FAIL no clone state; run --clone first")
+        return 1
+
+    repo_dir = clone["dir"]
+    tested = clone["tested"]
     test_path = os.path.join(repo_dir, "tests", "cpu_report.py")
     if not os.path.isfile(test_path):
         print("RUN FAIL missing tests/cpu_report.py at " + tested[:8])
         return 2
-    extra = ["--rounds", argv[argv.index("--rounds") + 1]] if "--rounds" in argv else []
-    result, reason = run_cpu_test(test_path, tested, run_id, workers, extra)
-    if result is None:
-        print("RUN FAIL " + reason)
-        return 1
+
     with open(result, "r", encoding="utf-8") as f:
         report = json.load(f)
+    with open(test_path, "rb") as f:
+        test_sha = hashlib.sha256(f.read()).hexdigest()
+    if report.get("status") != "ok":
+        print("RUN FAIL report status is %s" % report.get("status"))
+        return 1
+    if report.get("test_sha256") != test_sha:
+        print("RUN FAIL report tests a different tree than the clone")
+        return 1
+    if report.get("tested_sha") != tested:
+        print("RUN FAIL report tested %s, clone is %s" % (report.get("tested_sha"), tested))
+        return 1
     available = (report.get("memory") or {}).get("mem_available_kb")
     if isinstance(available, int) and available < 200 * 1024:
         print("RUN FAIL memory below 200 MB: %d KB" % available)
         return 1
+
     sha = git_runner.commit_results(
         repo_dir, result, "results: %s tested %s" % (run_id, tested[:8])
     )
@@ -327,6 +372,8 @@ def run_loop(argv):
 
 
 def main(argv):
+    if "--clone" in argv:
+        return clone_loop(argv)
     if "--cpu-worker" in argv:
         return cpu_worker(argv)
     if "--cpu" in argv:
@@ -339,7 +386,7 @@ def main(argv):
         return selftest("ca")
     if "--selftest-negative-host" in argv:
         return selftest("host")
-    print("usage: main.py --selftest [--selftest-negative-ca|--selftest-negative-host] | --run [--dir D] [--remote URL] [--run-id ID] [--workers N]")
+    print("usage: main.py --clone | --cpu-worker PATH | --run --run-id ID | --selftest [--selftest-negative-ca|--selftest-negative-host] | --run [--dir D] [--remote URL] [--run-id ID] [--workers N]")
     return 2
 
 
