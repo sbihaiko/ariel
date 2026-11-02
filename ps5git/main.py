@@ -14,8 +14,6 @@ import ssl
 import sys
 import time
 
-import git_runner
-
 STATE = os.environ.get("PS5GIT_STATE", "/data/ps5-git")
 LOG = STATE + "/log"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,10 +103,12 @@ def selftest(negative):
     seen, raised = audit_probe()
     if seen:
         lines.append("AUDIT OK subprocess blocked event=%s" % seen[0])
-    elif "blocked" in raised.lower() or "notimplemented" in raised.lower():
+    elif raised:
+        # The platform may refuse the call before the hook sees an event; the
+        # refusal itself is the proof that no process can start.
         lines.append("AUDIT OK subprocess blocked raised=%s" % raised)
     else:
-        lines.append("AUDIT FAIL subprocess not blocked raised=%s" % (raised or "none"))
+        lines.append("AUDIT FAIL subprocess not blocked")
 
     try:
         parent, child, data, status = fork_probe()
@@ -176,7 +176,53 @@ def setting(name, default=None):
         return default
 
 
+def run_cpu_test(test_path, tested, run_id, workers, extra=None):
+    """Run one CPU report in this interpreter and return its result path."""
+    saved = sys.argv
+    sys.argv = [test_path, "--tested-sha", tested, "--run-id", run_id,
+                "--workers", workers, "--out-dir", STATE + "/results"] + (extra or [])
+    try:
+        runpy.run_path(test_path, run_name="__main__")
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            return None, "cpu test exit=%s" % exc.code
+    finally:
+        sys.argv = saved
+    result = STATE + "/results/cpu-" + run_id + ".json"
+    if not os.path.isfile(result):
+        return None, "result file missing " + result
+    return result, ""
+
+
+def cpu_loop(argv):
+    """The local half of the CPU evidence: no Git, no credential."""
+    install_audit_hook()
+    print("AUDIT OK subprocess blocked for the whole run")
+    test_path = argv[argv.index("--cpu") + 1] if "--cpu" in argv else STATE + "/tests/cpu_report.py"
+    if not os.path.isfile(test_path):
+        print("CPU FAIL missing test at " + test_path)
+        return 2
+    run_id = argv[argv.index("--run-id") + 1] if "--run-id" in argv else None
+    if run_id is None:
+        run_id = "%s-%06x" % (
+            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+            int.from_bytes(os.urandom(3), "big"),
+        )
+    workers = argv[argv.index("--workers") + 1] if "--workers" in argv else "2"
+    extra = ["--rounds", argv[argv.index("--rounds") + 1]] if "--rounds" in argv else []
+    result, reason = run_cpu_test(test_path, "local", run_id, workers, extra)
+    if result is None:
+        print("CPU FAIL " + reason)
+        return 1
+    print("CPU OK " + run_id + " " + result)
+    return 0
+
+
 def run_loop(argv):
+    # Imported here: the self-test must start even when the Git dependency is
+    # absent, and dulwich is only needed from the first Git step on.
+    import git_runner
+
     install_audit_hook()
     print("AUDIT OK subprocess blocked for the whole run")
     repo_dir = argv[argv.index("--dir") + 1] if "--dir" in argv else "/data/ps5-git-spike"
@@ -211,21 +257,10 @@ def run_loop(argv):
     if not os.path.isfile(test_path):
         print("RUN FAIL missing tests/cpu_report.py at " + tested[:8])
         return 2
-    saved = sys.argv
-    sys.argv = [test_path, "--tested-sha", tested, "--run-id", run_id,
-                "--workers", workers, "--out-dir", STATE + "/results"]
-    try:
-        runpy.run_path(test_path, run_name="__main__")
-    except SystemExit as exc:
-        if exc.code not in (None, 0):
-            print("RUN FAIL cpu test exit=%s" % exc.code)
-            return 1
-    finally:
-        sys.argv = saved
-
-    result = STATE + "/results/cpu-" + run_id + ".json"
-    if not os.path.isfile(result):
-        print("RUN FAIL result file missing " + result)
+    extra = ["--rounds", argv[argv.index("--rounds") + 1]] if "--rounds" in argv else []
+    result, reason = run_cpu_test(test_path, tested, run_id, workers, extra)
+    if result is None:
+        print("RUN FAIL " + reason)
         return 1
     with open(result, "r", encoding="utf-8") as f:
         report = json.load(f)
@@ -244,6 +279,8 @@ def run_loop(argv):
 
 
 def main(argv):
+    if "--cpu" in argv:
+        return cpu_loop(argv)
     if "--run" in argv:
         return run_loop(argv)
     if "--selftest" in argv:

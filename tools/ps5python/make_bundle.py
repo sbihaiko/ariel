@@ -31,7 +31,7 @@ PACKAGES = [
         "url": "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz",
         "sha256": "63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63",
         "dir": "urllib3",
-        "copy": ["urllib3"],
+        "copy": ["src/urllib3"],
         "drop": [],
     },
     {
@@ -100,7 +100,7 @@ def main(argv=None):
     copytree(os.path.join(build, "cpython-lib"), os.path.join(out, "cpython-lib"))
     copytree(os.path.join(src, "web"), os.path.join(out, "web"))
 
-    app = os.path.join(out, "apps", "ps5-git")
+    app = os.path.join(out, "apps", "ps5git")
     os.makedirs(app)
     for name in ("app.json", "main.py", "git_runner.py"):
         shutil.copy2(os.path.join("ps5git", name), os.path.join(app, name))
@@ -121,7 +121,14 @@ def main(argv=None):
     version_file = os.path.join(src, "CPYTHON_VERSION.txt")
     with open(version_file, "r", encoding="utf-8") as f:
         pins["cpython"] = f.read().strip()
-    pins["sdk"] = os.environ.get("PS5_PAYLOAD_SDK", "")
+    sdk = os.environ.get("PS5_PAYLOAD_SDK", "")
+    toolchain = os.path.join(sdk, "toolchain", "prospero.sh")
+    pins["sdk"] = {
+        "path": sdk,
+        # The installed SDK is not a git checkout; the toolchain hash is what
+        # names the build environment it came from.
+        "toolchain_sha256": sha256(toolchain) if os.path.isfile(toolchain) else "absent",
+    }
     try:
         pins["compiler"] = subprocess.run(
             [os.path.join(pins["sdk"], "bin", "prospero-clang"), "--version"],

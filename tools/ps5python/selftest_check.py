@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 import console
 
 REQUIRED = (
-    "PYTHON OK 3.14.7 ps5",
+    "PYTHON OK 3.14.7 freebsd",
     "AUDIT OK subprocess blocked",
     "FORK OK parent=",
     "HTTPS OK verified github.com",
@@ -30,20 +30,25 @@ def launch_and_wait(host, app, args, timeout=120):
     query = urlencode({"app": app, "args": args})
     job = console.get_json(host, f"/api/launch?{query}")
     deadline = time.time() + timeout
+    pid = 0
     while time.time() < deadline:
         status = console.get_json(host, "/api/status")
         for item in status.get("jobs", []):
-            if item.get("job_id") == job.get("job_id") and item.get("finished"):
+            if item.get("job_id") != job.get("job_id"):
+                continue
+            pid = item.get("app_pid") or pid
+            if item.get("finished"):
                 data, _ = console.logs(host, since)
+                item["app_pid"] = item.get("app_pid") or pid
                 return item, data
-        time.sleep(1)
+        time.sleep(0.2)
     return None, ""
 
 
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--host", default=console.DEFAULT_HOST)
-    p.add_argument("--app", default="ps5-git")
+    p.add_argument("--app", default="ps5git")
     args = p.parse_args(argv)
 
     failures = []

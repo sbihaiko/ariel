@@ -1,6 +1,7 @@
 """Check that a PS5 Python bundle matches its manifest.
 
-The manifest lists every file the bundle carries, except the manifest itself.
+The manifest lists every file the bundle carries, except the manifest and the
+pins record, which sit beside it.
 A missing file, an unexpected file, a changed byte or a native library fails the
 check and names the path, so a bundle cannot pass by looking roughly right.
 """
@@ -41,7 +42,7 @@ def main(argv=None):
         for name in filenames:
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, root)
-            if rel == "MANIFEST.json":
+            if rel in ("MANIFEST.json", "PINS.json"):
                 continue
             actual.append(rel)
 

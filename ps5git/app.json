@@ -1,5 +1,5 @@
 {
-  "id": "ps5-git",
+  "id": "ps5git",
   "name": "PS5 Git",
   "version": "0.1.0",
   "entry": "main.py",

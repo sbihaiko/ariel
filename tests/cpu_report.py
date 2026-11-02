@@ -19,10 +19,10 @@ ROUNDS = 8192  # ~8 GiB of hashing per worker
 SAMPLES = []
 
 
-def worker(write_fd: int) -> None:
+def worker(write_fd: int, rounds: int) -> None:
     start = time.process_time()
     digest = hashlib.sha256()
-    for i in range(ROUNDS):
+    for i in range(rounds):
         digest.update(BUFFER)
         digest.update(i.to_bytes(4, "little"))
     cpu = time.process_time() - start
@@ -69,6 +69,10 @@ def main(argv):
     if "--workers" in argv:
         workers = int(argv[argv.index("--workers") + 1])
 
+    rounds = ROUNDS
+    if "--rounds" in argv:
+        rounds = int(argv[argv.index("--rounds") + 1])
+
     run_id = "%s-%s-%06x" % (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
         tested_sha[:8],
@@ -85,7 +89,7 @@ def main(argv):
     sampler = threading.Thread(target=sample_memory, args=(stop, mem), daemon=True)
 
     expected = hashlib.sha256()
-    for i in range(ROUNDS):
+    for i in range(rounds):
         expected.update(BUFFER)
         expected.update(i.to_bytes(4, "little"))
     expected_digest = expected.hexdigest()
@@ -97,7 +101,7 @@ def main(argv):
         pid = os.fork()
         if pid == 0:
             os.close(read_fd)
-            worker(write_fd)
+            worker(write_fd, rounds)
         os.close(write_fd)
         children.append((pid, read_fd))
 
@@ -135,6 +139,7 @@ def main(argv):
         "affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else "unavailable",
         "platform": "%s %s" % (sys.platform, os.uname().machine),
         "wall_seconds": wall_seconds,
+        "rounds": rounds,
         "expected_digest": expected_digest,
         "workers": results,
         "statuses": statuses,
