@@ -58,6 +58,18 @@ inside a job was enough ([ADR-0020](adr/0020-console-jobs-are-launched-by-the-ho
 A run with the defaults reports `cpu_count=16`, two distinct PIDs, a ratio near
 1.95 and `CPU OK`.
 
+## The end-to-end run
+
+Three host steps, because a console job may not launch another job: `--clone`
+records the tested SHA in `/data/ps5-git/state/clone.json`, one
+`--cpu-worker` job per worker writes its result, and `--run` checks the report
+against the clone (status, `test_sha256`, `tested_sha`, memory floor) and
+pushes the commit. `tools/ps5python/e2e_run.py` drives the three steps.
+
+The workers execute the copy under `/data/ps5-git/tests/` rather than the
+clone's own file, which is byte-identical; the report's `test_sha256` is
+checked against the clone, so the evidence still belongs to the tested tree.
+
 ## The self-test
 
 `main.py --selftest` prints one line per capability:

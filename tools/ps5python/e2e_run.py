@@ -76,7 +76,10 @@ def main(argv=None):
     repo_dir = clone["dir"]
     print(f"tested {tested[:8]} at {repo_dir}")
 
-    test_path = repo_dir + "/tests/cpu_report.py"
+    # The workers run the state copy, which is byte-identical to the clone's;
+    # `--run` refuses a report whose test_sha256 does not match the clone, so
+    # the evidence still belongs to the tested tree.
+    test_path = "/data/ps5-git/tests/cpu_report.py"
     common = f"--run-id {args.run_id} --workers {args.workers} --out-dir {RESULTS} --tested-sha {tested}"
     if args.rounds:
         common += f" --rounds {args.rounds}"
