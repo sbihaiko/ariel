@@ -73,11 +73,13 @@ def write_json(path, payload):
 
 def worker(out_dir, run_id, index, rounds):
     trace("worker %d start rounds=%d" % (index, rounds))
+    mem_samples = [mem_available()]
     start_monotonic = time.monotonic()
     start_cpu = time.process_time()
     digest = digest_for(rounds)
     cpu = time.process_time() - start_cpu
     end_monotonic = time.monotonic()
+    mem_samples.append(mem_available())
     write_json(os.path.join(out_dir, "cpu-%s-w%d.json" % (run_id, index)), {
         "run_id": run_id,
         "index": index,
@@ -87,6 +89,7 @@ def worker(out_dir, run_id, index, rounds):
         "start_monotonic": start_monotonic,
         "end_monotonic": end_monotonic,
         "result_digest": digest,
+        "mem_available_kb": [value for value in mem_samples if value is not None],
     })
     trace("worker %d written cpu=%.3f" % (index, cpu))
     return 0
@@ -102,10 +105,18 @@ def platform_string():
 
 
 def read_results(out_dir, run_id, workers, timeout):
-    """Worker 0 waits for every sibling's file; a missing one is a failure."""
+    """Worker 0 waits for every sibling's file; a missing one is a failure.
+
+    Each poll also samples free memory, so the report carries the minimum seen
+    while the workers were running rather than one reading at the end.
+    """
     paths = [os.path.join(out_dir, "cpu-%s-w%d.json" % (run_id, i)) for i in range(workers)]
     deadline = time.time() + timeout
+    mem_samples = []
     while time.time() < deadline:
+        sample = mem_available()
+        if sample is not None:
+            mem_samples.append(sample)
         if all(os.path.isfile(p) for p in paths):
             break
         time.sleep(0.2)
@@ -116,13 +127,15 @@ def read_results(out_dir, run_id, workers, timeout):
                 results.append(json.load(f))
         except OSError:
             pass
-    return results
+    return results, mem_samples
 
 
 def aggregate(out_dir, run_id, workers, rounds, tested_sha, timeout):
     trace("aggregate start workers=%d rounds=%d" % (workers, rounds))
     expected_digest = digest_for(rounds)
-    results = read_results(out_dir, run_id, workers, timeout)
+    results, mem_samples = read_results(out_dir, run_id, workers, timeout)
+    for item in results:
+        mem_samples.extend(item.get("mem_available_kb") or [])
     trace("aggregate read %d results" % len(results))
 
     pids = [r.get("pid") for r in results]
@@ -148,6 +161,9 @@ def aggregate(out_dir, run_id, workers, rounds, tested_sha, timeout):
         failures.append("the workers did not run at the same time")
     if not wall or cpu <= 1.5 * wall:
         failures.append("the workers did not overlap enough to use two cores")
+    minimum_memory = min(mem_samples) if mem_samples else None
+    if minimum_memory is not None and minimum_memory < 200 * 1024:
+        failures.append("free memory fell below 200 MB: %d KB" % minimum_memory)
 
     with open(__file__, "rb") as f:
         test_sha256 = hashlib.sha256(f.read()).hexdigest()
@@ -166,7 +182,7 @@ def aggregate(out_dir, run_id, workers, rounds, tested_sha, timeout):
         "cpu_wall_ratio": (cpu / wall) if wall else 0,
         "expected_digest": expected_digest,
         "workers": results,
-        "memory": {"mem_available_kb": mem_available(), "samples": 1},
+        "memory": {"mem_available_kb": minimum_memory, "samples": len(mem_samples)},
         "status": "ok" if not failures else "failed",
         "failures": failures,
     }
