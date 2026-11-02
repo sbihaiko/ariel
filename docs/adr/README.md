@@ -26,4 +26,4 @@ Decisions for ariel. Numbers are stable, so cross-references hold. A number is n
 | [0017](0017-the-mcp-server-is-a-host-process-that-never-signs.md) | The MCP server is a host process that never signs |
 | [0018](0018-a-pending-approval-answers-its-id-alone.md) | A repeat request for a pending approval answers its ID alone |
 | [0019](0019-the-console-git-credential-is-owner-delivered.md) | The console's Git credential is owner-delivered and repository-scoped |
-| [0020](0020-cpu-jobs-are-spawned-by-the-supervisor.md) | CPU jobs are spawned by the supervisor, never by an app's fork |
+| [0020](0020-console-jobs-are-launched-by-the-host.md) | The host launches console jobs; an app job never forks and never launches |

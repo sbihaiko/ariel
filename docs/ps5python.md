@@ -53,9 +53,11 @@ fixed buffer, records its CPU time, PID and digest, writes its JSON and exits.
 PIDs, exit 0 and matching digests, and writes `results/cpu-<run-id>.json`.
 
 The app's `--cpu` mode is the aggregator; `--cpu-worker <path>` is the worker.
-There is no `os.fork` in either: a second-level fork inside an app job takes
-this console's kernel down, while the supervisor's own fork is what every job
-already is ([ADR-0020](adr/0020-cpu-jobs-are-spawned-by-the-supervisor.md)).
+The **host** launches the workers and then the aggregator: no app job forks and
+no app job launches another job, both of which are documented ways this console
+goes down ([ADR-0020](adr/0020-console-jobs-are-launched-by-the-host.md)). Each
+worker records its own monotonic start and end, so the report proves overlap
+without trusting the host's clock.
 
 ## The self-test
 

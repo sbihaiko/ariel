@@ -3,14 +3,15 @@
 Two roles, both inside the launcher's normal app jobs:
 
   --index N     one CPU-bound worker: hashes a fixed buffer, records its own
-                CPU time, PID and digest, writes its JSON and exits.
-  --aggregate   launches the workers through the supervisor's HTTP API, waits
-                for them, and writes the run's report.
+                CPU time, PID, digest and the monotonic start and end of its
+                work, writes its JSON and exits.
+  --aggregate   reads the workers' JSONs, checks PIDs, digests and overlap,
+                and writes the run's report.
 
-There is no os.fork anywhere. A second-level fork inside an app job takes this
-console's kernel down (ticket #153), so the parallelism comes from the
-supervisor, which forks a process per job in C and has done so for every app
-since the launcher started.
+No job launches another job and no app forks. Upstream documents two ways this
+console goes down: a second-level fork inside a job, and homebrew starting
+while other homebrew runs (#153). The parallelism here is two worker jobs the
+host launches side by side, and the aggregator only reads their files.
 """
 
 import hashlib
@@ -19,8 +20,6 @@ import os
 import sys
 import threading
 import time
-import urllib.request
-from urllib.parse import urlencode
 
 BUFFER = b"ps5-cpu-report/" * (1024 * 1024 // 15 + 1)  # just over 1 MiB
 ROUNDS = 8192  # ~8 GiB of hashing per worker
@@ -79,15 +78,19 @@ def write_json(path, payload):
 
 def worker(out_dir, run_id, index, rounds):
     trace("worker %d start rounds=%d" % (index, rounds))
-    start = time.process_time()
+    start_monotonic = time.monotonic()
+    start_cpu = time.process_time()
     digest = digest_for(rounds)
-    cpu = time.process_time() - start
+    cpu = time.process_time() - start_cpu
+    end_monotonic = time.monotonic()
     payload = {
         "run_id": run_id,
         "index": index,
         "pid": os.getpid(),
         "rounds": rounds,
         "cpu_seconds": cpu,
+        "start_monotonic": start_monotonic,
+        "end_monotonic": end_monotonic,
         "result_digest": digest,
     }
     write_json(os.path.join(out_dir, "cpu-%s-w%d.json" % (run_id, index)), payload)
@@ -96,65 +99,14 @@ def worker(out_dir, run_id, index, rounds):
     return 0
 
 
-def launch(base_url, app, arguments):
-    query = urlencode({"app": app, "args": arguments})
-    with urllib.request.urlopen(base_url + "/api/launch?" + query, timeout=30) as r:
-        return json.loads(r.read().decode())
-
-
-def status(base_url):
-    with urllib.request.urlopen(base_url + "/api/status", timeout=30) as r:
-        return json.loads(r.read().decode())
-
-
-def wait_jobs(base_url, job_ids, deadline):
-    finished = {}
-    polls = 0
-    while time.time() < deadline and len(finished) < len(job_ids):
-        polls += 1
-        for item in status(base_url).get("jobs", []):
-            if item.get("job_id") in job_ids and item.get("finished"):
-                finished[item["job_id"]] = item
-        if polls % 10 == 0:
-            trace("poll %d done=%d/%d" % (polls, len(finished), len(job_ids)))
-        if len(finished) < len(job_ids):
-            time.sleep(0.2)
-    return finished
-
-
-def aggregate(out_dir, run_id, workers, rounds, base_url, app, tested_sha, timeout):
-    trace("aggregate start workers=%d rounds=%d base=%s" % (workers, rounds, base_url))
+def aggregate(out_dir, run_id, workers, rounds, tested_sha):
+    trace("aggregate start workers=%d rounds=%d" % (workers, rounds))
     expected_digest = digest_for(rounds)
-    for index in range(workers):
-        path = os.path.join(out_dir, "cpu-%s-w%d.json" % (run_id, index))
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
 
     stop = threading.Event()
     mem = []
     sampler = threading.Thread(target=sample_memory, args=(stop, mem), daemon=True)
     sampler.start()
-
-    wall_start = time.monotonic()
-    jobs = []
-    for index in range(workers):
-        arguments = (
-            "--cpu-worker /data/ps5-git/tests/cpu_report.py"
-            " --run-id %s --index %d --rounds %d --out-dir %s"
-            % (run_id, index, rounds, out_dir)
-        )
-        trace("launching worker %d" % index)
-        response = launch(base_url, app, arguments)
-        trace("launched worker %d job=%s" % (index, response.get("job_id")))
-        jobs.append(response.get("job_id"))
-    finished = wait_jobs(base_url, jobs, time.monotonic() + timeout)
-    wall_seconds = time.monotonic() - wall_start
-    trace("all jobs done=%d wall=%.3f" % (len(finished), wall_seconds))
-
-    stop.set()
-    sampler.join(timeout=2)
 
     results = []
     failures = []
@@ -166,6 +118,9 @@ def aggregate(out_dir, run_id, workers, rounds, base_url, app, tested_sha, timeo
         except OSError:
             failures.append("worker %d wrote no result" % index)
 
+    stop.set()
+    sampler.join(timeout=2)
+
     pids = [r.get("pid") for r in results]
     if len(results) != workers:
         failures.append("only %d of %d workers reported" % (len(results), workers))
@@ -173,11 +128,23 @@ def aggregate(out_dir, run_id, workers, rounds, base_url, app, tested_sha, timeo
         failures.append("worker pids are not distinct")
     if any(r.get("result_digest") != expected_digest for r in results):
         failures.append("a worker digest does not match the expected digest")
-    for job_id, item in finished.items():
-        if item.get("exit_code") != 0:
-            failures.append("job %s exited %s" % (job_id, item.get("exit_code")))
-    if len(finished) != len(jobs):
-        failures.append("a worker job did not finish")
+    if any(r.get("rounds") != rounds for r in results):
+        failures.append("a worker ran a different round count")
+
+    wall = 0.0
+    overlap = 0.0
+    cpu = sum(float(r.get("cpu_seconds", 0)) for r in results)
+    if results:
+        first = min(float(r["start_monotonic"]) for r in results)
+        last = max(float(r["end_monotonic"]) for r in results)
+        wall = last - first
+        overlap = min(float(r["end_monotonic"]) for r in results) - max(
+            float(r["start_monotonic"]) for r in results
+        )
+    if overlap <= 0:
+        failures.append("the workers did not run at the same time")
+    if not wall or cpu <= 1.5 * wall:
+        failures.append("the workers did not overlap enough to use two cores")
 
     available = [value for value in mem if value is not None]
     memory = {
@@ -197,10 +164,12 @@ def aggregate(out_dir, run_id, workers, rounds, base_url, app, tested_sha, timeo
         "affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else "unavailable",
         "platform": "%s %s" % (sys.platform, os.uname().machine),
         "rounds": rounds,
-        "wall_seconds": wall_seconds,
+        "wall_seconds": wall,
+        "overlap_seconds": overlap,
+        "cpu_seconds_total": cpu,
+        "cpu_wall_ratio": (cpu / wall) if wall else 0,
         "expected_digest": expected_digest,
         "workers": results,
-        "jobs": finished,
         "memory": memory,
         "status": "ok" if not failures else "failed",
         "failures": failures,
@@ -231,10 +200,7 @@ def main(argv):
             run_id,
             int(value("--workers", 2)),
             rounds,
-            value("--base-url", "http://127.0.0.1:8090"),
-            value("--app", "ps5git"),
             value("--tested-sha", "unknown"),
-            float(value("--timeout", 900)),
         )
     print("usage: cpu_report.py --index N | --aggregate [--workers N] [--rounds N]")
     return 2
