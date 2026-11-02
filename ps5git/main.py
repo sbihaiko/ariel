@@ -38,6 +38,21 @@ def emit(lines, path=None):
 BLOCKED = ("subprocess.Popen", "os.exec", "os.posix_spawn", "os.spawn")
 
 
+def trace(message):
+    """Append one durable line, so a crash can be read after a reboot."""
+    try:
+        os.makedirs(LOG, exist_ok=True)
+        fd = os.open(LOG + "/cpu-trace.txt", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            line = "%s pid=%d %s\n" % (time.strftime("%H:%M:%S"), os.getpid(), message)
+            os.write(fd, line.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def install_audit_hook():
     """Refuse process creation for the rest of the process, Git phase included."""
 
@@ -179,7 +194,7 @@ def setting(name, default=None):
 def run_cpu_test(test_path, tested, run_id, workers, extra=None):
     """Run one CPU report in this interpreter and return its result path."""
     saved = sys.argv
-    sys.argv = [test_path, "--tested-sha", tested, "--run-id", run_id,
+    sys.argv = [test_path, "--aggregate", "--tested-sha", tested, "--run-id", run_id,
                 "--workers", workers, "--out-dir", STATE + "/results"] + (extra or [])
     try:
         runpy.run_path(test_path, run_name="__main__")
@@ -194,9 +209,39 @@ def run_cpu_test(test_path, tested, run_id, workers, extra=None):
     return result, ""
 
 
+def cpu_worker(argv):
+    """One worker job: run the test file's --index mode and nothing else.
+
+    The parallelism comes from the supervisor, which starts this job. No app
+    here forks: a second-level fork inside a job takes this console down
+    (ticket #153).
+    """
+    install_audit_hook()
+    trace("cpu-worker entry " + " ".join(argv))
+    at = argv.index("--cpu-worker")
+    test_path = argv[at + 1]
+    if not os.path.isfile(test_path):
+        print("CPU FAIL missing test at " + test_path)
+        return 2
+    rest = argv[:at] + argv[at + 2:]
+    saved = sys.argv
+    sys.argv = [test_path] + rest
+    try:
+        runpy.run_path(test_path, run_name="__main__")
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        trace("cpu-worker exit %d" % code)
+        return code
+    finally:
+        sys.argv = saved
+    trace("cpu-worker exit 0")
+    return 0
+
+
 def cpu_loop(argv):
     """The local half of the CPU evidence: no Git, no credential."""
     install_audit_hook()
+    trace("cpu entry " + " ".join(argv))
     print("AUDIT OK subprocess blocked for the whole run")
     test_path = argv[argv.index("--cpu") + 1] if "--cpu" in argv else STATE + "/tests/cpu_report.py"
     if not os.path.isfile(test_path):
@@ -212,8 +257,10 @@ def cpu_loop(argv):
     extra = ["--rounds", argv[argv.index("--rounds") + 1]] if "--rounds" in argv else []
     result, reason = run_cpu_test(test_path, "local", run_id, workers, extra)
     if result is None:
+        trace("cpu exit 1 " + reason)
         print("CPU FAIL " + reason)
         return 1
+    trace("cpu exit 0 " + result)
     print("CPU OK " + run_id + " " + result)
     return 0
 
@@ -279,6 +326,8 @@ def run_loop(argv):
 
 
 def main(argv):
+    if "--cpu-worker" in argv:
+        return cpu_worker(argv)
     if "--cpu" in argv:
         return cpu_loop(argv)
     if "--run" in argv:

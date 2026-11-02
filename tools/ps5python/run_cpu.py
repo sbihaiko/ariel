@@ -78,17 +78,17 @@ def main(argv=None):
     print(f"cpu_count={report.get('cpu_count')} workers={len(workers)} pids={len(pids)}"
           f" cpu={cpu:.2f}s wall={wall:.2f}s ratio={(cpu / wall) if wall else 0:.2f}")
 
-    failures = []
+    failures = list(report.get("failures") or [])
     if len(workers) < 2:
         failures.append("fewer than two workers")
     if len(pids) != len(workers):
         failures.append("worker pids are not distinct")
-    if any(w.get("exit_code") != 0 for w in workers):
-        failures.append("a worker did not exit 0")
     if any(w.get("result_digest") != report.get("expected_digest") for w in workers):
         failures.append("a digest does not match expected_digest")
     if not wall or cpu <= 1.5 * wall:
         failures.append("workers did not overlap")
+    if report.get("status") != "ok":
+        failures.append("report status is %r" % report.get("status"))
 
     if args.out != "-":
         with open(args.out, "wb") as f:

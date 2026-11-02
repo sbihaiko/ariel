@@ -44,12 +44,25 @@ reproducible bundle and writes `PINS.json` and `MANIFEST.json`;
 `check_bundle.py` refuses a bundle with a changed byte, an unexpected file or
 a native library.
 
+## The CPU test
+
+`tests/cpu_report.py` has two modes. `--index N` is one worker: it hashes a
+fixed buffer, records its CPU time, PID and digest, writes its JSON and exits.
+`--aggregate` launches the workers as app jobs through the launcher's
+`/api/launch`, waits for their `job_id`s in `/api/status`, checks distinct
+PIDs, exit 0 and matching digests, and writes `results/cpu-<run-id>.json`.
+
+The app's `--cpu` mode is the aggregator; `--cpu-worker <path>` is the worker.
+There is no `os.fork` in either: a second-level fork inside an app job takes
+this console's kernel down, while the supervisor's own fork is what every job
+already is ([ADR-0020](adr/0020-cpu-jobs-are-spawned-by-the-supervisor.md)).
+
 ## The self-test
 
 `main.py --selftest` prints one line per capability:
 
 ```text
-PYTHON OK 3.14.7 ps5
+PYTHON OK 3.14.7 freebsd
 AUDIT OK subprocess blocked ...
 FORK OK parent=<pid> child=<pid> status=0
 HTTPS OK verified github.com CN=...
