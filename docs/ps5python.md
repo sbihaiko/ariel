@@ -39,10 +39,20 @@ the report over ftpsrv and judges it. Two steps still need the owner; they are
 written down in `docs/ps5python-owner-steps.md`.
 
 `bootstrap.py` uploads the runtime, the app and the state over ftpsrv and then
-starts the supervisor and the launcher. `make_bundle.py` assembles the
-reproducible bundle and writes `PINS.json` and `MANIFEST.json`;
-`check_bundle.py` refuses a bundle with a changed byte, an unexpected file or
-a native library.
+starts the supervisor and the launcher. `build_runtime.sh` builds the runtime
+from a ps5-python checkout; it applies `tools/ps5python/patches/ps5-python-build.patch`
+and pins `SOURCE_DATE_EPOCH`, which is what makes two clean builds agree.
+`make_bundle.py` assembles the bundle and writes `PINS.json` and `MANIFEST.json`;
+`check_bundle.py` refuses a bundle with a changed byte, an unexpected file or a
+native library. `compare_bundles.py` prints `REPRO OK <n> files` when two
+independent builds match.
+
+Two clean builds were compared on 2026-11-02: `REPRO OK 687 files`, with
+`python-web.elf` at `844456ce…` and `python-app-supervisor.elf` at `7d5ac412…`.
+The two sources of non-determinism were CPython's `__DATE__`/`__TIME__` in
+`Py_GetBuildInfo` (fixed by `SOURCE_DATE_EPOCH`) and the `.note.gnu.build-id`
+that lld does not derive from the content (dropped by `-Wl,--build-id=none`
+in the patch).
 
 ## The CPU test
 

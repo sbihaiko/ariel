@@ -54,12 +54,29 @@ def sha256(path):
     return h.hexdigest()
 
 
+def _ssl_context():
+    """Trust certifi when the interpreter carries no CA store of its own.
+
+    The host Python is often a Framework build whose OpenSSL has no default
+    bundle, so a bare urlopen fails the handshake.
+    """
+    import ssl
+
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def fetch(pkg, cache):
     os.makedirs(cache, exist_ok=True)
     name = pkg["url"].rsplit("/", 1)[-1]
     archive = os.path.join(cache, name)
     if not os.path.isfile(archive):
-        with urllib.request.urlopen(pkg["url"], timeout=120) as r, open(archive, "wb") as f:
+        with urllib.request.urlopen(
+            pkg["url"], timeout=120, context=_ssl_context()
+        ) as r, open(archive, "wb") as f:
             shutil.copyfileobj(r, f)
     digest = sha256(archive)
     if digest != pkg["sha256"]:
