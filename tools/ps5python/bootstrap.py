@@ -36,6 +36,7 @@ def main(argv=None):
     p.add_argument("--build", required=True, help="ps5-python build/ps5 directory")
     p.add_argument("--state", required=True, help="local directory holding the console state files")
     p.add_argument("--app", default="ps5git", help="local app bundle directory")
+    p.add_argument("--test", default="tests/cpu_report.py", help="CPU test to place in the state tree")
     p.add_argument("--no-start", action="store_true")
     p.add_argument("--wait", type=float, default=2.0)
     args = p.parse_args(argv)
@@ -51,6 +52,9 @@ def main(argv=None):
     pushed += push(args.host, args.state, "/data/ps5-git")
     for name in ("python-web.elf", "python-app-supervisor.elf"):
         push_file(args.host, os.path.join(args.build, name), "/data/python/runtime/" + name)
+        pushed += 1
+    if os.path.isfile(args.test):
+        push_file(args.host, args.test, "/data/ps5-git/tests/cpu_report.py")
         pushed += 1
     print(f"uploaded {pushed} files")
 
