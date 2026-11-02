@@ -1,17 +1,14 @@
 """A CPU test for the console, run by the console.
 
-Two roles, both inside the launcher's normal app jobs:
+One app job runs N worker threads. Each hashes a fixed buffer and records its
+own thread id, CPU time, digest and the monotonic start and end of its work;
+the job then writes the run's report.
 
-  --index N     one CPU-bound worker: hashes a fixed buffer, records its own
-                CPU time, PID, digest and the monotonic start and end of its
-                work, writes its JSON and exits.
-  --aggregate   reads the workers' JSONs, checks PIDs, digests and overlap,
-                and writes the run's report.
-
-No job launches another job and no app forks. Upstream documents two ways this
-console goes down: a second-level fork inside a job, and homebrew starting
-while other homebrew runs (#153). The parallelism here is two worker jobs the
-host launches side by side, and the aggregator only reads their files.
+There are no processes here on purpose. Every attempt to run two console homebrew
+processes at once took this console down (#153), with or without a fork and with
+or without one job launching another, which matches the platform note that
+homebrew crashes when previous homebrew is running. hashlib releases the GIL
+for a buffer this size, so two threads hash on two cores inside one process.
 """
 
 import hashlib
@@ -22,7 +19,8 @@ import threading
 import time
 
 BUFFER = b"ps5-cpu-report/" * (1024 * 1024 // 15 + 1)  # just over 1 MiB
-ROUNDS = 8192  # ~8 GiB of hashing per worker
+ROUNDS = 512  # ~0.5 GiB of hashing per worker: short bursts, the platform
+# shuts the console down after sustained load on all of its allowed CPUs
 TRACE_PATH = os.environ.get("PS5GIT_TRACE", "/data/ps5-git/log/cpu-trace.txt")
 
 
@@ -76,71 +74,79 @@ def write_json(path, payload):
     os.replace(tmp, path)
 
 
-def worker(out_dir, run_id, index, rounds):
+def thread_cpu():
+    # CLOCK_THREAD_CPUTIME_ID where the platform has it; the process clock is
+    # the honest fallback and the report says which one was used.
+    if hasattr(time, "thread_time"):
+        return time.thread_time(), "thread"
+    return time.process_time(), "process"
+
+
+def worker(index, rounds, results, clock):
     trace("worker %d start rounds=%d" % (index, rounds))
     start_monotonic = time.monotonic()
-    start_cpu = time.process_time()
+    start_cpu, _ = thread_cpu()
     digest = digest_for(rounds)
-    cpu = time.process_time() - start_cpu
+    cpu = thread_cpu()[0] - start_cpu
     end_monotonic = time.monotonic()
-    payload = {
-        "run_id": run_id,
+    results[index] = {
         "index": index,
+        "thread_id": threading.get_ident(),
         "pid": os.getpid(),
         "rounds": rounds,
         "cpu_seconds": cpu,
         "start_monotonic": start_monotonic,
         "end_monotonic": end_monotonic,
         "result_digest": digest,
+        "clock": clock,
     }
-    write_json(os.path.join(out_dir, "cpu-%s-w%d.json" % (run_id, index)), payload)
-    trace("worker %d written cpu=%.3f" % (index, cpu))
-    print("WORKER %d pid=%d cpu=%.3f" % (index, payload["pid"], cpu))
-    return 0
+    trace("worker %d done cpu=%.3f" % (index, cpu))
 
 
-def aggregate(out_dir, run_id, workers, rounds, tested_sha):
-    trace("aggregate start workers=%d rounds=%d" % (workers, rounds))
+def run(rounds, workers, tested_sha, run_id, out_dir):
+    trace("run start workers=%d rounds=%d" % (workers, rounds))
     expected_digest = digest_for(rounds)
+    trace("expected digest computed")
 
     stop = threading.Event()
     mem = []
     sampler = threading.Thread(target=sample_memory, args=(stop, mem), daemon=True)
     sampler.start()
 
-    results = []
-    failures = []
+    clock = "thread" if hasattr(time, "thread_time") else "process"
+    results = {}
+    threads = []
     for index in range(workers):
-        path = os.path.join(out_dir, "cpu-%s-w%d.json" % (run_id, index))
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                results.append(json.load(f))
-        except OSError:
-            failures.append("worker %d wrote no result" % index)
+        t = threading.Thread(target=worker, args=(index, rounds, results, clock))
+        threads.append(t)
+    started = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    finished = time.monotonic()
+    trace("threads joined")
 
     stop.set()
     sampler.join(timeout=2)
 
-    pids = [r.get("pid") for r in results]
-    if len(results) != workers:
-        failures.append("only %d of %d workers reported" % (len(results), workers))
-    if len(set(pids)) != len(pids):
-        failures.append("worker pids are not distinct")
-    if any(r.get("result_digest") != expected_digest for r in results):
-        failures.append("a worker digest does not match the expected digest")
-    if any(r.get("rounds") != rounds for r in results):
-        failures.append("a worker ran a different round count")
-
-    wall = 0.0
+    ordered = [results[i] for i in sorted(results)]
+    thread_ids = [r["thread_id"] for r in ordered]
+    cpu = sum(r["cpu_seconds"] for r in ordered)
+    wall = finished - started
     overlap = 0.0
-    cpu = sum(float(r.get("cpu_seconds", 0)) for r in results)
-    if results:
-        first = min(float(r["start_monotonic"]) for r in results)
-        last = max(float(r["end_monotonic"]) for r in results)
-        wall = last - first
-        overlap = min(float(r["end_monotonic"]) for r in results) - max(
-            float(r["start_monotonic"]) for r in results
+    if ordered:
+        overlap = min(r["end_monotonic"] for r in ordered) - max(
+            r["start_monotonic"] for r in ordered
         )
+
+    failures = []
+    if len(ordered) != workers:
+        failures.append("only %d of %d workers reported" % (len(ordered), workers))
+    if len(set(thread_ids)) != len(thread_ids):
+        failures.append("worker thread ids are not distinct")
+    if any(r["result_digest"] != expected_digest for r in ordered):
+        failures.append("a worker digest does not match the expected digest")
     if overlap <= 0:
         failures.append("the workers did not run at the same time")
     if not wall or cpu <= 1.5 * wall:
@@ -169,13 +175,13 @@ def aggregate(out_dir, run_id, workers, rounds, tested_sha):
         "cpu_seconds_total": cpu,
         "cpu_wall_ratio": (cpu / wall) if wall else 0,
         "expected_digest": expected_digest,
-        "workers": results,
+        "workers": ordered,
         "memory": memory,
         "status": "ok" if not failures else "failed",
         "failures": failures,
     }
     write_json(os.path.join(out_dir, "cpu-%s.json" % run_id), report)
-    trace("aggregate written status=%s failures=%d" % (report["status"], len(failures)))
+    trace("run written status=%s failures=%d" % (report["status"], len(failures)))
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if not failures else 1
 
@@ -188,22 +194,15 @@ def main(argv):
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
         int.from_bytes(os.urandom(3), "big"),
     )
-    rounds = int(value("--rounds", ROUNDS))
     out_dir = value("--out-dir", "/data/ps5-git/results")
     os.makedirs(out_dir, exist_ok=True)
-
-    if "--index" in argv:
-        return worker(out_dir, run_id, int(value("--index")), rounds)
-    if "--aggregate" in argv:
-        return aggregate(
-            out_dir,
-            run_id,
-            int(value("--workers", 2)),
-            rounds,
-            value("--tested-sha", "unknown"),
-        )
-    print("usage: cpu_report.py --index N | --aggregate [--workers N] [--rounds N]")
-    return 2
+    return run(
+        int(value("--rounds", ROUNDS)),
+        int(value("--workers", 2)),
+        value("--tested-sha", "unknown"),
+        run_id,
+        out_dir,
+    )
 
 
 if __name__ == "__main__":

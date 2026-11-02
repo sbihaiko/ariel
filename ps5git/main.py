@@ -194,7 +194,7 @@ def setting(name, default=None):
 def run_cpu_test(test_path, tested, run_id, workers, extra=None):
     """Run one CPU report in this interpreter and return its result path."""
     saved = sys.argv
-    sys.argv = [test_path, "--aggregate", "--tested-sha", tested, "--run-id", run_id,
+    sys.argv = [test_path, "--tested-sha", tested, "--run-id", run_id,
                 "--workers", workers, "--out-dir", STATE + "/results"] + (extra or [])
     try:
         runpy.run_path(test_path, run_name="__main__")
@@ -207,35 +207,6 @@ def run_cpu_test(test_path, tested, run_id, workers, extra=None):
     if not os.path.isfile(result):
         return None, "result file missing " + result
     return result, ""
-
-
-def cpu_worker(argv):
-    """One worker job: run the test file's --index mode and nothing else.
-
-    The parallelism comes from the supervisor, which starts this job. No app
-    here forks: a second-level fork inside a job takes this console down
-    (ticket #153).
-    """
-    install_audit_hook()
-    trace("cpu-worker entry " + " ".join(argv))
-    at = argv.index("--cpu-worker")
-    test_path = argv[at + 1]
-    if not os.path.isfile(test_path):
-        print("CPU FAIL missing test at " + test_path)
-        return 2
-    rest = argv[:at] + argv[at + 2:]
-    saved = sys.argv
-    sys.argv = [test_path] + rest
-    try:
-        runpy.run_path(test_path, run_name="__main__")
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-        trace("cpu-worker exit %d" % code)
-        return code
-    finally:
-        sys.argv = saved
-    trace("cpu-worker exit 0")
-    return 0
 
 
 def cpu_loop(argv):
@@ -326,8 +297,6 @@ def run_loop(argv):
 
 
 def main(argv):
-    if "--cpu-worker" in argv:
-        return cpu_worker(argv)
     if "--cpu" in argv:
         return cpu_loop(argv)
     if "--run" in argv:

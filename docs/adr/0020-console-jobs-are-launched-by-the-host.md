@@ -22,6 +22,12 @@ Three attempts took the console down:
 - probe 3 (no fork at all): an aggregator job launched the worker jobs through
   the launcher's `/api/launch`, polled `/api/status`, and the console went
   down again. The host lost port 8090 mid-run.
+- probe 4 (the host launched two workers, then an aggregator; no fork, no
+  nested launch): the trace shows both workers starting in the same second,
+  each finishing with about 1.58 s of CPU, and both exiting 0. The aggregator
+  started one second later and the trace stops at its first line. Two
+  console processes side by side were fine; the third job was not.
+- probe 5 (one job, two threads): the console went down again.
 
 So a second-level fork is not the whole story. The third probe has neither a
 fork nor a pipe, but it does have one job asking the console to start more
@@ -48,23 +54,24 @@ to its race and not to any payload.
 2. An app job never launches another job. The host or the operator starts
    every job; the console side reads state from files, never from the
    launcher's API.
-3. The CPU test is two worker jobs the host launches side by side, plus one
-   aggregator job that only reads the workers' JSONs. Each worker records its
-   own monotonic start and end, so the aggregator computes wall, overlap and
-   the CPU-to-wall ratio without any clock crossing the host boundary.
-4. A test keeps at most two CPU-bound workers, and no worker spins in a
-   busy-wait: every allowed CPU busy is a documented way to shut the console
-   down.
+3. The CPU test is one job with two worker threads. Each thread records its
+   own thread id, CPU time, digest and monotonic start and end; the job
+   computes wall, overlap and the CPU-to-wall ratio from those. `hashlib`
+   releases the GIL for a buffer this size, so the threads really run on two
+   cores, and only one console process exists at a time.
+4. A test keeps at most two CPU-bound workers, runs them in short bursts, and
+   no worker spins in a busy-wait: every allowed CPU busy is a documented way
+   to shut the console down.
 
 ## Consequences
 
 - The console is never the orchestrator. It runs what the host starts, and
   reports by file.
-- The aggregator cannot see a worker that never wrote its file; a missing
-  result is a failed run, not a retry.
-- The CPU evidence measures real parallelism only if the host's two launches
-  overlap, which the workers' monotonic intervals prove or disprove in the
-  report itself.
+- The threads' monotonic intervals prove or disprove the overlap inside the
+  report itself, so the CPU evidence does not depend on host timing.
+- A burst long enough to be measurable and short enough to be safe is a
+  tuning parameter on a platform that shuts down under sustained load; the
+  round count is chosen for seconds, not minutes.
 - If the platform later makes concurrent homebrew safe, this rule may be
   revisited; until then a nested launch is a defect.
 
