@@ -161,14 +161,20 @@ def pull(directory, branch):
     repo = Repo(directory)
     before = head(repo)
     wanted = b"refs/heads/" + branch.encode()
-    target = repo.refs.read_ref(b"HEAD")
+    try:
+        target = repo.refs.read_ref(b"HEAD")
+    except KeyError:
+        target = b""
     if not target.startswith(b"ref:") or target[5:] != wanted:
         log("PULL REFUSED head is %s, not %s" % (target.decode(errors="replace"), wanted.decode()))
         return 1
     status = porcelain.status(repo)
-    if status.staged or status.unstaged or status.untracked:
+    # dulwich reports staged changes as a dict of paths by action, so the dict
+    # itself is always truthy; emptiness has to be asked of its values.
+    staged = sum(len(paths) for paths in status.staged.values()) if hasattr(status.staged, "values") else len(status.staged)
+    if staged or status.unstaged or status.untracked:
         log("PULL REFUSED tree is dirty staged=%d unstaged=%d untracked=%d"
-            % (len(status.staged), len(status.unstaged), len(status.untracked)))
+            % (staged, len(status.unstaged), len(status.untracked)))
         return 1
     try:
         porcelain.pull(

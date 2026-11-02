@@ -227,6 +227,12 @@ def run_loop(argv):
     if not os.path.isfile(result):
         print("RUN FAIL result file missing " + result)
         return 1
+    with open(result, "r", encoding="utf-8") as f:
+        report = json.load(f)
+    available = (report.get("memory") or {}).get("mem_available_kb")
+    if isinstance(available, int) and available < 200 * 1024:
+        print("RUN FAIL memory below 200 MB: %d KB" % available)
+        return 1
     sha = git_runner.commit_results(
         repo_dir, result, "results: %s tested %s" % (run_id, tested[:8])
     )

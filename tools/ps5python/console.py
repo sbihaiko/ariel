@@ -26,6 +26,19 @@ def get_json(host: str, path: str, timeout: float = 30) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def logs(host: str, since: int, timeout: float = 30) -> tuple[str, int]:
+    """Return the buffered log text and the cursor to ask from next time."""
+    url = base(host, HTTP_PORT) + f"/api/logs?since={since}"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        body = r.read().decode("utf-8", "replace")
+        nxt = r.headers.get("X-Log-Next", since)
+    try:
+        data = json.loads(body).get("data", "")
+    except ValueError:
+        data = body
+    return data, int(nxt)
+
+
 def ftp(host: str) -> ftplib.FTP:
     conn = ftplib.FTP()
     conn.connect(host, FTP_PORT, timeout=30)
