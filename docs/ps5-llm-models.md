@@ -13,12 +13,17 @@ and friends are never sent.
 
 ## Results
 
-| Model | Quant | Weights | Context | Prefill (2.6k) | Prefill (23k) | Gen | `tool_calls` |
+| Model | Quant | Weights | Context | Prefill (3k) | Prefill (22–30k) | Gen | `tool_calls` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen2.5-Coder-14B | Q4_K_M | 9.0 GB | 32k | 140 tok/s | 87 tok/s | 35,7 tok/s | não |
 | Qwen2.5-Coder-7B | Q4_K_M | 4.7 GB | 32k | 363 tok/s | 256 tok/s | 57,4 tok/s | não |
-| **Qwen3.5-9B** | Q4_K_M | 5,7 GB | 32k | **333 tok/s** | **295 tok/s** | 52,8 tok/s | **sim** |
+| **Qwen3.5-9B** | Q4_K_M | 5,7 GB | 32k | **340 → 170 tok/s** | **295 → 145 tok/s** | 52–54 tok/s | **sim** |
 | Qwen3-Coder-30B-A3B | UD-IQ2_M | 10,8 GB | **4k** | 164 tok/s | — | 89,8 tok/s | sim |
+
+Prefill is reported as a range because it is not a constant: it starts at the
+high number on a fresh load and falls to the low one after the slot has held a
+long context. See "Prefill sags under sustained use" below. Generation does not
+sag — it stays at 52 to 54 tok/s in every condition measured.
 
 The 30B never reached a 23k prompt: the app could only give it 4096 tokens of
 context, because its weights already take 10,9 of the 11,0 GiB pool and the KV
@@ -32,11 +37,32 @@ shares a prefix prefills only the new tokens (4 tokens in 0.7 s on the 9B), so
 a turn that appends to the same conversation pays for the delta, not the whole
 prompt.
 
+## Prefill sags under sustained use
+
+The same 2967-token prompt was measured three times on the 9B in one process:
+
+| Condition | SoC / CPU °C | Prefill |
+| --- | --- | --- |
+| First request after the model loaded | 47 / 52 | 336 tok/s |
+| After a 30k-token context filled the slot | 57 / 63 | 169 tok/s |
+| After four idle minutes | 49 / 54 | 169 tok/s |
+
+Cooling recovers some of it but not all: a 5927-token prompt measured 145 tok/s
+while hot and 251 tok/s after the same four-minute cooldown. The rest does not
+come back without a fresh process — the slot cannot be cleared, because
+`POST /slots/0?action=erase` answers 501 in this build.
+
+So the honest expectation for an interactive session is the low number, not the
+one measured right after loading. Whether reopening the PS5LM title restores the
+top speed was not tested; that needs a third model reload, and the finding does
+not change which model is worth keeping.
+
 ## The choice
 
-Qwen3.5-9B Q4_K_M. It matches the 7B on prefill within 5%, has eight times the
-context of the 30B, and is the only small model here whose template emits
-structured `tool_calls`.
+Qwen3.5-9B Q4_K_M. It matches the 7B on prefill within about 8%, has eight
+times the context of the 30B, and is the only small model here whose template
+emits structured `tool_calls`. The 30B's faster generation does not pay for a
+4k context: an agent turn does not fit.
 
 That last point decided it. With `tool_choice: "required"`, the Qwen2.5-Coder
 models still returned the call as assistant *text* with `finish_reason: "stop"`,
