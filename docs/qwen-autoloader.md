@@ -69,6 +69,17 @@ The page set also gains a `qwen.html` chain page (the relapse chain with the
 patched autoloader embedded) and a `/app/qwen.html` pointer that skips the
 exploit-choice lookup, so the icon works with no installer page involved.
 
+The installer also preselects the chain it launches the browser with
+(`&exploit=relapse`): upstream only serves the page's `manifest` attribute once
+the request names a supported chain, and with nobody at the console the page
+would sit on its "Select Exploit" buttons and never cache. The consequence is
+worth knowing — a Qwen install that reaches `/install` without that preselect
+creates the icon with no offline page behind it, and tapping it after a reboot
+shows the browser's "internet unavailable" error. The fix is to run the
+installer again and let the page install itself: the log ending in
+`[WKALI] App installed. Stopping server...` means the cache was complete,
+because the page only calls `/install` after the AppCache reports ready.
+
 The installer links statically against libmicrohttpd, which the payload SDK
 does not ship. Build it once for the console:
 
