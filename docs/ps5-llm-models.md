@@ -90,6 +90,32 @@ disqualifies it for agent work.
 The 14B, 7B and 30B were deleted from the console; none of them beat the 9B on
 anything that matters here.
 
+## Thinking is on by default, and hides the answer
+
+Qwen3.5 reasons before answering, and the reasoning arrives in a separate field
+(`reasoning_content`), not in `content`. With the default settings a short
+answer is all thinking and no content:
+
+```
+$ curl -s .../v1/chat/completions -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":64}'
+content: ''            reasoning_content: 'Thinking Process:\n\n1. **Analyze the Request:** ...'
+```
+
+`max_tokens` counts the reasoning, so a small budget is spent before the model
+ever starts answering. The fix is to turn thinking off per request:
+
+```json
+"chat_template_kwargs": {"enable_thinking": false}
+```
+
+which answers `'2 + 2 equals **4**.'` in 0.4 s instead of not answering. The
+`/no_think` suffix in the prompt does **not** work — this template ignores it.
+`enable_thinking` is a boolean, so it does not trip the float bug.
+
+Tool calls work in both modes and answer `finish_reason: "tool_calls"` in about
+1.5 s with `tool_choice: "required"`. Streaming works: reasoning arrives as
+`delta.reasoning_content` chunks and the answer as `delta.content`.
+
 ## Why no GPU figure
 
 The console reports no GPU utilisation, and that is normal — there is no
