@@ -6,8 +6,13 @@ chain's file.
 
 | Icon (title ID) | Serves | Autoloader entry id | Config it reads |
 | --- | --- | --- | --- |
-| `WebKit Autoloader` (`PINK00001`) | `http://127.0.0.1:18181/app/ariel.html` | `webkit` (released upstream) | `/mnt/usb0/ps5_autoloader/autoload.txt` |
-| `WebKit Autoloader Qwen` (`PINK00002`) | `http://127.0.0.1:18182/app/qwen.html` | `qwen` (patched) | `/mnt/usb0/ps5_autoloader_qwen/autoload.txt` |
+| `Jailbreak` (`PINK00001`, PKAL v0.7.1 by MikePinku) | `http://127.0.0.1:18181/app/index.html` | `webkit` (upstream 0.7.1) | `/mnt/usb0/ps5_autoloader/autoload.txt` |
+| `Qwen` (`PINK00002`, ours) | `http://127.0.0.1:18182/app/qwen.html` | `qwen` (patched) | `/mnt/usb0/ps5_autoloader_qwen/autoload.txt` |
+
+The `Jailbreak` icon is the stock PKAL v0.7.1 installer the console already
+used, with one thing changed: the display name inside its embedded
+`param.json`. Its page, payloads and cache are the originals. Only the `Qwen`
+icon is a build of ours, with its own icon art.
 
 Both icons are the same design: a fake homescreen app whose `param.json`
 deeplinks into the console's own WebKit browser, and a WebKit autoloader
@@ -28,11 +33,31 @@ kstuff-lite 1.09, ShadowMountPlus 1.6 beta 16, ftpsrv, klogsrv, ariel.
 kstuff-lite 1.09, ShadowMountPlus 1.7 beta 11, ftpsrv, klogsrv, ariel. The
 1.7 mount is what PS5LM Plus 0.8.4 needs to reach `/data/PS5LM`.
 
+## Names and icons
+
+Both homescreen entries are launcher apps: `/user/app/<title>/sce_sys/` holds
+only `param.json` (name and deeplink) and `icon0.png`. The name is whatever the
+installer embedded when it registered the title, so renaming means running an
+installer that carries the new `param.json` — editing the file on the console
+is not enough, because the shell registers the metadata at install time.
+
+- `Jailbreak`: the PKAL v0.7.1 ELF with `"WebKit Autoloader v0.7.1"` replaced
+  in place by `"Jailbreak"` plus padding to the same byte length, so the
+  embedded JSON array keeps its size. The padded spaces never render.
+- `Qwen`: our build names the app directly in `assets/param.json.template`, and
+  its `icon0.png` comes from `assets/icon.svg` (a violet disc, cyan `<>`
+  brackets around a white Q) rendered by `tools/gen_icons.py`.
+
+A standalone "write param.json and re-register" payload would be neater than
+rewriting an installer, but an ELF that links `libSceAppInstUtil` and calls
+`sceAppInstUtilInitialize` from the shell never reaches `main` — the loader
+stops it (the shell reports `Suspended (signal): 17`). Running the real
+installer is the path that works.
+
 ## Building the Qwen installer
 
 The upstream source is `itsPLK/ps5-webkit-autoloader` at `v0.1.7-abc3b82` with
 its unified autoloader submodule. Two edits make it the Qwen variant:
-
 1. `third_party/ps5-unified-autoloader/src/app_killer.c` — the WebKit entry
    point id becomes `qwen`, so the autoloader looks for
    `ps5_autoloader_qwen` before falling back to the generic directory.
