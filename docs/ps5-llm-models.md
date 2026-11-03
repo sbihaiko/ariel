@@ -17,13 +17,13 @@ and friends are never sent.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen2.5-Coder-14B | Q4_K_M | 9.0 GB | 32k | 140 tok/s | 87 tok/s | 35,7 tok/s | não |
 | Qwen2.5-Coder-7B | Q4_K_M | 4.7 GB | 32k | 363 tok/s | 256 tok/s | 57,4 tok/s | não |
-| **Qwen3.5-9B** | Q4_K_M | 5,7 GB | 32k | **340 → 170 tok/s** | **295 → 145 tok/s** | 52–54 tok/s | **sim** |
+| **Qwen3.5-9B** | Q4_K_M | 5,7 GB | 32k | **170–342 tok/s** | **145–295 tok/s** | 52–54 tok/s | **sim** |
 | Qwen3-Coder-30B-A3B | UD-IQ2_M | 10,8 GB | **4k** | 164 tok/s | — | 89,8 tok/s | sim |
 
-Prefill is reported as a range because it is not a constant: it starts at the
-high number on a fresh load and falls to the low one after the slot has held a
-long context. See "Prefill sags under sustained use" below. Generation does not
-sag — it stays at 52 to 54 tok/s in every condition measured.
+Prefill is reported as a range because it varies from session to session by
+roughly a factor of two, for a reason not yet identified. See "Prefill varies
+between sessions" below. Generation is stable — 52 to 54 tok/s in every
+condition measured.
 
 The 30B never reached a 23k prompt: the app could only give it 4096 tokens of
 context, because its weights already take 10,9 of the 11,0 GiB pool and the KV
@@ -37,25 +37,35 @@ shares a prefix prefills only the new tokens (4 tokens in 0.7 s on the 9B), so
 a turn that appends to the same conversation pays for the delta, not the whole
 prompt.
 
-## Prefill sags under sustained use
+## Prefill varies between sessions, for an unknown reason
 
-The same 2967-token prompt was measured three times on the 9B in one process:
+One 9B process ran a 2967-token prompt at 336 tok/s on its first request, and
+then at 169 tok/s for the rest of its life — after a 30k-token request, at 57/63
+°C, and again after four idle minutes at 49/54 °C. A 5927-token prompt in that
+same process measured 145 tok/s while hot and 251 tok/s after the cooldown.
+Generation stayed at 52–54 tok/s throughout.
 
-| Condition | SoC / CPU °C | Prefill |
-| --- | --- | --- |
-| First request after the model loaded | 47 / 52 | 336 tok/s |
-| After a 30k-token context filled the slot | 57 / 63 | 169 tok/s |
-| After four idle minutes | 49 / 54 | 169 tok/s |
+The next process did not reproduce it. Three controlled tests there:
 
-Cooling recovers some of it but not all: a 5927-token prompt measured 145 tok/s
-while hot and 251 tok/s after the same four-minute cooldown. The rest does not
-come back without a fresh process — the slot cannot be cleared, because
-`POST /slots/0?action=erase` answers 501 in this build.
+| Test | Result |
+| --- | --- |
+| 2967-token prompt, fresh process, 46/51 °C | 339 tok/s |
+| Same prompt again after a 29,907-token request filled the slot, 67/75 °C | 337 tok/s |
+| Same prompt after a rejected 44,907-token request | 342 tok/s |
 
-So the honest expectation for an interactive session is the low number, not the
-one measured right after loading. Whether reopening the PS5LM title restores the
-top speed was not tested; that needs a third model reload, and the finding does
-not change which model is worth keeping.
+So context length, temperature and a rejected oversized request are all ruled
+out, and the 169 tok/s figure is not a property of sustained use. What separates
+the two processes is unknown; the slot cannot be cleared to probe it further
+(`POST /slots/0?action=erase` answers 501 in this build), so a model reload is
+the only reset.
+
+The practical reading: expect 170 to 340 tok/s of prefill at agent-sized
+prompts, depending on the session, and do not plan around the high number. If a
+session feels slow, reopening the PS5LM title is cheap.
+
+A long context does cost prefill on its own, independent of any of this: the
+same process went from 339 tok/s at 2967 tokens to 284 tok/s at 29,907 tokens,
+and the older 9B runs measured 295 tok/s at 23k.
 
 ## The choice
 
