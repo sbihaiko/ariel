@@ -68,7 +68,8 @@ endif
 CFLAGS := -Wall -Werror -O2
 
 SUBDIRS := bundles/core bundles/http2_get bundles/suspend \
-           bundles/launch bundles/hbldr bundles/pkg_install
+           bundles/launch bundles/hbldr bundles/pkg_install \
+           bundles/eden_links
 
 TOPTARGETS := all clean
 
