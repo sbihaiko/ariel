@@ -87,5 +87,6 @@ test: $(BIN) $(MCP) $(SIGNER) $(CANONICAL_TEST) $(TITLE_PART_TEST)
 	python3 tests/mcp_acceptance.py ./$(MCP) ./$(BIN)
 	python3 tests/release_workflow_acceptance.py ./$(MCP)
 	python3 tests/eden_links_test.py
+	python3 tests/retro_links_test.py
 
 .PHONY: all clean test
